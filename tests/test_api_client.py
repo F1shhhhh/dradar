@@ -10,7 +10,7 @@ import pytest
 
 from dradar import __version__
 from dradar.api_client import ApiClient, ApiError, normalize_batch_id
-from dradar.providers import DEEPSEEK_CAPABILITY
+from dradar.providers import DEEPSEEK_CAPABILITY, TASK_PACKAGE_SYNC_CAPABILITY
 from dradar.submission_intent import (
     UPLOAD_INTENT_VERSION,
     submission_payload_sha256,
@@ -42,6 +42,22 @@ def test_version_is_always_sent_and_capabilities_remain_sparse():
     assert seen[0]["x-dradar-client-version"] == __version__
     assert "x-dradar-capabilities" not in seen[0]
     assert seen[1]["x-dradar-capabilities"] == DEEPSEEK_CAPABILITY
+
+
+def test_default_client_advertises_task_package_sync_to_old_server():
+    seen = []
+
+    def old_server(request):
+        seen.append(dict(request.headers))
+        return httpx.Response(200, json={"assignment": None})
+
+    client = ApiClient(
+        "https://old.example.com", "drt_test",
+        transport=httpx.MockTransport(old_server),
+    )
+    assert client.get_assignment() == {"assignment": None}
+    advertised = set(seen[0]["x-dradar-capabilities"].split(","))
+    assert TASK_PACKAGE_SYNC_CAPABILITY in advertised
 
 
 def test_http_error_attaches_status_code_and_detail():

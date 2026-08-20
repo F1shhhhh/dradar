@@ -32,6 +32,7 @@ from dradar.providers import (
     DSH_PRO_CAPABILITY,
     DSH_VISION_CAPABILITY,
     DSH_VISION_TEXT_CAPABILITY,
+    TASK_PACKAGE_SYNC_CAPABILITY,
     advertised_capabilities,
     assignment_codex_provider,
     deepseek_catalog_error,
@@ -91,10 +92,12 @@ def _command(tmp_path: Path, monkeypatch, assignment=None) -> tuple[list[str], P
 
 def test_capability_advertises_software_support_before_first_key_setup():
     assert advertised_capabilities({}) == (
+        TASK_PACKAGE_SYNC_CAPABILITY,
         DEEPSEEK_CAPABILITY, DEEPSEEK_PRO_CAPABILITY,
         DEEPSEEK_FLASH_OFF_CAPABILITY, DEEPSEEK_PRO_OFF_CAPABILITY,
     )
     assert advertised_capabilities({DEEPSEEK_API_KEY_ENV: "key"}) == (
+        TASK_PACKAGE_SYNC_CAPABILITY,
         DEEPSEEK_CAPABILITY, DEEPSEEK_PRO_CAPABILITY,
         DEEPSEEK_FLASH_OFF_CAPABILITY, DEEPSEEK_PRO_OFF_CAPABILITY,
         DSH_FLASH_CAPABILITY, DSH_PRO_CAPABILITY,
@@ -137,7 +140,7 @@ def test_corrupt_catalog_withholds_paid_provider_capability(
     monkeypatch.setattr(providers, "deepseek_catalog_path", lambda: corrupt)
 
     assert "integrity check failed" in (deepseek_catalog_error(corrupt) or "")
-    assert advertised_capabilities({}) == ()
+    assert advertised_capabilities({}) == (TASK_PACKAGE_SYNC_CAPABILITY,)
 
 
 def test_missing_provider_preserves_original_codex_path():
