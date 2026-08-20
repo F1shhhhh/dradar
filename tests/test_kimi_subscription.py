@@ -494,13 +494,23 @@ def test_kimi_wire_groups_retries_and_accepts_multiturn_equal_millis() -> None:
                       "inputCacheRead": 20, "output": output},
         }
 
+    def retry(attempt: int, *, error_name: str = "APIProviderRateLimitError",
+              status_code: int | None = 429) -> dict:
+        return {
+            "role": "meta", "type": "turn.step.retrying",
+            "failed_attempt": attempt, "next_attempt": attempt + 1,
+            "max_attempts": 10, "delay_ms": 500.0,
+            "error_name": error_name, "error_message": "retryable",
+            "status_code": status_code,
+        }
+
     records = [
         {"type": "metadata", "protocol_version": "1"},
         {"type": "turn.prompt", "time": 100},
         request("0.1", 110),
-        request("0.1", 120, attempt="2/10"),
+        request("0.2", 120),
         usage(200, 3),
-        request("0.2", 200),
+        request("0.3", 200),
         usage(200, 4),
         {"type": "turn.ended", "turnId": 0, "reason": "completed", "time": 210},
         {"type": "turn.prompt", "time": 300},
@@ -508,7 +518,7 @@ def test_kimi_wire_groups_retries_and_accepts_multiturn_equal_millis() -> None:
         usage(400, 5),
         {"type": "turn.ended", "turnId": 1, "reason": "completed", "time": 410},
     ]
-    facts = namespace["_kimi_usage_facts"](records)
+    facts = namespace["_kimi_usage_facts"](records, [retry(1)])
     assert facts["complete"] is True
     assert facts["request_count"] == 3
     assert facts["session_usage_model_request_count"] == 3
@@ -518,11 +528,155 @@ def test_kimi_wire_groups_retries_and_accepts_multiturn_equal_millis() -> None:
     assert facts["turn_prompt_count"] == 2
 
     replay = list(records)
-    replay.insert(5, request("0.1", 201))
-    replayed = namespace["_kimi_usage_facts"](replay)
+    replay.insert(5, request("0.2", 201))
+    replayed = namespace["_kimi_usage_facts"](replay, [retry(1)])
     assert replayed["complete"] is False
     assert replayed["request_usage_observed"] is False
     assert replayed["request_ledger_duplicate_count"] == 1
+
+
+def test_kimi_replays_real_cliffy_429_retry_fixture() -> None:
+    source = Path(providers.__file__).with_name("pier_kimi.py").read_text()
+    module = ast.parse(source)
+    helpers = [
+        node for node in module.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"_usage_instant", "_kimi_usage_facts"}
+    ]
+    namespace = {
+        "Any": Any, "datetime": datetime, "timezone": timezone,
+        "deque": deque,
+    }
+    exec(compile(ast.Module(body=helpers, type_ignores=[]), "pier_kimi.py", "exec"),
+         namespace)
+    fixture = json.loads(
+        (Path(__file__).with_name("fixtures")
+         / "kimi_cliffy_429_reconciliation.json").read_text()
+    )
+    expected = fixture["expected"]
+    facts = namespace["_kimi_usage_facts"](
+        fixture["wire_records"], fixture["retry_records"],
+    )
+    assert facts["complete"] is True
+    assert facts["usage_evidence_tier"] == "complete_reconciled"
+    assert facts["request_count"] == expected["request_count"]
+    assert facts["session_usage_model_request_count"] == expected["request_count"]
+    assert facts["session_usage_request_attempt_count"] == expected["attempt_count"]
+    assert facts["session_usage_request_retry_count"] == expected["retry_count"]
+    assert facts["n_input_tokens"] == expected["n_input_tokens"]
+    assert facts["n_cache_tokens"] == expected["n_cache_tokens"]
+    assert facts["n_output_tokens"] == expected["n_output_tokens"]
+    assert facts["request_ledger_source"] == (
+        "kimi-code-0.36.1-main-wire-retry-v2"
+    )
+
+
+def test_kimi_retry_reconciliation_whitelists_connection_errors() -> None:
+    source = Path(providers.__file__).with_name("pier_kimi.py").read_text()
+    module = ast.parse(source)
+    helpers = [
+        node for node in module.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"_usage_instant", "_kimi_usage_facts"}
+    ]
+    namespace = {
+        "Any": Any, "datetime": datetime, "timezone": timezone,
+        "deque": deque,
+    }
+    exec(compile(ast.Module(body=helpers, type_ignores=[]), "pier_kimi.py", "exec"),
+         namespace)
+    wire = [
+        {"type": "metadata", "protocol_version": "1.5"},
+        {"type": "turn.prompt", "time": 100},
+        {"type": "llm.request", "model": "k3", "turnStep": "0.1",
+         "time": 110},
+        {"type": "llm.request", "model": "k3", "turnStep": "0.2",
+         "time": 120},
+        {"type": "usage.record", "usageScope": "turn",
+         "model": "kimi-code/k3", "time": 130,
+         "usage": {"inputOther": 10, "inputCacheCreation": 0,
+                   "inputCacheRead": 20, "output": 3}},
+        {"type": "turn.ended", "turnId": 0, "reason": "completed",
+         "time": 140},
+    ]
+    connection_retry = [{
+        "role": "meta", "type": "turn.step.retrying",
+        "failed_attempt": 1, "next_attempt": 2, "max_attempts": 10,
+        "delay_ms": 500, "error_name": "APIConnectionError",
+        "error_message": "connection reset",
+    }]
+    facts = namespace["_kimi_usage_facts"](wire, connection_retry)
+    assert facts["complete"] is True
+    assert facts["request_count"] == 1
+    assert facts["session_usage_request_attempt_count"] == 2
+    assert facts["session_usage_request_retry_count"] == 1
+
+
+def test_kimi_retry_reconciliation_rejects_count_coincidence_and_forgery() -> None:
+    source = Path(providers.__file__).with_name("pier_kimi.py").read_text()
+    module = ast.parse(source)
+    helpers = [
+        node for node in module.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"_usage_instant", "_kimi_usage_facts"}
+    ]
+    namespace = {
+        "Any": Any, "datetime": datetime, "timezone": timezone,
+        "deque": deque,
+    }
+    exec(compile(ast.Module(body=helpers, type_ignores=[]), "pier_kimi.py", "exec"),
+         namespace)
+
+    def retry(attempt: int, *, error_name: str = "APIProviderRateLimitError",
+              role: str = "meta", extra: dict | None = None) -> dict:
+        value = {
+            "role": role, "type": "turn.step.retrying",
+            "failed_attempt": attempt, "next_attempt": attempt + 1,
+            "max_attempts": 10, "delay_ms": 500,
+            "error_name": error_name, "error_message": "retryable",
+            "status_code": 429,
+        }
+        value.update(extra or {})
+        return value
+
+    wire = [
+        {"type": "metadata", "protocol_version": "1.5"},
+        {"type": "turn.prompt", "time": 100},
+        {"type": "llm.request", "model": "k3", "turnStep": "0.1",
+         "time": 110},
+        {"type": "llm.request", "model": "k3", "turnStep": "0.2",
+         "time": 120},
+        {"type": "llm.request", "model": "k3", "turnStep": "0.3",
+         "time": 130},
+        {"type": "usage.record", "usageScope": "turn",
+         "model": "kimi-code/k3", "time": 140,
+         "usage": {"inputOther": 10, "inputCacheCreation": 0,
+                   "inputCacheRead": 20, "output": 3}},
+        {"type": "turn.ended", "turnId": 0, "reason": "completed",
+         "time": 150},
+    ]
+    facts = namespace["_kimi_usage_facts"]
+
+    # Two retry events are not enough: they must form the one 1->2->3 group
+    # implied by the three consecutive wire attempts.
+    count_coincidence = facts(wire, [retry(1), retry(1)])
+    assert count_coincidence["complete"] is False
+    assert count_coincidence["usage_evidence_tier"] == "observed_unreconciled"
+
+    assert facts(wire, [retry(1)])["complete"] is False
+    assert facts(wire, [retry(1), retry(2, error_name="UnknownError")])[
+        "complete"] is False
+    assert facts(wire, [retry(1), retry(2, role="assistant")])[
+        "complete"] is False
+    assert facts(wire, [retry(1), retry(2, extra={"forged": True})])[
+        "complete"] is False
+
+    unfinished = wire[:-1]
+    assert facts(unfinished, [retry(1), retry(2)])["complete"] is False
+
+    successful_wire = [wire[0], wire[1], wire[4], wire[5], wire[6]]
+    successful_wire[2] = dict(successful_wire[2], turnStep="0.1")
+    assert facts(successful_wire, [retry(1)])["complete"] is False
 
 
 def test_kimi_copies_only_the_main_agent_durable_wire() -> None:

@@ -503,9 +503,12 @@ dradar resume --assignment <ASSIGNMENT_ID>
 | `--parallel` | 高级选项：允许手工启动另一个独立 DRadar 会话；隐含 `-y` |
 | `--refill` | 显式开启持续自动补题；必须同时给出额度或题数硬上限 |
 | `--refill-to N` | 持有/运行队列目标；传入时自动启用 `--refill`，但仍需硬上限 |
+| `--refill-harness HARNESS` | 将后续自动补领严格限定为一个 Harness；订阅补领支持 `kimi-code`、`zcode`、`grok-build` 及其短别名；`codex` 仍排除一次性 API 格子 |
+| `--refill-model MODEL` | 在指定 Harness 内进一步限定模型；必须与 `--refill-harness` 一起使用 |
+| `--refill-effort EFFORT` | 在指定 Harness 内进一步限定档位；必须与 `--refill-harness` 一起使用 |
 | `--max-estimated-quota-pct PCT` | 预计 7 天模型额度占用上限 |
 | `--quota-tier TIER` | 额度换算档位：`plus`、`pro-5x`、`pro-20x`，默认 `plus` |
-| `--max-tasks N` | 高级题数硬上限；可以低于默认内部安全上限 |
+| `--max-tasks N` | 本计划累计纳入的总题数硬上限；Kimi Code/ZCode/Grok 限定补领必须显式提供 |
 
 归档不会写入 Codex 自己的 `~/.codex/sessions`，因此不会混入 Codex 的会话索引。
 可先用 `dradar sessions prune` 查看占用，再用 `dradar sessions prune --yes` 明确删除。
@@ -538,10 +541,24 @@ dradar resume --workers auto
 运行必须显式提供停止条件。
 
 ```bash
-dradar resume -y --workers 3 \
+dradar resume -y --benchmark deep-swe --workers 3 \
   --refill --refill-to 3 \
   --quota-tier pro-5x --max-estimated-quota-pct 15
 ```
+
+订阅 Harness 不进入普通随机推荐。网页或终端需要三辆 Kimi Code low 车持续精确补领时，
+可以直接使用：
+
+```bash
+dradar resume -y --benchmark deep-swe --workers 3 \
+  --refill --refill-to 3 --max-tasks 30 \
+  --refill-harness kimi-code --refill-model k3 --refill-effort low
+```
+
+限定模式从公开格子表发现符合条件的开放格子，再调用同一个精确领取接口；服务器仍负责
+账号上限、租约和并发冲突。没有匹配库存时 CLI 明确退出并保留计划，不会改领 Codex 或
+其他 Harness；之后用相同命令继续即可。认证失败、订阅额度耗尽、运行环境失败或任务未能
+提交仍会触发原有熔断，停止继续领取并保留已有任务/检查点。
 
 - `--refill-to` 是希望持续保持的“运行中 + waiting”队列大小。
 - 启动补题计划时已经手工认领的题属于初始选择批次；必须全部成功提交后，CLI 才会领取

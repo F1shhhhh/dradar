@@ -432,7 +432,7 @@ def test_upload_uses_reconciled_kimi_provider_usage_with_audit_bundle(
         "usage_evidence_tier": "complete_reconciled",
         "timed_usage_complete": True,
         "request_ledger_duplicate_count": 0,
-        "request_ledger_source": "kimi-code-0.36.1-main-wire-v1",
+        "request_ledger_source": "kimi-code-0.36.1-main-wire-retry-v2",
         "token_usage_events": [{
             "occurred_at": "2026-08-20T00:00:00Z",
             "n_input_tokens": 300,
@@ -452,7 +452,7 @@ def test_upload_uses_reconciled_kimi_provider_usage_with_audit_bundle(
             assert meta["turn_prompt_count"] == 1
             assert meta["request_ledger_duplicate_count"] == 0
             assert meta["request_ledger_source"] == (
-                "kimi-code-0.36.1-main-wire-v1"
+                "kimi-code-0.36.1-main-wire-retry-v2"
             )
             assert trajectory_bundle is not None
             uploaded = json.loads(trajectory_bundle.read_text())

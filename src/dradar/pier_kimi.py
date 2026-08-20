@@ -12,7 +12,6 @@ import json
 import os
 import shlex
 import uuid
-from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -129,7 +128,9 @@ def _usage_instant(value: Any) -> str | None:
     return instant.isoformat().replace("+00:00", "Z")
 
 
-def _kimi_usage_facts(records: list[dict]) -> dict:
+def _kimi_usage_facts(
+    records: list[dict], retry_records: list[dict] | None = None,
+) -> dict:
     """Reconcile Kimi's durable per-request usage to completed turns.
 
     ``inputOther`` and ``inputCacheCreation`` are ordinary-priced prompt
@@ -137,13 +138,20 @@ def _kimi_usage_facts(records: list[dict]) -> dict:
     cached subset. Keeping that invariant matches Pier/DRadar's normalized
     contract: n_input_tokens already includes n_cache_tokens.
 
-    Kimi 0.36.1 emits one ``usage.record`` for every provider request but only
-    one ``turn.ended`` for the enclosing agent turn.  The two counts therefore
-    must not be compared directly.  Instead, require a single durable wire,
-    group retry attempts for each logical ``turnStep``, pair every settled
-    logical request with one later usage record, and require every opened turn
-    to end successfully after its requests are settled. A step that reappears
-    after settlement, or usage without a pending step, fails closed.
+    Kimi 0.36.1 emits one ``usage.record`` for every successful provider
+    response but advances ``turnStep`` for retryable failed attempts such as
+    HTTP 429.  Those failures have no usage.  The stream-json output carries a
+    separate, credential-free ``turn.step.retrying`` event for every failed
+    attempt.  Reconciliation therefore requires all of the following:
+
+    * strictly sequential durable-wire turn steps;
+    * one later usage record for the final attempt of every logical request;
+    * an exact ordered retry-event group for every preceding failed attempt;
+    * a completed turn after all logical requests have settled.
+
+    Retry counts alone are never sufficient. Unknown errors, malformed retry
+    groups, missing or extra events, duplicate steps, and unfinished turns all
+    fail closed.
     """
 
     totals = {name: 0 for name in (
@@ -161,13 +169,74 @@ def _kimi_usage_facts(records: list[dict]) -> dict:
     duplicate_count = 0
     unexpected_usage = False
     turn_open = False
-    pending_requests: deque[tuple[str, datetime | None]] = deque()
-    pending_request_steps: set[str] = set()
+    pending_attempts: list[tuple[str, datetime | None]] = []
     settled_request_steps: set[str] = set()
     request_attempt_count = 0
     request_retry_count = 0
     seen_turn_ids: set[int] = set()
     last_usage_instant: datetime | None = None
+    last_request_instant: datetime | None = None
+    current_turn_steps: list[tuple[int, int]] = []
+    retry_group_index = 0
+
+    retry_groups: list[list[dict[str, Any]]] = []
+    retry_ledger_valid = True
+    current_retry_group: list[dict[str, Any]] = []
+    retry_event_required_keys = {
+        "role", "type", "failed_attempt", "next_attempt", "max_attempts",
+        "delay_ms", "error_name", "error_message",
+    }
+    retryable_errors = {
+        ("APIProviderRateLimitError", 429),
+        ("APIConnectionError", None),
+        ("APITimeoutError", None),
+    }
+    for retry_record in retry_records or []:
+        if (not isinstance(retry_record, dict)
+                or frozenset(retry_record) not in {
+                    frozenset(retry_event_required_keys),
+                    frozenset({*retry_event_required_keys, "status_code"}),
+                }
+                or retry_record.get("role") != "meta"
+                or retry_record.get("type") != "turn.step.retrying"):
+            retry_ledger_valid = False
+            continue
+        failed_attempt = retry_record.get("failed_attempt")
+        next_attempt = retry_record.get("next_attempt")
+        max_attempts = retry_record.get("max_attempts")
+        delay_ms = retry_record.get("delay_ms")
+        error_message = retry_record.get("error_message")
+        if ((retry_record.get("error_name"), retry_record.get("status_code"))
+                not in retryable_errors
+                or not isinstance(failed_attempt, int)
+                or isinstance(failed_attempt, bool)
+                or not isinstance(next_attempt, int)
+                or isinstance(next_attempt, bool)
+                or next_attempt != failed_attempt + 1
+                or not isinstance(max_attempts, int)
+                or isinstance(max_attempts, bool)
+                or max_attempts != 10
+                or not 1 <= failed_attempt < max_attempts
+                or not isinstance(delay_ms, (int, float))
+                or isinstance(delay_ms, bool)
+                or delay_ms != delay_ms
+                or not 0 <= delay_ms <= 3_600_000
+                or not isinstance(error_message, str)
+                or not 0 < len(error_message) <= 4_096):
+            retry_ledger_valid = False
+            continue
+        if failed_attempt == 1:
+            if current_retry_group:
+                retry_groups.append(current_retry_group)
+            current_retry_group = [retry_record]
+        elif (not current_retry_group
+              or current_retry_group[-1].get("next_attempt") != failed_attempt
+              or current_retry_group[-1].get("max_attempts") != max_attempts):
+            retry_ledger_valid = False
+        else:
+            current_retry_group.append(retry_record)
+    if current_retry_group:
+        retry_groups.append(current_retry_group)
 
     def instant(value: Any) -> tuple[str, datetime] | None:
         text = _usage_instant(value)
@@ -188,6 +257,8 @@ def _kimi_usage_facts(records: list[dict]) -> dict:
             if turn_open:
                 turn_ledger_valid = False
             turn_open = True
+            current_turn_steps = []
+            last_request_instant = None
             continue
         if record_type == "llm.request":
             request_attempt_count += 1
@@ -198,35 +269,39 @@ def _kimi_usage_facts(records: list[dict]) -> dict:
             request_step = record.get("turnStep")
             if not isinstance(request_step, str) or not request_step:
                 request_ledger_valid = False
+                parsed_step = None
+            else:
+                parts = request_step.split(".")
+                if (len(parts) != 2 or not all(part.isdigit() for part in parts)
+                        or int(parts[1]) < 1):
+                    request_ledger_valid = False
+                    parsed_step = None
+                else:
+                    parsed_step = (int(parts[0]), int(parts[1]))
             request_instant = instant(record.get("time"))
             if request_instant is None:
                 request_ledger_valid = False
                 parsed_request_instant = None
             else:
                 parsed_request_instant = request_instant[1]
+                if ((last_request_instant is not None
+                     and parsed_request_instant < last_request_instant)
+                        or (last_usage_instant is not None
+                            and parsed_request_instant < last_usage_instant)):
+                    request_ledger_valid = False
+                last_request_instant = parsed_request_instant
             if isinstance(request_step, str) and request_step:
-                if request_step in settled_request_steps:
+                if (request_step in settled_request_steps
+                        or any(step == request_step for step, _ in pending_attempts)):
                     duplicate_count += 1
                     request_ledger_valid = False
-                elif request_step in pending_request_steps:
-                    # Kimi's retry/media-projection fallbacks issue another
-                    # provider request for the same logical turn step. Only
-                    # the eventual successful response emits usage.record.
-                    request_retry_count += 1
-                    if not pending_requests or pending_requests[-1][0] != request_step:
-                        request_ledger_valid = False
-                    else:
-                        pending_requests[-1] = (
-                            request_step, parsed_request_instant,
-                        )
-                else:
-                    model_request_count += 1
-                    pending_request_steps.add(request_step)
-                    pending_requests.append((request_step, parsed_request_instant))
+                pending_attempts.append((request_step, parsed_request_instant))
+                if parsed_step is not None:
+                    current_turn_steps.append(parsed_step)
             continue
         if record_type == "turn.ended":
             ended_turns += 1
-            if not turn_open or pending_requests:
+            if not turn_open or pending_attempts:
                 turn_ledger_valid = False
             turn_id = record.get("turnId")
             if (not isinstance(turn_id, int) or isinstance(turn_id, bool)
@@ -236,6 +311,12 @@ def _kimi_usage_facts(records: list[dict]) -> dict:
                 turn_ledger_valid = False
             else:
                 seen_turn_ids.add(turn_id)
+                if (not current_turn_steps
+                        or any(prefix != turn_id
+                               for prefix, _ in current_turn_steps)
+                        or [step for _, step in current_turn_steps]
+                           != list(range(1, len(current_turn_steps) + 1))):
+                    turn_ledger_valid = False
             terminal_instant = instant(record.get("time"))
             if (terminal_instant is None
                     or (last_usage_instant is not None
@@ -278,17 +359,27 @@ def _kimi_usage_facts(records: list[dict]) -> dict:
                     and occurred_instant < last_usage_instant):
                 usage_valid = False
             last_usage_instant = occurred_instant
-        if not pending_requests:
+        if not pending_attempts:
             request_ledger_valid = False
             unexpected_usage = True
             duplicate_count += 1
         else:
-            request_step, request_instant = pending_requests.popleft()
-            pending_request_steps.discard(request_step)
-            settled_request_steps.add(request_step)
+            failed_attempts = len(pending_attempts) - 1
+            if failed_attempts:
+                if (retry_group_index >= len(retry_groups)
+                        or len(retry_groups[retry_group_index])
+                           != failed_attempts):
+                    retry_ledger_valid = False
+                else:
+                    retry_group_index += 1
+                    request_retry_count += failed_attempts
+            model_request_count += 1
+            request_step, request_instant = pending_attempts[-1]
+            settled_request_steps.update(step for step, _ in pending_attempts)
             if (request_instant is None or occurred_instant is None
                     or occurred_instant < request_instant):
                 request_ledger_valid = False
+            pending_attempts = []
         events.append({
             "occurred_at": occurred_at,
             "n_input_tokens": (
@@ -308,7 +399,9 @@ def _kimi_usage_facts(records: list[dict]) -> dict:
     )
     request_ledger_valid = (
         request_ledger_valid
-        and not pending_requests
+        and retry_ledger_valid
+        and retry_group_index == len(retry_groups)
+        and not pending_attempts
         and model_request_count == len(events)
     )
     turn_ledger_valid = (
@@ -355,7 +448,7 @@ def _kimi_usage_facts(records: list[dict]) -> dict:
         "request_usage_observed": complete or observed,
         "timed_usage_complete": timed_complete,
         "request_ledger_duplicate_count": duplicate_count,
-        "request_ledger_source": "kimi-code-0.36.1-main-wire-v1",
+        "request_ledger_source": "kimi-code-0.36.1-main-wire-retry-v2",
         "provider_actual_cost_observed": False,
         "cost_semantics": (
             "api_equivalent_from_complete_tokens" if complete
@@ -745,6 +838,7 @@ class KimiCode(BaseInstalledAgent):
         except OSError:
             return
         steps: list[Step] = []
+        retry_records: list[dict] = []
         if self._instruction:
             steps.append(
                 Step(step_id=1, source="user", message=self._instruction)
@@ -758,6 +852,8 @@ class KimiCode(BaseInstalledAgent):
                 continue
             if not isinstance(event, dict):
                 continue
+            if event.get("type") == "turn.step.retrying":
+                retry_records.append(event)
             if event.get("type") == "session.resume_hint":
                 value = event.get("session_id")
                 if isinstance(value, str):
@@ -800,7 +896,7 @@ class KimiCode(BaseInstalledAgent):
                 continue
             if isinstance(record, dict):
                 wire_records.append(record)
-        usage_facts = _kimi_usage_facts(wire_records)
+        usage_facts = _kimi_usage_facts(wire_records, retry_records)
         prompt_tokens = usage_facts["n_input_tokens"] if usage_facts["complete"] else 0
         cached_tokens = usage_facts["n_cache_tokens"] if usage_facts["complete"] else 0
         output_tokens = usage_facts["n_output_tokens"] if usage_facts["complete"] else 0
