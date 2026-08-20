@@ -159,6 +159,17 @@ def _relative_time(iso: str | None) -> str:
 
 _STATUS_ICON = {"graded": None, "pending": "…", "grading": "…", "error": "⚠", "invalid": "⊘"}
 
+_FAILURE_LABELS = {
+    "provider-transport": "provider response stream failed",
+    "agent-deadline": "agent hard deadline reached",
+    "agent-command-failed": "agent command failed",
+    "agent-process-killed": "agent process was killed",
+    "rate-limit": "provider rate limit",
+    "quota-limit": "provider quota exhausted",
+    "insufficient-balance": "provider balance exhausted",
+    "auth": "provider authentication failed",
+}
+
 
 def cmd_status(args) -> int:
     """Read-only: the ONLY place a volunteer can see their own grading
@@ -188,7 +199,23 @@ def cmd_status(args) -> int:
         if s["grade_status"] == "error":
             note = "  — infra hiccup, the cell reopens automatically for a fresh attempt"
         elif s["grade_status"] == "invalid" and s.get("client_exception"):
-            note = f"  — {s['client_exception']}"
+            cause = _FAILURE_LABELS.get(
+                s["client_exception"], s["client_exception"],
+            )
+            elapsed = s.get("duration_sec")
+            hard = s.get("hard_budget_sec")
+            timing = (
+                f"; {elapsed / 60:.1f}/{hard / 60:.0f} min"
+                if isinstance(elapsed, (int, float))
+                and isinstance(hard, (int, float)) and hard > 0
+                else ""
+            )
+            retries = s.get("provider_resume_attempts")
+            retry_note = (
+                f"; {retries} provider resume attempt(s)"
+                if isinstance(retries, int) and retries > 0 else ""
+            )
+            note = f"  — {cause}{timing}{retry_note}"
         print(f"  {s['task_id']:42s} {s['model']}@{s['effort']:7s} "
               f"{s['grade_status']:8s} {icon}  {_relative_time(s['submitted_at'])}{flags}{note}")
     if len(subs) > 20:

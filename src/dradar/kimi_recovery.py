@@ -14,7 +14,7 @@ from collections.abc import Awaitable, Callable, Sequence
 
 KIMI_RETRYABLE_EXIT_CODE = 75
 KIMI_PROVIDER_CONNECTION_EXIT_CODE = 1
-KIMI_RESUME_DELAYS_SECONDS = (10, 30)
+KIMI_RESUME_DELAYS_SECONDS = (2, 8)
 KIMI_RESUME_PROMPT = (
     "Continue the unfinished task from where the previous turn stopped. "
     "Inspect the current working tree first, preserve completed work, finish "

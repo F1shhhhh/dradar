@@ -76,11 +76,13 @@ def test_pompeii_prompt_sets_simple_time_budget(tmp_path, monkeypatch):
         assignment, tmp_path, tmp_path / "jobs", "j", home,
     )
 
-    prompt = home / "codex-submission-prompt-pompeii-v1.j2"
+    prompt = home / "codex-submission-prompt-pompeii-v2.j2"
     assert f"prompt_template_path={prompt}" in cmd
     text = prompt.read_text()
-    assert "within 60 minutes" in text
-    assert "no later than 90 minutes" in text
+    assert "within 90 minutes" in text
+    assert "no later than 120 minutes" in text
+    assert "timeout to at most 600 seconds" in text
+    assert "at least 10 minutes in reserve" in text
     assert "do not start time-consuming new experiments" in text
     assert "complete, gradeable answer" in text
 
@@ -165,31 +167,33 @@ def test_multiplier_never_shrinks_below_one(tmp_path):
     assert runner_mod._agent_timeout_multiplier(assignment, task) == 1.0
 
 
-def test_pompeii_multiplier_shrinks_old_pack_to_90_minutes(tmp_path):
+def test_pompeii_multiplier_keeps_two_hour_pack_at_120_minutes(tmp_path):
     task = _task_with_toml(tmp_path, timeout_sec=7200.0)
     assignment = {
         "benchmark_id": runner_mod.POMPEII_BENCHMARK_ID,
         "est_minutes": 120,
     }
     multiplier = runner_mod._agent_timeout_multiplier(assignment, task)
-    assert multiplier == 0.75
+    assert multiplier == 1.0
     assert multiplier * 7200.0 == runner_mod.POMPEII_AGENT_TIMEOUT_SEC
 
 
-def test_pompeii_multiplier_keeps_refreshed_pack_at_90_minutes(tmp_path):
+def test_pompeii_multiplier_stretches_90_minute_pack_to_120_minutes(tmp_path):
     task = _task_with_toml(tmp_path, timeout_sec=5400.0)
     assignment = {
         "benchmark_id": runner_mod.POMPEII_BENCHMARK_ID,
         "est_minutes": 120,
     }
-    assert runner_mod._agent_timeout_multiplier(assignment, task) == 1.0
+    multiplier = runner_mod._agent_timeout_multiplier(assignment, task)
+    assert multiplier == 1.333333
+    assert 7199.0 < multiplier * 5400.0 <= runner_mod.POMPEII_AGENT_TIMEOUT_SEC
 
 
 def test_pompeii_timeout_requires_readable_task_config(tmp_path):
     task = tmp_path / "no-toml"
     task.mkdir()
     assignment = {"benchmark_id": runner_mod.POMPEII_BENCHMARK_ID}
-    with pytest.raises(RunnerError, match="90-minute execution limit"):
+    with pytest.raises(RunnerError, match="120-minute execution limit"):
         runner_mod._agent_timeout_multiplier(assignment, task)
 
 
@@ -221,7 +225,7 @@ def test_build_pier_command_omits_multiplier_for_short_estimate(tmp_path, monkey
     assert "--agent-timeout-multiplier" not in cmd
 
 
-def test_build_pier_command_caps_old_pompeii_pack(tmp_path, monkeypatch):
+def test_build_pier_command_keeps_two_hour_pompeii_pack(tmp_path, monkeypatch):
     _stub_pier(monkeypatch)
     _task_with_toml(
         tmp_path, task_id="abs-module-cache-flags", timeout_sec=7200.0,
@@ -236,8 +240,26 @@ def test_build_pier_command_caps_old_pompeii_pack(tmp_path, monkeypatch):
     cmd = build_pier_command(
         assignment, tmp_path, tmp_path / "jobs", "j", tmp_path / "home",
     )
+    assert "--agent-timeout-multiplier" not in cmd
+
+
+def test_build_pier_command_stretches_90_minute_pompeii_pack(tmp_path, monkeypatch):
+    _stub_pier(monkeypatch)
+    _task_with_toml(
+        tmp_path, task_id="abs-module-cache-flags", timeout_sec=5400.0,
+    )
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "tok")
+    assignment = _assignment(
+        "claude-code", model="claude-sonnet-5", effort="high",
+    ) | {
+        "benchmark_id": runner_mod.POMPEII_BENCHMARK_ID,
+        "est_minutes": 120,
+    }
+    cmd = build_pier_command(
+        assignment, tmp_path, tmp_path / "jobs", "j", tmp_path / "home",
+    )
     index = cmd.index("--agent-timeout-multiplier")
-    assert cmd[index + 1] == "0.750000"
+    assert cmd[index + 1] == "1.333333"
 
 
 def test_codex_command_enables_credential_free_checkpoint_metadata(tmp_path, monkeypatch):
@@ -1202,6 +1224,22 @@ def test_beta_subscription_harnesses_have_two_hour_floor():
         "agent": "codex",
         "est_minutes": 5,
     }) == 3600
+
+
+def test_pompeii_outer_watchdog_leaves_setup_outside_agent_budget():
+    expected = (
+        runner_mod.POMPEII_AGENT_TIMEOUT_SEC
+        + runner_mod.POMPEII_OUTER_WATCHDOG_SLACK_SEC
+    )
+    for agent in (
+        "codex", runner_mod.KIMI_AGENT, runner_mod.GROK_AGENT,
+        runner_mod.ZCODE_AGENT,
+    ):
+        assert _effective_trial_timeout_sec({
+            "agent": agent,
+            "benchmark_id": runner_mod.POMPEII_BENCHMARK_ID,
+            "est_minutes": 5,
+        }) == expected
 
 
 def test_summarize_result_exception_info_present(tmp_path):

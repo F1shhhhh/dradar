@@ -55,6 +55,9 @@ from .providers import (
 )
 from .runner import (
     CODEX_TRAJECTORY_BUNDLE_SCHEMA, DIAG_ADVICE, BuildFlakeError, RunnerError,
+    POMPEII_AGENT_TIMEOUT_SEC, POMPEII_BENCHMARK_ID,
+    POMPEII_FINALIZATION_RESERVE_SEC, POMPEII_SOFT_BUDGET_SEC,
+    POMPEII_TERMINAL_HEAVY_TIMEOUT_SEC,
     build_codex_trajectory_bundle, build_kimi_trajectory_bundle,
     _recover_completed_checkpoint_patch,
     check_task_content_hash, classify_exception_message,
@@ -1327,7 +1330,7 @@ def _upload_trial(
             "provider_actual_cost_observed", "cost_semantics",
             "completed_turn_count", "turn_prompt_count",
             "cache_creation_tokens", "subscription_reported_cost_usd",
-            "subscription_reported_cost_basis",
+            "subscription_reported_cost_basis", "resume_attempts",
         ):
             source_key = "sessions" if key == "agent_session_usage" else key
             if source_key in usage:
@@ -1579,7 +1582,7 @@ def _upload_trial(
         # diagnosis) may be anything from a stale agent image to a real rate
         # limit — claiming "wait for your quota to reset" here misled a real
         # volunteer whose quota was fine.
-        print(f"recorded as interrupted (not graded): {ack['submission_id']} — "
+        print(f"recorded as invalid (not graded): {ack['submission_id']} — "
               "no points lost, the cell reopens for a fresh attempt")
     else:
         print(f"submitted: {ack['submission_id']} (grading happens server-side)")
@@ -1979,8 +1982,9 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             "uploading", assignment["assignment_id"],
             assignment.get("resume_generation"),
         )
+    display_outcome = "invalid/not-graded" if interrupted else "completed"
     print(f"trial finished in {art.duration_sec/60:.1f} min (pier rc={art.returncode}, "
-          f"outcome={outcome}); uploading...")
+          f"outcome={display_outcome}); uploading...")
     if postrun_completion is not None:
         print(
             "agent completed and produced independently verified artifacts; treating the "
@@ -2021,6 +2025,27 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         # provider error.  The authenticated status view can then say
         # "insufficient-balance" instead of the opaque wrapper exception.
         meta["failure_kind"] = failure_kind
+        meta["failure_layer"] = {
+            "provider-transport": "provider_transport",
+            "provider-temporary": "provider_transport",
+            "rate-limit": "provider_transport",
+            "model-capacity": "provider_transport",
+            "agent-deadline": "agent_deadline",
+        }.get(failure_kind, "agent_process")
+        meta["failure_code"] = {
+            "provider-transport": "provider_stream_failed",
+            "provider-temporary": "provider_temporary",
+            "rate-limit": "provider_rate_limited",
+            "model-capacity": "provider_capacity",
+            "agent-deadline": "agent_hard_deadline",
+        }.get(failure_kind, failure_kind)
+    if assignment.get("benchmark_id") == POMPEII_BENCHMARK_ID:
+        meta.update({
+            "soft_budget_sec": POMPEII_SOFT_BUDGET_SEC,
+            "hard_budget_sec": POMPEII_AGENT_TIMEOUT_SEC,
+            "terminal_tool_timeout_cap_sec": POMPEII_TERMINAL_HEAVY_TIMEOUT_SEC,
+            "finalization_reserve_sec": POMPEII_FINALIZATION_RESERVE_SEC,
+        })
     if assignment_codex_provider(assignment) == DEEPSEEK_PROVIDER:
         # Server-side audit/gating can distinguish corrected official-catalog
         # runs from the earlier fallback-metadata benchmark without deleting

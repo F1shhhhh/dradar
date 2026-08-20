@@ -66,6 +66,24 @@ def test_diagnose_classifies_rate_limit(tmp_path):
     assert d["kind"] == "rate-limit"
 
 
+def test_diagnose_classifies_grok_stream_failure_as_provider_transport(tmp_path):
+    d = diagnose_exception(_result(
+        tmp_path,
+        "Command failed (exit 1): grok\n"
+        "reqwest error stream: error sending request for url "
+        "(https://cli-chat-proxy.grok.com/v1/responses)",
+    ))
+    assert d["kind"] == "provider-transport"
+
+
+def test_diagnose_classifies_agent_hard_deadline(tmp_path):
+    d = diagnose_exception(_result(
+        tmp_path, "agent execution timed out", exc_type="AgentTimeoutError",
+    ))
+    assert d["type"] == "AgentTimeoutError"
+    assert d["kind"] == "agent-deadline"
+
+
 def test_diagnose_classifies_quota_limit_before_generic_429(tmp_path):
     d = diagnose_exception(_result(
         tmp_path, "429 Too Many Requests: usage_limit_reached, retry after reset"))
