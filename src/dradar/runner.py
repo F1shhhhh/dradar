@@ -2418,6 +2418,72 @@ def _read_capped_json_object(path: Path | None, max_bytes: int) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def _zcode_quota_limit_facts(outcome_path: Path | None) -> dict[str, object] | None:
+    """Return allowlisted facts for ZCode's account-window exhaustion event.
+
+    ZCode 0.16.3 reports Coding Plan exhaustion as a structured provider event
+    even when Pier later reduces the run to ``model.patch missing``.  A bare
+    429 is only burst throttling and must remain retryable, so the account-wide
+    terminal requires all of the provider code, HTTP status, reason,
+    non-retryable bit, and explicit usage-limit/reset semantics to agree.
+
+    The outcome is already adapter-redacted.  Still, expose only enums and
+    numbers to callers; never propagate the provider message or request IDs.
+    """
+    payload = _read_capped_json_object(
+        outcome_path, _ZCODE_TERMINAL_ARTIFACT_MAX_BYTES,
+    )
+    if payload.get("schema") != "dradar-zcode-outcome-v1":
+        return None
+
+    events_object = payload.get("events")
+    events = events_object.get("events") if isinstance(events_object, dict) else None
+    if not isinstance(events, list) or len(events) > 5000:
+        return None
+    for event in events:
+        if not isinstance(event, dict) or event.get("type") != "session.updated":
+            continue
+        value = event.get("payload")
+        if not isinstance(value, dict) or value.get("type") != "model_request_failed":
+            continue
+        provider_code = value.get("providerErrorCode")
+        status = value.get("statusCode")
+        reason = value.get("reason")
+        retryable = value.get("retryable")
+        if not (
+            str(provider_code) == "1308"
+            and status == 429
+            and not isinstance(status, bool)
+            and reason == "rate_limited"
+            and retryable is False
+        ):
+            continue
+        messages = (
+            value.get("providerErrorMessage"), value.get("message"),
+        )
+        for message in messages:
+            if not isinstance(message, str) or len(message) > 4096:
+                continue
+            low = " ".join(message.lower().split())
+            chinese_semantics = (
+                ("使用上限" in message or "用量上限" in message)
+                and "重置" in message
+            )
+            english_semantics = (
+                ("usage limit" in low or "quota limit" in low)
+                and "reset" in low
+            )
+            if chinese_semantics or english_semantics:
+                return {
+                    "provider_code": 1308,
+                    "status_code": 429,
+                    "reason": "rate_limited",
+                    "retryable": False,
+                    "window_reset_explicit": True,
+                }
+    return None
+
+
 def _zcode_false_success_reason(
     result_path: Path | None,
     usage_path: Path | None,
@@ -2878,6 +2944,24 @@ def run_trial(
                 f"last lines of the log:\n{tail}")
         raise
     patch, trajectory, result = trial_artifact_paths(trial_dir)
+    if effective_agent == ZCODE_AGENT:
+        quota_facts = _zcode_quota_limit_facts(
+            trial_dir / "agent" / "zcode-outcome.json",
+        )
+        if quota_facts is not None:
+            diagnostic = _zcode_failure_diagnostic(
+                effective_assignment,
+                tasks_root / assignment["task_id"],
+                jobs_dir,
+                job_name,
+                "provider_quota_exhausted",
+            ) or {}
+            diagnostic.update(quota_facts)
+            raise RunnerError(
+                "ZCode structured provider outcome confirmed account quota "
+                "exhausted (Coding Plan usage window; reset required)",
+                failure_diagnostic=diagnostic,
+            )
     dsh_artifact_binding = None
     if effective_agent == DSH_AGENT:
         dsh_artifact_binding = _verify_dsh_artifact_binding(

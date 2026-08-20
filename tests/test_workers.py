@@ -691,6 +691,42 @@ def test_pool_drain_keeps_active_siblings_running_without_backfill(
     assert "drained cleanly" in out
 
 
+def test_eight_worker_quota_drain_never_starts_replacements_before_reset(
+        monkeypatch):
+    _patch_pool_setup(monkeypatch, active_count=8)
+    monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        runloop, "_pool_ready_work_count",
+        lambda _client: pytest.fail("open quota circuit must not inspect/backfill"),
+    )
+    monkeypatch.setattr(
+        runloop, "_signal_workers",
+        lambda _processes: pytest.fail("graceful quota drain must not interrupt siblings"),
+    )
+    calls = []
+
+    def popen(command, env, **kwargs):
+        if not calls:
+            process = _ScriptedProcess(
+                command,
+                env,
+                [0],
+                on_poll=lambda: runloop.Path(
+                    env["DRADAR_POOL_ABORT_FILE"],
+                ).write_text("drain:account quota exhausted"),
+                **kwargs,
+            )
+        else:
+            process = _ScriptedProcess(command, env, [None, 0], **kwargs)
+        calls.append(process)
+        return process
+
+    monkeypatch.setattr(runloop.subprocess, "Popen", popen)
+
+    assert runloop._run_worker_pool(_args(workers=8)) == 0
+    assert len(calls) == 8
+
+
 def test_external_pool_circuit_is_persistent_and_prevents_worker_start(
         tmp_path, monkeypatch, capsys):
     _patch_pool_setup(monkeypatch, active_count=2)

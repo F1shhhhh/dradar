@@ -782,6 +782,70 @@ def test_zcode_terminal_reader_rejects_oversized_json_without_loading_it(
     ) == {}
 
 
+def test_zcode_real_redacted_1308_fixture_is_account_quota_terminal() -> None:
+    fixture = Path(__file__).with_name("fixtures") / "zcode_quota_1308_outcome.json"
+
+    assert runner_mod._zcode_quota_limit_facts(fixture) == {
+        "provider_code": 1308,
+        "status_code": 429,
+        "reason": "rate_limited",
+        "retryable": False,
+        "window_reset_explicit": True,
+    }
+
+
+@pytest.mark.parametrize("overrides", [
+    {"providerErrorCode": "1308", "statusCode": 429, "retryable": True,
+     "reason": "rate_limited", "message": "usage limit; reset later"},
+    {"providerErrorCode": "1308", "statusCode": 429, "retryable": False,
+     "reason": "rate_limited", "message": "temporary burst rate limit"},
+    {"providerErrorCode": "1308", "statusCode": 429, "retryable": False,
+     "reason": "rate_limited", "message": "usage limit"},
+    {"providerErrorCode": "429", "statusCode": 429, "retryable": False,
+     "reason": "rate_limited", "message": "usage limit; reset later"},
+])
+def test_zcode_quota_terminal_rejects_ordinary_or_ambiguous_429(
+        tmp_path, overrides):
+    outcome = tmp_path / "zcode-outcome.json"
+    outcome.write_text(json.dumps({
+        "schema": "dradar-zcode-outcome-v1",
+        "events": {"events": [{
+            "type": "session.updated",
+            "payload": {"type": "model_request_failed", **overrides},
+        }]},
+    }))
+
+    assert runner_mod._zcode_quota_limit_facts(outcome) is None
+
+
+def test_run_trial_maps_structured_zcode_quota_to_existing_quota_limit(
+        tmp_path, monkeypatch):
+    _prepare_fake_zcode(monkeypatch, tmp_path)
+    fixture = Path(__file__).with_name("fixtures") / "zcode_quota_1308_outcome.json"
+    _fake_pier(
+        monkeypatch,
+        tmp_path,
+        patch=False,
+        trajectory=False,
+        zcode_outcome=json.loads(fixture.read_text()),
+        runtime_diagnostic={
+            "schema": "dradar-zcode-runtime-v1",
+            "status": "idle",
+            "turn_count": 1,
+            "seen_running": True,
+            "terminal_observed": True,
+        },
+        rc=0,
+    )
+
+    with pytest.raises(RunnerError, match="quota exhausted") as exc:
+        run_trial(_zcode_assignment_for_trial(), tmp_path, tmp_path)
+
+    assert runner_mod.classify_exception_message(str(exc.value)) == "quota-limit"
+    assert exc.value.failure_diagnostic["failure_code"] == "provider_quota_exhausted"
+    assert exc.value.failure_diagnostic["provider_code"] == 1308
+
+
 def test_run_trial_rejects_real_zcode_model_error_rc0_signature(
         tmp_path, monkeypatch):
     _prepare_fake_zcode(monkeypatch, tmp_path)
