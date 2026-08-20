@@ -16,6 +16,7 @@ from typing import Iterator
 from uuid import uuid4
 
 from .api_client import ApiError
+from .providers import validate_refill_scope
 
 SCHEMA_VERSION = 1
 PLAN_FILE = "refill-plan.json"
@@ -115,7 +116,22 @@ def _estimate_pct(assignment: dict, tier: str, windows: dict | None) -> float | 
     return plus_pct * float(plus_window) / float(tier_window)
 
 
-def _reserve(plan: dict, assignment: dict) -> bool:
+def _matches_scope(plan: dict, item: dict) -> bool:
+    harness = plan.get("refill_harness")
+    if not harness:
+        return True
+    agent = item.get("agent") or "codex"
+    if agent != harness:
+        return False
+    model = plan.get("refill_model")
+    effort = plan.get("refill_effort")
+    return (
+        (model is None or str(item.get("model", "")).lower() == model)
+        and (effort is None or str(item.get("effort", "")).lower() == effort)
+    )
+
+
+def _reserve(plan: dict, assignment: dict, *, enforce_scope: bool = False) -> bool:
     if assignment.get("billing_mode") == "api":
         raise RefillError(
             "paid-API assignments are one-off runs; continuous refill stopped"
@@ -123,6 +139,11 @@ def _reserve(plan: dict, assignment: dict) -> bool:
     assignment_id = assignment.get("assignment_id")
     if not assignment_id or assignment_id in plan["assignments"]:
         return False
+    if enforce_scope and not _matches_scope(plan, assignment):
+        raise RefillError(
+            "server returned an assignment outside the configured refill scope; "
+            "continuous refill stopped"
+        )
     windows = assignment.get("tier_windows_usd")
     if windows and not plan.get("tier_windows_usd"):
         plan["tier_windows_usd"] = windows
@@ -171,22 +192,74 @@ def configure(
     quota_tier: str,
     max_estimated_quota_pct: float | None,
     active: list[dict],
+    refill_harness: str | None = None,
+    refill_model: str | None = None,
+    refill_effort: str | None = None,
     replace_existing: bool = False,
 ) -> dict:
     if refill_to < 1 or max_tasks < 1 or max_tasks < len(active):
         raise RefillError("max tasks must be at least the currently held task count")
     if quota_tier not in TIERS:
         raise RefillError(f"unknown quota tier: {quota_tier}")
+    if refill_harness is None and (refill_model is not None or refill_effort is not None):
+        raise RefillError("refill model/effort filters require a refill harness")
+    if refill_harness is not None:
+        try:
+            refill_harness, refill_model, refill_effort = validate_refill_scope(
+                refill_harness, refill_model, refill_effort,
+            )
+        except ValueError as exc:
+            raise RefillError(str(exc)) from exc
     desired = {
         "volunteer_id": volunteer_id,
         "refill_to": refill_to,
         "max_tasks": max_tasks,
         "quota_tier": quota_tier,
         "max_estimated_quota_pct": max_estimated_quota_pct,
+        "refill_harness": refill_harness,
+        "refill_model": refill_model,
+        "refill_effort": refill_effort,
     }
     with _locked(home):
         current = _load_unlocked(home)
         replaced_plan_id = None
+        if (current and not current.get("refill_harness")
+                and refill_harness is not None
+                and current.get("status") in RUNNING_STATES):
+            legacy_keys = (
+                "volunteer_id", "refill_to", "max_tasks", "quota_tier",
+                "max_estimated_quota_pct",
+            )
+            if any(current.get(key) != desired[key] for key in legacy_keys):
+                raise RefillError(
+                    "an older refill plan is active with different limits; run "
+                    "`dradar refill stop` before starting the scoped campaign"
+                )
+            # Additive schema migration: keep every historical reservation so
+            # upgrading the CLI cannot reset max_tasks accounting mid-campaign.
+            current.update({
+                "refill_harness": refill_harness,
+                "refill_model": refill_model,
+                "refill_effort": refill_effort,
+                "scope_migrated_from_legacy": True,
+            })
+        # A scoped subscription campaign's assignment ledger is its hard
+        # spend boundary.  Never let a restart or changed argv silently reset
+        # that count.  Automatic stops preserve it; an explicit `refill stop`
+        # is the deliberate boundary between campaigns.
+        if current and current.get("refill_harness"):
+            if any(current.get(key) != value for key, value in desired.items()):
+                raise RefillError(
+                    "another scoped refill plan is saved with different limits or "
+                    "scope; run `dradar refill stop` before starting a new campaign"
+                )
+            if current.get("status") == "stopped":
+                if len(current.get("assignments", {})) >= max_tasks:
+                    current["status"] = "draining"
+                    current["stop_reason"] = "max_tasks reserved; draining queue"
+                else:
+                    current["status"] = "active"
+                    current["stop_reason"] = None
         if current and current.get("status") in RUNNING_STATES:
             if any(current.get(key) != value for key, value in desired.items()):
                 if not replace_existing:
@@ -239,6 +312,88 @@ def configure(
         return plan
 
 
+def _scoped_candidates(table: dict, plan: dict) -> list[dict]:
+    """Discover exact-claim candidates from the authoritative public board.
+
+    Subscription harnesses intentionally do not enter ``/suggest``.  The
+    table supplies their canonical agent/model/effort namespace and current
+    open state; the exact claim endpoint remains authoritative for races,
+    account limits and leases.
+    """
+
+    cells = table.get("cells")
+    combos = table.get("combos")
+    if not isinstance(cells, dict) or not isinstance(combos, list):
+        raise RefillError(
+            "server table lacks the cell/combination data required for scoped refill"
+        )
+    harness = plan.get("refill_harness")
+    model_filter = plan.get("refill_model")
+    effort_filter = plan.get("refill_effort")
+    combo_agents: dict[tuple[str, str], str] = {}
+    matching_combos: set[tuple[str, str]] = set()
+    for combo in combos:
+        if not isinstance(combo, dict):
+            continue
+        model = combo.get("model")
+        effort = combo.get("effort")
+        if not isinstance(model, str) or not isinstance(effort, str):
+            continue
+        key = (model.lower(), effort.lower())
+        agent = combo.get("agent") or "codex"
+        if isinstance(agent, str):
+            combo_agents[key] = agent
+        if (
+            agent == harness
+            and (model_filter is None or key[0] == model_filter)
+            and (effort_filter is None or key[1] == effort_filter)
+        ):
+            matching_combos.add(key)
+    if not matching_combos:
+        detail = "/".join(
+            value for value in (harness, model_filter, effort_filter) if value
+        )
+        raise RefillError(
+            f"server table exposes no combination matching refill scope {detail}"
+        )
+
+    windows = table.get("tier_windows_usd")
+    plus_window = windows.get("plus") if isinstance(windows, dict) else None
+    candidates: list[dict] = []
+    for raw_key, raw_value in cells.items():
+        if not isinstance(raw_key, str) or not isinstance(raw_value, dict):
+            continue
+        try:
+            task_id, model, effort = raw_key.split("|", 2)
+        except ValueError:
+            continue
+        key = (model.lower(), effort.lower())
+        if key not in matching_combos or raw_value.get("st") != "open":
+            continue
+        # Preserve the existing invariant that paid-API work is one-off.  A
+        # Codex-scoped board may contain manual DeepSeek API cells alongside
+        # subscription cells; table discovery must never broaden refill into
+        # billable API claims that `/suggest` deliberately excluded.
+        if raw_value.get("billing_mode") == "api":
+            continue
+        agent = raw_value.get("agent") or combo_agents.get(key) or "codex"
+        if agent != harness:
+            continue
+        candidate = dict(raw_value)
+        candidate.update(task_id=task_id, model=model, effort=effort, agent=agent)
+        if isinstance(windows, dict):
+            candidate["tier_windows_usd"] = windows
+        cost = candidate.get("cost")
+        if (
+            candidate.get("est_quota_pct") is None
+            and isinstance(cost, (int, float)) and not isinstance(cost, bool)
+            and isinstance(plus_window, (int, float)) and plus_window > 0
+        ):
+            candidate["est_quota_pct"] = float(cost) / float(plus_window) * 100
+        candidates.append(candidate)
+    return candidates
+
+
 def mark_submitted(home: Path, assignment_id: str) -> int:
     """Persist a successful seed submission and return the remaining count.
 
@@ -260,13 +415,18 @@ def mark_submitted(home: Path, assignment_id: str) -> int:
         return len(_pending_seed_assignment_ids(plan))
 
 
-def stop(home: Path, reason: str = "user stopped") -> dict | None:
+def stop(
+    home: Path, reason: str = "user stopped", *, discard: bool = False,
+) -> dict | None:
     with _locked(home):
         plan = _load_unlocked(home)
         if not plan:
             return None
         plan["status"] = "stopped"
         plan["stop_reason"] = reason
+        if plan.get("refill_harness") and not discard:
+            _save_unlocked(home, plan)
+            return plan
         # A stopped plan has no recovery work left to coordinate. Keeping the
         # file only exposes an internal implementation detail and previously
         # let stale state confuse the next campaign.
@@ -289,7 +449,8 @@ def complete_if_empty(home: Path, held: int) -> None:
         # Deleting an active plan here lets an idle sibling win that race and
         # prevents the first post-seed refill. Only a plan already known to be
         # draining has no future claim work and can be removed safely.
-        if plan and plan.get("status") == "draining":
+        if (plan and plan.get("status") == "draining"
+                and not plan.get("refill_harness")):
             _path(home).unlink(missing_ok=True)
 
 
@@ -362,7 +523,18 @@ def refill_once(home: Path, client) -> dict:
         # Ask for a few alternates so a stale recommendation or one expensive
         # cell does not prevent a bounded refill. The server still clamps this
         # request to the account's claim limit.
-        suggestions = client.suggest(max(wanted, wanted * 3)).get("cells") or []
+        if plan.get("refill_harness"):
+            try:
+                suggestions = _scoped_candidates(client.table(), plan)
+            except RefillError as exc:
+                plan["status"] = "stopped"
+                plan["stop_reason"] = str(exc)
+                _save_unlocked(home, plan)
+                return {"status": "stopped", "claimed": 0,
+                        "held": len(active), "planned": planned,
+                        "reason": str(exc)}
+        else:
+            suggestions = client.suggest(max(wanted, wanted * 3)).get("cells") or []
         quota_blocked = False
         missing_quota_estimate = False
         for cell in suggestions:
@@ -385,9 +557,20 @@ def refill_once(home: Path, client) -> dict:
                     continue
                 raise
             assignment = ack.get("assignment")
-            if assignment and _reserve(plan, assignment):
-                claimed += 1
-                _save_unlocked(home, plan)  # crash-safe after every accepted claim
+            if assignment:
+                try:
+                    accepted = _reserve(plan, assignment, enforce_scope=True)
+                except RefillError as exc:
+                    plan["status"] = "stopped"
+                    plan["stop_reason"] = str(exc)
+                    _save_unlocked(home, plan)
+                    return {"status": "stopped", "claimed": claimed,
+                            "held": len(active) + claimed,
+                            "planned": len(plan["assignments"]),
+                            "reason": str(exc)}
+                if accepted:
+                    claimed += 1
+                    _save_unlocked(home, plan)  # crash-safe after every accepted claim
 
         if claimed == 0 and missing_quota_estimate:
             # This is a server/client data-contract failure, not an exhausted
@@ -402,8 +585,16 @@ def refill_once(home: Path, client) -> dict:
             plan["status"] = "draining"
             plan["stop_reason"] = "no recommended task fits the estimated quota left"
         _save_unlocked(home, plan)
-        return {"status": plan["status"], "claimed": claimed,
+        result = {"status": plan["status"], "claimed": claimed,
                 "held": len(active) + claimed,
                 "planned": len(plan["assignments"]),
                 "reserved_quota_pct": _reserved_quota(plan),
                 "reason": plan.get("stop_reason")}
+        if (claimed == 0 and plan.get("refill_harness")
+                and plan.get("status") == "active"
+                and not missing_quota_estimate and not quota_blocked):
+            result["waiting_for_inventory"] = True
+            result["reason"] = (
+                "no currently claimable open cells match the configured refill scope"
+            )
+        return result

@@ -338,8 +338,23 @@ def main(argv: list[str] | None = None) -> int:
             help="target number of held/running tasks while refill is active",
         )
         p.add_argument(
+            "--refill-harness", metavar="HARNESS",
+            help="restrict every auto-refill claim to one harness (for example "
+                 "kimi-code, zcode, grok-build, or codex; paid-API DSH remains "
+                 "one-off)",
+        )
+        p.add_argument(
+            "--refill-model", metavar="MODEL",
+            help="optionally narrow --refill-harness to one model",
+        )
+        p.add_argument(
+            "--refill-effort", metavar="EFFORT",
+            help="optionally narrow --refill-harness to one effort level",
+        )
+        p.add_argument(
             "--max-tasks", type=int, metavar="N",
-            help="optional advanced task-count cap for this refill plan",
+            help="total-task cap for this refill plan (required for Kimi Code, "
+                 "ZCode, and Grok scoped refill)",
         )
         p.add_argument(
             "--max-estimated-quota-pct", type=float, metavar="PCT",

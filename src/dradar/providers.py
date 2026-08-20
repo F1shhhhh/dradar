@@ -186,7 +186,74 @@ ZCODE_API_KEY_ENV = "ZCODE_API_KEY"
 ZCODE_OFFICIAL_DOWNLOAD_PAGE = "https://zcode.z.ai/cn"
 _ZCODE_VERSION_RE = re.compile(r"(?:^|\s)(\d+\.\d+\.\d+)(?:\s|$)")
 
+# User-facing continuous-refill names resolve to the same canonical agent
+# wire values used by assignments and the public table.  Keeping this beside
+# the provider constants prevents the CLI from growing a second, drifting
+# model of which harness owns K3/GLM/Grok cells.
+REFILL_HARNESS_ALIASES = {
+    "codex": "codex",
+    "openai": "codex",
+    "dsh": DSH_AGENT,
+    "dsh-minimal": DSH_AGENT,
+    "deepseek-harness": DSH_AGENT,
+    "kimi": KIMI_AGENT,
+    "kimi-code": KIMI_AGENT,
+    "grok": GROK_AGENT,
+    "grok-build": GROK_AGENT,
+    "zcode": ZCODE_AGENT,
+}
+REFILL_HARNESS_CONSTRAINTS = {
+    DSH_AGENT: (frozenset(DSH_MODELS), DSH_SUPPORTED_EFFORTS),
+    KIMI_AGENT: (frozenset({KIMI_MODEL}), KIMI_SUPPORTED_EFFORTS),
+    GROK_AGENT: (frozenset({GROK_MODEL}), GROK_SUPPORTED_EFFORTS),
+    ZCODE_AGENT: (frozenset({ZCODE_MODEL}), ZCODE_SUPPORTED_EFFORTS),
+}
+SUBSCRIPTION_REFILL_AGENTS = frozenset({KIMI_AGENT, GROK_AGENT, ZCODE_AGENT})
+PAID_API_REFILL_AGENTS = frozenset({DSH_AGENT})
+
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+
+
+def normalize_refill_harness(value: str) -> str:
+    """Return the canonical assignment ``agent`` for a refill harness name."""
+
+    normalized = value.strip().lower().replace("_", "-")
+    try:
+        return REFILL_HARNESS_ALIASES[normalized]
+    except KeyError as exc:
+        names = ", ".join(sorted(REFILL_HARNESS_ALIASES))
+        raise ValueError(
+            f"unknown refill harness {value!r}; choose one of: {names}"
+        ) from exc
+
+
+def validate_refill_scope(
+    harness: str, model: str | None, effort: str | None,
+) -> tuple[str, str | None, str | None]:
+    """Normalize and fail fast on impossible built-in harness combinations.
+
+    Codex remains server-catalog driven because its model surface evolves
+    independently.  Subscription/DSH harnesses are pinned runtime contracts,
+    so their provider constants are authoritative before any network call.
+    """
+
+    agent = normalize_refill_harness(harness)
+    normalized_model = model.strip().lower() if model else None
+    normalized_effort = effort.strip().lower() if effort else None
+    constraint = REFILL_HARNESS_CONSTRAINTS.get(agent)
+    if constraint is not None:
+        models, efforts = constraint
+        if normalized_model is not None and normalized_model not in models:
+            raise ValueError(
+                f"{agent} refill supports model(s) {', '.join(sorted(models))}; "
+                f"got {model!r}"
+            )
+        if normalized_effort is not None and normalized_effort not in efforts:
+            raise ValueError(
+                f"{agent} refill supports effort(s) {', '.join(sorted(efforts))}; "
+                f"got {effort!r}"
+            )
+    return agent, normalized_model, normalized_effort
 
 
 def deepseek_catalog_path() -> Path:

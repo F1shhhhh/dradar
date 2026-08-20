@@ -51,7 +51,10 @@ from .providers import (
     ZCODE_AGENT,
     ZCODE_RUN_CONFIG_VERSION,
     ZCODE_RUNTIME_PROFILE,
+    PAID_API_REFILL_AGENTS,
+    SUBSCRIPTION_REFILL_AGENTS,
     assignment_codex_provider,
+    validate_refill_scope,
 )
 from .runner import (
     CODEX_TRAJECTORY_BUNDLE_SCHEMA, DIAG_ADVICE, BuildFlakeError, RunnerError,
@@ -2516,6 +2519,13 @@ def cmd_refill_status(args) -> int:
     print(f"refill plan {plan.get('plan_id', '?')}  status={plan.get('status', '?')}")
     print(f"  queue target: {plan.get('refill_to', '?')}")
     print(f"  task budget: {len(plan.get('assignments', {}))}/{plan.get('max_tasks', '?')}")
+    if plan.get("refill_harness"):
+        scope = plan["refill_harness"]
+        if plan.get("refill_model"):
+            scope += f"/{plan['refill_model']}"
+        if plan.get("refill_effort"):
+            scope += f"@{plan['refill_effort']}"
+        print(f"  exact scope: {scope} (no fallback)")
     print(f"  estimated quota cap: {quota_text}")
     seed_ids = plan.get("seed_assignment_ids")
     if seed_ids is not None:
@@ -2528,7 +2538,7 @@ def cmd_refill_status(args) -> int:
 
 
 def cmd_refill_stop(args) -> int:
-    plan = refill_plan.stop(HOME, "stopped by user")
+    plan = refill_plan.stop(HOME, "stopped by user", discard=True)
     if not plan:
         print("no local refill plan")
         return 0
@@ -2729,12 +2739,36 @@ def cmd_go(args) -> int:
     refill_options = (
         getattr(args, "max_tasks", None),
         getattr(args, "max_estimated_quota_pct", None),
+        getattr(args, "refill_harness", None),
+        getattr(args, "refill_model", None),
+        getattr(args, "refill_effort", None),
     )
     if any(value is not None for value in refill_options) and not getattr(args, "refill", False):
-        sys.exit("--max-tasks/--max-estimated-quota-pct require --refill")
+        sys.exit("refill limits and scope filters require --refill")
     if getattr(args, "refill", False):
         if getattr(args, "assignment", None):
             sys.exit("continuous refill cannot be combined with --assignment")
+        if (getattr(args, "refill_harness", None) is None
+                and (getattr(args, "refill_model", None) is not None
+                     or getattr(args, "refill_effort", None) is not None)):
+            sys.exit("--refill-model/--refill-effort require --refill-harness")
+        if getattr(args, "refill_harness", None) is not None:
+            try:
+                (args.refill_harness, args.refill_model,
+                 args.refill_effort) = validate_refill_scope(
+                    args.refill_harness,
+                    getattr(args, "refill_model", None),
+                    getattr(args, "refill_effort", None),
+                )
+            except ValueError as exc:
+                sys.exit(str(exc))
+        if getattr(args, "refill_harness", None) in PAID_API_REFILL_AGENTS:
+            sys.exit("paid-API Harness assignments remain one-off and cannot use "
+                     "continuous refill")
+        if (getattr(args, "refill_harness", None) in SUBSCRIPTION_REFILL_AGENTS
+                and args.max_tasks is None):
+            sys.exit("subscription Harness refill requires an explicit "
+                     "--max-tasks N total-task stop limit")
         if args.max_tasks is None and args.max_estimated_quota_pct is None:
             sys.exit("--refill requires --max-estimated-quota-pct PCT "
                      "(or the advanced --max-tasks N limit)")
@@ -2889,6 +2923,12 @@ def _worker_command(args) -> list[str]:
                 "--max-estimated-quota-pct", str(args.max_estimated_quota_pct),
             ))
         command.extend(("--quota-tier", args.quota_tier))
+        if getattr(args, "refill_harness", None):
+            command.extend(("--refill-harness", args.refill_harness))
+        if getattr(args, "refill_model", None):
+            command.extend(("--refill-model", args.refill_model))
+        if getattr(args, "refill_effort", None):
+            command.extend(("--refill-effort", args.refill_effort))
     return command
 
 
@@ -3553,6 +3593,10 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
                 elif replenished.get("status") == "stopped":
                     print(f"continuous refill stopped: "
                           f"{replenished.get('reason') or 'safety limit reached'}")
+                elif replenished.get("waiting_for_inventory"):
+                    print("no open cells match the refill scope right now; no "
+                          "other harness was claimed. The plan remains saved; "
+                          "run the same `dradar resume` command later to continue.")
         worker_failure = (
             getattr(args, "worker_child", False)
             and outcome not in ("submitted", "interrupted")
@@ -3657,6 +3701,13 @@ def _setup_refill(args, client: ApiClient, active: list[dict], free_pick: bool) 
     print(f"  held queue target: {target} (server claim limit {me['claim_limit']})")
     print(f"  server concurrent limit: {me['concurrent_limit']}")
     print(f"  internal task safety cap: {args.max_tasks}")
+    if getattr(args, "refill_harness", None):
+        scope = args.refill_harness
+        if getattr(args, "refill_model", None):
+            scope += f"/{args.refill_model}"
+        if getattr(args, "refill_effort", None):
+            scope += f"@{args.refill_effort}"
+        print(f"  exact refill scope: {scope} (no cross-harness fallback)")
     if args.max_estimated_quota_pct is not None:
         print(f"  estimated quota cap: {args.max_estimated_quota_pct}% {args.quota_tier}")
     print("  order: all initially selected tasks must submit before auto-refill starts")
@@ -3676,6 +3727,9 @@ def _setup_refill(args, client: ApiClient, active: list[dict], free_pick: bool) 
         quota_tier=args.quota_tier,
         max_estimated_quota_pct=args.max_estimated_quota_pct,
         active=active,
+        refill_harness=getattr(args, "refill_harness", None),
+        refill_model=getattr(args, "refill_model", None),
+        refill_effort=getattr(args, "refill_effort", None),
         # A normal parent owns the exclusive per-machine run lock here, so no
         # live local campaign can be displaced. Manual --parallel sessions do
         # not own that proof and must keep the fail-closed conflict behavior.
@@ -3759,7 +3813,13 @@ def _prepare_batch(args, client: ApiClient) -> tuple[list[dict], bool]:
             print(f"continuous refill not started: {exc}")
             args.refill = False
     if not active:
-        if free_pick and wants:
+        saved_refill = refill_plan.load(HOME) if wants_refill else None
+        if (saved_refill and saved_refill.get("status") == "active"
+                and saved_refill.get("refill_harness")):
+            print("no open cells match the refill scope right now; no other "
+                  "harness was claimed. The plan is saved; run the same "
+                  "`dradar resume` command later to continue.")
+        elif free_pick and wants:
             print("nothing claimed — try again, or pick on the radar page instead.")
         elif free_pick:
             print("no cells claimed — pick some on the radar page, then paste the "
