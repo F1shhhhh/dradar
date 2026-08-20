@@ -2403,8 +2403,12 @@ def local_deep_swe_commit(tasks_root: Path) -> str | None:
     return proc.stdout.strip() or None
 
 
-# The (public) task repo. Self-bootstrap clones it so a volunteer never has to.
-DEEP_SWE_REPO = "https://github.com/datacurve-ai/deep-swe"
+# The public task repo DRadar pins in assignments.  It tracks the upstream
+# corpus and also carries reviewed metadata corrections that must be identical
+# on the server and every volunteer checkout.  Fetching pins from this URL
+# (rather than an arbitrary existing ``origin``) keeps old upstream clones
+# able to self-heal to a DRadar-published task commit.
+DEEP_SWE_REPO = "https://github.com/SecurityMind/deep-swe"
 
 # Temporary SecurityMind Pier build containing datacurve-ai/pier#23 plus
 # persistent workspace/Codex-session checkpoints. Keep the immutable commit
@@ -2610,7 +2614,7 @@ def ensure_tasks_root(tasks_root: Path, benchmark_id: str = "deep-swe") -> None:
 def sync_deep_swe_commit(tasks_root: Path, pinned: str) -> bool:
     """Fetch + checkout the exact commit the server grades against, so a drifted
     checkout self-heals instead of hard-failing. Returns True on success."""
-    for cmd in (["git", "-C", str(tasks_root), "fetch", "--depth", "1", "origin", pinned],
+    for cmd in (["git", "-C", str(tasks_root), "fetch", "--depth", "1", DEEP_SWE_REPO, pinned],
                 ["git", "-C", str(tasks_root), "checkout", pinned]):
         try:
             if subprocess.run(cmd, capture_output=True, text=True, timeout=120).returncode != 0:
@@ -2636,6 +2640,34 @@ def check_task_content_hash(assignment: dict, tasks_root: Path) -> bool | None:
             "copy; refresh the selected benchmark task pack"
         )
     return match
+
+
+def task_content_mismatch_diagnostic(
+    assignment: dict, tasks_root: Path, local_commit: str | None,
+) -> dict[str, object]:
+    """Return bounded, content-free evidence for a pre-model hash refusal.
+
+    Only short hexadecimal identifiers and two false lifecycle facts leave the
+    machine.  Paths, task text, Git output, environment values and provider
+    credentials are deliberately excluded.
+    """
+    expected = str(assignment.get("task_content_hash") or "")
+    actual = task_content_hash(tasks_root, assignment["task_id"])
+    server_commit = str(assignment.get("deep_swe_commit") or "")
+
+    diagnostic: dict[str, object] = {
+        "schema": "dradar-task-content-mismatch-v1",
+        "failure_code": "task_content_mismatch",
+        "expected_hash_prefix": expected[:12].lower(),
+        "actual_hash_prefix": actual[:12].lower(),
+        "model_started": False,
+        "quota_consumed": False,
+    }
+    if re.fullmatch(r"[0-9a-fA-F]{7,64}", server_commit):
+        diagnostic["server_task_commit_prefix"] = server_commit[:12].lower()
+    if local_commit and re.fullmatch(r"[0-9a-fA-F]{7,64}", local_commit):
+        diagnostic["local_task_commit_prefix"] = local_commit[:12].lower()
+    return diagnostic
 
 
 def _tail(log_path: Path, n: int = 15) -> str:

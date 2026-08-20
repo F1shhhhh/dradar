@@ -606,8 +606,18 @@ def test_submission_attests_observed_zcode_cli_sha256(monkeypatch, tmp_path: Pat
     assert client.submissions[0]["meta"]["zcode_cli_sha256"] == digest
 
 
-def test_task_content_mismatch_stops_before_model_run(
-    monkeypatch, tmp_path: Path, capsys,
+@pytest.mark.parametrize(
+    ("agent", "provider"),
+    [
+        ("codex", None),
+        ("dsh-minimal", "deepseek"),
+        ("grok-build", "xai-subscription"),
+        ("kimi-code", "kimi-subscription"),
+        ("zcode", "bigmodel-coding-plan"),
+    ],
+)
+def test_task_content_mismatch_stops_before_model_run_for_every_harness(
+    monkeypatch, tmp_path: Path, capsys, agent, provider,
 ):
     monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
     monkeypatch.setattr(runloop, "check_task_content_hash", lambda *_args: False)
@@ -618,19 +628,44 @@ def test_task_content_mismatch_stops_before_model_run(
     stopped = []
     monkeypatch.setattr(
         runloop, "_mark_stopped_quietly",
-        lambda _client, assignment, **_kwargs: stopped.append(
-            assignment["assignment_id"]),
+        lambda _client, assignment, **kwargs: stopped.append(
+            (assignment["assignment_id"], kwargs)),
     )
     client = SubmitClient({})
+    assignment = {
+        **ASSIGNMENT,
+        "agent": agent,
+        "provider": provider,
+        "task_content_hash": "a" * 64,
+        "deep_swe_commit": "b" * 40,
+    }
 
     outcome = runloop._run_and_submit(
-        client, ASSIGNMENT, tmp_path, _args(), "abc123",
+        client, assignment, tmp_path, _args(), "c" * 40,
     )
 
     assert outcome == "task-content-mismatch"
-    assert stopped == ["a1"]
+    assert len(stopped) == 1
+    assignment_id, stop_kwargs = stopped[0]
+    assert assignment_id == "a1"
+    assert stop_kwargs["failure_kind"] == "task_content_mismatch"
+    diagnostic = stop_kwargs["failure_diagnostic"]
+    assert diagnostic == {
+        "schema": "dradar-task-content-mismatch-v1",
+        "failure_code": "task_content_mismatch",
+        "expected_hash_prefix": "a" * 12,
+        "actual_hash_prefix": "e3b0c44298fc",
+        "server_task_commit_prefix": "b" * 12,
+        "local_task_commit_prefix": "c" * 12,
+        "model_started": False,
+        "quota_consumed": False,
+    }
+    assert not ({"task_id", "model", "agent", "provider", "path"} & diagnostic.keys())
     assert client.submissions == []
-    assert "no model quota was consumed" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "No model process was started" in output
+    assert "no model quota was consumed" in output
+    assert "Do not use `--allow-task-drift` for an ordinary retry" in output
 
 
 def test_cleanup_unconfirmed_quarantines_slot_without_marking_lease_stopped(
