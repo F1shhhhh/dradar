@@ -1,0 +1,1249 @@
+{
+  "name": "cliffy-config-file-parsing-k3-low-429-sanitized",
+  "source": "Kimi Code 0.36.1 main-agent wire and stream-json, 2026-08-20",
+  "wire_records": [
+    {
+      "type": "metadata",
+      "protocol_version": "1.5"
+    },
+    {
+      "type": "turn.prompt",
+      "time": 1787223273240
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223273266,
+      "model": "k3",
+      "turnStep": "0.1"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223277089,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 2733,
+        "inputCacheRead": 7168,
+        "inputCacheCreation": 0,
+        "output": 74
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223277479,
+      "model": "k3",
+      "turnStep": "0.2"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223280530,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 336,
+        "inputCacheRead": 9728,
+        "inputCacheCreation": 0,
+        "output": 72
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223280740,
+      "model": "k3",
+      "turnStep": "0.3"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223283968,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 216,
+        "inputCacheRead": 9984,
+        "inputCacheCreation": 0,
+        "output": 70
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223284148,
+      "model": "k3",
+      "turnStep": "0.4"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223287983,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 1899,
+        "inputCacheRead": 9984,
+        "inputCacheCreation": 0,
+        "output": 83
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223288182,
+      "model": "k3",
+      "turnStep": "0.5"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223292405,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 632,
+        "inputCacheRead": 11776,
+        "inputCacheCreation": 0,
+        "output": 87
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223292587,
+      "model": "k3",
+      "turnStep": "0.6"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223305019,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 3707,
+        "inputCacheRead": 12288,
+        "inputCacheCreation": 0,
+        "output": 389
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223305240,
+      "model": "k3",
+      "turnStep": "0.7"
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223323590,
+      "model": "k3",
+      "turnStep": "0.8"
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223342488,
+      "model": "k3",
+      "turnStep": "0.9"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223364248,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 740,
+        "inputCacheRead": 15872,
+        "inputCacheCreation": 0,
+        "output": 96
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223364433,
+      "model": "k3",
+      "turnStep": "0.10"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223372911,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 763,
+        "inputCacheRead": 16384,
+        "inputCacheCreation": 0,
+        "output": 174
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223373077,
+      "model": "k3",
+      "turnStep": "0.11"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223378548,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 483,
+        "inputCacheRead": 16896,
+        "inputCacheCreation": 0,
+        "output": 86
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223378681,
+      "model": "k3",
+      "turnStep": "0.12"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223390189,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 2037,
+        "inputCacheRead": 17152,
+        "inputCacheCreation": 0,
+        "output": 178
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223390357,
+      "model": "k3",
+      "turnStep": "0.13"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223394013,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 720,
+        "inputCacheRead": 18944,
+        "inputCacheCreation": 0,
+        "output": 87
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223394156,
+      "model": "k3",
+      "turnStep": "0.14"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223448742,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 1266,
+        "inputCacheRead": 19456,
+        "inputCacheCreation": 0,
+        "output": 2242
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223448911,
+      "model": "k3",
+      "turnStep": "0.15"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223452979,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 4227,
+        "inputCacheRead": 20480,
+        "inputCacheCreation": 0,
+        "output": 97
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223453198,
+      "model": "k3",
+      "turnStep": "0.16"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223458647,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 703,
+        "inputCacheRead": 24576,
+        "inputCacheCreation": 0,
+        "output": 176
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223458905,
+      "model": "k3",
+      "turnStep": "0.17"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223511366,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 805,
+        "inputCacheRead": 25088,
+        "inputCacheCreation": 0,
+        "output": 1962
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223511603,
+      "model": "k3",
+      "turnStep": "0.18"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223515336,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 2166,
+        "inputCacheRead": 25856,
+        "inputCacheCreation": 0,
+        "output": 76
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223515518,
+      "model": "k3",
+      "turnStep": "0.19"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223519872,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 225,
+        "inputCacheRead": 27904,
+        "inputCacheCreation": 0,
+        "output": 101
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223520042,
+      "model": "k3",
+      "turnStep": "0.20"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223523575,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 449,
+        "inputCacheRead": 27904,
+        "inputCacheCreation": 0,
+        "output": 71
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223523766,
+      "model": "k3",
+      "turnStep": "0.21"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223529389,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 321,
+        "inputCacheRead": 28160,
+        "inputCacheCreation": 0,
+        "output": 168
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223529551,
+      "model": "k3",
+      "turnStep": "0.22"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223537830,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 984,
+        "inputCacheRead": 28416,
+        "inputCacheCreation": 0,
+        "output": 300
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223537983,
+      "model": "k3",
+      "turnStep": "0.23"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223541691,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 556,
+        "inputCacheRead": 29184,
+        "inputCacheCreation": 0,
+        "output": 55
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223541835,
+      "model": "k3",
+      "turnStep": "0.24"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223547378,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 434,
+        "inputCacheRead": 29696,
+        "inputCacheCreation": 0,
+        "output": 123
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223547532,
+      "model": "k3",
+      "turnStep": "0.25"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223558375,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 339,
+        "inputCacheRead": 29952,
+        "inputCacheCreation": 0,
+        "output": 418
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223558535,
+      "model": "k3",
+      "turnStep": "0.26"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223562091,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 540,
+        "inputCacheRead": 30208,
+        "inputCacheCreation": 0,
+        "output": 71
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223562219,
+      "model": "k3",
+      "turnStep": "0.27"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223569336,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 639,
+        "inputCacheRead": 30720,
+        "inputCacheCreation": 0,
+        "output": 232
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223569488,
+      "model": "k3",
+      "turnStep": "0.28"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223574752,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 398,
+        "inputCacheRead": 31232,
+        "inputCacheCreation": 0,
+        "output": 145
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223574952,
+      "model": "k3",
+      "turnStep": "0.29"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223604867,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 318,
+        "inputCacheRead": 31488,
+        "inputCacheCreation": 0,
+        "output": 1335
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223605020,
+      "model": "k3",
+      "turnStep": "0.30"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223614993,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 1438,
+        "inputCacheRead": 31744,
+        "inputCacheCreation": 0,
+        "output": 102
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223615157,
+      "model": "k3",
+      "turnStep": "0.31"
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223633810,
+      "model": "k3",
+      "turnStep": "0.32"
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223652977,
+      "model": "k3",
+      "turnStep": "0.33"
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223674566,
+      "model": "k3",
+      "turnStep": "0.34"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223691153,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 298,
+        "inputCacheRead": 33024,
+        "inputCacheCreation": 0,
+        "output": 339
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223691320,
+      "model": "k3",
+      "turnStep": "0.35"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223702140,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 961,
+        "inputCacheRead": 33280,
+        "inputCacheCreation": 0,
+        "output": 87
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223702280,
+      "model": "k3",
+      "turnStep": "0.36"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223714039,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 819,
+        "inputCacheRead": 34048,
+        "inputCacheCreation": 0,
+        "output": 365
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223714239,
+      "model": "k3",
+      "turnStep": "0.37"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223725780,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 569,
+        "inputCacheRead": 34816,
+        "inputCacheCreation": 0,
+        "output": 159
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223725912,
+      "model": "k3",
+      "turnStep": "0.38"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223730885,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 253,
+        "inputCacheRead": 35328,
+        "inputCacheCreation": 0,
+        "output": 128
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223731008,
+      "model": "k3",
+      "turnStep": "0.39"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223737475,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 162,
+        "inputCacheRead": 35584,
+        "inputCacheCreation": 0,
+        "output": 179
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223737596,
+      "model": "k3",
+      "turnStep": "0.40"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223747185,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 378,
+        "inputCacheRead": 35584,
+        "inputCacheCreation": 0,
+        "output": 387
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223747310,
+      "model": "k3",
+      "turnStep": "0.41"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223752593,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 546,
+        "inputCacheRead": 35840,
+        "inputCacheCreation": 0,
+        "output": 114
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223752713,
+      "model": "k3",
+      "turnStep": "0.42"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223757902,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 185,
+        "inputCacheRead": 36352,
+        "inputCacheCreation": 0,
+        "output": 131
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223758054,
+      "model": "k3",
+      "turnStep": "0.43"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223764448,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 353,
+        "inputCacheRead": 36352,
+        "inputCacheCreation": 0,
+        "output": 160
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223764606,
+      "model": "k3",
+      "turnStep": "0.44"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223779368,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 294,
+        "inputCacheRead": 36608,
+        "inputCacheCreation": 0,
+        "output": 132
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223779526,
+      "model": "k3",
+      "turnStep": "0.45"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223790136,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 207,
+        "inputCacheRead": 36864,
+        "inputCacheCreation": 0,
+        "output": 169
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223790333,
+      "model": "k3",
+      "turnStep": "0.46"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223797818,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 484,
+        "inputCacheRead": 36864,
+        "inputCacheCreation": 0,
+        "output": 155
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223798026,
+      "model": "k3",
+      "turnStep": "0.47"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223846406,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 538,
+        "inputCacheRead": 37120,
+        "inputCacheCreation": 0,
+        "output": 1438
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223846585,
+      "model": "k3",
+      "turnStep": "0.48"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223874582,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 1800,
+        "inputCacheRead": 37632,
+        "inputCacheCreation": 0,
+        "output": 1087
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223874774,
+      "model": "k3",
+      "turnStep": "0.49"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223881419,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 1132,
+        "inputCacheRead": 39424,
+        "inputCacheCreation": 0,
+        "output": 152
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223881557,
+      "model": "k3",
+      "turnStep": "0.50"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223886464,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 297,
+        "inputCacheRead": 40448,
+        "inputCacheCreation": 0,
+        "output": 102
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223886605,
+      "model": "k3",
+      "turnStep": "0.51"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223892414,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 543,
+        "inputCacheRead": 40704,
+        "inputCacheCreation": 0,
+        "output": 173
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223892594,
+      "model": "k3",
+      "turnStep": "0.52"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223898112,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 241,
+        "inputCacheRead": 41216,
+        "inputCacheCreation": 0,
+        "output": 130
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223898256,
+      "model": "k3",
+      "turnStep": "0.53"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223904457,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 409,
+        "inputCacheRead": 41216,
+        "inputCacheCreation": 0,
+        "output": 153
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223904667,
+      "model": "k3",
+      "turnStep": "0.54"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787223987405,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 692,
+        "inputCacheRead": 41472,
+        "inputCacheCreation": 0,
+        "output": 3157
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787223987569,
+      "model": "k3",
+      "turnStep": "0.55"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787224073323,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 3378,
+        "inputCacheRead": 41984,
+        "inputCacheCreation": 0,
+        "output": 2829
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787224073477,
+      "model": "k3",
+      "turnStep": "0.56"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787224080615,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 2916,
+        "inputCacheRead": 45312,
+        "inputCacheCreation": 0,
+        "output": 194
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787224080757,
+      "model": "k3",
+      "turnStep": "0.57"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787224090713,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 331,
+        "inputCacheRead": 48128,
+        "inputCacheCreation": 0,
+        "output": 315
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787224090858,
+      "model": "k3",
+      "turnStep": "0.58"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787224095888,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 430,
+        "inputCacheRead": 48384,
+        "inputCacheCreation": 0,
+        "output": 104
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787224099614,
+      "model": "k3",
+      "turnStep": "0.59"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787224105224,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 645,
+        "inputCacheRead": 48640,
+        "inputCacheCreation": 0,
+        "output": 136
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787224105976,
+      "model": "k3",
+      "turnStep": "0.60"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787224113824,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 420,
+        "inputCacheRead": 49152,
+        "inputCacheCreation": 0,
+        "output": 136
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787224131316,
+      "model": "k3",
+      "turnStep": "0.61"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787224138154,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 443,
+        "inputCacheRead": 49408,
+        "inputCacheCreation": 0,
+        "output": 129
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787224149299,
+      "model": "k3",
+      "turnStep": "0.62"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787224159458,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 716,
+        "inputCacheRead": 49664,
+        "inputCacheCreation": 0,
+        "output": 238
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787224172695,
+      "model": "k3",
+      "turnStep": "0.63"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787224182046,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 695,
+        "inputCacheRead": 50176,
+        "inputCacheCreation": 0,
+        "output": 211
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787224183016,
+      "model": "k3",
+      "turnStep": "0.64"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787224188478,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 647,
+        "inputCacheRead": 50688,
+        "inputCacheCreation": 0,
+        "output": 126
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787224189263,
+      "model": "k3",
+      "turnStep": "0.65"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787224202700,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 392,
+        "inputCacheRead": 51200,
+        "inputCacheCreation": 0,
+        "output": 318
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787224206210,
+      "model": "k3",
+      "turnStep": "0.66"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787224219347,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 578,
+        "inputCacheRead": 51456,
+        "inputCacheCreation": 0,
+        "output": 321
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787224229376,
+      "model": "k3",
+      "turnStep": "0.67"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787224240821,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 432,
+        "inputCacheRead": 51968,
+        "inputCacheCreation": 0,
+        "output": 286
+      }
+    },
+    {
+      "type": "llm.request",
+      "time": 1787224241178,
+      "model": "k3",
+      "turnStep": "0.68"
+    },
+    {
+      "type": "usage.record",
+      "time": 1787224255896,
+      "usageScope": "turn",
+      "model": "kimi-code/k3",
+      "usage": {
+        "inputOther": 619,
+        "inputCacheRead": 52224,
+        "inputCacheCreation": 0,
+        "output": 474
+      }
+    },
+    {
+      "type": "turn.ended",
+      "time": 1787224255903,
+      "turnId": 0,
+      "reason": "completed"
+    }
+  ],
+  "retry_records": [
+    {
+      "role": "meta",
+      "type": "turn.step.retrying",
+      "failed_attempt": 1,
+      "next_attempt": 2,
+      "max_attempts": 10,
+      "delay_ms": 544.0100171488131,
+      "error_name": "APIProviderRateLimitError",
+      "error_message": "429 provider overloaded",
+      "status_code": 429
+    },
+    {
+      "role": "meta",
+      "type": "turn.step.retrying",
+      "failed_attempt": 2,
+      "next_attempt": 3,
+      "max_attempts": 10,
+      "delay_ms": 1155.2742229866938,
+      "error_name": "APIProviderRateLimitError",
+      "error_message": "429 provider overloaded",
+      "status_code": 429
+    },
+    {
+      "role": "meta",
+      "type": "turn.step.retrying",
+      "failed_attempt": 1,
+      "next_attempt": 2,
+      "max_attempts": 10,
+      "delay_ms": 544.7838709581093,
+      "error_name": "APIProviderRateLimitError",
+      "error_message": "429 provider overloaded",
+      "status_code": 429
+    },
+    {
+      "role": "meta",
+      "type": "turn.step.retrying",
+      "failed_attempt": 2,
+      "next_attempt": 3,
+      "max_attempts": 10,
+      "delay_ms": 1109.7163553039532,
+      "error_name": "APIProviderRateLimitError",
+      "error_message": "429 provider overloaded",
+      "status_code": 429
+    },
+    {
+      "role": "meta",
+      "type": "turn.step.retrying",
+      "failed_attempt": 3,
+      "next_attempt": 4,
+      "max_attempts": 10,
+      "delay_ms": 2397.413003482483,
+      "error_name": "APIProviderRateLimitError",
+      "error_message": "429 provider overloaded",
+      "status_code": 429
+    }
+  ],
+  "expected": {
+    "request_count": 63,
+    "attempt_count": 68,
+    "retry_count": 5,
+    "n_input_tokens": 2140277,
+    "n_cache_tokens": 2086400,
+    "n_output_tokens": 23784
+  }
+}
