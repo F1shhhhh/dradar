@@ -301,6 +301,18 @@ def test_grok_prompt_stays_headless_in_one_single_option_argv(
     ]
     assert stream.read_bytes() == proc.stdout
 
+    resumed = namespace["_grok_prompt_command"](
+        str(fake), flags, "continue", str(stream),
+        session_id="01a01e4f-040a-71e3-a6c4-fdf6083ae20a", append=True,
+    )
+    resumed_proc = subprocess.run(
+        ["bash", "-o", "pipefail", "-c", resumed],
+        capture_output=True, check=False,
+    )
+    assert resumed_proc.returncode == 0
+    assert b"--resume=01a01e4f-040a-71e3-a6c4-fdf6083ae20a" in resumed_proc.stdout
+    assert stream.read_bytes().endswith(resumed_proc.stdout)
+
 
 def test_grok_usage_keeps_cached_input_as_prompt_subset() -> None:
     source = Path(providers.__file__).with_name("pier_grok.py").read_text()
@@ -332,8 +344,8 @@ def test_grok_usage_keeps_cached_input_as_prompt_subset() -> None:
         "total_tokens": 1_050,
     }
     response_events = [
-        {"type": "assistant", "message": {"usage": first_usage}},
-        {"type": "assistant", "message": {"usage": second_usage}},
+        {"type": "assistant", "message": {"id": "msg-1", "usage": first_usage}},
+        {"type": "assistant", "message": {"id": "msg-2", "usage": second_usage}},
     ]
     terminal = {
         "type": "result",
@@ -364,6 +376,13 @@ def test_grok_usage_keeps_cached_input_as_prompt_subset() -> None:
         },
     ]
     assert facts["subscription_reported_cost_usd"] == pytest.approx(0.00142052)
+
+    replayed = namespace["_grok_usage_facts"]([
+        response_events[0], response_events[0], response_events[1], terminal,
+    ])
+    assert replayed["complete"] is True
+    assert replayed["request_count"] == 2
+    assert replayed["n_input_tokens"] == 1_000
 
     incomplete = namespace["_grok_usage_facts"]([
         *response_events,

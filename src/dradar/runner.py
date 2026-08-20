@@ -161,6 +161,7 @@ DEEPSEEK_AGENT_IMPORT_PATH = "_dradar_pier_deepseek:DeepSeekCodex"
 DEEPSEEK_AGENT_MODULE_FILENAME = "_dradar_pier_deepseek.py"
 GROK_AGENT_IMPORT_PATH = "_dradar_pier_grok:GrokBuild"
 GROK_AGENT_MODULE_FILENAME = "_dradar_pier_grok.py"
+GROK_RECOVERY_MODULE_FILENAME = "_dradar_grok_recovery.py"
 KIMI_AGENT_IMPORT_PATH = "_dradar_pier_kimi:KimiCode"
 KIMI_AGENT_MODULE_FILENAME = "_dradar_pier_kimi.py"
 KIMI_RECOVERY_MODULE_FILENAME = "_dradar_kimi_recovery.py"
@@ -210,11 +211,20 @@ not wait for or invoke `/tests/pre_artifacts.sh`, and do not create or inspect
 """
 
 POMPEII_BENCHMARK_ID = "pompeii-adjacency"
-POMPEII_AGENT_TIMEOUT_SEC = 90 * 60
+POMPEII_SOFT_BUDGET_SEC = 90 * 60
+POMPEII_AGENT_TIMEOUT_SEC = 120 * 60
+POMPEII_TERMINAL_HEAVY_TIMEOUT_SEC = 10 * 60
+POMPEII_FINALIZATION_RESERVE_SEC = 10 * 60
+POMPEII_OUTER_WATCHDOG_SLACK_SEC = 15 * 60
 POMPEII_SUBMISSION_PROMPT = CODEX_SUBMISSION_PROMPT + """
 
-Time budget: aim to complete and commit a valid answer within 60 minutes.
-After 60 minutes, this run may stop at any time; agent execution will stop no later than 90 minutes.
+Time budget: aim to complete and commit a valid answer within 90 minutes.
+After 90 minutes, this run may stop at any time; agent execution will stop no later than 120 minutes.
+For bounded, compute-intensive offline work such as image stitching or grid
+search, set the individual terminal-tool timeout to at most 600 seconds when
+needed. Keep at least 10 minutes in reserve to persist the best answer, validate
+its format, and commit it. Do not lengthen ordinary commands or start another
+long computation once that reserve begins.
 Keep the best current answer persisted in the repository. As
 the deadline approaches, do not start time-consuming new experiments; use your
 best current judgment to finish and commit. A complete, gradeable answer takes
@@ -442,7 +452,7 @@ def _ensure_codex_submission_prompt(
         # Keep the benchmark-specific prompt at its own immutable path. Workers
         # from two benchmark channels can share DRADAR_HOME, so overwriting the
         # generic prompt in place would create a cross-run race.
-        path = home / "codex-submission-prompt-pompeii-v1.j2"
+        path = home / "codex-submission-prompt-pompeii-v2.j2"
         prompt = POMPEII_SUBMISSION_PROMPT
     else:
         path = home / "codex-submission-prompt.j2"
@@ -478,10 +488,14 @@ def _ensure_deepseek_agent_module(home: Path) -> Path:
 
 def _ensure_grok_agent_module(home: Path) -> Path:
     source = Path(__file__).with_name("pier_grok.py")
-    if not source.is_file():
+    recovery_source = Path(__file__).with_name("grok_recovery.py")
+    if not source.is_file() or not recovery_source.is_file():
         raise RunnerError(
             "Grok Build Pier adapter is missing; reinstall or upgrade dradar"
         )
+    _materialize_shared_file(
+        home / GROK_RECOVERY_MODULE_FILENAME, recovery_source.read_bytes()
+    )
     return _materialize_shared_file(
         home / GROK_AGENT_MODULE_FILENAME, source.read_bytes()
     )
@@ -792,7 +806,7 @@ def _pier_process_env(
 
 def _task_agent_timeout_sec(task_path: Path) -> float | None:
     """The task's own declared agent watchdog (task.toml's [agent].timeout_sec
-    -- currently 5400.0/90min flat across the whole deep-swe set). None if the
+    -- commonly 5400.0/90min or 7200.0/120min across managed packs). None if the
     file is missing or malformed; caller must not guess a number in that case."""
     try:
         with (task_path / "task.toml").open("rb") as f:
@@ -806,22 +820,23 @@ def _agent_timeout_multiplier(assignment: dict, task_path: Path) -> float:
     """Resolve Pier's agent watchdog multiplier for one assignment.
 
     Ordinary benchmarks stretch the task timeout to stay behind DRadar's outer
-    watchdog. Pompeii deliberately does the opposite: it normalizes old and new
-    managed task packs to the benchmark's strict 90-minute agent budget.
+    watchdog. Pompeii uses one benchmark-wide 120-minute hard budget regardless
+    of whether an installed task pack declares the older 90-minute watchdog or
+    the refreshed two-hour watchdog.
     """
     base = _task_agent_timeout_sec(task_path)
     if not base:
         if assignment.get("benchmark_id") == POMPEII_BENCHMARK_ID:
             raise RunnerError(
                 "Pompeii tasks require a readable [agent].timeout_sec so the "
-                "90-minute execution limit can be enforced"
+                "120-minute execution limit can be enforced"
             )
         return 1.0
     if assignment.get("benchmark_id") == POMPEII_BENCHMARK_ID:
-        # Old managed Pompeii packs declared 7200s while refreshed packs declare
-        # 5400s. Normalize both at launch so an already-installed old pack cannot
-        # silently retain the former two-hour limit. Floor the serialized ratio
-        # so unusual task defaults can stop a fraction early, never after 90m.
+        # Managed Pompeii packs in the field declare either 5400s or 7200s.
+        # Normalize both at launch so every model receives the same two-hour
+        # hard limit. Floor the serialized ratio so unusual task defaults can
+        # stop a fraction early, never after 120m.
         raw = POMPEII_AGENT_TIMEOUT_SEC / base
         return math.floor(raw * 1_000_000) / 1_000_000
     watchdog_sec = _effective_trial_timeout_sec(assignment) + 60
@@ -2298,6 +2313,19 @@ def _zcode_trial_timeout_sec(assignment: dict) -> int:
 
 
 def _effective_trial_timeout_sec(assignment: dict) -> int:
+    if assignment.get("benchmark_id") == POMPEII_BENCHMARK_ID:
+        # The outer watchdog starts before image/environment setup while Pier's
+        # hard agent deadline starts at agent execution. Keep setup outside the
+        # promised two-hour execution budget instead of undercutting it.
+        ordinary = (
+            _subscription_trial_timeout_sec(assignment)
+            if assignment.get("agent") in BETA_SUBSCRIPTION_AGENTS
+            else _trial_timeout_sec(assignment)
+        )
+        return max(
+            ordinary,
+            POMPEII_AGENT_TIMEOUT_SEC + POMPEII_OUTER_WATCHDOG_SLACK_SEC,
+        )
     agent = assignment.get("agent")
     if agent == ZCODE_AGENT:
         return _zcode_trial_timeout_sec(assignment)
@@ -3012,6 +3040,19 @@ def classify_exception_message(message: str) -> str | None:
         return "rate-limit"
     if "at capacity" in low:
         return "model-capacity"
+    if (
+        "cli-chat-proxy.grok.com/v1/responses" in low
+        and any(marker in low for marker in (
+            "reqwest error stream", "error sending request for url",
+            "stream disconnected before completion", "connection reset by peer",
+        ))
+    ) or any(marker in low for marker in (
+        "provider.connection_error: connection error",
+        "dsh: transport:",
+    )):
+        return "provider-transport"
+    if "agenttimeouterror" in low:
+        return "agent-deadline"
     if re.search(r"^command failed \(exit 75\):", low):
         return "provider-temporary"
     return None
@@ -3021,7 +3062,8 @@ def diagnose_exception(result_path: Path | None) -> dict:
     """Classify a trial's recorded exception for honest console reporting:
     {} when there is none, else {type, tail, kind} where kind is one of
     stale-agent | insufficient-balance | quota-limit | rate-limit | auth |
-    model-capacity | provider-temporary | None
+    model-capacity | provider-transport | provider-temporary |
+    agent-deadline | None
     (unrecognized). The message tail
     matters most: pier's exception_message embeds the agent's actual output,
     which for codex includes the API error JSON naming the real cause."""
@@ -3036,6 +3078,8 @@ def diagnose_exception(result_path: Path | None) -> dict:
         return {}
     msg = info.get("exception_message") or ""
     kind = classify_exception_message(msg)
+    if kind is None and info.get("exception_type") == "AgentTimeoutError":
+        kind = "agent-deadline"
     tail = [ln.strip() for ln in msg.splitlines() if ln.strip()][-6:]
     return {"type": info.get("exception_type"), "kind": kind, "tail": tail}
 
@@ -3085,6 +3129,13 @@ DIAG_ADVICE = {
         "session with bounded backoff. This is not a problem with your setup "
         "or work; the automatic recovery was attempted but could not finish "
         "within its retry budget. Claim the cell again later."),
+    "provider-transport": (
+        "the provider response stream failed after bounded same-session "
+        "recovery. Existing work and diagnostics were preserved; this run "
+        "is not graded and the cell reopens for a fresh attempt."),
+    "agent-deadline": (
+        "the agent reached its benchmark hard deadline. The best persisted "
+        "work and diagnostics were preserved, but this run is not graded."),
     "provider-temporary": (
         "the provider declared a temporary network or service failure. DRadar "
         "already exhausted its bounded same-session recovery budget, so the "

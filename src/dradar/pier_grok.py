@@ -23,6 +23,13 @@ from pier.models.agent.network import NetworkAllowlist
 from pier.models.trajectories import Agent, FinalMetrics, Step, Trajectory
 from pier.utils.trajectory_metrics import populate_context_from_final_metrics
 
+from _dradar_grok_recovery import (
+    grok_provider_stream_is_retryable,
+    pier_exit_code,
+    run_with_grok_resume,
+    validated_session_id,
+)
+
 
 GROK_CLI_VERSION = "1.0.3"
 GROK_VERSION_PATTERN = GROK_CLI_VERSION.replace(".", r"\.")
@@ -67,6 +74,7 @@ def _grok_model_preflight_command(remote_cli: str) -> str:
 
 def _grok_prompt_command(
     remote_cli: str, flags: list[str], instruction: str, stream: str,
+    *, session_id: str | None = None, append: bool = False,
 ) -> str:
     """Build an option-safe Grok invocation for an arbitrary task prompt.
 
@@ -75,11 +83,14 @@ def _grok_prompt_command(
     leading dash can never be reinterpreted as another CLI option.
     """
 
-    cli = " ".join(shlex.quote(part) for part in flags)
+    invocation = [remote_cli, *flags]
+    if session_id is not None:
+        invocation.append(f"--resume={session_id}")
+    cli = " ".join(shlex.quote(part) for part in invocation)
     single = shlex.quote(f"--single={instruction}")
-    return (
-        f"{shlex.quote(remote_cli)} {cli} {single} "
-        f"2>&1 </dev/null | tee {shlex.quote(stream)}"
+    tee = "tee -a" if append else "tee"
+    return "bash -o pipefail -c " + shlex.quote(
+        f"{cli} {single} 2>&1 </dev/null | {tee} {shlex.quote(stream)}"
     )
 
 
@@ -116,10 +127,16 @@ def _grok_usage_facts(events: list[dict]) -> dict:
     response_count = 0
     token_usage_events = []
     response_ledger_valid = True
+    seen_response_ids: set[str] = set()
     for event in events:
         if not isinstance(event, dict) or event.get("type") != "assistant":
             continue
         message = event.get("message")
+        message_id = message.get("id") if isinstance(message, dict) else None
+        if isinstance(message_id, str) and message_id:
+            if message_id in seen_response_ids:
+                continue
+            seen_response_ids.add(message_id)
         response_usage = message.get("usage") if isinstance(message, dict) else None
         if not isinstance(response_usage, dict):
             valid = False
@@ -300,6 +317,8 @@ class GrokBuild(BaseInstalledAgent):
         self._auth_json_file = auth
         self._shared_oauth = shared_oauth
         self._reasoning_effort = reasoning_effort
+        self._resume_attempts = 0
+        self._session_id: str | None = None
         super().__init__(*args, **kwargs)
 
     def get_version_command(self) -> str:
@@ -438,9 +457,66 @@ class GrokBuild(BaseInstalledAgent):
             "--deny", "Bash(*GROK_HOME*)",
             "--deny", f"Bash(*{remote_user_home}*)",
         ]
-        command = _grok_prompt_command(remote_cli, flags, instruction, stream)
+        async def remote_session_id() -> str | None:
+            result = await self.exec_as_agent(
+                environment,
+                command=(
+                    "sed -n 's/.*\"session_id\":\"\\([^\"]*\\)\".*/\\1/p' "
+                    f"{shlex.quote(stream)} | head -n 1"
+                ),
+                env=env,
+            )
+            return validated_session_id(result.stdout)
+
+        async def run_initial() -> None:
+            await self.exec_as_agent(
+                environment,
+                command=_grok_prompt_command(
+                    remote_cli, flags, instruction, stream,
+                ),
+                env=env,
+            )
+
+        async def run_resume(session_id: str, prompt: str) -> None:
+            await self.exec_as_agent(
+                environment,
+                command=_grok_prompt_command(
+                    remote_cli, flags, prompt, stream,
+                    session_id=session_id, append=True,
+                ),
+                env=env,
+            )
+
+        async def classify_retryable_error(error: BaseException) -> bool:
+            if pier_exit_code(error) != 1:
+                return False
+            try:
+                result = await self.exec_as_agent(
+                    environment,
+                    command=f"tail -c 8192 {shlex.quote(stream)}",
+                    env=env,
+                )
+            except Exception:
+                return False
+            return grok_provider_stream_is_retryable(result.stdout)
+
+        def announce_retry(attempt: int, delay: float, session_id: str) -> None:
+            self.logger.warning(
+                "Grok temporary provider stream failure; resuming session %s "
+                "in %ss (attempt %s/2)",
+                session_id,
+                int(delay),
+                attempt,
+            )
+
         try:
-            await self.exec_as_agent(environment, command=command, env=env)
+            self._resume_attempts, self._session_id = await run_with_grok_resume(
+                run_initial=run_initial,
+                find_session_id=remote_session_id,
+                run_resume=run_resume,
+                classify_retryable_error=classify_retryable_error,
+                on_retry=announce_retry,
+            )
         finally:
             # Silent refresh mutates auth.json.  Return that mutation to the
             # locked host run-copy even when the model command fails.
@@ -480,6 +556,7 @@ class GrokBuild(BaseInstalledAgent):
         steps: list[Step] = []
         session_id: str | None = None
         parsed_events = []
+        seen_messages: set[str] = set()
         for line in lines:
             try:
                 event = json.loads(line)
@@ -490,6 +567,11 @@ class GrokBuild(BaseInstalledAgent):
             parsed_events.append(event)
             session_id = event.get("session_id") or event.get("sessionId") or session_id
             message = event.get("message") if isinstance(event.get("message"), dict) else event
+            message_id = message.get("id")
+            if isinstance(message_id, str) and message_id:
+                if message_id in seen_messages:
+                    continue
+                seen_messages.add(message_id)
             role = message.get("role")
             text = self._content_text(message.get("content"))
             if not text or role not in {"user", "assistant"}:
@@ -507,6 +589,7 @@ class GrokBuild(BaseInstalledAgent):
         if not steps:
             return
         usage_facts = _grok_usage_facts(parsed_events)
+        usage_facts["resume_attempts"] = self._resume_attempts
         input_tokens = usage_facts["n_input_tokens"] if usage_facts["complete"] else 0
         cached_tokens = usage_facts["n_cache_tokens"] if usage_facts["complete"] else 0
         output_tokens = usage_facts["n_output_tokens"] if usage_facts["complete"] else 0
