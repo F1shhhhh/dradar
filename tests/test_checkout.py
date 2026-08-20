@@ -274,6 +274,37 @@ def test_checkout_loop_always_fuses_after_insufficient_balance(
     assert "siblings with model runs already in flight are allowed to finish" in out
 
 
+def test_eight_way_quota_terminal_never_checks_out_or_releases_waiting_siblings(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)
+    attempted = []
+
+    def run(_client, assignment, *_args, **_kwargs):
+        attempted.append(assignment["assignment_id"])
+        runloop._signal_pool_abort(
+            "account quota exhausted", interrupt_siblings=False,
+        )
+        return "quota-exhausted"
+
+    monkeypatch.setattr(runloop, "_run_and_submit", run)
+    abort_file = tmp_path / "pool-abort"
+    monkeypatch.setenv("DRADAR_POOL_ABORT_FILE", str(abort_file))
+    first = _cell("quota-probe")
+    waiting = [_cell(f"waiting-{index}") for index in range(7)]
+    client = CheckoutClient(
+        {"active": [first, *waiting], "free_pick": True},
+        [{"assignment": first, "held": 8, "unstarted": 7}],
+    )
+    client.release_assignments = lambda *_a, **_k: pytest.fail(
+        "quota drain must preserve waiting siblings",
+    )
+
+    assert runloop._go_menu(_args(), {}, client, tmp_path) == 1
+    assert attempted == ["quota-probe"]
+    assert len(client.checkout_exclusions) == 1
+    assert abort_file.read_text() == "drain:account quota exhausted"
+
+
 def test_checkout_loop_fuses_after_grok_preflight_without_switching_task(
         monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)

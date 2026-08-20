@@ -204,6 +204,42 @@ def test_interrupted_quota_limit_opens_pool_circuit(
     assert "quota window is exhausted" in capsys.readouterr().out
 
 
+def test_structured_quota_terminal_keeps_existing_checkpoint_and_drains_pool(
+        monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
+    abort_file = tmp_path / "ACCOUNT_STOP"
+    monkeypatch.setenv("DRADAR_POOL_ABORT_FILE", str(abort_file))
+    diagnostic = {
+        "schema": "dradar-runner-failure-v1",
+        "failure_code": "provider_quota_exhausted",
+        "provider_code": 1308,
+        "status_code": 429,
+    }
+
+    def quota_terminal(*_args, **_kwargs):
+        raise RunnerError(
+            "ZCode structured provider outcome confirmed account quota exhausted",
+            failure_diagnostic=diagnostic,
+        )
+
+    checkpoint = type("Checkpoint", (), {"checkpoint_id": "cp-kept"})()
+    monkeypatch.setattr(runloop, "run_trial", quota_terminal)
+    monkeypatch.setattr(
+        runloop, "_pause_checkpoint_quietly", lambda *_a, **_k: checkpoint,
+    )
+    client = SubmitClient({})
+    client.mark_stopped = lambda *_a, **_k: pytest.fail(
+        "a resumable checkpoint must not be released or reset",
+    )
+
+    outcome = runloop._run_and_submit(
+        client, ASSIGNMENT, tmp_path, _args(), "abc123",
+    )
+
+    assert outcome == "quota-exhausted"
+    assert abort_file.read_text() == "drain:account quota exhausted"
+
+
 def test_interrupted_insufficient_balance_returns_batch_terminal_outcome(
         monkeypatch, capsys, tmp_path: Path):
     monkeypatch.setattr(runloop, "HOME", tmp_path / "home")

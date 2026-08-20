@@ -1,0 +1,32 @@
+{
+  "schema": "dradar-zcode-outcome-v1",
+  "sessionId": "sess_redacted_fixture",
+  "model": "glm-5.3",
+  "reasoningEffort": "low",
+  "state": {
+    "projection": {
+      "status": "idle",
+      "turnCount": 1
+    }
+  },
+  "events": {
+    "events": [
+      {
+        "type": "session.updated",
+        "payload": {
+          "type": "model_request_failed",
+          "providerKind": "anthropic",
+          "transport": "sse",
+          "statusCode": 429,
+          "providerErrorCode": "1308",
+          "retryable": false,
+          "reason": "rate_limited",
+          "errorCode": "model_rate_limited",
+          "errorPhase": "stream",
+          "message": "[1308][已达到 5 小时的使用上限。您的限额将在 2099-01-01 00:00:00 重置。][request-redacted]"
+        }
+      }
+    ]
+  },
+  "notifications": []
+}
