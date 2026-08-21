@@ -22,18 +22,23 @@ from pier.models.agent.context import AgentContext
 from pier.models.agent.install import AgentInstallSpec, InstallStep
 from pier.models.agent.network import NetworkAllowlist
 
-DSH_VERSION = "0.1.0-rc.6"
+DSH_VERSION = "0.1.1-rc.1"
 NODE_VERSION = "22.23.2"
 NODE_SHA256 = {
     "x64": "d60acfe00a2932254bb0ad20e01b0d74397a0875595de719654b214f4b03f307",
     "arm64": "fff4078c5def658577f92c88db7db3bc0072924bfb93fe52c1e744a54e94abb8",
 }
 SUPPORTED_MODELS = frozenset(
-    {"dsh-deepseek-v4-flash", "dsh-deepseek-v4-pro"}
+    {
+        "dsh-deepseek-v4-flash",
+        "dsh-deepseek-v4-pro",
+        "dsh-deepseek-v4-flash-vision-exp",
+    }
 )
 RUNTIME_MODELS = {
     "dsh-deepseek-v4-flash": "deepseek-v4-flash",
     "dsh-deepseek-v4-pro": "deepseek-v4-pro",
+    "dsh-deepseek-v4-flash-vision-exp": "deepseek-v4-flash-vision-exp",
 }
 SUPPORTED_REASONING_EFFORTS = frozenset({"off", "high", "max"})
 _ARTIFACT_ID_RE = re.compile(r"[0-9a-f]{32}")
@@ -140,7 +145,7 @@ _MINIMAL_PATCH = """\
 
 _MINIMAL_HEADLESS_RUNNER = """\
 import { randomUUID } from "node:crypto";
-import { writeFileSync } from "node:fs";
+import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import z from "/opt/dsh-runtime/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/schemastery/lib/index.mjs";
 import { installModelSelection } from "/opt/dsh-runtime/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-agent/lib/index.js";
 import { createUserMessage } from "/opt/dsh-runtime/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-llm/lib/index.js";
@@ -151,6 +156,7 @@ export const inject = [
   "agentDefaultModel",
   "agentPresets",
   "agents",
+  "attachments",
   "sessions",
 ];
 export const Config = z.object({ task: z.string().required() });
@@ -227,13 +233,37 @@ function summarize(events, firstSeq) {
 
 async function run(ctx, task, io) {
   await ctx.get("loader")?.await();
+  try {
+    unlinkSync(process.env.DSH_CREDENTIALS_FILE);
+  } catch (error) {
+    if (!(error instanceof Error && error.code === "ENOENT")) throw error;
+  }
   const agents = ctx.get("agents");
+  const attachments = ctx.get("attachments");
   const defaultModel = ctx.get("agentDefaultModel");
   const presets = ctx.get("agentPresets");
   const sessions = ctx.get("sessions");
   if (!agents || !defaultModel || !presets || !sessions) return;
 
   const selection = defaultModel.currentSelection();
+  const visionInput = selection.model === "deepseek-v4-flash-vision-exp";
+  let imageRef = null;
+  if (visionInput) {
+    if (!attachments) {
+      throw new Error("Vision Exp requires DSH's durable attachment service");
+    }
+    let imageBytes;
+    try {
+      imageBytes = readFileSync("/app/question.png");
+    } catch (error) {
+      throw new Error(`Vision Exp requires readable /app/question.png: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    imageRef = await attachments.saveImage({
+      data: imageBytes,
+      mediaType: "image/png",
+      name: "question.png",
+    });
+  }
   const preset = await presets.resolve("minimal");
   const { agent } = await agents.create({
     sessionId: SessionId(`session-${randomUUID()}`),
@@ -254,7 +284,10 @@ async function run(ctx, task, io) {
   await agent.whenIdle();
   const firstSeq = agent.session.seq;
   agent.followup(createUserMessage({
-    content: [{ type: "text", text: task }],
+    content: [
+      { type: "text", text: task },
+      ...(imageRef ? [{ type: "image", attachment: imageRef }] : []),
+    ],
     source: { kind: "user" },
   }));
   await agent.whenIdle();
@@ -268,6 +301,15 @@ async function run(ctx, task, io) {
     taskId: process.env.DRADAR_TASK_ID ?? null,
     assignmentModel: process.env.DRADAR_ASSIGNMENT_MODEL ?? null,
     reasoningEffort: process.env.DSH_REASONING_EFFORT ?? null,
+    visionInputAttached: imageRef !== null,
+    visionInput: imageRef === null ? null : {
+      attachmentId: String(imageRef.attachmentId),
+      mediaType: imageRef.mediaType,
+      bytes: imageRef.bytes,
+      width: imageRef.width,
+      height: imageRef.height,
+      name: imageRef.name ?? null,
+    },
     terminalKind: terminalKind ?? null,
     requestCount: outcome.usage.requestCount,
     agentCompleted: terminalKind === "completed",
@@ -313,11 +355,11 @@ def _install_command() -> str:
         "elif command -v apt-get >/dev/null 2>&1; then "
         "  apt-get update && DEBIAN_FRONTEND=noninteractive "
         "  apt-get install -y --no-install-recommends "
-        "  ca-certificates curl g++ inotify-tools make python3 tar xz-utils; "
+        "  ca-certificates curl g++ make python3 tar xz-utils; "
         "elif command -v dnf >/dev/null 2>&1; then "
-        "  dnf install -y ca-certificates curl gcc-c++ inotify-tools make python3 tar xz; "
+        "  dnf install -y ca-certificates curl gcc-c++ make python3 tar xz; "
         "elif command -v yum >/dev/null 2>&1; then "
-        "  yum install -y ca-certificates curl gcc-c++ inotify-tools make python3 tar xz; "
+        "  yum install -y ca-certificates curl gcc-c++ make python3 tar xz; "
         "else echo 'No supported package manager found' >&2; exit 1; fi; "
         'case "$(uname -m)" in '
         f"  x86_64) node_arch=x64; node_sha={x64_sha} ;; "
@@ -337,7 +379,9 @@ def _install_command() -> str:
         '  ln -sfn "${node_root}/bin/${binary}" "/usr/local/bin/${binary}"; '
         "done; "
         "mkdir -p /opt/dsh-runtime; "
-        f"npm install --global --prefix /opt/dsh-runtime '@deepseek-ai/dsh@{DSH_VERSION}'; "
+        "npm install --fetch-retries=5 --fetch-retry-factor=2 "
+        "  --fetch-retry-mintimeout=20000 --fetch-retry-maxtimeout=120000 "
+        f"  --global --prefix /opt/dsh-runtime '@deepseek-ai/dsh@{DSH_VERSION}'; "
         "ln -sfn /opt/dsh-runtime/bin/dsh /usr/local/bin/dsh; "
         'rm -f "${node_archive}"; '
         f"test \"$(node --version)\" = 'v{NODE_VERSION}'; "
@@ -395,7 +439,7 @@ class DshMinimal(BaseInstalledAgent):
                 break
         if assignment_model not in SUPPORTED_MODELS:
             raise ValueError(
-                "DSH model must use an isolated dsh-deepseek-v4-flash/pro id"
+                "DSH model must use an enabled isolated dsh-* model id"
             )
         runtime_model = RUNTIME_MODELS[assignment_model]
         if reasoning_effort not in SUPPORTED_REASONING_EFFORTS:
@@ -480,7 +524,7 @@ class DshMinimal(BaseInstalledAgent):
                 f"test \"$(dsh --version)\" = '{DSH_VERSION}'"
             ),
             cache_key=(
-                f"dradar-dsh-minimal-{DSH_VERSION}-node-{NODE_VERSION}-patch-v2"
+                f"dradar-dsh-minimal-{DSH_VERSION}-node-{NODE_VERSION}-patch-v4"
             ),
         )
 
@@ -581,24 +625,19 @@ class DshMinimal(BaseInstalledAgent):
         )
         # Convert the uploaded raw key to DSH's 0600 credential document. DSH
         # reads that document into its credential service without ever placing
-        # the key in its process environment. An inotify guard unlinks it on
-        # the first open, before a model can receive and invoke any tool.
+        # the key in its process environment. The pinned runner unlinks it
+        # immediately after DSH's loader completes and before it creates the
+        # agent or sends any model-facing content.
         command = (
             "set -euo pipefail; "
-            "credential_guard_pid=''; "
             "cleanup_dsh_credentials() { "
             f"rm -f {shlex.quote(remote_api_key)} {shlex.quote(remote_credentials)}; "
-            'if [ -n "${credential_guard_pid}" ]; then '
-            'kill "${credential_guard_pid}" 2>/dev/null || true; fi; }; '
+            "}; "
             "trap cleanup_dsh_credentials EXIT HUP INT TERM; "
             f"python3 -c {shlex.quote(python_program)} "
             f"{shlex.quote(remote_api_key)} {shlex.quote(remote_credentials)}; "
             f"chmod 600 {shlex.quote(remote_credentials)}; "
             f"rm -f {shlex.quote(remote_api_key)}; "
-            f"(inotifywait --quiet --event open --format '' "
-            f"{shlex.quote(remote_credentials)} >/dev/null 2>&1 "
-            f"&& rm -f {shlex.quote(remote_credentials)}) & "
-            "credential_guard_pid=$!; "
             "cd /app; "
             f"dsh --profile headless --patch {shlex.quote(remote_patch)} "
             f"{shlex.quote(instruction)} 2>&1 </dev/null | tee {shlex.quote(stream)}"

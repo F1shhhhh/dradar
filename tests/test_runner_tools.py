@@ -521,7 +521,28 @@ from dradar.runner import (
     run_trial,
     summarize_result,
 )
-from dradar.runner import _normalize_utf16_patch, _verify_dsh_artifact_binding
+from dradar.runner import (
+    _dsh_tasks_overlay,
+    _normalize_utf16_patch,
+    _verify_dsh_artifact_binding,
+)
+
+
+def test_dsh_pompeii_pack_with_existing_hook_accepts_non_git_base_marker(tmp_path):
+    task_id = "pompeii-adjacency-rp-055"
+    task = tmp_path / "tasks" / task_id
+    task.mkdir(parents=True)
+    (task / "task.toml").write_text(
+        '[agent]\nnetwork_mode = "no-network"\n'
+        '[environment]\nallow_internet = false\n'
+        '[metadata]\nbase_commit_hash = "pompeii-base"\n'
+    )
+    (task / "pre_artifacts.sh").write_text("#!/bin/sh\n")
+
+    with _dsh_tasks_overlay(
+        {"task_id": task_id}, tmp_path / "tasks", tmp_path / "work", "job"
+    ) as selected:
+        assert selected == tmp_path / "tasks"
 
 
 def _fake_pier(monkeypatch, work_dir, *, patch=True, trajectory=True,
@@ -746,6 +767,50 @@ def test_run_trial_missing_patch_raises(tmp_path, monkeypatch):
     _fake_pier(monkeypatch, tmp_path, patch=False)
     with pytest.raises(RunnerError, match="model.patch missing"):
         run_trial(_assignment("codex"), tmp_path, tmp_path)
+
+
+def test_run_trial_dsh_normalizes_pier_zero_when_agent_failed(
+    tmp_path, monkeypatch,
+):
+    task_id = "pompeii-adjacency-rp-055"
+    task = tmp_path / task_id
+    task.mkdir()
+    (task / "task.toml").write_text(
+        '[agent]\nnetwork_mode = "no-network"\n'
+        '[environment]\nallow_internet = false\n'
+    )
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setattr(
+        runner_mod,
+        "_verify_dsh_artifact_binding",
+        lambda *_args, **_kwargs: {"visionInputAttached": True},
+    )
+    _fake_pier(
+        monkeypatch,
+        tmp_path,
+        result={
+            "exception_info": {
+                "exception_type": "NonZeroAgentExitCodeError",
+                "exception_message": "dsh: QUOTA: Insufficient Balance",
+            }
+        },
+        rc=0,
+    )
+    assignment = {
+        "assignment_id": "a1",
+        "task_id": task_id,
+        "benchmark_id": runner_mod.POMPEII_BENCHMARK_ID,
+        "agent": runner_mod.DSH_AGENT,
+        "provider": runner_mod.DEEPSEEK_PROVIDER,
+        "model": runner_mod.DSH_VISION_MODEL,
+        "effort": "high",
+        "agent_version": runner_mod.DSH_VERSION,
+    }
+
+    art = run_trial(assignment, tmp_path, tmp_path)
+
+    assert art.returncode == 1
+    assert summarize_result(art.result)["exception_info"] is True
 
 
 def _zcode_assignment_for_trial():
@@ -1564,6 +1629,46 @@ def test_dsh_artifact_binding_rejects_previous_assignment_bytes(tmp_path):
 
     with pytest.raises(RunnerError, match="does not match"):
         _verify_dsh_artifact_binding(trial, current)
+
+
+def test_dsh_vision_artifact_binding_requires_attached_question_image(tmp_path):
+    trial = tmp_path / "task__trial"
+    sidecar = trial / "agent" / "dsh-home" / "dsh-outcome.json"
+    sidecar.parent.mkdir(parents=True)
+    assignment = {
+        "assignment_id": "a" * 32,
+        "_artifact_run_id": "b" * 32,
+        "task_id": "pompeii-adjacency-rp-055",
+        "model": "dsh-deepseek-v4-flash-vision-exp",
+        "effort": "high",
+    }
+    payload = {
+        "schema": "dradar-dsh-outcome-v1",
+        "assignmentId": assignment["assignment_id"],
+        "artifactRunId": assignment["_artifact_run_id"],
+        "taskId": assignment["task_id"],
+        "assignmentModel": assignment["model"],
+        "reasoningEffort": assignment["effort"],
+        "visionInputAttached": True,
+        "visionInput": {
+            "attachmentId": "sha256:" + "c" * 64,
+            "mediaType": "image/png",
+            "bytes": 207309,
+            "width": 1074,
+            "height": 904,
+            "name": "question.png",
+        },
+    }
+    sidecar.write_text(json.dumps(payload))
+
+    binding = _verify_dsh_artifact_binding(trial, assignment)
+    assert binding["visionInputAttached"] is True
+    assert binding["visionInput"] == payload["visionInput"]
+
+    payload["visionInputAttached"] = False
+    sidecar.write_text(json.dumps(payload))
+    with pytest.raises(RunnerError, match="did not attest"):
+        _verify_dsh_artifact_binding(trial, assignment)
 
 
 def test_dsh_utf16_patch_is_normalized_only_after_git_validation(tmp_path):

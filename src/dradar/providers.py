@@ -54,24 +54,29 @@ DEEPSEEK_RUN_CONFIG_VERSION = "deepseek-codex-official-catalog-v2"
 DEEPSEEK_RUNTIME_PROFILE = "public-pier-0.3.0-catalog-v1"
 
 # DSH Minimal is a separate Pier agent, not a Codex provider alias. It reuses
-# the same local DeepSeek credential while preserving DSH rc.6's native effort
-# surface exactly: off/high/max (there is deliberately no synthetic low mode).
+# the same local DeepSeek credential while preserving DSH 0.1.1-rc.1's native
+# effort surface: off/high/max (there is deliberately no synthetic low mode).
 DSH_AGENT = "dsh-minimal"
-DSH_VERSION = "0.1.0-rc.6"
+DSH_VERSION = "0.1.1-rc.1"
 DSH_FLASH_MODEL = "dsh-deepseek-v4-flash"
 DSH_PRO_MODEL = "dsh-deepseek-v4-pro"
-DSH_MODELS = (DSH_FLASH_MODEL, DSH_PRO_MODEL)
+DSH_VISION_MODEL = "dsh-deepseek-v4-flash-vision-exp"
+DSH_MODELS = (DSH_FLASH_MODEL, DSH_PRO_MODEL, DSH_VISION_MODEL)
 DSH_RUNTIME_MODELS = {
     DSH_FLASH_MODEL: DEEPSEEK_FLASH_MODEL,
     DSH_PRO_MODEL: DEEPSEEK_PRO_MODEL,
+    DSH_VISION_MODEL: "deepseek-v4-flash-vision-exp",
 }
 DSH_SUPPORTED_EFFORTS = frozenset({"off", "high", "max"})
 DSH_FLASH_CAPABILITY = "dsh-minimal-deepseek-v4-flash-artifact-v5"
 DSH_PRO_CAPABILITY = "dsh-minimal-deepseek-v4-pro-artifact-v5"
+DSH_VISION_CAPABILITY = (
+    "dsh-minimal-deepseek-v4-flash-vision-exp-pompeii-image-v1"
+)
 DSH_FLASH_LEGACY_CAPABILITY = "dsh-minimal-deepseek-v4-flash-artifact-v4"
 DSH_PRO_LEGACY_CAPABILITY = "dsh-minimal-deepseek-v4-pro-artifact-v4"
-DSH_RUN_CONFIG_VERSION = "dsh-minimal-native-rc6-v1"
-DSH_RUNTIME_PROFILE = "public-pier-0.3.0-dsh-minimal-v1"
+DSH_RUN_CONFIG_VERSION = "dsh-minimal-native-0.1.1-rc.1-v1"
+DSH_RUNTIME_PROFILE = "public-pier-0.3.0-dsh-minimal-0.1.1-rc.1-v1"
 
 # Grok Build is intentionally subscription/OAuth-only.  In particular, the
 # runner strips XAI_API_KEY from Pier's environment and never accepts a key in
@@ -1220,6 +1225,7 @@ def advertised_capabilities(
         capabilities.extend((
             DSH_FLASH_CAPABILITY,
             DSH_PRO_CAPABILITY,
+            DSH_VISION_CAPABILITY,
             # Transitional compatibility: an old server knows only v4,
             # while the v5 marker lets the new server require timed usage.
             DSH_FLASH_LEGACY_CAPABILITY,

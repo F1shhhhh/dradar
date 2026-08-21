@@ -40,6 +40,7 @@ from .providers import (
     deepseek_codex_reasoning_effort,
     DSH_AGENT,
     DSH_MODELS,
+    DSH_VISION_MODEL,
     DSH_SUPPORTED_EFFORTS,
     DSH_VERSION,
     GROK_AGENT,
@@ -98,6 +99,7 @@ ALLOWLIST_TOML = (
     '[__pier_allowlist]\n'
     'url = "https://chatgpt.com"\n'
 )
+_DSH_IMAGE_ATTACHMENT_ID_RE = re.compile(r"sha256:[0-9a-f]{64}")
 
 
 def _resolve_user_tool(name: str, *, home: Path | None = None) -> str | None:
@@ -246,7 +248,7 @@ class TrialArtifacts:
     kimi_cli_version: str | None = None
     zcode_cli_version: str | None = None
     dsh_version: str | None = None
-    dsh_artifact_binding: dict[str, str] | None = None
+    dsh_artifact_binding: dict[str, object] | None = None
 
 
 class RunnerError(RuntimeError):
@@ -733,6 +735,13 @@ def _validate_dsh_assignment(assignment: dict) -> None:
         raise RunnerError(
             f"unsupported DSH model {assignment.get('model')!r}; enabled "
             f"models are {', '.join(DSH_MODELS)}"
+        )
+    task_id = assignment.get("task_id")
+    if assignment.get("model") == DSH_VISION_MODEL and not (
+        isinstance(task_id, str) and task_id.startswith("pompeii-adjacency-rp-")
+    ):
+        raise RunnerError(
+            "DSH Vision Exp is restricted to Pompeii adjacency image tasks"
         )
     if assignment.get("effort") not in DSH_SUPPORTED_EFFORTS:
         supported = ", ".join(sorted(DSH_SUPPORTED_EFFORTS))
@@ -1299,7 +1308,7 @@ def trial_artifact_paths(trial_dir: Path) -> tuple[Path, Path | None, Path | Non
 
 def _verify_dsh_artifact_binding(
     trial_dir: Path, assignment: dict,
-) -> dict[str, str]:
+) -> dict[str, object]:
     """Reject DSH artifacts that cannot be tied to this exact checkout/run."""
     path = trial_dir / "agent" / "dsh-home" / "dsh-outcome.json"
     try:
@@ -1325,7 +1334,34 @@ def _verify_dsh_artifact_binding(
             "DSH artifact identity does not match the current assignment/run; "
             "the stale files were kept locally and will not be uploaded"
         )
-    return expected
+    if assignment.get("model") == DSH_VISION_MODEL:
+        image = value.get("visionInput")
+        if (
+            value.get("visionInputAttached") is not True
+            or not isinstance(image, dict)
+            or not isinstance(image.get("attachmentId"), str)
+            or _DSH_IMAGE_ATTACHMENT_ID_RE.fullmatch(
+                image["attachmentId"]
+            ) is None
+            or image.get("mediaType") != "image/png"
+            or image.get("name") != "question.png"
+            or any(
+                isinstance(image.get(key), bool)
+                or not isinstance(image.get(key), int)
+                or image[key] <= 0
+                for key in ("bytes", "width", "height")
+            )
+        ):
+            raise RunnerError(
+                "DSH Vision Exp did not attest a valid question.png input; "
+                "the artifact will not be uploaded"
+            )
+        return {
+            **expected,
+            "visionInputAttached": True,
+            "visionInput": image,
+        }
+    return {**expected, "visionInputAttached": False}
 
 
 def _normalize_utf16_patch(patch: Path) -> bool:
@@ -2598,11 +2634,6 @@ def _dsh_tasks_overlay(
         )
     needs_network_fence = no_network and allow_internet is not False
     needs_artifact_hook = not (source / "pre_artifacts.sh").is_file()
-    base_commit = task_config.get("metadata", {}).get("base_commit_hash", "")
-    if not isinstance(base_commit, str) or (
-        base_commit and re.fullmatch(r"[0-9a-f]{40}", base_commit) is None
-    ):
-        raise RunnerError("DSH task has an invalid metadata.base_commit_hash")
     if not needs_network_fence and not needs_artifact_hook:
         yield tasks_root
         return
@@ -2629,6 +2660,16 @@ def _dsh_tasks_overlay(
                 )
             (overlay_task / "task.toml").write_text(task_text, encoding="utf-8")
         if needs_artifact_hook:
+            base_commit = task_config.get("metadata", {}).get(
+                "base_commit_hash", ""
+            )
+            if not isinstance(base_commit, str) or (
+                base_commit
+                and re.fullmatch(r"[0-9a-f]{40}", base_commit) is None
+            ):
+                raise RunnerError(
+                    "DSH task has an invalid metadata.base_commit_hash"
+                )
             hook = overlay_task / "pre_artifacts.sh"
             hook.write_text(
                 DSH_PRE_ARTIFACTS_SCRIPT.replace(
@@ -3046,6 +3087,15 @@ def run_trial(
                 ),
             )
     returncode = proc.returncode
+    if (
+        effective_agent == DSH_AGENT
+        and returncode == 0
+        and _result_exception_text(result)
+    ):
+        # Public Pier can exit successfully after harvesting a trial whose
+        # installed agent failed.  Keep the structured result for diagnosis,
+        # but do not expose that wrapper status as a successful DSH run.
+        returncode = 1
     if terminal_error is not None and returncode in (None, 0):
         # A TERM-aware Pier may exit cleanly after a DRadar watchdog fired.
         # Preserve the semantic failure so runloop uploads it as interrupted
