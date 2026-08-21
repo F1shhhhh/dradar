@@ -34,8 +34,9 @@ DEEPSEEK_CAPABILITY = "codex-deepseek-v4-flash-v2"
 DEEPSEEK_PRO_CAPABILITY = "codex-deepseek-v4-pro-v1"
 DEEPSEEK_FLASH_OFF_CAPABILITY = "codex-deepseek-v4-flash-off-v1"
 DEEPSEEK_PRO_OFF_CAPABILITY = "codex-deepseek-v4-pro-off-v1"
-DEEPSEEK_CODEX_VERSION = "0.147.0"
-DEEPSEEK_MIN_CODEX_VERSION = "0.144.0"
+# DeepSeek follows npm's latest stable Codex release at run time.  Keep the
+# last audited fixed release as a compatibility floor, not as a permanent pin.
+DEEPSEEK_MIN_CODEX_VERSION = "0.147.0"
 # The bundled upstream catalog still describes ``low`` for integrity and
 # compatibility checks, but DRadar's public DeepSeek Codex lane retires it.
 DEEPSEEK_SUPPORTED_EFFORTS = frozenset({"off", "high", "max"})

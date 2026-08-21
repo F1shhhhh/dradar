@@ -19,7 +19,7 @@ from dradar.providers import (
     DEEPSEEK_CAPABILITY,
     DEEPSEEK_CATALOG_REMOTE_PATH,
     DEEPSEEK_CATALOG_SHA256,
-    DEEPSEEK_CODEX_VERSION,
+    DEEPSEEK_MIN_CODEX_VERSION,
     DEEPSEEK_FLASH_OFF_CAPABILITY,
     DEEPSEEK_MODEL,
     DEEPSEEK_MODELS,
@@ -38,6 +38,8 @@ from dradar.providers import (
 )
 from dradar.runner import RunnerError
 
+TEST_CODEX_VERSION = "0.149.0"
+
 
 def _assignment(**overrides) -> dict:
     values = {
@@ -47,7 +49,7 @@ def _assignment(**overrides) -> dict:
         "provider": DEEPSEEK_PROVIDER,
         "model": DEEPSEEK_MODEL,
         "effort": "max",
-        "agent_version": DEEPSEEK_CODEX_VERSION,
+        "agent_version": TEST_CODEX_VERSION,
         "resume_generation": 0,
         "est_minutes": 5,
     }
@@ -151,7 +153,7 @@ def test_command_uses_official_catalog_adapter_and_auth_without_secret_env(
     )
     assert "--agent" not in command
     assert runner.PIER_SPEC not in joined
-    assert f"version={DEEPSEEK_CODEX_VERSION}" in command
+    assert f"version={TEST_CODEX_VERSION}" in command
     assert "reasoning_effort=max" in command
     assert "checkpoint_enabled=true" not in command
     assert "checkpoint_path=" not in joined
@@ -196,7 +198,7 @@ def test_command_routes_pro_with_its_requested_reasoning_effort(
     )
     assert command[command.index("--model") + 1] == DEEPSEEK_PRO_MODEL
     assert "reasoning_effort=high" in command
-    assert f"version={DEEPSEEK_CODEX_VERSION}" in command
+    assert f"version={TEST_CODEX_VERSION}" in command
 
 
 @pytest.mark.parametrize("model", DEEPSEEK_MODELS)
@@ -345,7 +347,7 @@ def test_retired_or_compatibility_efforts_are_not_benchmark_cells(
     [
         ({"model": "deepseek-other"}, "unsupported DeepSeek model"),
         ({"effort": "ultra"}, "effort must be"),
-        ({"agent_version": "0.145.0"}, "pinned to tested Codex"),
+        ({"agent_version": "0.145.0"}, "requires Codex >="),
         ({"agent_version": "latest"}, "exact stable"),
     ],
 )
@@ -454,14 +456,15 @@ def test_run_removes_temporary_auth_when_command_build_fails(
     assert not created[0].exists()
 
 
-def test_deepseek_run_never_queries_npm_latest(tmp_path: Path, monkeypatch):
+def test_deepseek_run_resolves_npm_latest(tmp_path: Path, monkeypatch):
     monkeypatch.setenv(DEEPSEEK_API_KEY_ENV, "sentinel-deepseek-secret")
-    monkeypatch.setattr(
-        runner,
-        "resolve_latest_codex_cli_version",
-        lambda *args, **kwargs: pytest.fail("DeepSeek must use the tested fixed pin"),
-    )
     seen = {}
+
+    def resolve(server_version, server_version_verified):
+        seen["resolver"] = (server_version, server_version_verified)
+        return "0.150.0"
+
+    monkeypatch.setattr(runner, "resolve_latest_codex_cli_version", resolve)
 
     def stop_after_version(assignment, *args, **kwargs):
         seen["version"] = assignment["agent_version"]
@@ -469,5 +472,62 @@ def test_deepseek_run_never_queries_npm_latest(tmp_path: Path, monkeypatch):
 
     monkeypatch.setattr(runner, "build_pier_command", stop_after_version)
     with pytest.raises(RunnerError, match="intentional test stop"):
+        runner.run_trial(
+            _assignment(agent_version_verified=True),
+            tmp_path / "tasks",
+            tmp_path / "work",
+        )
+    assert seen["resolver"] == (TEST_CODEX_VERSION, True)
+    assert seen["version"] == "0.150.0"
+
+
+def test_deepseek_run_can_replace_stale_server_hint_with_npm_latest(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.setenv(DEEPSEEK_API_KEY_ENV, "sentinel-deepseek-secret")
+    seen = {}
+
+    def resolve(server_version, server_version_verified):
+        seen["resolver"] = (server_version, server_version_verified)
+        return TEST_CODEX_VERSION
+
+    monkeypatch.setattr(runner, "resolve_latest_codex_cli_version", resolve)
+
+    def stop_after_version(assignment, *args, **kwargs):
+        seen["version"] = assignment["agent_version"]
+        raise RunnerError("intentional test stop")
+
+    monkeypatch.setattr(runner, "build_pier_command", stop_after_version)
+    with pytest.raises(RunnerError, match="intentional test stop"):
+        runner.run_trial(
+            _assignment(agent_version="0.145.0"),
+            tmp_path / "tasks",
+            tmp_path / "work",
+        )
+
+    assert seen["resolver"] == ("0.145.0", False)
+    assert seen["version"] == TEST_CODEX_VERSION
+
+
+def test_deepseek_run_rejects_resolved_version_below_compatibility_floor(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.setenv(DEEPSEEK_API_KEY_ENV, "sentinel-deepseek-secret")
+    monkeypatch.setattr(
+        runner,
+        "resolve_latest_codex_cli_version",
+        lambda *args, **kwargs: "0.146.0",
+    )
+    monkeypatch.setattr(
+        runner,
+        "build_pier_command",
+        lambda *args, **kwargs: pytest.fail("unsupported version must not run"),
+    )
+
+    with pytest.raises(
+        RunnerError,
+        match=rf"requires Codex >= {DEEPSEEK_MIN_CODEX_VERSION}",
+    ):
         runner.run_trial(_assignment(), tmp_path / "tasks", tmp_path / "work")
-    assert seen["version"] == DEEPSEEK_CODEX_VERSION
