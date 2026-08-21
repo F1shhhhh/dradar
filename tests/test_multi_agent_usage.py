@@ -145,15 +145,131 @@ def test_unknown_child_history_without_baseline_remains_incomplete(tmp_path: Pat
     assert usage["n_input_tokens"] == 100
 
 
-def test_paginated_marker_with_inherited_counter_is_not_double_counted(
+def test_paginated_subagent_followup_keeps_all_cumulative_usage(tmp_path: Path):
+    sessions = tmp_path / "agent" / "sessions"
+    _session(sessions / "root.jsonl", "root-1", "user", [
+        _usage(100, 60, 10),
+    ], history_mode="paginated")
+    _session(sessions / "child.jsonl", "child-1", "subagent", [
+        _usage(50, 20, 5),
+    ], parent="root-1", history_mode="paginated")
+    child = sessions / "child.jsonl"
+    events = [json.loads(line) for line in child.read_text().splitlines()]
+    events += [
+        {"type": "event_msg", "payload": {"type": "task_complete"}},
+        {"type": "event_msg", "payload": {"type": "task_started"}},
+        {"type": "turn_context", "payload": {"model": "gpt-5.6-terra"}},
+        {"type": "event_msg", "timestamp": "2026-08-17T01:01:00Z",
+         "payload": {"type": "token_count", "info": {
+             "total_token_usage": _usage(90, 40, 9),
+         }}},
+    ]
+    child.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+
+    usage = aggregate_codex_session_usage(tmp_path)
+
+    assert usage is not None and usage["complete"] is True
+    assert usage["n_input_tokens"] == 190
+    assert usage["n_cache_tokens"] == 100
+    assert usage["n_output_tokens"] == 19
+
+
+def test_codex_0149_ultra_eight_agents_matches_max_accounting_rules(
+    tmp_path: Path,
+):
+    ultra = tmp_path / "ultra"
+    ultra_sessions = ultra / "agent" / "sessions"
+    _session(ultra_sessions / "root.jsonl", "root-ultra", "user", [
+        _usage(600_000, 200_000, 50_000, 10_000),
+    ], history_mode="paginated")
+    for index in range(1, 8):
+        usages = [_usage(10_000 * index, 5_000 * index,
+                         100 * index, 10 * index)]
+        if index == 1:
+            # Codex 0.149 Sol ultra: one child is reused for a second task.
+            usages = [_usage(675_603, 610_560, 7_966, 5_832)]
+        path = ultra_sessions / f"child-{index}.jsonl"
+        _session(path, f"child-{index}", "subagent", usages,
+                 parent="root-ultra", history_mode="paginated")
+        if index == 1:
+            events = [json.loads(line) for line in path.read_text().splitlines()]
+            events += [
+                {"type": "event_msg", "payload": {"type": "task_complete"}},
+                {"type": "event_msg", "payload": {"type": "task_started"}},
+                {"type": "turn_context", "payload": {
+                    "model": "gpt-5.6-sol",
+                }},
+                {"type": "event_msg", "timestamp": "2026-08-21T01:01:00Z",
+                 "payload": {"type": "token_count", "info": {
+                     "total_token_usage": _usage(
+                         1_324_584, 1_239_296, 10_467, 7_423,
+                     ),
+                 }}},
+            ]
+            path.write_text(
+                "\n".join(json.dumps(event) for event in events) + "\n")
+
+    max_trial = tmp_path / "max"
+    _session(max_trial / "agent" / "sessions" / "root.jsonl",
+             "root-max", "user", [
+                 _usage(600_000, 200_000, 50_000, 10_000),
+             ], history_mode="paginated")
+
+    ultra_usage = aggregate_codex_session_usage(ultra)
+    max_usage = aggregate_codex_session_usage(max_trial)
+
+    assert ultra_usage is not None and ultra_usage["complete"] is True
+    assert ultra_usage["agent_session_count"] == 8
+    assert ultra_usage["n_input_tokens"] == 2_194_584
+    assert ultra_usage["n_cache_tokens"] == 1_574_296
+    assert ultra_usage["n_output_tokens"] == 63_167
+    assert ultra_usage["n_reasoning_output_tokens"] == 17_693
+    assert max_usage is not None and max_usage["complete"] is True
+    assert max_usage["agent_session_count"] == 1
+    assert max_usage["n_input_tokens"] == 600_000
+
+
+def test_paginated_subagent_counter_reset_at_followup_stays_incomplete(
     tmp_path: Path,
 ):
     sessions = tmp_path / "agent" / "sessions"
-    root_usage = _usage(100, 60, 10)
-    _session(sessions / "root.jsonl", "root-1", "user", [root_usage])
+    _session(sessions / "root.jsonl", "root-1", "user", [
+        _usage(100, 60, 10),
+    ], history_mode="paginated")
     _session(sessions / "child.jsonl", "child-1", "subagent", [
-        _usage(150, 80, 15),
-    ], parent="root-1", inherited=root_usage, history_mode="paginated")
+        _usage(80, 40, 20, 8),
+    ], parent="root-1", history_mode="paginated")
+    child = sessions / "child.jsonl"
+    events = [json.loads(line) for line in child.read_text().splitlines()]
+    events += [
+        {"type": "event_msg", "payload": {"type": "task_complete"}},
+        {"type": "event_msg", "payload": {"type": "task_started"}},
+        {"type": "turn_context", "payload": {"model": "gpt-5.6-terra"}},
+        # A new prompt can make input/cache exceed the prior epoch even while
+        # output/reasoning reveal that the cumulative counter reset.
+        {"type": "event_msg", "timestamp": "2026-08-17T01:01:00Z",
+         "payload": {"type": "token_count", "info": {
+             "total_token_usage": _usage(120, 90, 5, 2),
+         }}},
+    ]
+    child.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+
+    usage = aggregate_codex_session_usage(tmp_path)
+
+    assert usage is not None and usage["complete"] is False
+    assert usage["n_input_tokens"] == 100
+
+
+def test_paginated_counter_reset_without_task_boundary_stays_incomplete(
+    tmp_path: Path,
+):
+    sessions = tmp_path / "agent" / "sessions"
+    _session(sessions / "root.jsonl", "root-1", "user", [
+        _usage(100, 60, 10),
+    ], history_mode="paginated")
+    _session(sessions / "child.jsonl", "child-1", "subagent", [
+        _usage(80, 40, 20), _usage(120, 90, 5),
+    ], parent="root-1", history_mode="paginated")
 
     usage = aggregate_codex_session_usage(tmp_path)
 

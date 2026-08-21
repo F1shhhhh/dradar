@@ -1557,24 +1557,20 @@ def _analyze_codex_session_events(events: list[dict], fallback_id: str) -> dict:
 
     # Root and paginated child counters start at zero.  Legacy child files
     # contain a complete inherited prefix; their last task_started is the
-    # beginning of the child's own work.  Unknown history formats stay on the
-    # conservative legacy path so a missing baseline can never be priced.
+    # beginning of the child's own work.  A paginated child can receive more
+    # than one task in Codex 0.149+, so its earlier task counters are still its
+    # own usage and must not be mistaken for an inherited prefix.
     paginated_child = (
         role == "subagent" and first_meta.get("history_mode") == "paginated"
     )
     inherited_prefix = role == "subagent" and not paginated_child and (
         len(meta_events) > 1 or len(starts) > 1)
-    boundary = starts[-1] if starts else 0
+    boundary = 0 if paginated_child else (starts[-1] if starts else 0)
     baseline = {name: 0 for name in (
         "input_tokens", "cached_input_tokens", "output_tokens",
         "reasoning_output_tokens",
     )}
     baseline_found = not inherited_prefix
-    # A paginated marker paired with inherited counters is internally
-    # inconsistent.  Suppress accounting instead of risking a parent double
-    # count; valid paginated streams have no counter before the child boundary.
-    if paginated_child and any(index < boundary for index, *_ in usage_events):
-        baseline_found = False
     if inherited_prefix:
         for index, usage, _timestamp in usage_events:
             if index >= boundary:
@@ -1583,26 +1579,33 @@ def _analyze_codex_session_events(events: list[dict], fallback_id: str) -> dict:
             baseline_found = True
 
     final_usage = usage_events[-1][1] if usage_events else None
-    final_after_boundary = bool(usage_events and usage_events[-1][0] >= boundary)
-    own_usage = None
-    if final_usage is not None and final_after_boundary and baseline_found:
-        candidate = {name: final_usage[name] - baseline[name] for name in baseline}
-        if (all(value >= 0 for value in candidate.values())
-                and candidate["cached_input_tokens"] <= candidate["input_tokens"]):
-            own_usage = candidate
-
     timed_usage = []
     timed_usage_complete = baseline_found
+    aggregate_valid = baseline_found
     previous = baseline
+    own_usage = {name: 0 for name in baseline}
+    saw_usage = False
     for index, cumulative, occurred_at in usage_events:
         if index < boundary:
             continue
         delta = {name: cumulative[name] - previous[name] for name in previous}
-        if (occurred_at is None or any(value < 0 for value in delta.values())
-                or delta["cached_input_tokens"] > delta["input_tokens"]):
+        if any(value < 0 for value in delta.values()):
+            # TokenUsage is cumulative for the lifetime of a paginated child,
+            # including follow-up tasks.  Any rollback is therefore ambiguous
+            # and must remain unpriced rather than starting a guessed epoch.
+            aggregate_valid = False
             timed_usage_complete = False
             break
-        if any(delta.values()):
+        saw_usage = True
+        for name, value in delta.items():
+            own_usage[name] += value
+        timed_delta_valid = (
+            occurred_at is not None
+            and delta["cached_input_tokens"] <= delta["input_tokens"]
+        )
+        if not timed_delta_valid:
+            timed_usage_complete = False
+        elif timed_usage_complete and any(delta.values()):
             timed_usage.append({
                 "occurred_at": occurred_at,
                 "n_input_tokens": delta["input_tokens"],
@@ -1610,6 +1613,8 @@ def _analyze_codex_session_events(events: list[dict], fallback_id: str) -> dict:
                 "n_output_tokens": delta["output_tokens"],
             })
         previous = cumulative
+    if not saw_usage or not aggregate_valid:
+        own_usage = None
     if own_usage is None or not timed_usage:
         timed_usage_complete = False
     if timed_usage_complete:
