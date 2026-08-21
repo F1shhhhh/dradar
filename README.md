@@ -230,7 +230,8 @@ DeepSeek API 价格按北京时间分段：每天 `09:00–12:00`、`14:00–18:
   `off`、`high` 和 `max`。`off` 在 Codex Responses API 链路上严格转换为
   `reasoning.effort=none`，其余两档原样传递。上游目录中的 `low` 仅为完整性校验保留，
   不可领取或运行；`medium`、`xhigh` 也不建立重复实验格。
-- 使用已验证的正式版 Codex `0.147.0`、Responses API，以及官方目录声明的
+- 每次启动前解析 npm 的最新稳定版 Codex，并把精确版本传给 Pier 以刷新 Docker 构建
+  缓存；`0.147.0` 仅作为最低兼容版本。继续使用 Responses API，以及官方目录声明的
   1,048,576 token 上下文和 95% 有效上下文比例。
 - 基于公开 `datacurve-pier==0.3.0` 的标准 `codex` agent；附加代码只负责校验并上传
   官方模型目录，不包含 checkpoint 或任何 DRadar 私有 Pier 实现。

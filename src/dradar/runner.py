@@ -32,7 +32,6 @@ from .providers import (
     DEFAULT_CODEX_PROVIDER,
     DEEPSEEK_API_KEY_ENV,
     DEEPSEEK_CATALOG_REMOTE_PATH,
-    DEEPSEEK_CODEX_VERSION,
     DEEPSEEK_MIN_CODEX_VERSION,
     DEEPSEEK_MODEL,
     DEEPSEEK_MODELS,
@@ -617,9 +616,9 @@ def _version_tuple(value: str) -> tuple[int, int, int]:
 
 
 def _deepseek_codex_version(assignment: dict) -> str:
-    """Return the exact stable Codex release tested with DeepSeek."""
+    """Validate the exact stable Codex release resolved for DeepSeek."""
 
-    requested = assignment.get("agent_version") or DEEPSEEK_CODEX_VERSION
+    requested = assignment.get("agent_version")
     if not isinstance(requested, str) or not _STABLE_CODEX_VERSION_RE.fullmatch(
         requested
     ):
@@ -629,15 +628,14 @@ def _deepseek_codex_version(assignment: dict) -> str:
             f"DeepSeek requires Codex >= {DEEPSEEK_MIN_CODEX_VERSION}, "
             f"but the assignment requested {requested}"
         )
-    if requested != DEEPSEEK_CODEX_VERSION:
-        raise RunnerError(
-            f"DeepSeek runs are pinned to tested Codex {DEEPSEEK_CODEX_VERSION}; "
-            f"the server requested unverified {requested}"
-        )
     return requested
 
 
-def _validate_deepseek_assignment(assignment: dict) -> None:
+def _validate_deepseek_assignment(
+    assignment: dict,
+    *,
+    validate_version: bool = True,
+) -> None:
     if assignment.get("model") not in DEEPSEEK_MODELS:
         raise RunnerError(
             f"unsupported DeepSeek model {assignment.get('model')!r}; "
@@ -649,7 +647,8 @@ def _validate_deepseek_assignment(assignment: dict) -> None:
             f"DeepSeek effort must be one of {supported}; "
             f"got {assignment.get('effort')!r}"
         )
-    _deepseek_codex_version(assignment)
+    if validate_version:
+        _deepseek_codex_version(assignment)
 
 
 def _validate_grok_assignment(assignment: dict) -> None:
@@ -2661,9 +2660,23 @@ def run_trial(
             assignment_codex_provider(assignment) or DEFAULT_CODEX_PROVIDER
         )
         if codex_provider == DEEPSEEK_PROVIDER:
-            _validate_deepseek_assignment(assignment)
-            codex_cli_version = _deepseek_codex_version(assignment)
-            print(f"verified pinned DeepSeek Codex CLI: {codex_cli_version}")
+            # Validate the requested cell before network access. The server's
+            # version is only a fallback hint, so validate the version after
+            # resolving npm stable rather than rejecting an otherwise usable
+            # stale server hint here.
+            _validate_deepseek_assignment(assignment, validate_version=False)
+            codex_cli_version = resolve_latest_codex_cli_version(
+                assignment.get("agent_version"),
+                bool(assignment.get("agent_version_verified")),
+            )
+            codex_cli_version = _deepseek_codex_version({
+                **assignment,
+                "agent_version": codex_cli_version,
+            })
+            print(
+                "verified latest stable DeepSeek Codex CLI: "
+                f"{codex_cli_version}"
+            )
         else:
             # Resolve before creating the job, extending the lease, or starting
             # Pier. A registry outage therefore consumes no model quota and leaves
