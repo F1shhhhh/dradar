@@ -31,6 +31,7 @@ from dradar.providers import (
     DSH_FLASH_LEGACY_CAPABILITY,
     DSH_PRO_CAPABILITY,
     DSH_PRO_LEGACY_CAPABILITY,
+    DSH_VISION_CAPABILITY,
     advertised_capabilities,
     assignment_codex_provider,
     deepseek_catalog_error,
@@ -90,6 +91,7 @@ def test_capability_advertises_software_support_before_first_key_setup():
         DEEPSEEK_CAPABILITY, DEEPSEEK_PRO_CAPABILITY,
         DEEPSEEK_FLASH_OFF_CAPABILITY, DEEPSEEK_PRO_OFF_CAPABILITY,
         DSH_FLASH_CAPABILITY, DSH_PRO_CAPABILITY,
+        DSH_VISION_CAPABILITY,
         DSH_FLASH_LEGACY_CAPABILITY, DSH_PRO_LEGACY_CAPABILITY,
     )
 

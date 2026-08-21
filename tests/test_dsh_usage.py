@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from dradar import runloop
+from dradar.providers import DSH_VERSION
 from dradar.runloop import _apply_usage_to_result, _dsh_trial_usage
 
 
@@ -113,7 +114,7 @@ def test_dsh_upload_sends_token_counters_for_server_side_pricing(
             self, assignment_id, nonce, patch, trajectory, result, meta,
             outcome="completed", resume_generation=None,
         ):
-            assert meta["dsh_version"] == "0.1.0-rc.6"
+            assert meta["dsh_version"] == DSH_VERSION
             assert meta["usage_aggregation"] == "dsh-provider-usage-v2"
             assert meta["usage_aggregation_complete"] is True
             assert meta["n_input_tokens"] == 155
@@ -133,7 +134,7 @@ def test_dsh_upload_sends_token_counters_for_server_side_pricing(
         "nonce": "nonce-1",
         "task_id": "task-1",
         "trial_dir": str(trial),
-        "meta": {"dsh_version": "0.1.0-rc.6"},
+        "meta": {"dsh_version": DSH_VERSION},
         "outcome": "completed",
         "job_dir": None,
         "keep": True,

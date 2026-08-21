@@ -89,12 +89,15 @@ def test_install_spec_is_fully_pinned(tmp_path: Path) -> None:
     assert NODE_SHA256["arm64"] in command
     assert "@latest" not in command
     assert "requires a glibc task image" in command
-    assert "g++ inotify-tools make python3" in command
+    assert "g++ make python3" in command
+    assert "inotify-tools" not in command
+    assert "--fetch-retries=5" in command
+    assert "--fetch-retry-maxtimeout=120000" in command
     assert spec.verification_command is not None
     assert f"v{NODE_VERSION}" in spec.verification_command
     assert DSH_VERSION in spec.verification_command
     assert spec.cache_key == (
-        f"dradar-dsh-minimal-{DSH_VERSION}-node-{NODE_VERSION}-patch-v2"
+        f"dradar-dsh-minimal-{DSH_VERSION}-node-{NODE_VERSION}-patch-v4"
     )
     bash = shutil.which("bash")
     if bash is not None:
@@ -162,7 +165,11 @@ def test_rejects_group_readable_key_file(tmp_path: Path) -> None:
     ("model", "effort"),
     [
         (model, effort)
-        for model in ("dsh-deepseek-v4-flash", "dsh-deepseek-v4-pro")
+        for model in (
+            "dsh-deepseek-v4-flash",
+            "dsh-deepseek-v4-pro",
+            "dsh-deepseek-v4-flash-vision-exp",
+        )
         for effort in ("off", "high", "max")
     ],
 )
@@ -210,6 +217,12 @@ def test_run_supports_model_effort_matrix_without_logging_secret(
     assert "watch: false" in patch
     assert 'presets.resolve("minimal")' in runner
     assert "await presets.mount(agentCtx, preset.id)" in runner
+    assert 'const attachments = ctx.get("attachments")' in runner
+    assert "unlinkSync(process.env.DSH_CREDENTIALS_FILE)" in runner
+    assert 'readFileSync("/app/question.png")' in runner
+    assert "await attachments.saveImage" in runner
+    assert '{ type: "image", attachment: imageRef }' in runner
+    assert "visionInputAttached: imageRef !== null" in runner
     assert "agentPreset: preset.id" in runner
     assert 'event.type === "assistant/chunk"' in runner
     assert 'usageByStep.set(`${event.data.turn}:${event.data.step}`' in runner
@@ -240,7 +253,7 @@ def test_run_supports_model_effort_matrix_without_logging_secret(
     assert command.index(f"rm -f {key_target}") < command.index(
         "dsh --profile headless"
     )
-    assert "inotifywait --quiet --event open" in command
+    assert "inotifywait" not in command
     assert "DEEPSEEK_API_KEY" not in (dsh_call.get("env") or {})
     assert dsh_call["cwd"] == "/app"
     assert (dsh_call.get("env") or {})["DSH_MODEL"] == RUNTIME_MODELS[model]
