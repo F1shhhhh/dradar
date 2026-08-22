@@ -296,7 +296,7 @@ async function run(ctx, task, io) {
       agentOptions,
       setup,
     });
-  writeFileSync(process.env.DSH_SESSION_ID_FILE, String(agent.session.id) + "\n", {
+  writeFileSync(process.env.DSH_SESSION_ID_FILE, String(agent.session.id) + "\\n", {
     encoding: "utf8",
     mode: 0o600,
   });
