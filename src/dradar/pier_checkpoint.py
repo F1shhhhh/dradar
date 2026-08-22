@@ -234,8 +234,11 @@ umask 077
 workdir={shlex.quote(workdir)}
 checkpoint_dir={shlex.quote(checkpoint_dir)}
 interval={interval}
+snapshot_lock="$checkpoint_dir/snapshot.lock"
+stop_file="$checkpoint_dir/stop"
 secret_re='(sk-(ant-|proj-)?[A-Za-z0-9_-]{{16,}}|ghp_[A-Za-z0-9]{{20,}}|github_pat_[A-Za-z0-9_]{{20,}}|gAAAAA[A-Za-z0-9_-]{{40,}}|eyJ[A-Za-z0-9_-]{{10,}}[.][A-Za-z0-9_-]{{10,}}[.][A-Za-z0-9_-]{{10,}})'
 snapshot_once() {{
+  if ! mkdir "$snapshot_lock" 2>/dev/null; then return 75; fi
   base=$(cat "$checkpoint_dir/base_commit")
   git -C "$workdir" diff --binary "$base" -- > "$checkpoint_dir/workspace.patch.tmp"
   if LC_ALL=C grep -aEq "$secret_re" "$checkpoint_dir/workspace.patch.tmp"; then
@@ -277,9 +280,17 @@ snapshot_once() {{
 {probe}
   date -u +%Y-%m-%dT%H:%M:%SZ > "$checkpoint_dir/last_heartbeat.tmp"
   mv "$checkpoint_dir/last_heartbeat.tmp" "$checkpoint_dir/last_heartbeat"
+  rmdir "$snapshot_lock" 2>/dev/null || true
 }}
 if [ "${{1:-}}" = "--once" ]; then snapshot_once; exit 0; fi
-while :; do snapshot_once || true; sleep "$interval"; done
+while [ ! -f "$stop_file" ]; do
+  snapshot_once || true
+  waited=0
+  while [ "$waited" -lt "$interval" ] && [ ! -f "$stop_file" ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+done
 """
 
 
@@ -333,6 +344,8 @@ class DurableCheckpoint:
         self.manifest_path: Path | None = None
         self.previous: dict[str, Any] | None = None
         self.session_id: str | None = None
+        self.snapshot_launch_attempted = False
+        self.snapshot_token: str | None = None
 
     def _event(self, event: str, **detail: Any) -> None:
         if self.manifest_path is None:
@@ -493,6 +506,26 @@ class DurableCheckpoint:
             )
         return bool(leaked)
 
+    def _discard_untrusted_artifacts(self) -> None:
+        """Remove all payload-bearing files after snapshot synchronization fails."""
+
+        for name in (
+            "workspace.patch",
+            "workspace.patch.tmp",
+            "untracked.tar.gz",
+            "untracked.tar.gz.tmp",
+            "provider-state",
+            "provider-state.tmp",
+        ):
+            candidate = self.host_dir / name
+            try:
+                if candidate.is_symlink() or candidate.is_file():
+                    candidate.unlink(missing_ok=True)
+                elif candidate.is_dir():
+                    shutil.rmtree(candidate)
+            except OSError:
+                pass
+
     async def start(
         self, agent: Any, environment: Any, env: dict[str, str],
     ) -> str | None:
@@ -505,6 +538,10 @@ class DurableCheckpoint:
         if self.previous_dir is not None:
             if self.previous_dir.is_symlink():
                 raise CheckpointError("checkpoint root is a symlink")
+            if (self.previous_dir / "invalid-secret").is_file():
+                raise CheckpointError("checkpoint contains rejected credential data")
+            if (self.previous_dir / "invalid-snapshot").is_file():
+                raise CheckpointError("checkpoint snapshot did not finish safely")
             previous_path = _safe_path(self.previous_dir, "checkpoint.json")
             previous = _load_manifest(previous_path)
             try:
@@ -576,6 +613,7 @@ class DurableCheckpoint:
             **_FIXED_ARTIFACTS,
         }
         _write_manifest(self.manifest_path, manifest)
+        self.snapshot_token = manifest["checkpoint_id"]
         (self.host_dir / "base_commit").write_text(base_commit + "\n", encoding="utf-8")
         script = self.host_dir / "snapshot.sh"
         script.write_text(
@@ -606,12 +644,18 @@ class DurableCheckpoint:
                 "checkpoint_restored", native_session_available=bool(self.session_id),
             )
         remote_script = self.REMOTE_DIR / "snapshot.sh"
+        self.snapshot_launch_attempted = True
         await agent.exec_as_agent(
             environment,
             command=(
-                f"nohup sh {shlex.quote(str(remote_script))} >"
+                "command -v setsid >/dev/null 2>&1 || exit 75; "
+                "DRADAR_SNAPSHOT_TOKEN="
+                f"{shlex.quote(self.snapshot_token)} "
+                f"nohup setsid sh {shlex.quote(str(remote_script))} >"
                 f"{shlex.quote(str(self.REMOTE_DIR / 'snapshot.log'))} 2>&1 & "
-                f"echo $! >{shlex.quote(str(self.REMOTE_DIR / 'snapshot.pid'))}"
+                "snapshot_pid=$!; "
+                f"echo \"$snapshot_pid\" >"
+                f"{shlex.quote(str(self.REMOTE_DIR / 'snapshot.pid'))}"
             ),
             env=env,
         )
@@ -630,26 +674,83 @@ class DurableCheckpoint:
         if not self.enabled or self.manifest_path is None:
             return
         remote = self.REMOTE_DIR
-        try:
-            await agent.exec_as_agent(
-                environment,
-                command=(
-                    f"if [ -f {shlex.quote(str(remote / 'snapshot.pid'))} ]; then "
-                    f"kill $(cat {shlex.quote(str(remote / 'snapshot.pid'))}) "
-                    "2>/dev/null || true; fi; "
+        snapshot_stopped = True
+        if self.snapshot_launch_attempted:
+            try:
+                snapshot_token = shlex.quote(self.snapshot_token or "")
+                await agent.exec_as_agent(
+                    environment,
+                    command=(
+                    f"touch {shlex.quote(str(remote / 'stop'))}; "
+                    f"snapshot_pid=''; if [ -f "
+                    f"{shlex.quote(str(remote / 'snapshot.pid'))} ]; then "
+                    f"snapshot_pid=$(cat {shlex.quote(str(remote / 'snapshot.pid'))}); "
+                    "fi; case \"$snapshot_pid\" in ''|*[!0-9]*) snapshot_pid='';; esac; "
+                    f"snapshot_token={snapshot_token}; "
+                    "snapshot_group_running() { "
+                    "[ -n \"$snapshot_pid\" ] || return 1; "
+                    "for snapshot_proc in /proc/[0-9]*; do "
+                    "[ -r \"$snapshot_proc/stat\" ] "
+                    "&& [ -r \"$snapshot_proc/environ\" ] || continue; "
+                    "snapshot_state=$(awk '{print $3}' \"$snapshot_proc/stat\" "
+                    "2>/dev/null || true); "
+                    "snapshot_pgrp=$(awk '{print $5}' \"$snapshot_proc/stat\" "
+                    "2>/dev/null || true); "
+                    "[ \"$snapshot_state\" != Z ] "
+                    "&& [ \"$snapshot_pgrp\" = \"$snapshot_pid\" ] || continue; "
+                    "if tr '\\000' '\\n' < \"$snapshot_proc/environ\" "
+                    "2>/dev/null | grep -Fqx "
+                    "\"DRADAR_SNAPSHOT_TOKEN=$snapshot_token\"; then "
+                    "return 0; fi; done; return 1; }; "
+                    "waited=0; while snapshot_group_running "
+                    "&& [ \"$waited\" -lt 300 ]; do "
+                    "sleep 0.1; waited=$((waited + 1)); done; "
+                    "if snapshot_group_running; then "
+                    "kill -TERM -- \"-$snapshot_pid\" 2>/dev/null || true; "
+                    "waited=0; while snapshot_group_running "
+                    "&& [ \"$waited\" -lt 50 ]; do "
+                    "sleep 0.1; waited=$((waited + 1)); done; fi; "
+                    "if snapshot_group_running; then "
+                    "kill -KILL -- \"-$snapshot_pid\" 2>/dev/null || true; "
+                    "waited=0; while snapshot_group_running "
+                    "&& [ \"$waited\" -lt 50 ]; do "
+                    "sleep 0.1; waited=$((waited + 1)); done; fi; "
+                    "if snapshot_group_running; then exit 75; fi; "
                     f"sh {shlex.quote(str(remote / 'snapshot.sh'))} --once"
-                ),
-                env=env,
-            )
-        except BaseException:
-            pass
+                    ),
+                    env=env,
+                )
+            except BaseException:
+                snapshot_stopped = False
+                self._discard_untrusted_artifacts()
+                (self.host_dir / "invalid-snapshot").write_text(
+                    "checkpoint snapshot did not stop cleanly\n",
+                    encoding="utf-8",
+                )
         try:
-            self._remove_sensitive_artifacts()
+            if snapshot_stopped:
+                self._remove_sensitive_artifacts()
         except BaseException:
-            (self.host_dir / "invalid-secret").write_text(
+            self._discard_untrusted_artifacts()
+            (self.host_dir / "invalid-snapshot").write_text(
                 "checkpoint artifact validation failed\n", encoding="utf-8",
             )
         selected_session = session_id or self.session_id
+        if not (
+            isinstance(selected_session, str)
+            and _SESSION_ID_RE.fullmatch(selected_session)
+        ):
+            sidecar = self.host_dir / "session-id"
+            if (
+                sidecar.is_file()
+                and not sidecar.is_symlink()
+                and sidecar.stat().st_size <= 512
+            ):
+                candidate = sidecar.read_text(
+                    encoding="utf-8", errors="replace",
+                ).strip()
+                if _SESSION_ID_RE.fullmatch(candidate):
+                    selected_session = candidate
         if isinstance(selected_session, str) and _SESSION_ID_RE.fullmatch(selected_session):
             (self.host_dir / "session-id").write_text(
                 selected_session + "\n", encoding="utf-8",
@@ -658,13 +759,25 @@ class DurableCheckpoint:
                 (self.host_dir / "session-id").chmod(0o600)
             except OSError:
                 pass
-        invalid = (self.host_dir / "invalid-secret").is_file()
-        phase = "invalid" if invalid else ("agent_completed" if completed else "paused")
+        invalid_secret = (self.host_dir / "invalid-secret").is_file()
+        invalid_snapshot = (self.host_dir / "invalid-snapshot").is_file()
+        invalid = invalid_secret or invalid_snapshot
+        phase = (
+            "invalid"
+            if invalid
+            else (
+                "incompatible"
+                if isinstance(failure, CheckpointIncompatibleError)
+                else ("agent_completed" if completed else "paused")
+            )
+        )
         changes: dict[str, Any] = {"phase": phase}
         if isinstance(selected_session, str) and _SESSION_ID_RE.fullmatch(selected_session):
             changes["session_id"] = selected_session
-        if invalid:
+        if invalid_secret:
             changes["failure_type"] = "CheckpointSecretDetected"
+        elif invalid_snapshot:
+            changes["failure_type"] = "CheckpointSnapshotInvalid"
         elif failure is not None:
             changes["failure_type"] = type(failure).__name__
         self._update(**changes)

@@ -45,11 +45,25 @@ class FakeEnvironment:
         self.uploaded_dirs.append((Path(source), target))
 
 
+class FailingFinishAgent(FakeAgent):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_finish = False
+
+    async def exec_as_agent(self, environment, *, command, env):
+        if self.fail_finish and "checkpoint/stop" in command:
+            raise RuntimeError("snapshot did not stop")
+        return await super().exec_as_agent(environment, command=command, env=env)
+
+
 def _manager(
     logs_dir: Path,
     *,
     previous: Path | None = None,
     sensitive_values: tuple[str | bytes, ...] = (),
+    state_paths: tuple[StatePath, ...] = (
+        StatePath("sessions", "/tmp/provider/sessions"),
+    ),
 ) -> DurableCheckpoint:
     return DurableCheckpoint(
         logs_dir=logs_dir,
@@ -63,7 +77,7 @@ def _manager(
         harness="test-harness",
         provider="test-provider",
         agent_version="1.2.3",
-        state_paths=(StatePath("sessions", "/tmp/provider/sessions"),),
+        state_paths=state_paths,
         sensitive_values=sensitive_values,
     )
 
@@ -148,6 +162,23 @@ def test_checkpoint_restore_rejects_corrupt_manifest(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.parametrize("marker", ["invalid-secret", "invalid-snapshot"])
+def test_checkpoint_restore_rejects_invalid_marker(
+    tmp_path: Path, marker: str,
+) -> None:
+    previous = tmp_path / "previous"
+    previous.mkdir()
+    (previous / "checkpoint.json").write_text(json.dumps(_manifest()))
+    (previous / marker).write_text("rejected\n", encoding="utf-8")
+
+    with pytest.raises(CheckpointError, match="checkpoint"):
+        asyncio.run(
+            _manager(tmp_path / "agent", previous=previous).start(
+                FakeAgent(), FakeEnvironment(), {},
+            )
+        )
+
+
 def test_checkpoint_restore_rejects_symlinked_root(tmp_path: Path) -> None:
     previous = tmp_path / "previous-real"
     previous.mkdir()
@@ -213,6 +244,37 @@ def test_checkpoint_finish_deletes_exact_credential_and_marks_invalid(
     assert not (tmp_path / "agent/checkpoint/provider-state").exists()
 
 
+def test_snapshot_stop_failure_discards_all_payload_artifacts(
+    tmp_path: Path,
+) -> None:
+    secret = b"provider-secret-value-not-covered-by-generic-pattern"
+    manager = _manager(tmp_path / "agent", sensitive_values=(secret,))
+    agent = FailingFinishAgent()
+    environment = FakeEnvironment()
+    asyncio.run(manager.start(agent, environment, {}))
+    checkpoint = manager.host_dir
+    (checkpoint / "workspace.patch").write_bytes(secret)
+    (checkpoint / "untracked.tar.gz").write_bytes(secret)
+    state = checkpoint / "provider-state/sessions"
+    state.mkdir(parents=True)
+    (state / "wire.jsonl").write_bytes(secret)
+    agent.fail_finish = True
+
+    asyncio.run(
+        manager.finish(
+            agent, environment, {}, completed=False, failure=KeyboardInterrupt(),
+        )
+    )
+
+    manifest = json.loads((checkpoint / "checkpoint.json").read_text())
+    assert manifest["phase"] == "invalid"
+    assert manifest["failure_type"] == "CheckpointSnapshotInvalid"
+    assert (checkpoint / "invalid-snapshot").is_file()
+    assert not (checkpoint / "workspace.patch").exists()
+    assert not (checkpoint / "untracked.tar.gz").exists()
+    assert not (checkpoint / "provider-state").exists()
+
+
 def test_checkpoint_restore_rejects_unsafe_untracked_archive(tmp_path: Path) -> None:
     previous = tmp_path / "previous"
     previous.mkdir()
@@ -253,6 +315,114 @@ def test_checkpoint_restores_only_allowlisted_state_and_session_id(
     assert environment.uploaded_dirs == [
         (state, "/tmp/provider/sessions"),
     ]
+
+
+def test_checkpoint_restores_allowlisted_file_state(tmp_path: Path) -> None:
+    previous = tmp_path / "previous"
+    previous.mkdir()
+    index = previous / "provider-state/session-index"
+    index.parent.mkdir()
+    index.write_text('{"sessionId":"session-12345678"}\n', encoding="utf-8")
+    (previous / "checkpoint.json").write_text(json.dumps(_manifest()))
+    environment = FakeEnvironment()
+
+    asyncio.run(
+        _manager(
+            tmp_path / "agent",
+            previous=previous,
+            state_paths=(
+                StatePath("session-index", "/tmp/provider/session_index.jsonl"),
+            ),
+        ).start(FakeAgent(), environment, {})
+    )
+
+    assert environment.uploaded_files == [
+        (index, "/tmp/provider/session_index.jsonl"),
+    ]
+
+
+def test_checkpoint_finish_uses_snapshot_session_sidecar(tmp_path: Path) -> None:
+    manager = _manager(tmp_path / "agent")
+    agent = FakeAgent()
+    environment = FakeEnvironment()
+    asyncio.run(manager.start(agent, environment, {}))
+    (manager.host_dir / "session-id").write_text(
+        "session-12345678\n", encoding="utf-8",
+    )
+
+    asyncio.run(
+        manager.finish(
+            agent, environment, {}, completed=False, failure=KeyboardInterrupt(),
+        )
+    )
+
+    manifest = json.loads((manager.host_dir / "checkpoint.json").read_text())
+    assert manifest["phase"] == "paused"
+    assert manifest["session_id"] == "session-12345678"
+    final_snapshot = agent.commands[-1]
+    assert "touch /logs/agent/checkpoint/stop" in final_snapshot
+    assert 'snapshot_state=$(awk \'{print $3}\'' in final_snapshot
+    assert '[ "$snapshot_state" != Z ]' in final_snapshot
+    assert "snapshot_group_running" in final_snapshot
+    assert 'kill -TERM -- "-$snapshot_pid"' in final_snapshot
+    assert 'kill -KILL -- "-$snapshot_pid"' in final_snapshot
+    assert "DRADAR_SNAPSHOT_TOKEN" in final_snapshot
+    assert final_snapshot.index("stop") < final_snapshot.index("--once")
+
+
+def test_checkpoint_finish_marks_restore_rejection_incompatible(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(tmp_path / "agent")
+    agent = FakeAgent()
+    environment = FakeEnvironment()
+    asyncio.run(manager.start(agent, environment, {}))
+
+    asyncio.run(
+        manager.finish(
+            agent,
+            environment,
+            {},
+            completed=False,
+            failure=CheckpointIncompatibleError("native session missing"),
+        )
+    )
+
+    manifest = json.loads((manager.host_dir / "checkpoint.json").read_text())
+    assert manifest["phase"] == "incompatible"
+    assert manifest["failure_type"] == "CheckpointIncompatibleError"
+
+
+def test_restore_identity_rejection_never_requires_snapshot_script(
+    tmp_path: Path,
+) -> None:
+    previous = tmp_path / "previous"
+    previous.mkdir()
+    (previous / "checkpoint.json").write_text(json.dumps(_manifest(
+        provider="another-provider",
+    )))
+    manager = _manager(tmp_path / "agent", previous=previous)
+    agent = FakeAgent()
+    environment = FakeEnvironment()
+
+    with pytest.raises(CheckpointIncompatibleError) as caught:
+        asyncio.run(manager.start(agent, environment, {}))
+    asyncio.run(
+        manager.finish(
+            agent,
+            environment,
+            {},
+            completed=False,
+            failure=caught.value,
+        )
+    )
+
+    manifest = json.loads((manager.host_dir / "checkpoint.json").read_text())
+    assert manifest["phase"] == "incompatible"
+    assert manifest["failure_type"] == "CheckpointIncompatibleError"
+    assert not (manager.host_dir / "invalid-secret").exists()
+    assert not (manager.host_dir / "invalid-snapshot").exists()
+    assert not any("--once" in command for command in agent.commands)
 
 
 def test_snapshot_script_captures_workspace_state_and_session(tmp_path: Path) -> None:
@@ -304,3 +474,44 @@ def test_snapshot_script_captures_workspace_state_and_session(tmp_path: Path) ->
     assert (checkpoint / "provider-state/sessions/wire.jsonl").read_text() == "{}\n"
     assert (checkpoint / "session-id").read_text() == "session-abcdefgh\n"
     assert (checkpoint / "last_heartbeat").is_file()
+
+
+def test_snapshot_once_fails_when_lock_is_held(tmp_path: Path) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    subprocess.run(["git", "init", "-q", str(worktree)], check=True)
+    (worktree / "tracked.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(worktree), "add", "tracked.txt"], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(worktree), "-c", "user.name=DRadar Test",
+            "-c", "user.email=test@dradar.invalid", "commit", "-qm", "base",
+        ],
+        check=True,
+    )
+    base = subprocess.run(
+        ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "base_commit").write_text(base + "\n", encoding="utf-8")
+    (checkpoint / "snapshot.lock").mkdir()
+    script = checkpoint / "snapshot.sh"
+    script.write_text(
+        _snapshot_script(
+            checkpoint_dir=str(checkpoint),
+            workdir=str(worktree),
+            interval_sec=30,
+            state_paths=(),
+            session_probe=None,
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(["sh", str(script), "--once"], check=False)
+
+    assert result.returncode == 75
+    assert not (checkpoint / "last_heartbeat").exists()

@@ -95,6 +95,29 @@ def test_scan_reads_extended_harness_identity(tmp_path: Path):
     assert item.session_id == "session-12345678"
 
 
+def test_scan_reads_session_from_safe_sidecar(tmp_path: Path):
+    item = _make_checkpoint(
+        tmp_path,
+        "d" * 32,
+        manifest_overrides={
+            "harness": "kimi-code",
+            "provider": "kimi-subscription",
+            "agent_version": "0.36.1",
+        },
+    )
+    (item.checkpoint_dir / "session-id").write_text(
+        "session_832d7f94-ab9a-4f83-b630-37a3dab65025\n",
+        encoding="utf-8",
+    )
+
+    loaded = next(
+        found for found in checkpoints.scan(tmp_path)
+        if found.manifest_path == item.manifest_path
+    )
+
+    assert loaded.session_id == "session_832d7f94-ab9a-4f83-b630-37a3dab65025"
+
+
 def test_scan_rejects_symlinked_checkpoint_root(tmp_path: Path):
     aid = "b" * 32
     real_home = tmp_path / "real"
@@ -120,6 +143,22 @@ def test_scan_rejects_manifest_assignment_mismatch(tmp_path: Path):
     assert not item.valid
     assert item.assignment_id == job_assignment
     assert "does not match job directory" in (item.invalid_reason or "")
+
+
+def test_scan_reports_snapshot_failure_separately_from_secret(tmp_path: Path):
+    item = _make_checkpoint(tmp_path, "7" * 32, phase="running")
+    (item.checkpoint_dir / "invalid-snapshot").write_text(
+        "snapshot lock remained\n", encoding="utf-8",
+    )
+
+    loaded = next(
+        found for found in checkpoints.scan(tmp_path)
+        if found.manifest_path == item.manifest_path
+    )
+
+    assert not loaded.valid
+    assert loaded.phase == "invalid"
+    assert "snapshot did not finish safely" in (loaded.invalid_reason or "")
 
 
 def test_custom_checkpoint_runtime_identity_is_fail_closed(tmp_path: Path):
