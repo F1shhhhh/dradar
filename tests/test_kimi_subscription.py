@@ -270,26 +270,123 @@ def test_unverified_kimi_assignments_fail_before_paid_run(
         )
 
 
-def test_kimi_checkpoint_resume_is_rejected(
+def test_kimi_checkpoint_resume_passes_durable_metadata(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(runner.shutil, "which", lambda _name: "/usr/bin/pier")
     tasks = tmp_path / "tasks"
     (tasks / "task-1").mkdir(parents=True)
-    auth = _write_auth(tmp_path / "auth.json")
-    cli = tmp_path / "kimi"
+    home = tmp_path / "home"
+    home.mkdir()
+    auth = _write_auth(
+        tmp_path / "kimi" / "credentials" / "kimi-code.json"
+    )
+    cli = tmp_path / "kimi-cli"
     cli.write_text("binary", encoding="utf-8")
-    with pytest.raises(RunnerError, match="checkpoints are not supported"):
-        runner.build_pier_command(
-            _assignment(),
-            tasks,
-            tmp_path / "jobs",
-            "job",
-            tmp_path,
-            resume_checkpoint=tmp_path / "checkpoint",
-            provider_auth_path=auth,
-            provider_cli_path=cli,
+    checkpoint = tmp_path / "previous" / "checkpoint"
+
+    command = runner.build_pier_command(
+        _assignment(resume_generation=3),
+        tasks,
+        tmp_path / "jobs",
+        "job",
+        home,
+        resume_checkpoint=checkpoint,
+        provider_auth_path=auth,
+        provider_cli_path=cli,
+    )
+
+    values = [
+        command[index + 1]
+        for index, value in enumerate(command[:-1])
+        if value == "--ak"
+    ]
+    assert "checkpoint_enabled=true" in values
+    assert "checkpoint_assignment_id=a-kimi-1" in values
+    assert "checkpoint_task_id=task-1" in values
+    assert "checkpoint_effort=high" in values
+    assert "checkpoint_resume_generation=3" in values
+    assert f"checkpoint_path={checkpoint}" in values
+    assert not any(
+        "auth" in value.lower() or "token" in value.lower()
+        for value in values
+        if value.startswith("checkpoint_")
+    )
+
+
+def test_kimi_checkpoint_keeps_sessions_stream_and_original_prompt_only() -> None:
+    source = Path(providers.__file__).with_name("pier_kimi.py").read_text()
+    module = ast.parse(source)
+    adapter = next(
+        node for node in module.body
+        if isinstance(node, ast.ClassDef) and node.name == "KimiCode"
+    )
+    constructor = next(
+        node for node in adapter.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+    parameters = {argument.arg for argument in constructor.args.kwonlyargs}
+    assert {
+        "checkpoint_enabled",
+        "checkpoint_assignment_id",
+        "checkpoint_task_id",
+        "checkpoint_resume_generation",
+        "checkpoint_path",
+    } <= parameters
+    checkpoint_call = next(
+        node for node in ast.walk(constructor)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "DurableCheckpoint"
+    )
+    checkpoint_source = ast.unparse(checkpoint_call)
+    state_paths = [
+        node for node in ast.walk(checkpoint_call)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "StatePath"
+    ]
+    assert [node.args[0].value for node in state_paths] == ["sessions", "stream"]
+    assert "_REMOTE_HOME" in ast.unparse(state_paths[0].args[1])
+    assert "_STREAM_FILE" in ast.unparse(state_paths[1].args[1])
+    assert "sensitive_values=self._credential_values" in checkpoint_source
+    assert "_REMOTE_AUTH" not in checkpoint_source
+    assert "credentials" not in checkpoint_source
+    assert "oauth" not in checkpoint_source.lower()
+
+    run = next(
+        node for node in adapter.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "run"
+    )
+    resume = next(
+        node for node in ast.walk(run)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_resume"
+    )
+    loaded_names = {
+        node.id for node in ast.walk(resume)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+    }
+    assert "instruction" in loaded_names
+    assert "_prompt" not in loaded_names
+    assert any(
+        isinstance(node, ast.Await)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute)
+        and node.value.func.attr == "start"
+        for node in ast.walk(run)
+    )
+    assert any(
+        isinstance(node, ast.Try)
+        and any(
+            isinstance(child, ast.Await)
+            and isinstance(child.value, ast.Call)
+            and isinstance(child.value.func, ast.Attribute)
+            and child.value.func.attr == "finish"
+            for statement in node.finalbody for child in ast.walk(statement)
         )
+        for node in ast.walk(run)
+    )
+    assert "append=self._checkpoint.previous is not None" in ast.unparse(run)
 
 
 def test_kimi_adapter_source_has_fixed_security_contract() -> None:

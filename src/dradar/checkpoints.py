@@ -41,6 +41,10 @@ class Checkpoint:
     updated_at: datetime
     valid: bool
     invalid_reason: str | None = None
+    harness: str | None = None
+    provider: str | None = None
+    agent_version: str | None = None
+    session_id: str | None = None
 
     @property
     def size_bytes(self) -> int:
@@ -90,6 +94,25 @@ def _infer_assignment_id(job_dir: Path) -> str | None:
     return matched.group(1) if matched else None
 
 
+def _path_uses_symlink(root: Path, path: Path) -> bool:
+    """Return true when ``path`` escapes ``root`` lexically or crosses a link."""
+
+    lexical_root = root.absolute()
+    lexical_path = path.absolute()
+    try:
+        relative = lexical_path.relative_to(lexical_root)
+    except ValueError:
+        return True
+    current = lexical_root
+    if current.is_symlink():
+        return True
+    for part in relative.parts:
+        current /= part
+        if current.is_symlink():
+            return True
+    return False
+
+
 def _load(path: Path) -> Checkpoint:
     checkpoint_dir = path.parent
     # .../<job>/<trial>/agent/checkpoint/checkpoint.json
@@ -107,9 +130,13 @@ def _load(path: Path) -> Checkpoint:
             None, None, None, _parse_time(None, fallback), False, str(exc),
         )
 
-    assignment_id = raw.get("assignment_id")
-    if not isinstance(assignment_id, str) or not assignment_id:
-        assignment_id = _infer_assignment_id(job_dir)
+    inferred_assignment_id = _infer_assignment_id(job_dir)
+    manifest_assignment_id = raw.get("assignment_id")
+    assignment_id = (
+        manifest_assignment_id
+        if isinstance(manifest_assignment_id, str) and manifest_assignment_id
+        else inferred_assignment_id
+    )
     checkpoint_id = raw.get("checkpoint_id")
     phase = raw.get("phase") if isinstance(raw.get("phase"), str) else "invalid"
     generation = raw.get("resume_generation", 0)
@@ -120,6 +147,12 @@ def _load(path: Path) -> Checkpoint:
         errors.append("manifest contains a sensitive field")
     if not assignment_id:
         errors.append("missing assignment_id")
+    elif (
+        inferred_assignment_id is not None
+        and assignment_id != inferred_assignment_id
+    ):
+        errors.append("manifest assignment_id does not match job directory")
+        assignment_id = inferred_assignment_id
     if not isinstance(checkpoint_id, str) or not re.fullmatch(
         r"[A-Za-z0-9._-]{8,64}", checkpoint_id
     ):
@@ -152,21 +185,32 @@ def _load(path: Path) -> Checkpoint:
         max(manifest_time, heartbeat_time),
         not errors and phase != "invalid",
         "; ".join(errors) if errors else None,
+        raw.get("harness") if isinstance(raw.get("harness"), str) else None,
+        raw.get("provider") if isinstance(raw.get("provider"), str) else None,
+        (
+            raw.get("agent_version")
+            if isinstance(raw.get("agent_version"), str) else None
+        ),
+        raw.get("session_id") if isinstance(raw.get("session_id"), str) else None,
     )
 
 
 def scan(home: Path) -> list[Checkpoint]:
     root = home / "work" / "jobs"
-    if not root.is_dir():
+    if root.is_symlink() or not root.is_dir():
         return []
     found = []
     for path in root.glob("*/*/agent/checkpoint/checkpoint.json"):
+        if _path_uses_symlink(root, path):
+            continue
         try:
             found.append(_load(path))
         except (OSError, IndexError):
             continue
     seen_jobs = {item.job_dir.resolve() for item in found}
     for marker in root.glob(f"*/{TERMINAL_MARKER}"):
+        if _path_uses_symlink(root, marker):
+            continue
         try:
             job_dir = marker.parent
             if job_dir.resolve() in seen_jobs:
@@ -201,11 +245,48 @@ def find_latest(home: Path, assignment_id: str) -> Checkpoint | None:
 
 
 def _safe_job_dir(home: Path, item: Checkpoint) -> Path:
-    root = (home / "work" / "jobs").resolve()
-    job_dir = item.job_dir.resolve()
+    lexical_root = (home / "work" / "jobs").absolute()
+    lexical_job = item.job_dir.absolute()
+    if _path_uses_symlink(lexical_root, lexical_job):
+        raise ValueError(f"checkpoint path crosses a symlink: {lexical_job}")
+    root = lexical_root.resolve()
+    job_dir = lexical_job.resolve()
     if job_dir == root or root not in job_dir.parents:
         raise ValueError(f"checkpoint path escaped jobs directory: {job_dir}")
     return job_dir
+
+
+def persist_resume_generation(
+    home: Path, item: Checkpoint, generation: int,
+) -> None:
+    """Fence a server-accepted resume locally before starting paid work."""
+
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+        raise ValueError("resume generation must be a non-negative integer")
+    job_dir = _safe_job_dir(home, item)
+    manifest = item.manifest_path.absolute()
+    if _path_uses_symlink(job_dir, manifest):
+        raise ValueError(f"checkpoint manifest crosses a symlink: {manifest}")
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("checkpoint manifest is unreadable") from exc
+    if not isinstance(payload, dict) or _contains_sensitive_key(payload):
+        raise ValueError("checkpoint manifest is unsafe")
+    if payload.get("assignment_id") != item.assignment_id:
+        raise ValueError("checkpoint assignment changed before resume")
+    payload["resume_generation"] = generation
+    payload["phase"] = "paused"
+    payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+    temporary = manifest.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8",
+    )
+    try:
+        temporary.chmod(0o600)
+    except OSError:
+        pass
+    os.replace(temporary, manifest)
 
 
 def remove(home: Path, item: Checkpoint) -> None:

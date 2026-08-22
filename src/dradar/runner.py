@@ -136,7 +136,7 @@ def _resolve_user_tool(name: str, *, home: Path | None = None) -> str | None:
                 return str(candidate)
     return None
 
-# Public-safe DeepSeek configuration for an isolated stock Pier Codex agent.
+# Public-safe DeepSeek configuration for the pinned checkpoint-capable Codex agent.
 # The official catalog is uploaded to this container-local path before Codex
 # starts; do not add manual context/compaction/reasoning-summary overrides here,
 # because DeepSeek's official setup script explicitly removes them when the
@@ -174,6 +174,7 @@ ZCODE_AGENT_IMPORT_PATH = "_dradar_pier_zcode:ZCodeBigModel"
 ZCODE_AGENT_MODULE_FILENAME = "_dradar_pier_zcode.py"
 DSH_AGENT_IMPORT_PATH = "_dradar_pier_dsh:DshMinimal"
 DSH_AGENT_MODULE_FILENAME = "_dradar_pier_dsh.py"
+CHECKPOINT_MODULE_FILENAME = "_dradar_pier_checkpoint.py"
 BETA_SUBSCRIPTION_TRIAL_TIMEOUT_FLOOR_SEC = 120 * 60
 BETA_SUBSCRIPTION_AGENTS = frozenset({GROK_AGENT, KIMI_AGENT, ZCODE_AGENT})
 
@@ -487,6 +488,19 @@ def _ensure_deepseek_agent_module(home: Path) -> Path:
     return _materialize_shared_file(target, source.read_bytes())
 
 
+def _ensure_checkpoint_module(home: Path) -> Path:
+    """Expose the credential-free checkpoint helper to custom Pier agents."""
+
+    source = Path(__file__).with_name("pier_checkpoint.py")
+    if not source.is_file():
+        raise RunnerError(
+            "Pier checkpoint helper is missing; reinstall or upgrade dradar"
+        )
+    return _materialize_shared_file(
+        home / CHECKPOINT_MODULE_FILENAME, source.read_bytes()
+    )
+
+
 def _ensure_grok_agent_module(home: Path) -> Path:
     source = Path(__file__).with_name("pier_grok.py")
     recovery_source = Path(__file__).with_name("grok_recovery.py")
@@ -509,6 +523,7 @@ def _ensure_kimi_agent_module(home: Path) -> Path:
         raise RunnerError(
             "Kimi Code Pier adapter is missing; reinstall or upgrade dradar"
         )
+    _ensure_checkpoint_module(home)
     _materialize_shared_file(
         home / KIMI_RECOVERY_MODULE_FILENAME, recovery_source.read_bytes()
     )
@@ -582,6 +597,7 @@ def _ensure_zcode_agent_module(home: Path) -> Path:
         raise RunnerError(
             "ZCode Pier adapter is missing; reinstall or upgrade dradar"
         )
+    _ensure_checkpoint_module(home)
     return _materialize_shared_file(
         home / ZCODE_AGENT_MODULE_FILENAME, source.read_bytes()
     )
@@ -595,6 +611,7 @@ def _ensure_dsh_agent_module(home: Path) -> Path:
         raise RunnerError(
             "DSH Minimal Pier adapter is missing; reinstall or upgrade dradar"
         )
+    _ensure_checkpoint_module(home)
     return _materialize_shared_file(
         home / DSH_AGENT_MODULE_FILENAME, source.read_bytes()
     )
@@ -791,9 +808,8 @@ def _pier_process_env(
         # Removing the ambient variable prevents accidental fallback to the
         # old ``docker compose exec -e KEY=value`` path.
         env.pop(DEEPSEEK_API_KEY_ENV, None)
-        # uvx's public Pier environment must see only the copied, standalone
-        # adapter module. An ambient PYTHONPATH/PYTHONHOME could accidentally
-        # shadow datacurve-pier with another local Pier installation.
+        # The pinned Pier environment must see only the copied, standalone
+        # adapter module. Ambient Python paths could accidentally shadow it.
     if assignment.get("agent") == GROK_AGENT:
         env.pop(GROK_API_KEY_ENV, None)
     if assignment.get("agent") == KIMI_AGENT:
@@ -858,6 +874,24 @@ def _agent_timeout_multiplier(assignment: dict, task_path: Path) -> float:
     return math.ceil(raw * 1000) / 1000
 
 
+def _checkpoint_agent_kwargs(
+    assignment: dict, resume_checkpoint: Path | None,
+) -> list[str]:
+    values = [
+        "--ak", "checkpoint_enabled=true",
+        "--ak", f"checkpoint_assignment_id={assignment['assignment_id']}",
+        "--ak", f"checkpoint_task_id={assignment['task_id']}",
+        "--ak", f"checkpoint_effort={assignment['effort']}",
+        "--ak", (
+            "checkpoint_resume_generation="
+            f"{assignment.get('resume_generation', 0)}"
+        ),
+    ]
+    if resume_checkpoint is not None:
+        values += ["--ak", f"checkpoint_path={resume_checkpoint}"]
+    return values
+
+
 def build_pier_command(
     assignment: dict,
     tasks_root: Path,
@@ -897,11 +931,9 @@ def build_pier_command(
         # A developer override from another agent family predates provider
         # support and must retain the original OpenAI behavior.
         provider = DEFAULT_CODEX_PROVIDER
-    if provider == DEEPSEEK_PROVIDER or agent == DSH_AGENT:
-        # Keep the provider independent of DRadar's legacy checkpoint Pier
-        # build. uvx resolves this exact public PyPI release in an isolated
-        # tool environment; PYTHONPATH later exposes only the narrow catalog
-        # uploader copied into this run directory.
+    if agent == DSH_AGENT:
+        # DSH is a standalone adapter for stock Pier. Its own provider-native
+        # checkpoint implementation does not depend on Pier's Codex support.
         public_pier = "datacurve-pier==0.3.0"
         uvx = _resolve_user_tool("uvx")
         uv = _resolve_user_tool("uv")
@@ -916,7 +948,7 @@ def build_pier_command(
             ]
         else:
             raise RunnerError(
-                "uv/uvx is required for the isolated public DeepSeek/DSH runner"
+                "uv/uvx is required for the isolated public DSH runner"
             )
     else:
         pier = _resolve_user_tool("pier")
@@ -930,11 +962,6 @@ def build_pier_command(
         _validate_deepseek_assignment(assignment)
         deepseek_catalog = _validated_deepseek_catalog()
         _ensure_deepseek_agent_module(home)
-        if resume_checkpoint is not None:
-            raise RunnerError(
-                "DeepSeek checkpoints are not supported by the public runner; "
-                "start a fresh explicit run"
-            )
         agent_args = ["--agent-import-path", DEEPSEEK_AGENT_IMPORT_PATH]
     elif agent == GROK_AGENT:
         _validate_grok_assignment(assignment)
@@ -950,28 +977,14 @@ def build_pier_command(
         _validate_kimi_assignment(assignment)
         _ensure_kimi_agent_module(home)
         _ensure_shared_oauth_environment_module(home)
-        if resume_checkpoint is not None:
-            raise RunnerError(
-                "Kimi subscription checkpoints are not supported yet; start a "
-                "fresh explicit run"
-            )
         agent_args = ["--agent-import-path", KIMI_AGENT_IMPORT_PATH]
     elif agent == ZCODE_AGENT:
         _validate_zcode_assignment(assignment)
         _ensure_zcode_agent_module(home)
-        if resume_checkpoint is not None:
-            raise RunnerError(
-                "ZCode checkpoints are not supported yet; start a fresh explicit run"
-            )
         agent_args = ["--agent-import-path", ZCODE_AGENT_IMPORT_PATH]
     elif agent == DSH_AGENT:
         _validate_dsh_assignment(assignment)
         _ensure_dsh_agent_module(home)
-        if resume_checkpoint is not None:
-            raise RunnerError(
-                "DSH Minimal checkpoints are not supported yet; start a fresh "
-                "explicit run"
-            )
         agent_args = ["--agent-import-path", DSH_AGENT_IMPORT_PATH]
     else:
         agent_args = ["--agent", agent]
@@ -1019,15 +1032,9 @@ def build_pier_command(
             "--ak", f"reasoning_effort={assignment['effort']}",
             "--ak", f"config_toml_file={allowlist}",
             "--ak", f"prompt_template_path={submission_prompt}",
-            "--ak", "checkpoint_enabled=true",
-            "--ak", f"checkpoint_assignment_id={assignment['assignment_id']}",
-            "--ak", f"checkpoint_task_id={assignment['task_id']}",
-            "--ak", f"checkpoint_effort={assignment['effort']}",
-            "--ak", f"checkpoint_resume_generation={assignment.get('resume_generation', 0)}",
+            *_checkpoint_agent_kwargs(assignment, resume_checkpoint),
             "--ae", f"CODEX_AUTH_JSON_PATH={auth}",
         ]
-        if resume_checkpoint is not None:
-            cmd += ["--ak", f"checkpoint_path={resume_checkpoint}"]
         # The caller must resolve npm's stable tag to an exact version before
         # every task start. Pier bakes `npm install -g @openai/codex@...` into
         # a Docker layer, so the literal "latest" can stay cached forever.
@@ -1061,6 +1068,7 @@ def build_pier_command(
             "--ak", f"config_toml_file={config_path}",
             "--ak", f"model_catalog_json_file={deepseek_catalog}",
             "--ak", f"prompt_template_path={submission_prompt}",
+            *_checkpoint_agent_kwargs(assignment, resume_checkpoint),
             "--ae", f"CODEX_AUTH_JSON_PATH={provider_auth_path}",
             "--ak", f"version={_deepseek_codex_version(assignment)}",
         ]
@@ -1104,6 +1112,7 @@ def build_pier_command(
             "--ak", f"artifact_assignment_id={assignment['assignment_id']}",
             "--ak", f"artifact_run_id={assignment.get('_artifact_run_id') or uuid.uuid4().hex}",
             "--ak", f"artifact_task_id={assignment['task_id']}",
+            *_checkpoint_agent_kwargs(assignment, resume_checkpoint),
         ]
     elif agent == GROK_AGENT:
         if provider_auth_path is None or not provider_auth_path.is_file():
@@ -1150,6 +1159,7 @@ def build_pier_command(
             "--ak", f"kimi_cli_file={provider_cli_path}",
             "--ak", f"prompt_template_path={submission_prompt}",
             "--ak", f"version={KIMI_CLI_VERSION}",
+            *_checkpoint_agent_kwargs(assignment, resume_checkpoint),
         ]
     elif agent == ZCODE_AGENT:
         if provider_auth_path is None or not provider_auth_path.is_file():
@@ -1173,6 +1183,7 @@ def build_pier_command(
             "--ak", f"session_timeout_sec={_zcode_session_timeout_sec(assignment)}",
             "--ak", f"prompt_template_path={submission_prompt}",
             "--ak", f"version={ZCODE_CLI_VERSION}",
+            *_checkpoint_agent_kwargs(assignment, resume_checkpoint),
         ]
     return cmd
 

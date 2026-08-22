@@ -233,12 +233,12 @@ DeepSeek API 价格按北京时间分段：每天 `09:00–12:00`、`14:00–18:
 - 每次启动前解析 npm 的最新稳定版 Codex，并把精确版本传给 Pier 以刷新 Docker 构建
   缓存；`0.147.0` 仅作为最低兼容版本。继续使用 Responses API，以及官方目录声明的
   1,048,576 token 上下文和 95% 有效上下文比例。
-- 基于公开 `datacurve-pier==0.3.0` 的标准 `codex` agent；附加代码只负责校验并上传
-  官方模型目录，不包含 checkpoint 或任何 DRadar 私有 Pier 实现。
+- 基于 DRadar 固定的 checkpoint-capable Pier `codex` agent；附加代码负责校验并上传
+  官方模型目录，并给 checkpoint 写入明确的 DeepSeek provider 与精确 Codex 版本身份。
 - 基准配置关闭 Codex apps、remote plugin 和 web search，避免无关联网探测影响隔离性。
 - DeepSeek 格子只能显式领取，不进入 `/suggest`、`--auto` 或持续补题。
-- 第一版公开路径不恢复 DeepSeek checkpoint；中断后重新显式领取，避免把缺少 provider
-  身份的旧 Codex checkpoint 恢复到另一个计费 provider。
+- 支持 DeepSeek checkpoint；恢复前同时核对 assignment、任务、模型、档位、provider 和
+  精确 Codex 版本，缺少 provider 身份的旧 checkpoint 不会跨计费 provider 恢复。
 - 未显式领取 DeepSeek 格子时，原有 OpenAI Codex 与 Claude 行为完全不变。
 
 配置依据：[DeepSeek 官方 Codex 集成文档](https://api-docs.deepseek.com/quick_start/agent_integrations/codex/)、
@@ -263,7 +263,8 @@ dradar resume -y
 
 运行器通过 `uvx --isolated` 使用公开 `datacurve-pier==0.3.0`，并在任务容器内安装固定的
 `@deepseek-ai/dsh` 版本。普通 Codex、Claude、Grok 和 DeepSeek Codex 的环境检查与运行
-路径不受影响。DSH 第一版不恢复 checkpoint；中断任务会按现有失效/重新认领流程处理。
+路径不受影响。DSH checkpoint 只保存工作区、原生 session 与图片附件；恢复使用原生
+`agents.resume`，并按完整 session transcript 累计前后两代 usage。
 
 ### Grok 订阅 OAuth 补充 agent
 
@@ -297,7 +298,7 @@ subagents 和 plan，并把容器运行时网络限制为 `auth.x.ai` 与
 ### Kimi Code K3 订阅 OAuth agent
 
 Kimi Code 只使用官方订阅 OAuth，不接受 `KIMI_API_KEY`、`MOONSHOT_API_KEY` 等按量 key。
-`provider setup` 会自动准备官方 Kimi Code CLI `1.49.0` 到 DRadar 的隔离运行目录，
+`provider setup` 会自动准备官方 Kimi Code CLI `0.36.1` 到 DRadar 的隔离运行目录，
 然后在跑题机器自己的交互式终端中建立 DRadar 专用会话：
 
 ```bash
@@ -312,7 +313,8 @@ DRadar 把 OAuth 保存在 `~/.dradar/providers/kimi`，不会借用或覆盖日
 Kimi CLI 版本，因此 macOS、Windows 与 Linux 用户都不会把错误平台的本机程序传进
 容器。容器只收到一次运行所需的锁定凭证副本，退出后会回收刷新状态并删除临时副本。
 模型固定为 `k3`，只接受 `low`/`high`/`max`；DeepSWE 与庞贝壁画均可显式领取，但不进入
-自动推荐、排序或持续补题。第一版不恢复 checkpoint。
+自动推荐、排序或持续补题。checkpoint 保存工作区、Kimi session 与累计 usage stream，
+恢复使用官方 `--session`，不会追加恢复提示词。
 
 ### ZCode GLM-5.3 国内 Coding Plan agent
 
@@ -332,7 +334,8 @@ dradar go --pick TASK_ID:glm-5.3:high
 DRadar 服务端或轨迹。容器启动后 Key 会立即转入 ZCode 的内存会话并删除临时文件。
 
 模型固定为 `glm-5.3`，档位为 `low`/`high`/`max`。它只参与 DeepSWE，不会出现在庞贝壁画
-认领表；只能显式领取，不进入自动推荐或补题，第一版不恢复 checkpoint。
+认领表；只能显式领取，不进入自动推荐或补题。checkpoint 保存工作区和无凭据的 ZCode
+session/rollout 状态，恢复使用原生 `session/resume` 并重新注入仅驻内存的运行凭据。
 
 体检失败不会领取任务。修复所有 `FAIL` 后重新运行即可。
 
@@ -611,9 +614,10 @@ dradar release --all --force -y             # 高风险：无确认释放全部
 
 ## checkpoint 与中断续跑
 
-Pier 在任务运行期间约每 30 秒把工作区差异、未跟踪文件、Codex session ID、阶段和心跳
-写入 `~/.dradar/work/jobs/`。模型容量不足、WebSocket/TLS 断开、代理抖动、CLI 退出或
-机器重启后，下一次 `go` / `resume` 会先尝试恢复，而不是从头运行。
+Pier 在任务运行期间约每 30 秒把工作区差异、未跟踪文件、harness 原生 session、累计
+usage 所需状态、阶段和心跳写入 `~/.dradar/work/jobs/`。当前覆盖 OpenAI/DeepSeek Codex、
+DSH、Kimi 与 ZCode。模型容量不足、WebSocket/TLS 断开、代理抖动、CLI 退出或机器
+重启后，下一次 `go` / `resume` 会先尝试恢复，而不是从头运行。
 
 ```bash
 dradar checkpoints
@@ -624,15 +628,16 @@ dradar checkpoint discard <CHECKPOINT_ID_OR_ASSIGNMENT_ID>
 
 恢复优先级：
 
-1. 原工作区 + 原 Codex session；
-2. 原 session 不可用时，保留工作区，用进度摘要启动新 session；
-3. checkpoint 损坏、超过 7 天、版本不兼容或租约失效时，安全标记无效并重新开放格子。
+1. 原工作区 + 与 harness/provider/版本严格匹配的原生 session；
+2. 支持安全降级的 harness 在原 session 不可用时保留工作区，并使用原始任务说明；
+3. checkpoint 损坏、超过 7 天、身份不兼容或租约失效时，安全标记无效并重新开放格子。
 
 同一 assignment 使用本地文件锁，健康运行中的任务不会被第二个 `resume` 重复启动。超级
 账号批量运行时，每个 worker 独立认领 checkpoint，一个损坏项不会阻塞整个批次。
 
-checkpoint 不保存账号 Token、assignment nonce 或 Codex `auth.json`。manifest 出现
-敏感字段，或者 session 检测到凭据形态内容时，会拒绝持久化相应敏感状态并安全降级。
+checkpoint 不保存账号 Token、assignment nonce、API key 或 OAuth 文件。provider state
+使用逐 harness 最小白名单；manifest 出现敏感字段、状态包含通用凭据形态或精确命中本次
+注入的真实凭据值时，会删除相关产物、标记 checkpoint 无效并拒绝恢复。
 
 `checkpoint discard` 会删除本地恢复数据；如果服务端租约仍有效，还会通过恢复协议重新
 开放格子。这是明确放弃进度的操作。
