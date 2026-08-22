@@ -167,6 +167,9 @@ def _load(path: Path) -> Checkpoint:
     if (checkpoint_dir / "invalid-secret").is_file():
         errors.append("credential-shaped content was rejected")
         phase = "invalid"
+    if (checkpoint_dir / "invalid-snapshot").is_file():
+        errors.append("checkpoint snapshot did not finish safely")
+        phase = "invalid"
 
     heartbeat = checkpoint_dir / "last_heartbeat"
     manifest_time = _parse_time(
@@ -176,6 +179,19 @@ def _load(path: Path) -> Checkpoint:
         datetime.fromtimestamp(heartbeat.stat().st_mtime, timezone.utc)
         if heartbeat.is_file() else manifest_time
     )
+    session_id = raw.get("session_id")
+    if not isinstance(session_id, str):
+        sidecar = checkpoint_dir / "session-id"
+        if (
+            sidecar.is_file()
+            and not sidecar.is_symlink()
+            and sidecar.stat().st_size <= 512
+        ):
+            candidate = sidecar.read_text(
+                encoding="utf-8", errors="replace",
+            ).strip()
+            if re.fullmatch(r"[A-Za-z0-9._:-]{8,160}", candidate):
+                session_id = candidate
     return Checkpoint(
         path, checkpoint_dir, trial_dir, job_dir, assignment_id, checkpoint_id,
         phase, generation,
@@ -191,7 +207,7 @@ def _load(path: Path) -> Checkpoint:
             raw.get("agent_version")
             if isinstance(raw.get("agent_version"), str) else None
         ),
-        raw.get("session_id") if isinstance(raw.get("session_id"), str) else None,
+        session_id if isinstance(session_id, str) else None,
     )
 
 

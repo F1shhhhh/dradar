@@ -346,9 +346,12 @@ def test_kimi_checkpoint_keeps_sessions_stream_and_original_prompt_only() -> Non
         and isinstance(node.func, ast.Name)
         and node.func.id == "StatePath"
     ]
-    assert [node.args[0].value for node in state_paths] == ["sessions", "stream"]
+    assert [node.args[0].value for node in state_paths] == [
+        "sessions", "session-index", "stream",
+    ]
     assert "_REMOTE_HOME" in ast.unparse(state_paths[0].args[1])
-    assert "_STREAM_FILE" in ast.unparse(state_paths[1].args[1])
+    assert "session_index.jsonl" in ast.unparse(state_paths[1].args[1])
+    assert "_STREAM_FILE" in ast.unparse(state_paths[2].args[1])
     assert "sensitive_values=self._credential_values" in checkpoint_source
     assert "_REMOTE_AUTH" not in checkpoint_source
     assert "credentials" not in checkpoint_source
@@ -387,6 +390,12 @@ def test_kimi_checkpoint_keeps_sessions_stream_and_original_prompt_only() -> Non
         for node in ast.walk(run)
     )
     assert "append=self._checkpoint.previous is not None" in ast.unparse(run)
+    run_source = ast.unparse(run)
+    assert "restoring_checkpoint = self._checkpoint.previous is not None" in run_source
+    assert run_source.count("raise CheckpointIncompatibleError") >= 2
+    assert run_source.index("raise CheckpointIncompatibleError") < run_source.index(
+        "run_with_kimi_resume"
+    )
 
 
 def test_kimi_adapter_source_has_fixed_security_contract() -> None:
@@ -809,7 +818,9 @@ def test_kimi_retry_reconciliation_rejects_count_coincidence_and_forgery() -> No
 
 def test_kimi_copies_only_the_main_agent_durable_wire() -> None:
     source = Path(providers.__file__).with_name("pier_kimi.py").read_text()
-    assert "-path '*/agents/main/wire.jsonl'" in source
+    recovery = Path(providers.__file__).with_name("kimi_recovery.py").read_text()
+    assert "unique_session_probe_command" in source
+    assert "-path '*/agents/main/wire.jsonl'" in recovery
 
 
 def _write_kimi_session(

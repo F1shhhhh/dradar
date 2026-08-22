@@ -24,12 +24,18 @@ from pier.models.agent.network import NetworkAllowlist
 from pier.models.trajectories import Agent, FinalMetrics, Step, Trajectory
 from pier.utils.trajectory_metrics import populate_context_from_final_metrics
 
-from _dradar_pier_checkpoint import DurableCheckpoint, StatePath
+from _dradar_pier_checkpoint import (
+    CheckpointIncompatibleError,
+    DurableCheckpoint,
+    StatePath,
+)
 from _dradar_kimi_recovery import (
     KIMI_PROVIDER_CONNECTION_EXIT_CODE,
     kimi_provider_connection_stderr_is_retryable,
+    native_session_probe_command,
     pier_exit_code,
     run_with_kimi_resume,
+    unique_session_probe_command,
     validated_session_id,
 )
 
@@ -580,17 +586,15 @@ class KimiCode(BaseInstalledAgent):
             agent_version=self._version or KIMI_CLI_VERSION,
             state_paths=(
                 StatePath("sessions", (self._REMOTE_HOME / "sessions").as_posix()),
+                StatePath(
+                    "session-index",
+                    (self._REMOTE_HOME / "session_index.jsonl").as_posix(),
+                ),
                 StatePath("stream", f"/logs/agent/{self._STREAM_FILE}"),
             ),
             sensitive_values=self._credential_values,
-            session_probe=(
-                "candidate=$(find "
-                + shlex.quote((self._REMOTE_HOME / "sessions").as_posix())
-                + " -type f -path '*/agents/main/wire.jsonl' -print "
-                "2>/dev/null | sort | tail -n 1); "
-                "if [ -n \"$candidate\" ]; then "
-                "session_dir=${candidate%/agents/main/wire.jsonl}; "
-                "basename \"$session_dir\"; fi"
+            session_probe=unique_session_probe_command(
+                (self._REMOTE_HOME / "sessions").as_posix(),
             ),
         )
 
@@ -786,20 +790,11 @@ class KimiCode(BaseInstalledAgent):
             return "bash -o pipefail -c " + shlex.quote(command)
 
         async def remote_session_id(*, copy_log: bool = False) -> str | None:
-            copy = (
-                f"cp \"$candidate\" {shlex.quote(session_log)}; "
-                if copy_log else ""
-            )
             result = await self.exec_as_agent(
                 environment,
-                command=(
-                    "candidate=$(find " + shlex.quote(remote_home + "/sessions")
-                    + " -type f -path '*/agents/main/wire.jsonl' "
-                    "-print 2>/dev/null | sort "
-                    "| tail -n 1); "
-                    f"if [ -n \"$candidate\" ]; then {copy}"
-                    "session_dir=${candidate%/agents/main/wire.jsonl}; "
-                    "basename \"$session_dir\"; fi"
+                command=unique_session_probe_command(
+                    remote_home + "/sessions",
+                    copy_to=session_log if copy_log else None,
                 ),
                 env=env,
             )
@@ -855,24 +850,28 @@ class KimiCode(BaseInstalledAgent):
             checkpoint_session = await self._checkpoint.start(
                 self, environment, env,
             )
+            restoring_checkpoint = self._checkpoint.previous is not None
+            if checkpoint_session is not None:
+                checkpoint_session = validated_session_id(checkpoint_session)
+                self._checkpoint.session_id = checkpoint_session
+            if restoring_checkpoint and checkpoint_session is None:
+                raise CheckpointIncompatibleError(
+                    "Kimi checkpoint has no canonical native session id"
+                )
             if checkpoint_session is not None:
                 native = await self.exec_as_agent(
                     environment,
-                    command=(
-                        "if [ -f "
-                        + shlex.quote(
-                            f"{remote_home}/sessions/{checkpoint_session}"
-                            "/agents/main/wire.jsonl"
-                        )
-                        + " ]; then printf '%s\\n' "
-                        + shlex.quote(checkpoint_session)
-                        + "; fi"
+                    command=native_session_probe_command(
+                        remote_home + "/sessions",
+                        remote_home + "/session_index.jsonl",
+                        checkpoint_session,
                     ),
                     env=env,
                 )
                 if validated_session_id(native.stdout) != checkpoint_session:
-                    checkpoint_session = None
-                    self._checkpoint.session_id = None
+                    raise CheckpointIncompatibleError(
+                        "Kimi checkpoint native session state is unavailable"
+                    )
             self._session_id = checkpoint_session
             resume_attempts, runtime_session = await run_with_kimi_resume(
                 run_initial=run_initial,

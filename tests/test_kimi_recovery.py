@@ -1,18 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import subprocess
 
 import pytest
 
 from dradar.kimi_recovery import (
     KIMI_RESUME_PROMPT,
     kimi_provider_connection_stderr_is_retryable,
+    native_session_probe_command,
     pier_exit_code,
     run_with_kimi_resume,
+    unique_session_probe_command,
     validated_session_id,
 )
 
 SESSION = "832d7f94-ab9a-4f83-b630-37a3dab65025"
+KIMI_SESSION = f"session_{SESSION}"
 
 
 class CommandFailed(RuntimeError):
@@ -63,14 +68,272 @@ def test_kimi_connection_fallback_is_fail_closed(stderr_line: str) -> None:
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
-        (SESSION, SESSION),
-        (f" {SESSION}\n", SESSION),
+        (SESSION, KIMI_SESSION),
+        (f" {SESSION}\n", KIMI_SESSION),
+        (KIMI_SESSION, KIMI_SESSION),
+        (f" {KIMI_SESSION}\n", KIMI_SESSION),
         ("not-a-session", None),
         (f"{SESSION}; touch /tmp/owned", None),
+        (f"session_{SESSION}; touch /tmp/owned", None),
+        (f"other_{SESSION}", None),
     ],
 )
-def test_session_id_requires_one_canonical_uuid(value: str, expected: str | None) -> None:
+def test_session_id_requires_one_canonical_kimi_id(
+    value: str, expected: str | None,
+) -> None:
     assert validated_session_id(value) == expected
+
+
+def test_native_session_probe_finds_one_nested_session(tmp_path) -> None:
+    wire = (
+        tmp_path / "2026-08-23" / "project" / KIMI_SESSION
+        / "agents" / "main" / "wire.jsonl"
+    )
+    wire.parent.mkdir(parents=True)
+    wire.write_text("{}\n", encoding="utf-8")
+    (wire.parents[2] / "state.json").write_text("{}\n", encoding="utf-8")
+    index = tmp_path / "session_index.jsonl"
+    index.write_text(json.dumps({
+        "sessionId": KIMI_SESSION,
+        "sessionDir": str(wire.parents[2]),
+        "workDir": "/app",
+    }) + "\n", encoding="utf-8")
+
+    command = native_session_probe_command(str(tmp_path), str(index), SESSION)
+    result = subprocess.run(
+        ["/bin/sh", "-c", command],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout == KIMI_SESSION + "\n"
+
+
+def test_native_session_probe_rejects_missing_or_duplicate_session(tmp_path) -> None:
+    index = tmp_path / "session_index.jsonl"
+    index.write_text("", encoding="utf-8")
+    command = native_session_probe_command(
+        str(tmp_path), str(index), KIMI_SESSION,
+    )
+    missing = subprocess.run(
+        ["/bin/sh", "-c", command],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert missing.stdout == ""
+
+    for parent in ("first", "second"):
+        wire = tmp_path / parent / KIMI_SESSION / "agents" / "main" / "wire.jsonl"
+        wire.parent.mkdir(parents=True)
+        wire.write_text("{}\n", encoding="utf-8")
+        (wire.parents[2] / "state.json").write_text("{}\n", encoding="utf-8")
+        with index.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "sessionId": KIMI_SESSION,
+                "sessionDir": str(wire.parents[2]),
+                "workDir": "/app",
+            }) + "\n")
+    duplicate = subprocess.run(
+        ["/bin/sh", "-c", command],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert duplicate.stdout == ""
+
+
+def test_native_session_probe_rejects_unsafe_id(tmp_path) -> None:
+    with pytest.raises(ValueError, match="session id is invalid"):
+        native_session_probe_command(
+            str(tmp_path), str(tmp_path / "session_index.jsonl"),
+            f"{KIMI_SESSION}; touch owned",
+        )
+
+
+def test_native_session_probe_rejects_index_outside_session_root(tmp_path) -> None:
+    root = tmp_path / "sessions"
+    wire = root / "wd" / KIMI_SESSION / "agents" / "main" / "wire.jsonl"
+    wire.parent.mkdir(parents=True)
+    wire.write_text("{}\n", encoding="utf-8")
+    (wire.parents[2] / "state.json").write_text("{}\n", encoding="utf-8")
+    index = tmp_path / "session_index.jsonl"
+    index.write_text(json.dumps({
+        "sessionId": KIMI_SESSION,
+        "sessionDir": str(tmp_path / "outside" / KIMI_SESSION),
+        "workDir": "/app",
+    }) + "\n", encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            "/bin/sh", "-c",
+            native_session_probe_command(str(root), str(index), KIMI_SESSION),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout == ""
+
+
+def test_native_session_probe_uses_latest_append_only_index_entry(
+    tmp_path,
+) -> None:
+    root = tmp_path / "sessions"
+    session_dir = root / "wd" / KIMI_SESSION
+    wire = session_dir / "agents" / "main" / "wire.jsonl"
+    wire.parent.mkdir(parents=True)
+    wire.write_text("{}\n", encoding="utf-8")
+    (session_dir / "state.json").write_text("{}\n", encoding="utf-8")
+    entry = {
+        "sessionId": KIMI_SESSION,
+        "sessionDir": str(session_dir),
+        "workDir": "/app",
+    }
+    index = tmp_path / "session_index.jsonl"
+    index.write_text(
+        json.dumps(entry) + "\n" + json.dumps(entry) + "\n",
+        encoding="utf-8",
+    )
+
+    command = native_session_probe_command(str(root), str(index), KIMI_SESSION)
+    duplicate_live = subprocess.run(
+        ["/bin/sh", "-c", command],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert duplicate_live.stdout == KIMI_SESSION + "\n"
+
+    with index.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({
+            "sessionId": KIMI_SESSION,
+            "deleted": True,
+        }) + "\n")
+    deleted = subprocess.run(
+        ["/bin/sh", "-c", command],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert deleted.stdout == ""
+
+
+def test_native_session_probe_rejects_index_wire_directory_mismatch(
+    tmp_path,
+) -> None:
+    root = tmp_path / "sessions"
+    indexed_dir = root / "indexed" / KIMI_SESSION
+    wire_dir = root / "actual" / KIMI_SESSION
+    wire = wire_dir / "agents" / "main" / "wire.jsonl"
+    wire.parent.mkdir(parents=True)
+    wire.write_text("{}\n", encoding="utf-8")
+    (wire_dir / "state.json").write_text("{}\n", encoding="utf-8")
+    index = tmp_path / "session_index.jsonl"
+    index.write_text(json.dumps({
+        "sessionId": KIMI_SESSION,
+        "sessionDir": str(indexed_dir),
+        "workDir": "/app",
+    }) + "\n", encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            "/bin/sh", "-c",
+            native_session_probe_command(str(root), str(index), KIMI_SESSION),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout == ""
+
+
+def test_native_session_probe_prefers_state_workdir_over_stale_index(
+    tmp_path,
+) -> None:
+    root = tmp_path / "sessions"
+    session_dir = root / "wd" / KIMI_SESSION
+    wire = session_dir / "agents" / "main" / "wire.jsonl"
+    wire.parent.mkdir(parents=True)
+    wire.write_text("{}\n", encoding="utf-8")
+    (session_dir / "state.json").write_text(
+        json.dumps({"workDir": "/app"}) + "\n", encoding="utf-8",
+    )
+    index = tmp_path / "session_index.jsonl"
+    index.write_text(json.dumps({
+        "sessionId": KIMI_SESSION,
+        "sessionDir": str(session_dir),
+        "workDir": "/stale/original/path",
+    }) + "\n", encoding="utf-8")
+    command = native_session_probe_command(str(root), str(index), KIMI_SESSION)
+
+    accepted = subprocess.run(
+        ["/bin/sh", "-c", command],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert accepted.stdout == KIMI_SESSION + "\n"
+
+    (session_dir / "state.json").write_text(
+        json.dumps({"workDir": "/another/worktree"}) + "\n",
+        encoding="utf-8",
+    )
+    rejected = subprocess.run(
+        ["/bin/sh", "-c", command],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert rejected.stdout == ""
+
+
+def test_unique_session_probe_finds_and_copies_one_nested_session(tmp_path) -> None:
+    wire = (
+        tmp_path / "sessions" / "workdir-key" / KIMI_SESSION
+        / "agents" / "main" / "wire.jsonl"
+    )
+    wire.parent.mkdir(parents=True)
+    wire.write_text("wire\n", encoding="utf-8")
+    copied = tmp_path / "copied-wire.jsonl"
+
+    result = subprocess.run(
+        [
+            "/bin/sh", "-c",
+            unique_session_probe_command(
+                str(tmp_path / "sessions"), copy_to=str(copied),
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout == KIMI_SESSION + "\n"
+    assert copied.read_text(encoding="utf-8") == "wire\n"
+
+
+def test_unique_session_probe_rejects_ambiguous_sessions(tmp_path) -> None:
+    root = tmp_path / "sessions"
+    for index in (1, 2):
+        wire = (
+            root / f"workdir-{index}" / f"session_{index:08d}-0000-4000-8000-000000000000"
+            / "agents" / "main" / "wire.jsonl"
+        )
+        wire.parent.mkdir(parents=True)
+        wire.write_text("{}\n", encoding="utf-8")
+
+    result = subprocess.run(
+        ["/bin/sh", "-c", unique_session_probe_command(str(root))],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout == ""
 
 
 def test_success_does_not_probe_or_resume() -> None:
@@ -124,12 +387,12 @@ def test_exit_75_resumes_same_session_and_workspace() -> None:
             sleep=no_wait,
         )
 
-    assert asyncio.run(scenario()) == (1, SESSION)
+    assert asyncio.run(scenario()) == (1, KIMI_SESSION)
     assert calls == [
         "initial",
         "find",
         ("sleep", 10),
-        ("resume", SESSION, KIMI_RESUME_PROMPT),
+        ("resume", KIMI_SESSION, KIMI_RESUME_PROMPT),
     ]
 
 
@@ -176,13 +439,13 @@ def test_exit_1_with_exact_provider_signal_resumes_same_session() -> None:
             classify_retryable_error=classify,
         )
 
-    assert asyncio.run(scenario()) == (1, SESSION)
+    assert asyncio.run(scenario()) == (1, KIMI_SESSION)
     assert calls == [
         "initial",
         ("classify", 1),
         "find",
         ("sleep", 10),
-        ("resume", SESSION, KIMI_RESUME_PROMPT),
+        ("resume", KIMI_SESSION, KIMI_RESUME_PROMPT),
     ]
 
 
@@ -214,7 +477,7 @@ def test_retry_budget_is_bounded_and_reraises_last_failure() -> None:
 
     with pytest.raises(CommandFailed, match=r"exit 75"):
         asyncio.run(scenario())
-    assert attempts == [SESSION, SESSION]
+    assert attempts == [KIMI_SESSION, KIMI_SESSION]
 
 
 def test_retry_never_drifts_to_a_newly_discovered_session() -> None:
@@ -248,8 +511,8 @@ def test_retry_never_drifts_to_a_newly_discovered_session() -> None:
             sleep=no_wait,
         )
 
-    assert asyncio.run(scenario()) == (2, SESSION)
-    assert resumed_sessions == [SESSION, SESSION]
+    assert asyncio.run(scenario()) == (2, KIMI_SESSION)
+    assert resumed_sessions == [KIMI_SESSION, KIMI_SESSION]
     assert find_calls == 1
 
 
