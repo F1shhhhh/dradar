@@ -692,19 +692,61 @@ class KimiCode(BaseInstalledAgent):
             "--skills-dir", remote_skills,
         ]
 
+        def shared_oauth_guarded_command(command: str) -> str:
+            """Keep container-created refresh files owned by the host user.
+
+            Kimi rotates ``kimi-code.json`` with an atomic rename.  A Docker
+            container running as root consequently replaces the bind-mounted
+            host file with a root-owned inode.  Derive the numeric owner from
+            the mounted credentials directory (never from a username), repair
+            replacements while Kimi runs, and make one final repair before the
+            container command returns to the host.
+            """
+
+            auth = shlex.quote(remote_auth)
+            credentials = shlex.quote(remote_home + "/credentials")
+            guarded = (
+                f"oauth_auth={auth}; oauth_credentials={credentials}; "
+                "oauth_owner=$(stat -c '%u:%g' \"$oauth_credentials\") || exit 1; "
+                "oauth_guard_pid=''; "
+                "oauth_repair() { "
+                "[ -f \"$oauth_auth\" ] && [ ! -L \"$oauth_auth\" ] || return 0; "
+                "oauth_current=$(stat -c '%u:%g' \"$oauth_auth\" 2>/dev/null) "
+                "|| return 0; "
+                "if [ \"$oauth_current\" != \"$oauth_owner\" ]; then "
+                "chown \"$oauth_owner\" \"$oauth_auth\" || return 1; fi; "
+                "chmod 600 \"$oauth_auth\"; "
+                "}; "
+                "oauth_cleanup() { "
+                "oauth_status=$?; "
+                "if [ -n \"$oauth_guard_pid\" ]; then "
+                "kill \"$oauth_guard_pid\" 2>/dev/null || true; "
+                "wait \"$oauth_guard_pid\" 2>/dev/null || true; fi; "
+                "oauth_repair || true; "
+                "exit \"$oauth_status\"; "
+                "}; "
+                "if [ \"$(id -u)\" = 0 ]; then "
+                "(while :; do oauth_repair || true; sleep 0.02; done) & "
+                "oauth_guard_pid=$!; fi; "
+                "trap oauth_cleanup EXIT; "
+                "trap 'exit 130' INT; trap 'exit 143' TERM; "
+                + command
+            )
+            return "bash -o pipefail -c " + shlex.quote(guarded)
+
         def command_for(extra_flags: list[str], *, append: bool) -> str:
             flags = [*common_flags, *extra_flags]
             cli = " ".join(shlex.quote(part) for part in flags)
             tee = "tee -a" if append else "tee"
             stderr_tee = "tee -a" if append else "tee"
-            return (
-                "bash -o pipefail -c "
-                + shlex.quote(
-                    f"cd /app && {remote_cli} {cli} "
-                    f"2> >({stderr_tee} {stderr_log} >&2) "
-                    f"| {tee} {stream}"
-                )
+            command = (
+                f"cd /app && {remote_cli} {cli} "
+                f"2> >({stderr_tee} {stderr_log} >&2) "
+                f"| {tee} {stream}"
             )
+            if self._shared_oauth:
+                return shared_oauth_guarded_command(command)
+            return "bash -o pipefail -c " + shlex.quote(command)
 
         async def remote_session_id(*, copy_log: bool = False) -> str | None:
             copy = (

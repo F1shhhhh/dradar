@@ -15,6 +15,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 from contextlib import contextmanager
 from collections.abc import Iterable, Mapping
@@ -1150,6 +1151,14 @@ def kimi_subscription_session(directory: Path, *, home: Path | None = None):
         os.chmod(native_lock, 0o600)
     directory.mkdir(parents=True, exist_ok=True)
     yield canonical
+    if os.name != "nt":
+        # A concurrent rootful task container may have just atomically
+        # replaced the shared credential.  Its in-container ownership guard
+        # repairs the new inode; allow that bounded handoff to settle before
+        # treating a transient EACCES as an invalid OAuth refresh.
+        deadline = time.monotonic() + 1.0
+        while not os.access(canonical, os.R_OK) and time.monotonic() < deadline:
+            time.sleep(0.02)
     issue = kimi_auth_error(canonical)
     if issue is not None:
         raise ValueError("Kimi returned an invalid refreshed OAuth credential: " + issue)
