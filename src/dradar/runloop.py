@@ -391,18 +391,65 @@ def _terminal_failure_outcome(kind: str | None) -> str | None:
 
 
 def _checkpoint_backoff_seconds(
-    item: checkpoints.Checkpoint, *, now: datetime | None = None,
+    item: checkpoints.Checkpoint, *, generation: int | None = None,
+    now: datetime | None = None,
 ) -> float:
     """Remaining bounded delay before the next checkpoint recovery attempt."""
-    if item.resume_generation <= 0:
+    effective_generation = (
+        item.resume_generation if generation is None else generation
+    )
+    if effective_generation <= 0:
         return 0.0
     delay = min(
         _CHECKPOINT_BACKOFF_MAX_SECONDS,
-        _CHECKPOINT_BACKOFF_BASE_SECONDS * (2 ** (item.resume_generation - 1)),
+        _CHECKPOINT_BACKOFF_BASE_SECONDS * (2 ** (effective_generation - 1)),
     )
     current = now or datetime.now(timezone.utc)
     elapsed = max(0.0, (current - item.updated_at).total_seconds())
     return max(0.0, delay - elapsed)
+
+
+def _checkpoint_identity_mismatches(
+    item: checkpoints.Checkpoint, assignment: dict,
+) -> list[str]:
+    """Return fail-closed runtime identity differences before lease resume."""
+
+    expected = {
+        "task_id": assignment.get("task_id"),
+        "model": assignment.get("model"),
+        "effort": assignment.get("effort"),
+    }
+    mismatched = [
+        name for name, value in expected.items()
+        if getattr(item, name) != value
+    ]
+    agent = assignment.get("agent")
+    provider = assignment_codex_provider(assignment)
+    extended_identity_required = (
+        provider == DEEPSEEK_PROVIDER
+        or agent in {DSH_AGENT, KIMI_AGENT, ZCODE_AGENT}
+    )
+    if extended_identity_required:
+        expected_extended = {
+            "harness": "codex" if provider == DEEPSEEK_PROVIDER else agent,
+            "provider": assignment.get("provider"),
+        }
+        mismatched.extend(
+            name for name, value in expected_extended.items()
+            if getattr(item, name) != value
+        )
+        requested_version = assignment.get("agent_version")
+        if agent != "codex" and (
+            not isinstance(requested_version, str)
+            or item.agent_version != requested_version
+        ):
+            mismatched.append("agent_version")
+        elif agent == "codex" and not item.agent_version:
+            # The exact stable DeepSeek Codex version is resolved immediately
+            # before the run. The adapter compares that version again inside
+            # the container before restoring provider state.
+            mismatched.append("agent_version")
+    return list(dict.fromkeys(mismatched))
 
 
 def _fmt_pct(pct: float) -> str:
@@ -2271,39 +2318,23 @@ def _resume_one_checkpoint(
                 ):
                     return "discarded"
                 return "paused"
-            if item.task_id and item.task_id != assignment.get("task_id"):
-                print(f"  {assignment_id}: checkpoint task does not match the lease; discarding it")
-                if _discard_checkpoint_quietly(
-                    client, item, assignment, reason="incompatible",
-                ):
-                    return "discarded"
-                return "paused"
-            if assignment_codex_provider(assignment) == DEEPSEEK_PROVIDER:
-                # The public DeepSeek path deliberately uses stock Pier and
-                # does not resume provider-ambiguous Codex checkpoints. This
-                # prevents an old OpenAI checkpoint from ever being restored
-                # through a paid DeepSeek assignment.
+            if assignment.get("agent") == GROK_AGENT:
                 print(
-                    f"  {assignment_id}: DeepSeek checkpoints are not supported; "
-                    "discarding the stale local checkpoint"
+                    f"  {assignment_id}: Grok Build checkpoints are not "
+                    "supported; discarding the stale local checkpoint"
                 )
                 if _discard_checkpoint_quietly(
                     client, item, assignment, reason="incompatible",
                 ):
                     return "discarded"
                 return "paused"
-            if assignment.get("agent") in {
-                DSH_AGENT, GROK_AGENT, KIMI_AGENT, ZCODE_AGENT,
-            }:
-                label = {
-                    DSH_AGENT: "DSH Minimal",
-                    GROK_AGENT: "Grok Build",
-                    KIMI_AGENT: "Kimi Code",
-                    ZCODE_AGENT: "ZCode",
-                }[assignment["agent"]]
+            identity_mismatches = _checkpoint_identity_mismatches(item, assignment)
+            if identity_mismatches:
                 print(
-                    f"  {assignment_id}: {label} checkpoints are not "
-                    "supported; discarding the stale local checkpoint"
+                    f"  {assignment_id}: checkpoint runtime identity does not "
+                    "match the lease ("
+                    + ", ".join(identity_mismatches)
+                    + "); discarding it"
                 )
                 if _discard_checkpoint_quietly(
                     client, item, assignment, reason="incompatible",
@@ -2347,7 +2378,9 @@ def _resume_one_checkpoint(
                 )
                 return "recovery-exhausted"
 
-            wait_seconds = _checkpoint_backoff_seconds(item)
+            wait_seconds = _checkpoint_backoff_seconds(
+                item, generation=generation,
+            )
             if wait_seconds > 0:
                 print(
                     f"  {assignment_id}: checkpoint recovery backoff "
@@ -2365,7 +2398,7 @@ def _resume_one_checkpoint(
             try:
                 data = client.checkpoint_resume(
                     assignment_id, item.checkpoint_id,
-                    item.resume_generation,
+                    generation,
                     session_id=telemetry.session_id if telemetry else None,
                 )
             except ApiError as exc:
@@ -2384,6 +2417,27 @@ def _resume_one_checkpoint(
                 print(f"  {assignment_id}: couldn't resume checkpoint ({exc}); kept locally")
                 return "paused"
             resumed = data["assignment"]
+            resumed_generation = resumed.get("resume_generation")
+            if (
+                not isinstance(resumed_generation, int)
+                or isinstance(resumed_generation, bool)
+                or resumed_generation != generation + 1
+            ):
+                print(
+                    f"  {assignment_id}: server returned an invalid checkpoint "
+                    "generation; kept locally"
+                )
+                return "paused"
+            try:
+                checkpoints.persist_resume_generation(
+                    HOME, item, resumed_generation,
+                )
+            except (OSError, ValueError) as exc:
+                print(
+                    f"  {assignment_id}: couldn't persist the fenced checkpoint "
+                    f"generation ({exc}); kept locally"
+                )
+                return "paused"
             if telemetry:
                 telemetry.set_phase(
                     "running", assignment_id,

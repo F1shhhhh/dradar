@@ -161,7 +161,7 @@ def test_dsh_rejects_unverified_assignment_before_paid_run(
         _command(tmp_path, monkeypatch, assignment)
 
 
-def test_dsh_checkpoint_resume_is_rejected(
+def test_dsh_checkpoint_resume_passes_durable_metadata(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -171,16 +171,22 @@ def test_dsh_checkpoint_resume_is_rejected(
     (tasks / assignment["task_id"]).mkdir(parents=True)
     key = _key(tmp_path / "dsh-key")
 
-    with pytest.raises(RunnerError, match="checkpoints are not supported"):
-        runner.build_pier_command(
-            assignment,
-            tasks,
-            tmp_path / "jobs",
-            "job",
-            tmp_path,
-            resume_checkpoint=tmp_path / "checkpoint",
-            provider_auth_path=key,
-        )
+    checkpoint = tmp_path / "checkpoint"
+    command = runner.build_pier_command(
+        {**assignment, "resume_generation": 3},
+        tasks,
+        tmp_path / "jobs",
+        "job",
+        tmp_path,
+        resume_checkpoint=checkpoint,
+        provider_auth_path=key,
+    )
+    assert f"checkpoint_path={checkpoint}" in command
+    assert "checkpoint_enabled=true" in command
+    assert "checkpoint_assignment_id=a-dsh-1" in command
+    assert "checkpoint_task_id=task-1" in command
+    assert "checkpoint_effort=high" in command
+    assert "checkpoint_resume_generation=3" in command
 
 
 def test_dsh_process_env_strips_secret_and_isolates_adapter(

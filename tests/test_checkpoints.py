@@ -18,13 +18,14 @@ def _make_checkpoint(
     generation: int = 0,
     updated_at: str | None = None,
     suffix: str = "one",
+    manifest_overrides: dict | None = None,
 ) -> checkpoints.Checkpoint:
     job = home / "work" / "jobs" / f"a{assignment_id}-{suffix}"
     checkpoint = job / "task__trial" / "agent" / "checkpoint"
     checkpoint.mkdir(parents=True)
     heartbeat = updated_at or datetime.now(timezone.utc).isoformat()
     manifest = checkpoint / "checkpoint.json"
-    manifest.write_text(json.dumps({
+    payload = {
         "schema_version": 1,
         "checkpoint_id": checkpoint_id,
         "assignment_id": assignment_id,
@@ -38,7 +39,9 @@ def _make_checkpoint(
         "base_commit": "abc",
         "resume_generation": generation,
         "root_thread_id": "thread-1",
-    }))
+    }
+    payload.update(manifest_overrides or {})
+    manifest.write_text(json.dumps(payload))
     return next(item for item in checkpoints.scan(home)
                 if item.manifest_path == manifest)
 
@@ -73,6 +76,75 @@ def test_scan_reads_metadata_but_never_requires_nonce_or_account_token(tmp_path:
     raw = item.manifest_path.read_text().lower()
     assert "nonce" not in raw
     assert "account_token" not in raw
+
+
+def test_scan_reads_extended_harness_identity(tmp_path: Path):
+    item = _make_checkpoint(
+        tmp_path,
+        "e" * 32,
+        manifest_overrides={
+            "harness": "kimi-code",
+            "provider": "kimi-subscription",
+            "agent_version": "0.36.1",
+            "session_id": "session-12345678",
+        },
+    )
+    assert item.harness == "kimi-code"
+    assert item.provider == "kimi-subscription"
+    assert item.agent_version == "0.36.1"
+    assert item.session_id == "session-12345678"
+
+
+def test_scan_rejects_symlinked_checkpoint_root(tmp_path: Path):
+    aid = "b" * 32
+    real_home = tmp_path / "real"
+    real = _make_checkpoint(real_home, aid)
+    linked_job = tmp_path / "work" / "jobs" / f"a{aid}-linked"
+    checkpoint_parent = linked_job / "task__trial" / "agent"
+    checkpoint_parent.mkdir(parents=True)
+    (checkpoint_parent / "checkpoint").symlink_to(
+        real.checkpoint_dir, target_is_directory=True,
+    )
+
+    assert checkpoints.scan(tmp_path) == []
+
+
+def test_scan_rejects_manifest_assignment_mismatch(tmp_path: Path):
+    job_assignment = "b" * 32
+    item = _make_checkpoint(
+        tmp_path,
+        job_assignment,
+        manifest_overrides={"assignment_id": "c" * 32},
+    )
+
+    assert not item.valid
+    assert item.assignment_id == job_assignment
+    assert "does not match job directory" in (item.invalid_reason or "")
+
+
+def test_custom_checkpoint_runtime_identity_is_fail_closed(tmp_path: Path):
+    item = _make_checkpoint(
+        tmp_path,
+        "f" * 32,
+        manifest_overrides={
+            "harness": "kimi-code",
+            "provider": "kimi-subscription",
+            "agent_version": "0.36.1",
+        },
+    )
+    assignment = {
+        **_assignment("f" * 32),
+        "agent": "kimi-code",
+        "provider": "kimi-subscription",
+        "agent_version": "0.36.1",
+    }
+    assert runloop._checkpoint_identity_mismatches(item, assignment) == []
+    assert runloop._checkpoint_identity_mismatches(
+        item, {**assignment, "provider": "another-provider"},
+    ) == ["provider"]
+    assert runloop._checkpoint_identity_mismatches(
+        item, {**assignment, "agent_version": "0.99.0"},
+    ) == ["agent_version"]
 
 
 def test_corrupt_manifest_infers_assignment_from_job_name(tmp_path: Path):
@@ -189,6 +261,33 @@ def test_resume_one_passes_checkpoint_and_new_generation_to_runner(
     assert client.resumes[0][2] == 2
     assert seen["assignment"]["resume_generation"] == 3
     assert seen["checkpoint"].checkpoint_id == item.checkpoint_id
+
+
+def test_resume_uses_server_generation_and_persists_fence_before_runner(
+    tmp_path: Path, monkeypatch,
+):
+    aid = "5" * 32
+    item = _make_checkpoint(tmp_path, aid, generation=1)
+    assignment = _assignment(aid, generation=2)
+    client = _RecoveryClient(assignment)
+    seen = {}
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **k: "base")
+    monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
+
+    def fake_run(*args, **kwargs):
+        seen["persisted_generation"] = json.loads(
+            item.manifest_path.read_text()
+        )["resume_generation"]
+        return "submitted"
+
+    monkeypatch.setattr(runloop, "_run_and_submit", fake_run)
+
+    assert runloop._resume_one_checkpoint(
+        client, item, assignment, _args(), tmp_path / "tasks", None,
+    ) == "submitted"
+    assert client.resumes[0][2] == 2
+    assert seen["persisted_generation"] == 3
 
 
 def test_resume_registers_queued_then_announces_fenced_owner_after_success(

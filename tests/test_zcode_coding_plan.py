@@ -227,6 +227,9 @@ def test_pier_command_uses_private_zcode_adapter_without_secret(
     assert (home / runner.ZCODE_AGENT_MODULE_FILENAME).read_bytes() == (
         Path(runner.__file__).with_name("pier_zcode.py").read_bytes()
     )
+    assert (home / runner.CHECKPOINT_MODULE_FILENAME).read_bytes() == (
+        Path(runner.__file__).with_name("pier_checkpoint.py").read_bytes()
+    )
     env = runner._pier_process_env(_assignment(), zcode_module_dir=home)
     assert ZCODE_API_KEY_ENV not in env
     assert env["PYTHONPATH"] == str(home)
@@ -259,7 +262,7 @@ def test_unverified_zcode_assignment_fails_before_paid_run(
         )
 
 
-def test_zcode_checkpoint_resume_is_rejected(
+def test_zcode_checkpoint_resume_is_forwarded_with_exact_runtime_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(runner.shutil, "which", lambda _name: "/usr/bin/pier")
@@ -267,13 +270,23 @@ def test_zcode_checkpoint_resume_is_rejected(
     (tasks / "task-1").mkdir(parents=True)
     cli = tmp_path / "zcode.cjs"
     cli.write_text("pinned")
-    with pytest.raises(RunnerError, match="checkpoints are not supported"):
-        runner.build_pier_command(
-            _assignment(), tasks, tmp_path / "jobs", "job", tmp_path,
-            resume_checkpoint=tmp_path / "checkpoint",
-            provider_auth_path=_private(tmp_path / "key"),
-            provider_cli_path=cli,
-        )
+    checkpoint = tmp_path / "checkpoint"
+    command = runner.build_pier_command(
+        _assignment(resume_generation=3), tasks, tmp_path / "jobs", "job", tmp_path,
+        resume_checkpoint=checkpoint,
+        provider_auth_path=_private(tmp_path / "key"),
+        provider_cli_path=cli,
+    )
+    values = [
+        command[index + 1]
+        for index, value in enumerate(command[:-1]) if value == "--ak"
+    ]
+    assert "checkpoint_enabled=true" in values
+    assert "checkpoint_assignment_id=a-zcode-1" in values
+    assert "checkpoint_task_id=task-1" in values
+    assert "checkpoint_effort=high" in values
+    assert "checkpoint_resume_generation=3" in values
+    assert f"checkpoint_path={checkpoint}" in values
 
 
 def test_zcode_adapter_source_has_fixed_security_contract() -> None:
@@ -296,6 +309,51 @@ def test_zcode_adapter_source_has_fixed_security_contract() -> None:
     assert "deadline = time.monotonic() + session_timeout_sec" in source
     assert "90 * 60" not in source
     assert "dradar-zcode-runtime-v1" in source
+    assert "from _dradar_pier_checkpoint import DurableCheckpoint, StatePath" in source
+    assert 'StatePath("xdg-data", (self._REMOTE_HOME / "data").as_posix())' in source
+    assert 'self._REMOTE_USER_HOME / ".zcode" / "cli" / "rollout"' in source
+    assert 'self._REMOTE_HOME / "config"' not in source
+    assert "sensitive_values=(key_value,)" in source
+    assert "await self._checkpoint.start(self, environment, env)" in source
+    assert "await self._checkpoint.finish(" in source
+
+
+def test_zcode_protocol_uses_native_resume_without_changing_instruction() -> None:
+    source = Path(providers.__file__).with_name("pier_zcode.py").read_text()
+    module = ast.parse(source)
+    runner_assignment = next(
+        node for node in module.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "_PROTOCOL_RUNNER"
+                for target in node.targets)
+    )
+    runner_source = ast.literal_eval(runner_assignment.value)
+    ast.parse(runner_source)
+    assert '"session/resume"' in runner_source
+    assert '"sessionId": resume_session_id' in runner_source
+    assert '"runtimeModel": runtime_model' in runner_source
+    assert '"content": instruction' in runner_source
+    assert "continue from" not in runner_source.lower()
+    assert "continue working" not in runner_source.lower()
+    assert "starting_turn_count" in runner_source
+    assert "turns > starting_turn_count" in runner_source
+
+
+def test_zcode_session_id_is_durable_before_the_paid_turn() -> None:
+    source = Path(providers.__file__).with_name("pier_zcode.py").read_text()
+    module = ast.parse(source)
+    runner_assignment = next(
+        node for node in module.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "_PROTOCOL_RUNNER"
+                for target in node.targets)
+    )
+    runner_source = ast.literal_eval(runner_assignment.value)
+    write_at = runner_source.index("session_tmp.write_text(session_id")
+    replace_at = runner_source.index("os.replace(session_tmp, session_path)")
+    unlink_at = runner_source.index("key_file.unlink()", replace_at)
+    send_at = runner_source.index('call("session/send"', unlink_at)
+    assert write_at < replace_at < unlink_at < send_at
 
 
 def test_zcode_session_deadline_tracks_long_assignment_budget(

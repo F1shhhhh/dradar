@@ -24,6 +24,7 @@ from pier.models.agent.network import NetworkAllowlist
 from pier.models.trajectories import Agent, FinalMetrics, Step, Trajectory
 from pier.utils.trajectory_metrics import populate_context_from_final_metrics
 
+from _dradar_pier_checkpoint import DurableCheckpoint, StatePath
 from _dradar_kimi_recovery import (
     KIMI_PROVIDER_CONNECTION_EXIT_CODE,
     kimi_provider_connection_stderr_is_retryable,
@@ -526,6 +527,12 @@ class KimiCode(BaseInstalledAgent):
         kimi_cli_file: str,
         reasoning_effort: str,
         shared_oauth: bool = False,
+        checkpoint_enabled: str | bool = False,
+        checkpoint_assignment_id: str | None = None,
+        checkpoint_task_id: str | None = None,
+        checkpoint_effort: str | None = None,
+        checkpoint_resume_generation: str | int = 0,
+        checkpoint_path: str | None = None,
         **kwargs: Any,
     ):
         auth = Path(auth_json_file)
@@ -536,6 +543,8 @@ class KimiCode(BaseInstalledAgent):
             raise ValueError("Verified host Kimi CLI executable is missing")
         if reasoning_effort not in {"low", "high", "max"}:
             raise ValueError("Kimi reasoning_effort must be low, high, or max")
+        if checkpoint_effort is not None and checkpoint_effort != reasoning_effort:
+            raise ValueError("Kimi checkpoint effort must match reasoning_effort")
         if not isinstance(shared_oauth, bool):
             raise ValueError("Kimi shared_oauth must be a boolean")
         try:
@@ -557,6 +566,33 @@ class KimiCode(BaseInstalledAgent):
         self._resume_attempts = 0
         self._session_id: str | None = None
         super().__init__(*args, **kwargs)
+        self._checkpoint = DurableCheckpoint(
+            logs_dir=self.logs_dir,
+            enabled=checkpoint_enabled,
+            assignment_id=checkpoint_assignment_id,
+            task_id=checkpoint_task_id,
+            model=self.model_name,
+            effort=checkpoint_effort or reasoning_effort,
+            resume_generation=checkpoint_resume_generation,
+            checkpoint_path=checkpoint_path,
+            harness=self.name(),
+            provider="kimi-subscription",
+            agent_version=self._version or KIMI_CLI_VERSION,
+            state_paths=(
+                StatePath("sessions", (self._REMOTE_HOME / "sessions").as_posix()),
+                StatePath("stream", f"/logs/agent/{self._STREAM_FILE}"),
+            ),
+            sensitive_values=self._credential_values,
+            session_probe=(
+                "candidate=$(find "
+                + shlex.quote((self._REMOTE_HOME / "sessions").as_posix())
+                + " -type f -path '*/agents/main/wire.jsonl' -print "
+                "2>/dev/null | sort | tail -n 1); "
+                "if [ -n \"$candidate\" ]; then "
+                "session_dir=${candidate%/agents/main/wire.jsonl}; "
+                "basename \"$session_dir\"; fi"
+            ),
+        )
 
     def get_version_command(self) -> str:
         return f"{self._REMOTE_CLI.as_posix()} --version"
@@ -691,6 +727,7 @@ class KimiCode(BaseInstalledAgent):
             "--output-format", "stream-json",
             "--skills-dir", remote_skills,
         ]
+        checkpoint_session: str | None = None
 
         def shared_oauth_guarded_command(command: str) -> str:
             """Keep container-created refresh files owned by the host user.
@@ -769,17 +806,23 @@ class KimiCode(BaseInstalledAgent):
             return validated_session_id(result.stdout)
 
         async def run_initial() -> None:
-            await self.exec_as_agent(
-                environment,
-                command=command_for(["--prompt", instruction], append=False),
-                env=env,
-            )
+            if checkpoint_session is not None:
+                await run_resume(checkpoint_session, instruction)
+            else:
+                await self.exec_as_agent(
+                    environment,
+                    command=command_for(
+                        ["--prompt", instruction],
+                        append=self._checkpoint.previous is not None,
+                    ),
+                    env=env,
+                )
 
-        async def run_resume(session_id: str, prompt: str) -> None:
+        async def run_resume(session_id: str, _prompt: str) -> None:
             await self.exec_as_agent(
                 environment,
                 command=command_for(
-                    ["--session", session_id, "--prompt", prompt], append=True,
+                    ["--session", session_id, "--prompt", instruction], append=True,
                 ),
                 env=env,
             )
@@ -806,14 +849,44 @@ class KimiCode(BaseInstalledAgent):
                 attempt,
             )
 
+        completed = False
+        failure: BaseException | None = None
         try:
-            self._resume_attempts, self._session_id = await run_with_kimi_resume(
+            checkpoint_session = await self._checkpoint.start(
+                self, environment, env,
+            )
+            if checkpoint_session is not None:
+                native = await self.exec_as_agent(
+                    environment,
+                    command=(
+                        "if [ -f "
+                        + shlex.quote(
+                            f"{remote_home}/sessions/{checkpoint_session}"
+                            "/agents/main/wire.jsonl"
+                        )
+                        + " ]; then printf '%s\\n' "
+                        + shlex.quote(checkpoint_session)
+                        + "; fi"
+                    ),
+                    env=env,
+                )
+                if validated_session_id(native.stdout) != checkpoint_session:
+                    checkpoint_session = None
+                    self._checkpoint.session_id = None
+            self._session_id = checkpoint_session
+            resume_attempts, runtime_session = await run_with_kimi_resume(
                 run_initial=run_initial,
                 find_session_id=remote_session_id,
                 run_resume=run_resume,
                 on_retry=announce_retry,
                 classify_retryable_error=classify_retryable_error,
             )
+            self._resume_attempts = resume_attempts
+            self._session_id = runtime_session or checkpoint_session
+            completed = True
+        except BaseException as exc:
+            failure = exc
+            raise
         finally:
             try:
                 recovered_session_id = await remote_session_id(copy_log=True)
@@ -821,6 +894,14 @@ class KimiCode(BaseInstalledAgent):
                     self._session_id = recovered_session_id
             except Exception as exc:
                 self.logger.warning("Could not recover Kimi session log: %s", exc)
+            await self._checkpoint.finish(
+                self,
+                environment,
+                env,
+                completed=completed,
+                failure=failure,
+                session_id=self._session_id,
+            )
             if not self._shared_oauth:
                 try:
                     await environment.download_file(remote_auth, self._auth_json_file)

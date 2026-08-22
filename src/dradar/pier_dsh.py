@@ -22,6 +22,13 @@ from pier.models.agent.context import AgentContext
 from pier.models.agent.install import AgentInstallSpec, InstallStep
 from pier.models.agent.network import NetworkAllowlist
 
+try:
+    from _dradar_pier_checkpoint import DurableCheckpoint, StatePath
+except ModuleNotFoundError as exc:  # Local source/test import before materialization.
+    if exc.name != "_dradar_pier_checkpoint":
+        raise
+    from dradar.pier_checkpoint import DurableCheckpoint, StatePath
+
 DSH_VERSION = "0.1.1-rc.1"
 NODE_VERSION = "22.23.2"
 NODE_SHA256 = {
@@ -265,24 +272,38 @@ async function run(ctx, task, io) {
     });
   }
   const preset = await presets.resolve("minimal");
-  const { agent } = await agents.create({
-    sessionId: SessionId(`session-${randomUUID()}`),
-    meta: { cwd: process.cwd(), agentPreset: preset.id },
-    agentOptions: {
-      provider: selection.provider,
-      model: selection.model,
-    },
-    setup: async (agentCtx) => {
-      installModelSelection(agentCtx, {
-        current: selection,
-        assembled: undefined,
-      });
-      await presets.mount(agentCtx, preset.id);
-    },
+  const resumeSessionId = process.env.DSH_RESUME_SESSION_ID?.trim() || null;
+  const agentOptions = {
+    provider: selection.provider,
+    model: selection.model,
+  };
+  const setup = async (agentCtx) => {
+    installModelSelection(agentCtx, {
+      current: selection,
+      assembled: undefined,
+    });
+    await presets.mount(agentCtx, preset.id);
+  };
+  const { agent } = resumeSessionId === null
+    ? await agents.create({
+      sessionId: SessionId(`session-${randomUUID()}`),
+      meta: { cwd: process.cwd(), agentPreset: preset.id },
+      agentOptions,
+      setup,
+    })
+    : await agents.resume({
+      resumeSessionId: SessionId(resumeSessionId),
+      agentOptions,
+      setup,
+    });
+  writeFileSync(process.env.DSH_SESSION_ID_FILE, String(agent.session.id) + "\n", {
+    encoding: "utf8",
+    mode: 0o600,
   });
 
   await agent.whenIdle();
-  const firstSeq = agent.session.seq;
+  // Resumed runs send exactly the benchmark instruction again.  No recovery
+  // wording is appended, which keeps prompts identical across harnesses.
   agent.followup(createUserMessage({
     content: [
       { type: "text", text: task },
@@ -292,7 +313,9 @@ async function run(ctx, task, io) {
   }));
   await agent.whenIdle();
   await sessions.flush(agent.session);
-  const outcome = summarize(agent.session.events, firstSeq);
+  // The restored transcript is the usage ledger.  Re-fold the whole session
+  // so every generation is billed exactly once in the final result.
+  const outcome = summarize(agent.session.events, 0);
   const terminalKind = outcome.reason?.kind;
   writeFileSync(process.env.DSH_OUTCOME_FILE, JSON.stringify({
     schema: "dradar-dsh-outcome-v1",
@@ -301,6 +324,7 @@ async function run(ctx, task, io) {
     taskId: process.env.DRADAR_TASK_ID ?? null,
     assignmentModel: process.env.DRADAR_ASSIGNMENT_MODEL ?? null,
     reasoningEffort: process.env.DSH_REASONING_EFFORT ?? null,
+    resumed: resumeSessionId !== null,
     visionInputAttached: imageRef !== null,
     visionInput: imageRef === null ? null : {
       attachmentId: String(imageRef.attachmentId),
@@ -416,6 +440,12 @@ class DshMinimal(BaseInstalledAgent):
         artifact_assignment_id: str | None = None,
         artifact_run_id: str | None = None,
         artifact_task_id: str | None = None,
+        checkpoint_enabled: str | bool = False,
+        checkpoint_assignment_id: str | None = None,
+        checkpoint_task_id: str | None = None,
+        checkpoint_effort: str | None = None,
+        checkpoint_resume_generation: str | int = 0,
+        checkpoint_path: str | None = None,
         extra_env: dict[str, str] | None = None,
         **kwargs: Any,
     ):
@@ -444,6 +474,11 @@ class DshMinimal(BaseInstalledAgent):
         runtime_model = RUNTIME_MODELS[assignment_model]
         if reasoning_effort not in SUPPORTED_REASONING_EFFORTS:
             raise ValueError("DSH reasoning_effort must be off, high, or max")
+        if (
+            checkpoint_effort is not None
+            and checkpoint_effort != reasoning_effort
+        ):
+            raise ValueError("DSH checkpoint effort must match reasoning_effort")
         for label, value in (
             ("assignment", artifact_assignment_id),
             ("artifact run", artifact_run_id),
@@ -493,6 +528,13 @@ class DshMinimal(BaseInstalledAgent):
         self._artifact_assignment_id = artifact_assignment_id
         self._artifact_run_id = artifact_run_id
         self._artifact_task_id = artifact_task_id
+        self._checkpoint_enabled = checkpoint_enabled
+        self._checkpoint_assignment_id = checkpoint_assignment_id
+        self._checkpoint_task_id = checkpoint_task_id
+        self._checkpoint_effort = checkpoint_effort or reasoning_effort
+        self._checkpoint_resume_generation = checkpoint_resume_generation
+        self._checkpoint_path = checkpoint_path
+        self._checkpoint_sensitive_values = (key_bytes.strip(),)
         run_secret_dir = self._REMOTE_SECRET_ROOT / uuid.uuid4().hex
         self._remote_secret_dir = run_secret_dir
         self._remote_api_key = run_secret_dir / "deepseek-api-key"
@@ -549,6 +591,7 @@ class DshMinimal(BaseInstalledAgent):
         stream = f"{remote_home}/{self._STREAM_FILE}"
         usage_file = f"{remote_home}/{self._USAGE_FILE}"
         outcome_file = f"{remote_home}/{self._OUTCOME_FILE}"
+        session_id_file = "/logs/agent/dsh-session-id"
 
         env = self.build_process_env(
             {
@@ -562,6 +605,7 @@ class DshMinimal(BaseInstalledAgent):
                 "DSH_CREDENTIALS_FILE": remote_credentials,
                 "DSH_USAGE_FILE": usage_file,
                 "DSH_OUTCOME_FILE": outcome_file,
+                "DSH_SESSION_ID_FILE": session_id_file,
                 "DRADAR_ASSIGNMENT_ID": self._artifact_assignment_id or "",
                 "DRADAR_ARTIFACT_RUN_ID": self._artifact_run_id or "",
                 "DRADAR_TASK_ID": self._artifact_task_id or "",
@@ -589,65 +633,116 @@ class DshMinimal(BaseInstalledAgent):
         # Pier bind-mounts /logs at runtime, so Dockerfile ownership does not
         # survive. Create and hand off all runtime directories after mounts.
         await self.exec_as_root(environment, command=setup_command, env=env)
-        local_patch = self.logs_dir / "dsh-minimal.patch.yml"
-        local_runner = self.logs_dir / "dsh-minimal-headless-runner.mjs"
-        local_patch.parent.mkdir(parents=True, exist_ok=True)
-        local_patch.write_text(_MINIMAL_PATCH, encoding="utf-8")
-        local_runner.write_text(_MINIMAL_HEADLESS_RUNNER, encoding="utf-8")
-        await environment.upload_file(self._api_key_file, remote_api_key)
-        await environment.upload_file(local_patch, remote_patch)
-        await environment.upload_file(local_runner, remote_runner)
-
-        chmod_command = (
-            f"chmod 600 {shlex.quote(remote_api_key)} "
-            f"&& chmod 644 {shlex.quote(remote_patch)} "
-            f"{shlex.quote(remote_runner)}"
+        checkpoint = DurableCheckpoint(
+            logs_dir=self.logs_dir,
+            enabled=self._checkpoint_enabled,
+            assignment_id=(
+                self._checkpoint_assignment_id or self._artifact_assignment_id
+            ),
+            task_id=self._checkpoint_task_id or self._artifact_task_id,
+            model=self._assignment_model,
+            effort=self._checkpoint_effort,
+            resume_generation=self._checkpoint_resume_generation,
+            checkpoint_path=self._checkpoint_path,
+            harness=self.name(),
+            provider="deepseek",
+            agent_version=DSH_VERSION,
+            state_paths=(
+                StatePath("dsh-sessions", f"{remote_home}/sessions"),
+                StatePath("dsh-attachments", f"{remote_home}/attachments"),
+            ),
+            session_probe=f"cat {shlex.quote(session_id_file)}",
+            sensitive_values=self._checkpoint_sensitive_values,
         )
-        if environment.default_user is not None:
-            await self.exec_as_root(
-                environment,
-                command=(
-                    f"chown {owner} {shlex.quote(remote_api_key)} "
-                    f"{shlex.quote(remote_patch)} {shlex.quote(remote_runner)} "
-                    f"&& {chmod_command}"
-                ),
-                env=env,
+        resume_session_id = await checkpoint.start(self, environment, env)
+        failure: BaseException | None = None
+        try:
+            if resume_session_id is not None:
+                env = dict(env)
+                env["DSH_RESUME_SESSION_ID"] = resume_session_id
+            # Restored archives may be uploaded as root by an environment
+            # backend. Re-assert ownership before DSH opens the session store.
+            if environment.default_user is not None:
+                await self.exec_as_root(
+                    environment,
+                    command=(
+                        f"chown -R {owner} {shlex.quote(remote_home)} "
+                        f"&& chmod 700 {shlex.quote(remote_home)}"
+                    ),
+                    env=env,
+                )
+            local_patch = self.logs_dir / "dsh-minimal.patch.yml"
+            local_runner = self.logs_dir / "dsh-minimal-headless-runner.mjs"
+            local_patch.parent.mkdir(parents=True, exist_ok=True)
+            local_patch.write_text(_MINIMAL_PATCH, encoding="utf-8")
+            local_runner.write_text(_MINIMAL_HEADLESS_RUNNER, encoding="utf-8")
+            await environment.upload_file(self._api_key_file, remote_api_key)
+            await environment.upload_file(local_patch, remote_patch)
+            await environment.upload_file(local_runner, remote_runner)
+
+            chmod_command = (
+                f"chmod 600 {shlex.quote(remote_api_key)} "
+                f"&& chmod 644 {shlex.quote(remote_patch)} "
+                f"{shlex.quote(remote_runner)}"
             )
-        else:
-            await self.exec_as_agent(environment, command=chmod_command, env=env)
+            if environment.default_user is not None:
+                await self.exec_as_root(
+                    environment,
+                    command=(
+                        f"chown {owner} {shlex.quote(remote_api_key)} "
+                        f"{shlex.quote(remote_patch)} {shlex.quote(remote_runner)} "
+                        f"&& {chmod_command}"
+                    ),
+                    env=env,
+                )
+            else:
+                await self.exec_as_agent(
+                    environment, command=chmod_command, env=env,
+                )
 
-        python_program = (
-            "import json,pathlib,sys;"
-            "key=pathlib.Path(sys.argv[1]).read_text().strip();"
-            "assert key and not any(c.isspace() for c in key);"
-            "pathlib.Path(sys.argv[2]).write_text("
-            "json.dumps({'DEEPSEEK_API_KEY':key})+'\\n')"
-        )
-        # Convert the uploaded raw key to DSH's 0600 credential document. DSH
-        # reads that document into its credential service without ever placing
-        # the key in its process environment. The pinned runner unlinks it
-        # immediately after DSH's loader completes and before it creates the
-        # agent or sends any model-facing content.
-        command = (
-            "set -euo pipefail; "
-            "cleanup_dsh_credentials() { "
-            f"rm -f {shlex.quote(remote_api_key)} {shlex.quote(remote_credentials)}; "
-            "}; "
-            "trap cleanup_dsh_credentials EXIT HUP INT TERM; "
-            f"python3 -c {shlex.quote(python_program)} "
-            f"{shlex.quote(remote_api_key)} {shlex.quote(remote_credentials)}; "
-            f"chmod 600 {shlex.quote(remote_credentials)}; "
-            f"rm -f {shlex.quote(remote_api_key)}; "
-            "cd /app; "
-            f"dsh --profile headless --patch {shlex.quote(remote_patch)} "
-            f"{shlex.quote(instruction)} 2>&1 </dev/null | tee {shlex.quote(stream)}"
-        )
-        await self.exec_as_agent(
-            environment,
-            command=command,
-            env=env,
-            cwd="/app",
-        )
+            python_program = (
+                "import json,pathlib,sys;"
+                "key=pathlib.Path(sys.argv[1]).read_text().strip();"
+                "assert key and not any(c.isspace() for c in key);"
+                "pathlib.Path(sys.argv[2]).write_text("
+                "json.dumps({'DEEPSEEK_API_KEY':key})+'\\n')"
+            )
+            # Convert the raw key to DSH's 0600 credential document. DSH reads
+            # it without placing the key in its environment, then the pinned
+            # runner unlinks it before creating or resuming the agent.
+            command = (
+                "set -euo pipefail; "
+                "cleanup_dsh_credentials() { "
+                f"rm -f {shlex.quote(remote_api_key)} "
+                f"{shlex.quote(remote_credentials)}; "
+                "}; "
+                "trap cleanup_dsh_credentials EXIT HUP INT TERM; "
+                f"python3 -c {shlex.quote(python_program)} "
+                f"{shlex.quote(remote_api_key)} {shlex.quote(remote_credentials)}; "
+                f"chmod 600 {shlex.quote(remote_credentials)}; "
+                f"rm -f {shlex.quote(remote_api_key)}; "
+                "cd /app; "
+                f"dsh --profile headless --patch {shlex.quote(remote_patch)} "
+                f"{shlex.quote(instruction)} 2>&1 </dev/null | "
+                f"tee {shlex.quote(stream)}"
+            )
+            await self.exec_as_agent(
+                environment,
+                command=command,
+                env=env,
+                cwd="/app",
+            )
+        except BaseException as exc:
+            failure = exc
+            raise
+        finally:
+            await checkpoint.finish(
+                self,
+                environment,
+                env,
+                completed=failure is None,
+                failure=failure,
+            )
 
     def populate_context_post_run(self, context: AgentContext) -> None:
         # DSH rc.6 does not expose a stable ATIF event stream. Keep this false

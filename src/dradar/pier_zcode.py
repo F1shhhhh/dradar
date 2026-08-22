@@ -2,8 +2,8 @@
 
 The adapter runs the official ZCode Protocol server from a digest-pinned
 desktop bundle.  The Coding Plan key is uploaded as an owner-only run file,
-moved into ZCode's in-memory session-secret store during ``session/create``,
-and then unlinked before the model is allowed to execute a tool.
+moved into ZCode's in-memory session-secret store during ``session/create`` or
+``session/resume``, and then unlinked before the model may execute a tool.
 """
 
 from __future__ import annotations
@@ -26,6 +26,11 @@ from pier.models.agent.install import AgentInstallSpec, InstallStep
 from pier.models.agent.network import NetworkAllowlist
 from pier.models.trajectories import Agent, FinalMetrics, Step, Trajectory
 from pier.utils.trajectory_metrics import populate_context_from_final_metrics
+
+try:
+    from _dradar_pier_checkpoint import DurableCheckpoint, StatePath
+except ModuleNotFoundError:  # Local source-tree tests import the packaged module.
+    from dradar.pier_checkpoint import DurableCheckpoint, StatePath
 
 
 ZCODE_CLI_VERSION = "0.16.3"
@@ -95,6 +100,7 @@ class ProtocolError(RuntimeError):
 (
     node, cli, key_path, instruction_path, effort, session_timeout_raw,
     outcome_path, events_path, stderr_path, diagnostic_path, compact_usage_path,
+    resume_session_id, session_id_path,
 ) = sys.argv[1:]
 try:
     session_timeout_sec = int(session_timeout_raw)
@@ -109,6 +115,38 @@ if not key or any(character.isspace() for character in key):
 instruction = Path(instruction_path).read_text(encoding="utf-8")
 if not instruction.strip():
     raise ProtocolError("instruction is empty")
+if resume_session_id and not resume_session_id.startswith("sess_"):
+    raise ProtocolError("checkpoint session id is invalid")
+
+
+workspace = {"workspacePath": "/app", "workspaceKey": "dradar-zcode"}
+runtime_model = {
+    "revision": "dradar-zcode-glm-5.3-v1",
+    "generatedAt": int(time.time() * 1000),
+    "model": {"providerId": "bigmodel-coding-plan", "modelId": "glm-5.3"},
+    "provider": {
+        "providerId": "bigmodel-coding-plan",
+        "kind": "anthropic",
+        "apiFormat": "anthropic-messages",
+        "label": "BigModel Coding Plan",
+        "source": "ephemeral",
+        "baseURL": "https://open.bigmodel.cn/api/anthropic",
+        "apiKey": {"source": "inline", "value": key},
+        "apiKeyRequired": True,
+        "models": [{"modelId": "glm-5.3", "label": "GLM-5.3"}],
+    },
+    "thoughtLevel": effort,
+}
+tool_allowlist = [
+    "Read", "Write", "Edit", "ApplyPatch", "Bash", "Glob", "Grep",
+    "TodoRead", "TodoWrite",
+]
+tool_denylist = [
+    "WebFetch", "WebSearch", "web_search", "Agent", "Task", "Skill",
+    "AskUserQuestion", "SendMessage", "RespondToCoordinator", "TaskOutput",
+    "TaskStop", "js", "js_reset", "js_add_node_module_dir",
+    "mcp__node_repl__*",
+]
 
 
 def redact(value):
@@ -587,54 +625,56 @@ def optional_call(method, params, *, timeout=30.0):
 session_id = None
 outcome = None
 compact_collector = None
+resumed_from_checkpoint = bool(resume_session_id)
 try:
-    created = call(
-        "session/create",
-        {
-            "workspace": {"workspacePath": "/app", "workspaceKey": "dradar-zcode"},
-            "runtimeModel": {
-                "revision": "dradar-zcode-glm-5.3-v1",
-                "generatedAt": int(time.time() * 1000),
-                "model": {"providerId": "bigmodel-coding-plan", "modelId": "glm-5.3"},
-                "provider": {
-                    "providerId": "bigmodel-coding-plan",
-                    "kind": "anthropic",
-                    "apiFormat": "anthropic-messages",
-                    "label": "BigModel Coding Plan",
-                    "source": "ephemeral",
-                    "baseURL": "https://open.bigmodel.cn/api/anthropic",
-                    "apiKey": {"source": "inline", "value": key},
-                    "apiKeyRequired": True,
-                    "models": [{"modelId": "glm-5.3", "label": "GLM-5.3"}],
-                },
+    if resumed_from_checkpoint:
+        created = call(
+            "session/resume",
+            {
+                "sessionId": resume_session_id,
+                "workspace": workspace,
+                "runtimeModel": runtime_model,
                 "thoughtLevel": effort,
+                "mcpServers": [],
+                "toolAllowlist": tool_allowlist,
+                "toolDenylist": tool_denylist,
             },
-            "thoughtLevel": effort,
-            "mode": "yolo",
-            "persistence": "deferred",
-            "titleGenerationEnabled": False,
-            "mcpServers": [],
-            "toolAllowlist": [
-                "Read", "Write", "Edit", "ApplyPatch", "Bash", "Glob", "Grep",
-                "TodoRead", "TodoWrite",
-            ],
-            # ZCode normalizes deny rules such as ``Read(/tmp/...)`` to the
-            # tool name before registering tools, so path-shaped rules would
-            # disable the coding tool completely.  The key file is instead
-            # unlinked below before the first model-controlled tool can run.
-            "toolDenylist": [
-                "WebFetch", "WebSearch", "web_search", "Agent", "Task", "Skill",
-                "AskUserQuestion", "SendMessage", "RespondToCoordinator", "TaskOutput",
-                "TaskStop", "js", "js_reset", "js_add_node_module_dir",
-                "mcp__node_repl__*",
-            ],
-        },
-        timeout=120.0,
-    )
+            timeout=120.0,
+        )
+    else:
+        created = call(
+            "session/create",
+            {
+                "workspace": workspace,
+                "runtimeModel": runtime_model,
+                "thoughtLevel": effort,
+                "mode": "yolo",
+                "persistence": "deferred",
+                "titleGenerationEnabled": False,
+                "mcpServers": [],
+                "toolAllowlist": tool_allowlist,
+                # ZCode normalizes deny rules such as ``Read(/tmp/...)`` to the
+                # tool name before registering tools, so path-shaped rules would
+                # disable the coding tool completely.  The key file is instead
+                # unlinked below before the first model-controlled tool can run.
+                "toolDenylist": tool_denylist,
+            },
+            timeout=120.0,
+        )
     session = created.get("session") if isinstance(created, dict) else None
-    session_id = session.get("sessionId") if isinstance(session, dict) else None
+    session_id = session.get("sessionId") if isinstance(session, dict) else (
+        resume_session_id if resumed_from_checkpoint else None
+    )
     if not isinstance(session_id, str) or not session_id.startswith("sess_"):
-        raise ProtocolError("session/create returned no valid session id")
+        raise ProtocolError("ZCode returned no valid session id")
+    if resumed_from_checkpoint and session_id != resume_session_id:
+        raise ProtocolError("session/resume returned a different session id")
+    session_path = Path(session_id_path)
+    session_path.parent.mkdir(parents=True, exist_ok=True)
+    session_tmp = session_path.with_suffix(session_path.suffix + ".tmp")
+    session_tmp.write_text(session_id + "\n", encoding="utf-8")
+    os.chmod(session_tmp, 0o600)
+    os.replace(session_tmp, session_path)
     compact_collector = CompactRolloutUsageCollector(
         session_id, compact_usage_path,
     )
@@ -644,15 +684,37 @@ try:
         item.get("value") for item in thought.get("available", [])
         if isinstance(item, dict)
     } if isinstance(thought, dict) else set()
-    if thought.get("current") != effort or available != {"low", "high", "max"}:
+    if (not resumed_from_checkpoint
+            and (thought.get("current") != effort
+                 or available != {"low", "high", "max"})):
         raise ProtocolError("ZCode did not apply the requested GLM-5.3 thought level")
     projection = created.get("projection") if isinstance(created, dict) else None
-    if not isinstance(projection, dict) or projection.get("contextWindow") != 1000000:
+    if (not resumed_from_checkpoint
+            and (not isinstance(projection, dict)
+                 or projection.get("contextWindow") != 1000000)):
         raise ProtocolError("ZCode did not materialize the pinned GLM-5.3 model")
+    starting_turn_count = 0
+    if resumed_from_checkpoint:
+        restored_state = call(
+            "session/read", {"sessionId": session_id}, timeout=60.0,
+        )
+        restored_projection = (
+            restored_state.get("projection")
+            if isinstance(restored_state, dict) else None
+        )
+        restored_turns = (
+            restored_projection.get("turnCount", 0)
+            if isinstance(restored_projection, dict) else 0
+        )
+        if not isinstance(restored_turns, int) or isinstance(restored_turns, bool):
+            raise ProtocolError("resumed ZCode session has an invalid turn count")
+        starting_turn_count = max(0, restored_turns)
 
     # ZCode has replaced the inline value with an in-memory session-secret ref.
     # Remove the only filesystem copy before any model-controlled tool can run.
     key_file.unlink()
+    # A resumed session is continued with the byte-for-byte original benchmark
+    # instruction.  No recovery hint or harness-specific wording is appended.
     call("session/send", {"sessionId": session_id, "content": instruction}, timeout=120.0)
 
     deadline = time.monotonic() + session_timeout_sec
@@ -668,13 +730,15 @@ try:
         if status not in {None, "idle"}:
             seen_running = True
         terminal_observed = (
-            (isinstance(turns, int) and turns > 0 and status == "idle")
+            (isinstance(turns, int)
+             and turns > starting_turn_count and status == "idle")
             or status in {"error", "failed", "stopped"}
         )
         write_runtime_diagnostic(
             status, turns, seen_running, terminal_observed,
         )
-        if isinstance(turns, int) and turns > 0 and status == "idle":
+        if (isinstance(turns, int)
+                and turns > starting_turn_count and status == "idle"):
             final_state = state
             break
         if status in {"error", "failed", "stopped"}:
@@ -711,6 +775,7 @@ try:
         "sessionId": session_id,
         "model": "glm-5.3",
         "reasoningEffort": effort,
+        "resumedFromCheckpoint": resumed_from_checkpoint,
         "seenRunning": seen_running,
         "state": final_state,
         "messages": messages,
@@ -1043,6 +1108,7 @@ class ZCodeBigModel(BaseInstalledAgent):
     _STDERR_FILE = "zcode-stderr.log"
     _DIAGNOSTIC_FILE = "zcode-runtime-diagnostic.json"
     _COMPACT_USAGE_FILE = "zcode-compact-usage.jsonl"
+    _SESSION_ID_FILE = "zcode-session-id"
     _STREAM_FILE = "zcode-protocol.log"
     _USAGE_FILE = "provider-usage.json"
 
@@ -1057,6 +1123,12 @@ class ZCodeBigModel(BaseInstalledAgent):
         zcode_cli_file: str,
         reasoning_effort: str,
         session_timeout_sec: str | int,
+        checkpoint_enabled: str | bool = False,
+        checkpoint_assignment_id: str | None = None,
+        checkpoint_task_id: str | None = None,
+        checkpoint_effort: str | None = None,
+        checkpoint_resume_generation: str | int = 0,
+        checkpoint_path: str | None = None,
         model_name: str | None = None,
         version: str | None = ZCODE_CLI_VERSION,
         **kwargs: Any,
@@ -1085,6 +1157,8 @@ class ZCodeBigModel(BaseInstalledAgent):
             raise ValueError("ZCode adapter enables only glm-5.3")
         if reasoning_effort not in SUPPORTED_EFFORTS:
             raise ValueError("ZCode reasoning_effort must be low, high, or max")
+        if checkpoint_effort is not None and checkpoint_effort != reasoning_effort:
+            raise ValueError("ZCode checkpoint effort must match reasoning_effort")
         try:
             resolved_session_timeout = int(session_timeout_sec)
         except (TypeError, ValueError) as exc:
@@ -1115,6 +1189,32 @@ class ZCodeBigModel(BaseInstalledAgent):
         self._remote_secret_dir = run_secret_dir
         self._remote_api_key = run_secret_dir / "coding-plan-key"
         super().__init__(*args, model_name="glm-5.3", version=resolved_version, **kwargs)
+        self._checkpoint = DurableCheckpoint(
+            logs_dir=self.logs_dir,
+            enabled=checkpoint_enabled,
+            assignment_id=checkpoint_assignment_id,
+            task_id=checkpoint_task_id,
+            model="glm-5.3",
+            effort=checkpoint_effort or reasoning_effort,
+            resume_generation=checkpoint_resume_generation,
+            checkpoint_path=checkpoint_path,
+            harness=self.name(),
+            provider="bigmodel-coding-plan",
+            agent_version=resolved_version,
+            state_paths=(
+                StatePath("xdg-data", (self._REMOTE_HOME / "data").as_posix()),
+                StatePath(
+                    "zcode-rollout",
+                    (
+                        self._REMOTE_USER_HOME / ".zcode" / "cli" / "rollout"
+                    ).as_posix(),
+                ),
+            ),
+            sensitive_values=(key_value,),
+            session_probe=(
+                f"cat /logs/agent/{self._SESSION_ID_FILE}"
+            ),
+        )
 
     def get_version_command(self) -> str:
         return "true"
@@ -1162,6 +1262,7 @@ class ZCodeBigModel(BaseInstalledAgent):
         stderr = f"/logs/agent/{self._STDERR_FILE}"
         diagnostic = f"/logs/agent/{self._DIAGNOSTIC_FILE}"
         compact_usage = f"/logs/agent/{self._COMPACT_USAGE_FILE}"
+        session_id_path = f"/logs/agent/{self._SESSION_ID_FILE}"
         stream = f"/logs/agent/{self._STREAM_FILE}"
         instruction_path = f"{remote_secret}/instruction.txt"
         env = self.build_process_env({
@@ -1184,56 +1285,88 @@ class ZCodeBigModel(BaseInstalledAgent):
         setup += " && chmod 700 " + " ".join(shlex.quote(item) for item in directories)
         await self.exec_as_agent(environment, command=setup, env=env)
 
-        local_runner = self.logs_dir / "zcode-protocol-runner.py"
-        local_instruction = self.logs_dir / "zcode-instruction.txt"
-        local_runner.parent.mkdir(parents=True, exist_ok=True)
-        local_runner.write_text(_PROTOCOL_RUNNER, encoding="utf-8")
-        local_instruction.write_text(instruction, encoding="utf-8")
-        await environment.upload_file(self._zcode_cli_file, remote_cli)
-        await environment.upload_file(local_runner, remote_runner)
-        await environment.upload_file(local_instruction, instruction_path)
-        await environment.upload_file(self._api_key_file, remote_key)
-        targets = " ".join(
-            shlex.quote(item)
-            for item in (remote_cli, remote_runner, instruction_path, remote_key)
-        )
-        if environment.default_user is not None:
-            await self.exec_as_root(
+        failure: BaseException | None = None
+        completed = False
+        resume_session_id: str | None = None
+        try:
+            resume_session_id = await self._checkpoint.start(self, environment, env)
+
+            local_runner = self.logs_dir / "zcode-protocol-runner.py"
+            local_instruction = self.logs_dir / "zcode-instruction.txt"
+            local_runner.parent.mkdir(parents=True, exist_ok=True)
+            local_runner.write_text(_PROTOCOL_RUNNER, encoding="utf-8")
+            local_instruction.write_text(instruction, encoding="utf-8")
+            await environment.upload_file(self._zcode_cli_file, remote_cli)
+            await environment.upload_file(local_runner, remote_runner)
+            await environment.upload_file(local_instruction, instruction_path)
+            await environment.upload_file(self._api_key_file, remote_key)
+            targets = " ".join(
+                shlex.quote(item)
+                for item in (remote_cli, remote_runner, instruction_path, remote_key)
+            )
+            if environment.default_user is not None:
+                await self.exec_as_root(
+                    environment,
+                    command=(
+                        f"chown {shlex.quote(str(environment.default_user))} {targets} "
+                        f"&& chmod 600 {targets}"
+                    ),
+                    env=env,
+                )
+            else:
+                await self.exec_as_agent(
+                    environment, command=f"chmod 600 {targets}", env=env,
+                )
+            version_pattern = ZCODE_CLI_VERSION.replace(".", r"\.")
+            await self.exec_as_agent(
                 environment,
                 command=(
-                    f"chown {shlex.quote(str(environment.default_user))} {targets} "
-                    f"&& chmod 600 {targets}"
+                    f"node {shlex.quote(remote_cli)} version "
+                    f"| grep -Eq '(^| ){version_pattern}( |$)'"
                 ),
                 env=env,
             )
-        else:
+            args = " ".join(
+                shlex.quote(item)
+                for item in (
+                    "node", remote_cli, remote_key, instruction_path,
+                    self._reasoning_effort, str(self._session_timeout_sec),
+                    outcome, events, stderr, diagnostic, compact_usage,
+                    resume_session_id or "", session_id_path,
+                )
+            )
+            command = (
+                "set -o pipefail; "
+                f"trap 'rm -f {shlex.quote(remote_key)}' EXIT HUP INT TERM; "
+                f"cd /app; python3 {shlex.quote(remote_runner)} {args} "
+                f"2>&1 | tee {shlex.quote(stream)}"
+            )
             await self.exec_as_agent(
-                environment, command=f"chmod 600 {targets}", env=env,
+                environment, command=command, env=env, cwd="/app",
             )
-        version_pattern = ZCODE_CLI_VERSION.replace(".", r"\.")
-        await self.exec_as_agent(
-            environment,
-            command=(
-                f"node {shlex.quote(remote_cli)} version "
-                f"| grep -Eq '(^| ){version_pattern}( |$)'"
-            ),
-            env=env,
-        )
-        args = " ".join(
-            shlex.quote(item)
-            for item in (
-                "node", remote_cli, remote_key, instruction_path,
-                self._reasoning_effort, str(self._session_timeout_sec),
-                outcome, events, stderr, diagnostic, compact_usage,
+            completed = True
+        except BaseException as exc:
+            failure = exc
+            raise
+        finally:
+            checkpoint_session_id = None
+            local_session_id = self.logs_dir / self._SESSION_ID_FILE
+            try:
+                candidate = local_session_id.read_text(
+                    encoding="utf-8", errors="replace",
+                ).strip()
+                if candidate.startswith("sess_") and len(candidate) <= 160:
+                    checkpoint_session_id = candidate
+            except OSError:
+                pass
+            await self._checkpoint.finish(
+                self,
+                environment,
+                env,
+                completed=completed,
+                failure=failure,
+                session_id=checkpoint_session_id,
             )
-        )
-        command = (
-            "set -o pipefail; "
-            f"trap 'rm -f {shlex.quote(remote_key)}' EXIT HUP INT TERM; "
-            f"cd /app; python3 {shlex.quote(remote_runner)} {args} "
-            f"2>&1 | tee {shlex.quote(stream)}"
-        )
-        await self.exec_as_agent(environment, command=command, env=env, cwd="/app")
 
     def _redact_or_reject_credential_output(self, paths: list[Path]) -> None:
         leaked = False

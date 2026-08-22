@@ -1,5 +1,6 @@
 """DeepSeek V4 Flash / Pro are additive, public-safe Codex providers."""
 
+import ast
 import hashlib
 import json
 import os
@@ -146,18 +147,18 @@ def test_command_uses_official_catalog_adapter_and_auth_without_secret_env(
     command, home = _command(tmp_path, monkeypatch)
     joined = " ".join(command)
 
-    assert command[:5] == [
-        "/usr/bin/pier", "--isolated", "--from",
-        "datacurve-pier==0.3.0", "pier",
-    ]
+    assert command[:2] == ["/usr/bin/pier", "run"]
     assert command[command.index("--agent-import-path") + 1] == (
         runner.DEEPSEEK_AGENT_IMPORT_PATH
     )
     assert "--agent" not in command
-    assert runner.PIER_SPEC not in joined
     assert f"version={TEST_CODEX_VERSION}" in command
     assert "reasoning_effort=max" in command
-    assert "checkpoint_enabled=true" not in command
+    assert "checkpoint_enabled=true" in command
+    assert "checkpoint_assignment_id=a1" in command
+    assert "checkpoint_task_id=task-1" in command
+    assert "checkpoint_effort=max" in command
+    assert "checkpoint_resume_generation=0" in command
     assert "checkpoint_path=" not in joined
     assert DEEPSEEK_API_KEY_ENV not in joined
     assert "CODEX_AUTH_JSON_PATH=" in joined
@@ -394,18 +395,46 @@ def test_missing_runtime_auth_file_is_rejected(tmp_path: Path, monkeypatch):
         )
 
 
-def test_deepseek_checkpoint_resume_is_rejected(tmp_path: Path, monkeypatch):
+def test_deepseek_checkpoint_resume_passes_durable_metadata(
+    tmp_path: Path, monkeypatch,
+):
     monkeypatch.setattr(runner.shutil, "which", lambda name: "/usr/bin/pier")
     tasks = tmp_path / "tasks"
     (tasks / "task-1").mkdir(parents=True)
     auth = tmp_path / "auth.json"
     auth.write_text("{}")
-    with pytest.raises(RunnerError, match="checkpoints are not supported"):
-        runner.build_pier_command(
-            _assignment(), tasks, tmp_path / "jobs", "job", tmp_path,
-            resume_checkpoint=tmp_path / "checkpoint",
-            provider_auth_path=auth,
-        )
+    checkpoint = tmp_path / "checkpoint"
+    command = runner.build_pier_command(
+        _assignment(resume_generation=2),
+        tasks,
+        tmp_path / "jobs",
+        "job",
+        tmp_path,
+        resume_checkpoint=checkpoint,
+        provider_auth_path=auth,
+    )
+    assert f"checkpoint_path={checkpoint}" in command
+    assert "checkpoint_resume_generation=2" in command
+
+
+def test_deepseek_identity_mismatch_writes_only_the_new_attempt() -> None:
+    source = Path(runner.__file__).with_name("pier_deepseek.py").read_text()
+    module = ast.parse(source)
+    adapter = next(
+        node for node in module.body
+        if isinstance(node, ast.ClassDef) and node.name == "DeepSeekCodex"
+    )
+    start = next(
+        node for node in adapter.body
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "_start_checkpoint"
+    )
+    rendered = ast.unparse(start)
+
+    assert "previous_dir.is_symlink()" in rendered
+    assert "self._checkpoint_manifest_path = checkpoint_dir / 'checkpoint.json'" in rendered
+    assert "write_manifest(self._checkpoint_manifest_path, incompatible)" in rendered
+    assert "update_manifest(previous_dir / 'checkpoint.json'" not in rendered
 
 
 def test_pier_process_isolates_deepseek_secret_and_adapter_path(
