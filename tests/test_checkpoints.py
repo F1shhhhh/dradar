@@ -290,6 +290,62 @@ def test_resume_uses_server_generation_and_persists_fence_before_runner(
     assert seen["persisted_generation"] == 3
 
 
+def test_worker_child_skips_checkpoint_owned_by_healthy_runner(
+    tmp_path: Path, monkeypatch,
+):
+    aid = "e" * 32
+    item = _make_checkpoint(tmp_path, aid)
+    assignment = _assignment(aid)
+
+    class HealthyOwnerClient(_RecoveryClient):
+        def checkpoint_resume(self, *args, **kwargs):
+            raise runloop.ApiError(
+                "assignment is still running with a healthy runner",
+                status_code=409,
+            )
+
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **k: "base")
+    monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
+
+    assert runloop._resume_one_checkpoint(
+        HealthyOwnerClient(assignment),
+        item,
+        assignment,
+        _args(parallel=True, worker_child=True),
+        tmp_path / "tasks",
+        None,
+    ) == "busy"
+
+
+def test_worker_child_does_not_hide_other_checkpoint_conflicts(
+    tmp_path: Path, monkeypatch,
+):
+    aid = "f" * 32
+    item = _make_checkpoint(tmp_path, aid)
+    assignment = _assignment(aid)
+
+    class MismatchedCheckpointClient(_RecoveryClient):
+        def checkpoint_resume(self, *args, **kwargs):
+            raise runloop.ApiError(
+                "checkpoint does not own this assignment",
+                status_code=409,
+            )
+
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **k: "base")
+    monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
+
+    assert runloop._resume_one_checkpoint(
+        MismatchedCheckpointClient(assignment),
+        item,
+        assignment,
+        _args(parallel=True, worker_child=True),
+        tmp_path / "tasks",
+        None,
+    ) == "paused"
+
+
 def test_resume_registers_queued_then_announces_fenced_owner_after_success(
     tmp_path: Path, monkeypatch,
 ):

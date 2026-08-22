@@ -2402,6 +2402,20 @@ def _resume_one_checkpoint(
                     session_id=telemetry.session_id if telemetry else None,
                 )
             except ApiError as exc:
+                if (
+                    exc.status_code == 409
+                    and getattr(args, "worker_child", False)
+                    and (
+                        exc.code == "checkpoint_runner_healthy"
+                        or "assignment is still running with a healthy runner"
+                        in str(exc)
+                    )
+                ):
+                    print(
+                        f"  {assignment_id}: checkpoint is already owned by a "
+                        "healthy runner; checking for a different waiting task"
+                    )
+                    return "busy"
                 if exc.status_code == 404:
                     try:
                         still_active = assignment_id in _active_by_id(client)

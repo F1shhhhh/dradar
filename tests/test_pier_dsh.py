@@ -273,6 +273,7 @@ def test_run_supports_model_effort_matrix_without_logging_secret(
     assert "await agents.resume({" in runner
     assert "resumeSessionId: SessionId(resumeSessionId)" in runner
     assert 'writeFileSync(process.env.DSH_SESSION_ID_FILE' in runner
+    assert 'String(agent.session.id) + "\\n"' in runner
     assert "const outcome = summarize(agent.session.events, 0)" in runner
     assert "continue the previous" not in runner.lower()
     assert 'const attachments = ctx.get("attachments")' in runner
