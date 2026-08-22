@@ -1173,14 +1173,33 @@ def _bundled_completed_outcome(
         return None
     bundle = build_codex_trajectory_bundle(trial_dir)
     usage = codex_trajectory_bundle_usage(bundle) if bundle is not None else None
-    if usage is None or usage.get("complete") is not True:
+    if usage is None:
+        return None
+    if usage.get("complete") is True:
+        return {
+            "schema": "dradar-bundled-completion-v1",
+            "usage_schema": usage.get("schema"),
+            "agent_session_count": usage.get("agent_session_count"),
+            "root_session_count": usage.get("root_session_count"),
+            "subagent_session_count": usage.get("subagent_session_count"),
+        }
+    if bundle.get("parse_degraded_completion_eligible") is not True:
+        return None
+    parse_error_count = bundle.get("parse_error_count")
+    if (
+        not isinstance(parse_error_count, int)
+        or isinstance(parse_error_count, bool)
+        or parse_error_count < 1
+    ):
         return None
     return {
-        "schema": "dradar-bundled-completion-v1",
+        "schema": "dradar-bundled-completion-v2",
+        "evidence_mode": "single-root-terminal-parse-degraded",
         "usage_schema": usage.get("schema"),
         "agent_session_count": usage.get("agent_session_count"),
         "root_session_count": usage.get("root_session_count"),
         "subagent_session_count": usage.get("subagent_session_count"),
+        "parse_error_count": parse_error_count,
     }
 
 
