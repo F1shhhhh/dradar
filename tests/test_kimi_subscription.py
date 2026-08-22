@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import ast
+import shlex
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -312,6 +313,36 @@ def test_kimi_adapter_source_has_fixed_security_contract() -> None:
     assert "KIMI_DISABLE_TELEMETRY" in source
     assert "KIMI_DISABLE_CRON" in source
     assert "[REDACTED_KIMI_CREDENTIAL]" in source
+    assert "stat -c '%u:%g'" in source
+    assert "oauth_repair" in source
+    assert "oauth_guard_pid" in source
+    assert "sleep 0.02" in source
+    assert "aloha" not in source
+
+
+def test_kimi_shared_oauth_guard_is_dynamic_and_preserves_exit_status() -> None:
+    source = Path(providers.__file__).with_name("pier_kimi.py").read_text()
+    module = ast.parse(source)
+    run_method = next(
+        node for node in ast.walk(module)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "run"
+    )
+    helper = next(
+        node for node in run_method.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "shared_oauth_guarded_command"
+    )
+    namespace = {"shlex": shlex, "remote_auth": "/managed/credentials/kimi-code.json",
+                 "remote_home": "/managed"}
+    exec(compile(ast.Module(body=[helper], type_ignores=[]), "pier_kimi.py", "exec"),
+         namespace)
+    command = namespace["shared_oauth_guarded_command"]("exit 37")
+    assert "aloha" not in command
+    assert "1002" not in command
+    assert "stat -c" in command
+    assert "oauth_repair" in command
+    assert "exit 37" in command
 
 
 def test_kimi_wire_usage_sums_request_records_without_cache_overlap() -> None:
