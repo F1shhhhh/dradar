@@ -753,6 +753,74 @@ def test_complete_bundle_survives_nonzero_pier_postrun_rc(monkeypatch, tmp_path:
     }
 
 
+def test_parse_degraded_terminal_bundle_survives_nonzero_postrun_rc(
+    monkeypatch, tmp_path: Path,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
+    phases = {
+        name: {
+            "started_at": "2026-08-14T00:00:01Z",
+            "finished_at": "2026-08-14T00:00:02Z",
+        }
+        for name in ("environment_setup", "agent_setup", "agent_execution")
+    }
+    art = _fake_art(tmp_path, rc=1, result_data={
+        "started_at": "2026-08-14T00:00:00Z",
+        "finished_at": "2026-08-14T00:10:00Z",
+        "exception_info": None,
+        "agent_result": {"n_agent_steps": 4},
+        **phases,
+    })
+    art.patch.write_text(
+        "diff --git a/result.txt b/result.txt\n"
+        "new file mode 100644\n--- /dev/null\n+++ b/result.txt\n"
+        "@@ -0,0 +1 @@\n+done\n",
+        encoding="utf-8",
+    )
+    bundle = {
+        "schema_version": "test",
+        "sessions": [],
+        "parse_error_count": 1,
+        "parse_degraded_completion_eligible": True,
+    }
+    usage = {
+        "schema": "dradar-codex-trajectory-bundle-v1",
+        "complete": False,
+        "agent_session_count": 1,
+        "root_session_count": 1,
+        "subagent_session_count": 0,
+        "sessions": [],
+        "n_input_tokens": 100,
+        "n_cache_tokens": 20,
+        "n_output_tokens": 5,
+    }
+    monkeypatch.setattr(
+        runloop, "build_codex_trajectory_bundle", lambda _trial_dir: bundle,
+    )
+    monkeypatch.setattr(
+        runloop, "codex_trajectory_bundle_usage", lambda _bundle: usage,
+    )
+    monkeypatch.setattr(runloop, "run_trial", lambda *a, **kw: art)
+    client = SubmitClient({})
+
+    tag = runloop._run_and_submit(
+        client, ASSIGNMENT, tmp_path, _args(), "abc123",
+    )
+
+    assert tag == "submitted"
+    sub = client.submissions[0]
+    assert sub["outcome"] == "completed"
+    assert sub["meta"]["bundled_completion_evidence"] == {
+        "schema": "dradar-bundled-completion-v2",
+        "evidence_mode": "single-root-terminal-parse-degraded",
+        "usage_schema": "dradar-codex-trajectory-bundle-v1",
+        "agent_session_count": 1,
+        "root_session_count": 1,
+        "subagent_session_count": 0,
+        "parse_error_count": 1,
+    }
+
+
 def _write_complete_grok_artifacts(art: TrialArtifacts) -> dict:
     usage = {
         "schema": "dradar-subscription-provider-usage-v1",

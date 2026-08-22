@@ -1,7 +1,10 @@
 import json
 from pathlib import Path
 
-from dradar.runner import aggregate_codex_session_usage
+from dradar.runner import (
+    aggregate_codex_session_usage,
+    build_codex_trajectory_bundle,
+)
 
 
 def _session(path: Path, session_id: str, role: str, usages: list[dict],
@@ -298,3 +301,52 @@ def test_missing_child_token_count_marks_aggregate_incomplete(tmp_path: Path):
 
 def test_no_sessions_returns_none(tmp_path: Path):
     assert aggregate_codex_session_usage(tmp_path) is None
+
+
+def test_blank_jsonl_records_do_not_make_complete_usage_incomplete(
+    tmp_path: Path,
+):
+    session = tmp_path / "agent" / "sessions" / "root.jsonl"
+    _session(session, "root-1", "user", [_usage(30, 20, 4)])
+    lines = session.read_text().splitlines()
+    session.write_text("\n\n".join(lines) + "\n\n")
+
+    usage = aggregate_codex_session_usage(tmp_path)
+
+    assert usage is not None and usage["complete"] is True
+    assert usage["n_input_tokens"] == 30
+    assert usage["timed_usage_complete"] is True
+
+
+def test_nonblank_parse_damage_has_narrow_single_root_terminal_recovery_fact(
+    tmp_path: Path,
+):
+    session = tmp_path / "agent" / "sessions" / "root.jsonl"
+    _session(session, "root-1", "user", [_usage(30, 20, 4)])
+    events = session.read_text().splitlines()
+    events.insert(-1, "{not-json")
+    events.append(json.dumps({
+        "type": "event_msg",
+        "timestamp": "2026-08-17T01:00:59Z",
+        "payload": {"type": "task_complete"},
+    }))
+    session.write_text("\n".join(events) + "\n")
+
+    bundle = build_codex_trajectory_bundle(tmp_path)
+
+    assert bundle is not None
+    assert bundle["complete"] is False
+    assert bundle["timed_usage_complete"] is False
+    assert bundle["parse_error_count"] == 1
+    assert bundle["parse_degraded_completion_eligible"] is True
+
+
+def test_parse_damage_without_terminal_event_is_not_recoverable(tmp_path: Path):
+    session = tmp_path / "agent" / "sessions" / "root.jsonl"
+    _session(session, "root-1", "user", [_usage(30, 20, 4)])
+    session.write_text(session.read_text() + "{not-json\n")
+
+    bundle = build_codex_trajectory_bundle(tmp_path)
+
+    assert bundle is not None
+    assert bundle["parse_degraded_completion_eligible"] is False

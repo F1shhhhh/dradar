@@ -1541,12 +1541,15 @@ def _analyze_codex_session_events(events: list[dict], fallback_id: str) -> dict:
                 parent_session_id = raw_parent
 
     starts = []
+    completes = []
     usage_events: list[tuple[int, dict]] = []
     for index, event in enumerate(events):
         payload = event.get("payload") or {}
         if event.get("type") == "event_msg" and isinstance(payload, dict):
             if payload.get("type") == "task_started":
                 starts.append(index)
+            elif payload.get("type") == "task_complete":
+                completes.append(index)
             elif payload.get("type") == "token_count":
                 info = payload.get("info") or {}
                 usage = _codex_usage(
@@ -1646,6 +1649,15 @@ def _analyze_codex_session_events(events: list[dict], fallback_id: str) -> dict:
         "usage": own_usage,
         "token_usage_events": timed_usage if timed_usage_complete else [],
         "timed_usage_complete": timed_usage_complete,
+        "task_started_count": len(starts),
+        "task_complete_count": len(completes),
+        "terminal_task_complete": (
+            len(starts) == 1
+            and len(completes) == 1
+            and completes[0] == len(events) - 1
+            and bool(usage_events)
+            and usage_events[-1][0] < completes[0]
+        ),
         "complete": (
             role != "unknown" and model_name is not None and own_usage is not None
         ),
@@ -1687,6 +1699,13 @@ def build_codex_trajectory_bundle(trial_dir: Path) -> dict | None:
             continue
         with handle:
             for line in handle:
+                # Empty records carry no trajectory event and JSONL readers
+                # conventionally ignore them.  Counting one as corrupt can
+                # needlessly degrade an otherwise lossless Windows session.
+                # Non-whitespace malformed records remain integrity failures
+                # and are handled only by the strict terminal-evidence gate.
+                if not line.strip():
+                    continue
                 try:
                     event = json.loads(line)
                 except (json.JSONDecodeError, TypeError):
@@ -1776,6 +1795,23 @@ def build_codex_trajectory_bundle(trial_dir: Path) -> dict | None:
         complete
         and all(item["timed_usage_complete"] for item in representatives.values())
     )
+    parse_error_count = sum(item["parse_error_count"] for item in sessions)
+    parse_degraded_completion_eligible = (
+        not complete
+        and len(files) == 1
+        and len(representatives) == 1
+        and root_count == 1
+        and parse_error_count > 0
+        and parent_graph_valid
+        and all(
+            item["role"] == "root"
+            and item["model_name"] is not None
+            and item["usage"] is not None
+            and item["timed_usage_complete"]
+            and item["terminal_task_complete"]
+            for item in representatives.values()
+        )
+    )
     return {
         "schema_version": CODEX_TRAJECTORY_BUNDLE_SCHEMA,
         "complete": complete,
@@ -1787,6 +1823,10 @@ def build_codex_trajectory_bundle(trial_dir: Path) -> dict | None:
         "aggregate_usage": aggregate,
         "token_usage_events": token_usage_events if timed_usage_complete else [],
         "timed_usage_complete": timed_usage_complete,
+        "parse_error_count": parse_error_count,
+        "parse_degraded_completion_eligible": (
+            parse_degraded_completion_eligible
+        ),
         "usage_sessions": usage_sessions,
         "sessions": sessions,
     }
