@@ -1463,6 +1463,7 @@ def publish_checkpoint_export_v2(
     _ensure_private_directory(generations, stage="publish")
     target = generations / f"generation-{request.snapshot_generation:020d}"
     incoming = checkpoint_root / f".incoming-{request.capture_id}"
+    target_existed = False
     if incoming.exists() or incoming.is_symlink():
         raise CheckpointDataPlaneError("publish", "incoming_stage_exists")
     try:
@@ -1497,6 +1498,7 @@ def publish_checkpoint_export_v2(
         selected = False
         with _publication_lock(checkpoint_root):
             if target.exists() or target.is_symlink():
+                target_existed = True
                 existing = target / "publication.json"
                 try:
                     if existing.read_bytes() != receipt_bytes:
@@ -1521,23 +1523,32 @@ def publish_checkpoint_export_v2(
                 current_temp = checkpoint_root / (
                     f".CURRENT.{request.capture_id}.{uuid.uuid4().hex}.part"
                 )
-                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-                flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-                descriptor = os.open(current_temp, flags, 0o600)
                 try:
-                    view = memoryview(current_payload)
-                    while view:
-                        written = os.write(descriptor, view)
-                        if written <= 0:
-                            raise CheckpointDataPlaneError("publish", "current_write_failed")
-                        view = view[written:]
-                    os.fchmod(descriptor, 0o600)
-                    os.fsync(descriptor)
+                    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                    flags |= getattr(os, "O_NOFOLLOW", 0)
+                    flags |= getattr(os, "O_CLOEXEC", 0)
+                    descriptor = os.open(current_temp, flags, 0o600)
+                    try:
+                        view = memoryview(current_payload)
+                        while view:
+                            written = os.write(descriptor, view)
+                            if written <= 0:
+                                raise CheckpointDataPlaneError(
+                                    "publish", "current_write_failed",
+                                )
+                            view = view[written:]
+                        os.fchmod(descriptor, 0o600)
+                        os.fsync(descriptor)
+                    finally:
+                        os.close(descriptor)
+                    os.replace(current_temp, checkpoint_root / "CURRENT")
+                    _fsync_directory(checkpoint_root)
                 finally:
-                    os.close(descriptor)
-                os.replace(current_temp, checkpoint_root / "CURRENT")
-                _fsync_directory(checkpoint_root)
-        return PublishedCheckpointV2(
+                    try:
+                        current_temp.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+        published = PublishedCheckpointV2(
             checkpoint_id=request.checkpoint_id,
             snapshot_generation=request.snapshot_generation,
             capture_id=request.capture_id,
@@ -1552,6 +1563,19 @@ def publish_checkpoint_export_v2(
             authoritative=bool(authoritative),
             selected=selected,
         )
+        if target_existed:
+            # A replay must not trust a matching receipt alone.  A previous
+            # process may have crashed after publication, or local material
+            # may have drifted before the retry.  Re-hash the exact existing
+            # generation before reporting the idempotent publication as
+            # sealed; never replace it with the retry's incoming bytes.
+            revalidate_published_checkpoint_v2(
+                published,
+                expected_identity_fingerprint=request.identity_fingerprint,
+                expected_checkpoint_abi=request.checkpoint_abi,
+                limits=limits,
+            )
+        return published
     except BaseException:
         shutil.rmtree(incoming, ignore_errors=True)
         raise

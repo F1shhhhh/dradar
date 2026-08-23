@@ -1050,6 +1050,118 @@ def test_same_generation_is_idempotent_but_conflicting_capture_is_rejected(
     assert current["manifest_sha256"] == first.manifest_sha256
 
 
+def test_publication_retries_after_crash_between_generation_and_current(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, archive, exported = _seal(tmp_path / "fixture")
+    exported = replace(
+        exported,
+        remote_path="/run/dradar-checkpoint-v2/x/sealed/export.tar.gz",
+    )
+    store = tmp_path / "host"
+    real_replace = runtime.os.replace
+    failed_once = False
+
+    def fail_first_current_replace(source, destination):
+        nonlocal failed_once
+        if Path(destination).name == "CURRENT" and not failed_once:
+            failed_once = True
+            raise OSError("injected crash before CURRENT replace")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(runtime.os, "replace", fail_first_current_replace)
+    with pytest.raises(OSError, match="before CURRENT"):
+        publish_checkpoint_export_v2(
+            archive, store, request, exported, authoritative=False,
+        )
+
+    checkpoint_root = store / request.checkpoint_id
+    generation = (
+        checkpoint_root / "generations" /
+        "generation-00000000000000000001"
+    )
+    assert generation.is_dir()
+    assert not (checkpoint_root / "CURRENT").exists()
+    assert not list(checkpoint_root.glob(".CURRENT.*.part"))
+
+    retried = publish_checkpoint_export_v2(
+        archive, store, request, exported, authoritative=False,
+    )
+    assert retried.root == generation
+    assert retried.selected is True
+    current = json.loads((checkpoint_root / "CURRENT").read_text())
+    assert current["generation"] == 1
+    assert current["manifest_sha256"] == retried.manifest_sha256
+
+
+def test_publication_replay_rehashes_existing_generation(
+    tmp_path: Path,
+) -> None:
+    request, archive, exported = _seal(tmp_path / "fixture")
+    exported = replace(
+        exported,
+        remote_path="/run/dradar-checkpoint-v2/x/sealed/export.tar.gz",
+    )
+    store = tmp_path / "host"
+    published = publish_checkpoint_export_v2(
+        archive, store, request, exported, authoritative=False,
+    )
+    tampered = published.payload_root / "workspace/model.patch"
+    original = tampered.read_bytes()
+    tampered.write_bytes(b"X" + original[1:])
+    tampered.chmod(0o600)
+
+    with pytest.raises(
+        CheckpointDataPlaneError,
+        match="published_payload_digest_mismatch",
+    ):
+        publish_checkpoint_export_v2(
+            archive, store, request, exported, authoritative=False,
+        )
+
+
+def test_publication_retries_after_current_directory_fsync_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, archive, exported = _seal(tmp_path / "fixture")
+    exported = replace(
+        exported,
+        remote_path="/run/dradar-checkpoint-v2/x/sealed/export.tar.gz",
+    )
+    store = tmp_path / "host"
+    checkpoint_root = store / request.checkpoint_id
+    real_fsync_directory = runtime._fsync_directory
+    failed_once = False
+
+    def fail_first_current_directory_fsync(path: Path) -> None:
+        nonlocal failed_once
+        if (
+            Path(path) == checkpoint_root
+            and (checkpoint_root / "CURRENT").is_file()
+            and not failed_once
+        ):
+            failed_once = True
+            raise OSError("injected CURRENT directory fsync failure")
+        real_fsync_directory(path)
+
+    monkeypatch.setattr(
+        runtime, "_fsync_directory", fail_first_current_directory_fsync,
+    )
+    with pytest.raises(OSError, match="directory fsync"):
+        publish_checkpoint_export_v2(
+            archive, store, request, exported, authoritative=False,
+        )
+
+    assert (checkpoint_root / "CURRENT").is_file()
+    retried = publish_checkpoint_export_v2(
+        archive, store, request, exported, authoritative=False,
+    )
+    assert retried.selected is True
+    assert not list(checkpoint_root.glob(".CURRENT.*.part"))
+
+
 def test_late_older_generation_is_retained_but_never_rewinds_current(
     tmp_path: Path,
 ) -> None:
