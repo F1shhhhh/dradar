@@ -131,15 +131,25 @@ def test_runner_executes_fixed_complete_plan_and_writes_private_results(
     client, server, revisions, cohort, output = _inputs(tmp_path)
     monkeypatch.setattr(runner, "_network_isolated", lambda: True)
     monkeypatch.setattr(runner, "_provider_credentials_present", lambda: False)
-    monkeypatch.setattr(runner, "_run_probe", _successful_probe)
+    invoked_pythons = []
+
+    def successful_probe(**kwargs):
+        invoked_pythons.append(kwargs["python"])
+        return _successful_probe(**kwargs)
+
+    monkeypatch.setattr(runner, "_run_probe", successful_probe)
+    client_python = tmp_path / "client-venv-python"
+    server_python = tmp_path / "server-venv-python"
+    client_python.symlink_to(sys.executable)
+    server_python.symlink_to(sys.executable)
 
     result = runner.run_lifecycle_matrix_v2(
         cohort_path=cohort,
         output_path=output,
         client_source=client,
         server_source=server,
-        client_python=Path(sys.executable),
-        server_python=Path(sys.executable),
+        client_python=client_python,
+        server_python=server_python,
     )
     assert result["source_revisions"] == revisions
     assert {case["case_id"] for case in result["cases"]} == (
@@ -149,6 +159,9 @@ def test_runner_executes_fixed_complete_plan_and_writes_private_results(
     assert result["network_isolated"] is True
     assert result["provider_credentials_present"] is False
     assert len(result["runner_environment_sha256"]) == 64
+    assert set(invoked_pythons) == {
+        client_python.absolute(), server_python.absolute(),
+    }
     assert stat.S_IMODE(output.stat().st_mode) == 0o600
     logs = list(output.parent.glob(f".{output.name}.logs-*"))
     assert len(logs) == 1

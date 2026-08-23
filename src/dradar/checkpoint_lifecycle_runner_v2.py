@@ -629,11 +629,11 @@ def run_lifecycle_matrix_v2(
         "server": Path(server_source).resolve(strict=True),
     }
     pythons = {
-        "client": Path(client_python).resolve(strict=True),
-        "server": Path(server_python).resolve(strict=True),
+        "client": Path(client_python).absolute(),
+        "server": Path(server_python).absolute(),
     }
     if any(
-        not path.is_file() or not os.access(path, os.X_OK)
+        not path.resolve(strict=True).is_file() or not os.access(path, os.X_OK)
         for path in pythons.values()
     ):
         raise ValueError("lifecycle probe Python is not executable")
