@@ -2501,6 +2501,23 @@ def _record_local_checkpoint_failure_v2(
         return
 
 
+def record_local_checkpoint_failure_v2(
+    storage_root: Path,
+    *,
+    exc: BaseException,
+    stage: str,
+    code: str,
+) -> None:
+    """Public bounded diagnostic hook for owner/reconciliation failures."""
+
+    _record_local_checkpoint_failure_v2(
+        storage_root,
+        exc=exc,
+        stage=stage,
+        code=code,
+    )
+
+
 def checkpoint_observation_failure_family_v2(code: str | None) -> str:
     """Collapse local detail into one stable, low-cardinality server family."""
 
@@ -3154,6 +3171,7 @@ __all__ = [
     "publish_checkpoint_export_v2",
     "load_exact_published_checkpoint_v2",
     "revalidate_published_checkpoint_v2",
+    "record_local_checkpoint_failure_v2",
     "run_mainline_with_shadow_checkpoint_v2",
     "run_mainline_with_periodic_shadow_captures_v2",
     "seal_checkpoint_export_v2",

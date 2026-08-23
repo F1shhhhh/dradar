@@ -24,7 +24,10 @@ LOCK_FILE = "refill-plan.lock"
 RUNNING_STATES = {"active", "draining"}
 FAULTED_STATE = "faulted"
 CHECKPOINT_FAULT_FAMILIES = frozenset({
-    "checkpoint_invalid", "checkpoint_incompatible",
+    "checkpoint_invalid",
+    "checkpoint_incompatible",
+    "checkpoint_reconcile_ambiguous",
+    "checkpoint_orphan_reconcile_blocked",
 })
 TIERS = ("plus", "pro-5x", "pro-20x")
 

@@ -119,4 +119,3 @@ def test_process_evidence_and_exit_receipt_are_exactly_bound(
     receipt["process_start_signature"] = "reused"
     with pytest.raises(CheckpointV2ProcessGuardError, match="inconsistent"):
         validate_process_exited_receipt_v2(receipt, evidence=validated)
-

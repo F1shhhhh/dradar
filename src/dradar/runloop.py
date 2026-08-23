@@ -2508,6 +2508,17 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                 cleanup_containers=_cleanup_terminated_pier_containers,
             )
         except Exception as exc:
+            from .checkpoint_runtime_v2 import (
+                record_local_checkpoint_failure_v2,
+            )
+
+            record_local_checkpoint_failure_v2(
+                HOME / "checkpoint-v2" / "authoritative"
+                / str(assignment.get("assignment_id")),
+                exc=exc,
+                stage="reconcile",
+                code="orphan_reconcile_blocked",
+            )
             refill_plan.open_circuit(
                 HOME, assignment, "checkpoint_orphan_reconcile_blocked",
             )

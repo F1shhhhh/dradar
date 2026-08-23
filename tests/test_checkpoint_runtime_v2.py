@@ -33,6 +33,7 @@ from dradar.checkpoint_runtime_v2 import (
     PublishedCheckpointV2,
     apply_checkpoint_generation_retention_v2,
     publish_checkpoint_export_v2,
+    record_local_checkpoint_failure_v2,
     checkpoint_observation_payload_v2,
     checkpoint_restore_observation_payload_v2,
     load_exact_published_checkpoint_v2,
@@ -883,6 +884,31 @@ def test_typed_failure_writes_only_bounded_local_diagnostics(
         "failure_type": "CheckpointDataPlaneError",
         "schema": "dradar-checkpoint-local-diagnostic-v2",
         "stage": "capture",
+    }
+
+
+def test_owner_reconcile_diagnostic_omits_exception_text(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "authoritative" / "assignment-0001"
+    record_local_checkpoint_failure_v2(
+        root,
+        exc=RuntimeError("token=must-never-be-persisted /private/path"),
+        stage="reconcile",
+        code="orphan_reconcile_blocked",
+    )
+    path = root / "diagnostics.jsonl"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    raw = path.read_text(encoding="utf-8")
+    assert "must-never" not in raw
+    assert "/private/path" not in raw
+    assert json.loads(raw) == {
+        "at": json.loads(raw)["at"],
+        "code": "orphan_reconcile_blocked",
+        "diagnostic": {},
+        "failure_type": "RuntimeError",
+        "schema": "dradar-checkpoint-local-diagnostic-v2",
+        "stage": "reconcile",
     }
 
 

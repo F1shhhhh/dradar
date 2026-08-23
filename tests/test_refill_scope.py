@@ -332,6 +332,39 @@ def test_checkpoint_fault_circuit_survives_restart_and_scope_variants(
     assert refill.load(tmp_path)["plan_id"] == first["plan_id"]
 
 
+@pytest.mark.parametrize(
+    "failure_family",
+    [
+        "checkpoint_reconcile_ambiguous",
+        "checkpoint_orphan_reconcile_blocked",
+    ],
+)
+def test_checkpoint_v2_reconciliation_faults_are_durable_refill_circuits(
+    tmp_path: Path,
+    failure_family: str,
+) -> None:
+    assignment = _assignment(
+        "v2-fault", agent=ZCODE_AGENT, model="glm-5.3", effort="low",
+    )
+    assignment["provider"] = ZCODE_PROVIDER
+    _configure(
+        tmp_path,
+        harness=ZCODE_AGENT,
+        model="glm-5.3",
+        effort="low",
+        active=[assignment],
+        refill_to=1,
+    )
+    faulted = refill.open_circuit(
+        tmp_path,
+        assignment,
+        failure_family,
+    )
+    assert faulted is not None
+    assert faulted["status"] == refill.FAULTED_STATE
+    assert faulted["circuit"]["failure_family"] == failure_family
+
+
 def test_checkpoint_fault_circuit_is_atomic_and_does_not_cross_harness(
     tmp_path: Path,
 ) -> None:
