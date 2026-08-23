@@ -1,9 +1,14 @@
 """Per-cell checkout loop: the parallel-safe run path (owner decision
 2026-07-14 — sessions get work from a server-side dispenser instead of
 racing over a shared batch snapshot)."""
+import json
+import threading
+from types import SimpleNamespace
+
 import dradar.runloop as runloop
 import pytest
 from dradar.api_client import ApiError
+from dradar.runner import diagnose_exception
 
 from test_go_menu import FakeClient, _args, _patch_run
 
@@ -230,6 +235,98 @@ def test_preclaimed_waiting_queue_stops_after_second_same_zero_progress_failure(
     assert len(client._checkouts) == 1
     assert client.stopped == []
     assert "safety circuit opened" in capsys.readouterr().out
+
+
+def test_two_workers_share_long_exception_circuit_and_never_start_third(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        runloop, "build_codex_trajectory_bundle", lambda _trial_dir: {},
+    )
+    monkeypatch.setenv(
+        runloop._REPEAT_FAILURE_STATE_ENV, str(tmp_path / "failure-state.json"),
+    )
+    monkeypatch.setenv(
+        "DRADAR_POOL_ABORT_FILE", str(tmp_path / "pool-abort"),
+    )
+    result_path = tmp_path / "result.json"
+    result_path.write_text(json.dumps({
+        "exception_info": {
+            "exception_type": "NonZeroAgentExitCodeError",
+            "exception_message": (
+                "Command failed (exit 1): codex exec\n"
+                + "\n".join(f"long output {index}" for index in range(12))
+            ),
+        },
+    }))
+    diagnostic = diagnose_exception(result_path)
+    assert diagnostic["exit_code"] == 1
+    assert all("Command failed" not in line for line in diagnostic["tail"])
+
+    first_observed = threading.Event()
+    circuit_opened = threading.Event()
+    started = []
+    started_lock = threading.Lock()
+
+    def run(_client, assignment, *_args, **_kwargs):
+        with started_lock:
+            started.append(assignment["assignment_id"])
+        signature = runloop._repeat_failure_signature(
+            assignment,
+            {"n_agent_steps": 0, "n_input_tokens": None},
+            diagnostic,
+            SimpleNamespace(codex_cli_version="0.149.0", trial_dir=tmp_path),
+        )
+        assert signature is not None
+        if assignment["assignment_id"] == "worker-one":
+            assert not runloop._observe_repeat_failure(
+                assignment, signature, success=False,
+            )
+            first_observed.set()
+            assert circuit_opened.wait(timeout=5)
+            return "interrupted"
+        assert first_observed.wait(timeout=5)
+        assert runloop._observe_repeat_failure(
+            assignment, signature, success=False,
+        )
+        circuit_opened.set()
+        return "repeat-agent-failure"
+
+    monkeypatch.setattr(runloop, "_run_and_submit", run)
+    first_cells = [_cell("worker-one"), _cell("worker-two")]
+    clients = [
+        CheckoutClient(
+            {"active": [first_cell], "free_pick": True},
+            [
+                {"assignment": first_cell, "held": 3, "unstarted": 2},
+                {"assignment": _cell(third), "held": 3, "unstarted": 1},
+            ],
+        )
+        for first_cell, third in (
+            (first_cells[0], "must-not-start-three"),
+            (first_cells[1], "must-not-start-four"),
+        )
+    ]
+    outcomes = []
+
+    def worker(client, active):
+        outcomes.append(runloop._run_checkout_loop(
+            _args(), client, tmp_path, [active],
+        ))
+
+    threads = [
+        threading.Thread(target=worker, args=(client, active))
+        for client, active in zip(clients, first_cells)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert sorted(started) == ["worker-one", "worker-two"]
+    assert sorted(outcomes) == [0, 1]
+    assert [len(client.checkout_exclusions) for client in clients] == [1, 1]
 
 
 def test_repeat_failure_stops_refill_before_second_replenishment(
