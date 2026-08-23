@@ -141,13 +141,19 @@ class LiveCheckpointShadowControllerV2:
             await asyncio.sleep(0.1)
 
     def _run(self) -> None:
+        async def lifecycle() -> None:
+            try:
+                await self.coordinator.run(
+                    self._mainline_lifetime(),
+                    initial_delay_sec=self.initial_delay_sec,
+                    interval_sec=self.interval_sec,
+                    maximum_captures=self.maximum_captures,
+                )
+            finally:
+                await self.coordinator.release_local_snapshots()
+
         try:
-            asyncio.run(self.coordinator.run(
-                self._mainline_lifetime(),
-                initial_delay_sec=self.initial_delay_sec,
-                interval_sec=self.interval_sec,
-                maximum_captures=self.maximum_captures,
-            ))
+            asyncio.run(lifecycle())
         except BaseException:
             # A shadow lane has no authority to surface an exception through
             # the ordinary Pier result or its upload path.

@@ -1838,6 +1838,156 @@ def _prune_shadow_generations_v2(
     return removed
 
 
+def release_shadow_generation_v2(
+    storage_root: Path,
+    published: PublishedCheckpointV2,
+    *,
+    expected_identity_fingerprint: str,
+    expected_checkpoint_abi: str,
+    limits: CheckpointPackageLimitsV2 = DEFAULT_PACKAGE_LIMITS_V2,
+) -> bool:
+    """Release one fully verified non-authoritative shadow generation.
+
+    Shadow archives are runtime probes, not recovery authority.  Keeping two
+    generations while a task is live exercises fallback, but keeping hundreds
+    of completed assignments would eventually turn the experiment into disk
+    pressure.  This operation is intentionally content-bound and restart-safe:
+    it never touches authoritative, malformed, unknown, or concurrently
+    replaced material, and a crash after quarantine is resumed by the same
+    deterministic release identity.
+
+    Return ``True`` when material was removed and ``False`` for an exact
+    already-absent replay.
+    """
+
+    if (
+        not isinstance(published, PublishedCheckpointV2)
+        or published.authoritative is not False
+        or _IDENTIFIER_RE.fullmatch(published.checkpoint_id) is None
+        or _IDENTIFIER_RE.fullmatch(published.capture_id) is None
+        or not isinstance(published.snapshot_generation, int)
+        or isinstance(published.snapshot_generation, bool)
+        or published.snapshot_generation < 0
+        or _DIGEST_RE.fullmatch(published.manifest_sha256) is None
+        or _DIGEST_RE.fullmatch(expected_identity_fingerprint) is None
+        or _ABI_RE.fullmatch(expected_checkpoint_abi) is None
+    ):
+        raise CheckpointDataPlaneError(
+            "retention", "shadow_release_identity_invalid",
+        )
+    storage_root = Path(os.path.abspath(storage_root))
+    checkpoints = storage_root / "checkpoints"
+    checkpoint_root = checkpoints / published.checkpoint_id
+    generations = checkpoint_root / "generations"
+    expected_root = generations / (
+        f"generation-{published.snapshot_generation:020d}"
+    )
+    if (
+        Path(os.path.abspath(published.root.parent.parent.parent.parent))
+        != storage_root
+        or Path(os.path.abspath(published.root))
+        != Path(os.path.abspath(expected_root))
+        or Path(os.path.abspath(published.payload_root))
+        != Path(os.path.abspath(expected_root / PAYLOAD_ROOT))
+        or Path(os.path.abspath(published.archive_path))
+        != Path(os.path.abspath(expected_root / "export.tar.gz"))
+    ):
+        raise CheckpointDataPlaneError(
+            "retention", "shadow_release_identity_invalid",
+        )
+    _assert_private_directory(storage_root, stage="retention")
+    _assert_private_directory(checkpoints, stage="retention")
+    _assert_private_directory(checkpoint_root, stage="retention")
+    _assert_private_directory(generations, stage="retention")
+    quarantine = generations / (
+        f".shadow-release-{published.snapshot_generation:020d}-"
+        f"{published.capture_id}-{published.manifest_sha256[:16]}"
+    )
+
+    def rebound(root: Path) -> PublishedCheckpointV2:
+        return replace(
+            published,
+            root=root,
+            payload_root=root / PAYLOAD_ROOT,
+            archive_path=root / "export.tar.gz",
+        )
+
+    with _publication_lock(checkpoint_root):
+        target_exists = expected_root.exists() or expected_root.is_symlink()
+        quarantine_exists = quarantine.exists() or quarantine.is_symlink()
+        if target_exists and quarantine_exists:
+            raise CheckpointDataPlaneError(
+                "retention", "shadow_release_state_conflict",
+            )
+        current = _read_current(checkpoint_root)
+        remove_current = False
+        if current is not None and current.get("directory") == expected_root.name:
+            if (
+                current.get("generation") != published.snapshot_generation
+                or current.get("manifest_sha256") != published.manifest_sha256
+                or current.get("authoritative") is not False
+            ):
+                raise CheckpointDataPlaneError(
+                    "retention", "shadow_release_current_mismatch",
+                )
+            remove_current = True
+        if target_exists:
+            revalidate_published_checkpoint_v2(
+                rebound(expected_root),
+                expected_identity_fingerprint=expected_identity_fingerprint,
+                expected_checkpoint_abi=expected_checkpoint_abi,
+                limits=limits,
+            )
+            try:
+                os.replace(expected_root, quarantine)
+                _fsync_directory(generations)
+            except OSError as exc:
+                raise CheckpointDataPlaneError(
+                    "retention", "shadow_release_quarantine_failed",
+                ) from exc
+            quarantine_exists = True
+        if remove_current:
+            try:
+                (checkpoint_root / "CURRENT").unlink()
+                _fsync_directory(checkpoint_root)
+            except OSError as exc:
+                raise CheckpointDataPlaneError(
+                    "retention", "shadow_release_current_failed",
+                ) from exc
+        if not quarantine_exists:
+            return False
+        try:
+            metadata = quarantine.lstat()
+            if (
+                quarantine.is_symlink()
+                or not stat.S_ISDIR(metadata.st_mode)
+                or (
+                    os.name == "posix"
+                    and (
+                        metadata.st_uid != os.getuid()
+                        or stat.S_IMODE(metadata.st_mode) & 0o077
+                    )
+                )
+            ):
+                raise OSError("unsafe shadow release quarantine")
+            quarantined = rebound(quarantine)
+            revalidate_published_checkpoint_v2(
+                quarantined,
+                expected_identity_fingerprint=expected_identity_fingerprint,
+                expected_checkpoint_abi=expected_checkpoint_abi,
+                limits=limits,
+            )
+            shutil.rmtree(quarantine)
+            _fsync_directory(generations)
+        except CheckpointDataPlaneError:
+            raise
+        except OSError as exc:
+            raise CheckpointDataPlaneError(
+                "retention", "shadow_release_cleanup_failed",
+            ) from exc
+        return True
+
+
 def revalidate_published_checkpoint_v2(
     published: PublishedCheckpointV2,
     *,
@@ -3344,6 +3494,7 @@ __all__ = [
     "publish_checkpoint_export_v2",
     "load_exact_published_checkpoint_v2",
     "revalidate_published_checkpoint_v2",
+    "release_shadow_generation_v2",
     "record_local_checkpoint_failure_v2",
     "run_mainline_with_shadow_checkpoint_v2",
     "run_mainline_with_periodic_shadow_captures_v2",

@@ -39,6 +39,7 @@ from dradar.checkpoint_runtime_v2 import (
     apply_checkpoint_generation_retention_v2,
     publish_checkpoint_export_v2,
     record_local_checkpoint_failure_v2,
+    release_shadow_generation_v2,
     checkpoint_observation_payload_v2,
     checkpoint_restore_observation_payload_v2,
     load_exact_published_checkpoint_v2,
@@ -423,6 +424,119 @@ def test_observe_mode_seals_verifies_and_publishes_non_authoritative_snapshot(
     assert payload["file_count"] == 2
     assert payload["payload_bytes"] > 0
     assert payload["failure_code"] is None
+
+
+def test_verified_shadow_generation_is_released_after_experiment_use(
+    tmp_path: Path,
+) -> None:
+    plane = CheckpointDataPlaneV2(
+        activation=_activation("observe", "observe"),
+        storage_root=tmp_path / "host",
+        retention=CheckpointRetentionPolicyV2(
+            shadow_generations=2,
+            minimum_free_bytes=0,
+        ),
+    )
+    request = _request()
+    observation = asyncio.run(plane.observe_capture(
+        request, FakeExporter(tmp_path / "container"),
+    ))
+    assert observation.status == "sealed"
+    assert observation.published is not None
+    published = observation.published
+
+    with pytest.raises(
+        CheckpointDataPlaneError, match="shadow_release_identity_invalid",
+    ):
+        release_shadow_generation_v2(
+            tmp_path / "other-shadow-root",
+            published,
+            expected_identity_fingerprint=request.identity_fingerprint,
+            expected_checkpoint_abi=request.checkpoint_abi,
+        )
+    assert published.root.is_dir()
+    assert release_shadow_generation_v2(
+        plane.storage_root,
+        published,
+        expected_identity_fingerprint=request.identity_fingerprint,
+        expected_checkpoint_abi=request.checkpoint_abi,
+    ) is True
+    assert not published.root.exists()
+    assert not (published.root.parent.parent / "CURRENT").exists()
+    assert release_shadow_generation_v2(
+        plane.storage_root,
+        published,
+        expected_identity_fingerprint=request.identity_fingerprint,
+        expected_checkpoint_abi=request.checkpoint_abi,
+    ) is False
+
+
+def test_shadow_release_resumes_after_quarantine_cleanup_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plane = CheckpointDataPlaneV2(
+        activation=_activation("observe", "observe"),
+        storage_root=tmp_path / "host",
+        retention=CheckpointRetentionPolicyV2(
+            shadow_generations=2,
+            minimum_free_bytes=0,
+        ),
+    )
+    request = _request()
+    observation = asyncio.run(plane.observe_capture(
+        request, FakeExporter(tmp_path / "container"),
+    ))
+    assert observation.published is not None
+    published = observation.published
+    real_rmtree = runtime.shutil.rmtree
+    failed = False
+
+    def fail_once(path, *args, **kwargs):
+        nonlocal failed
+        if Path(path).name.startswith(".shadow-release-") and not failed:
+            failed = True
+            raise OSError("injected cleanup crash")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(runtime.shutil, "rmtree", fail_once)
+    with pytest.raises(
+        CheckpointDataPlaneError, match="shadow_release_cleanup_failed",
+    ):
+        release_shadow_generation_v2(
+            plane.storage_root,
+            published,
+            expected_identity_fingerprint=request.identity_fingerprint,
+            expected_checkpoint_abi=request.checkpoint_abi,
+        )
+    assert not published.root.exists()
+    assert len(list(published.root.parent.glob(".shadow-release-*"))) == 1
+
+    monkeypatch.setattr(runtime.shutil, "rmtree", real_rmtree)
+    assert release_shadow_generation_v2(
+        plane.storage_root,
+        published,
+        expected_identity_fingerprint=request.identity_fingerprint,
+        expected_checkpoint_abi=request.checkpoint_abi,
+    ) is True
+    assert list(published.root.parent.glob(".shadow-release-*")) == []
+
+
+def test_shadow_release_refuses_authoritative_generation(tmp_path: Path) -> None:
+    storage_root, published = _authoritative_generations(tmp_path, 1)
+    generation = published[0]
+
+    with pytest.raises(
+        CheckpointDataPlaneError, match="shadow_release_identity_invalid",
+    ):
+        release_shadow_generation_v2(
+            storage_root,
+            generation,
+            expected_identity_fingerprint="a" * 64,
+            expected_checkpoint_abi="dradar-checkpoint-v2/zcode/1",
+        )
+    assert generation.root.is_dir()
+    assert (storage_root / "checkpoints" / generation.checkpoint_id / "CURRENT").is_file()
 
 
 def test_shadow_capture_disk_pressure_is_fail_open_before_export(

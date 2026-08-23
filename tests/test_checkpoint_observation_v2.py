@@ -464,6 +464,49 @@ def test_stable_semantic_rejection_is_quarantined_not_retried(tmp_path):
     assert json.loads(rejected[0].read_text())["payload"] == payload
 
 
+def test_rejected_spool_is_bounded_without_deleting_failure_evidence(tmp_path):
+    root = tmp_path / "observations"
+    spool = CheckpointObservationSpoolV2(
+        root,
+        max_rejected=1,
+        max_rejected_bytes=16 * 1024,
+    )
+    first = _payload()
+    second = _payload("operation-0002", "capture-0002")
+    assert spool.persist(first)
+    first_path = spool.pending()[0][0]
+    spool.reject(first_path, first["operation_id"])
+    assert spool.persist(second)
+    second_path = spool.pending()[0][0]
+
+    with pytest.raises(
+        CheckpointObservationSpoolError, match="rejected spool is full",
+    ):
+        spool.reject(second_path, second["operation_id"])
+
+    assert [payload for _, payload in spool.pending()] == [second]
+    rejected = list(spool.rejected_root.glob("*.json"))
+    assert len(rejected) == 1
+    assert json.loads(rejected[0].read_text())["payload"] == first
+
+
+def test_exact_rejected_replay_converges_without_duplicate_evidence(tmp_path):
+    spool = CheckpointObservationSpoolV2(tmp_path / "observations")
+    payload = _payload()
+    assert spool.persist(payload)
+    first_path = spool.pending()[0][0]
+    spool.reject(first_path, payload["operation_id"])
+    assert spool.persist(payload)
+    replay_path = spool.pending()[0][0]
+
+    spool.reject(replay_path, payload["operation_id"])
+
+    assert spool.pending() == []
+    rejected = list(spool.rejected_root.glob("*.json"))
+    assert len(rejected) == 1
+    assert json.loads(rejected[0].read_text())["payload"] == payload
+
+
 @pytest.mark.parametrize("code", [
     "checkpoint_v2_kill_switch_active",
     "checkpoint_observation_not_authorized",
@@ -647,6 +690,32 @@ def test_local_evidence_counts_hidden_crash_residue_in_both_storage_lanes(
     )
 
     assert packet["attestations"][0]["metrics"]["cleanup_residue"] == 6
+
+
+def test_local_evidence_blocks_on_unreleased_shadow_generation(tmp_path):
+    reporter = CheckpointObservationReporterV2(
+        FakeObservationApi(), tmp_path,
+    )
+    assert reporter.register_cohort(_cohort_registration()) is True
+    generation = (
+        tmp_path / "checkpoint-v2" / "shadow" / "assignment-0001"
+        / "checkpoints" / "checkpoint-0001" / "generations"
+        / "generation-00000000000000000001"
+    )
+    generation.mkdir(parents=True, mode=0o700)
+
+    packet = checkpoint_local_evidence_v2(
+        tmp_path,
+        now=datetime.now(timezone.utc) + timedelta(seconds=1),
+    )
+    assert packet["attestations"][0]["metrics"]["cleanup_residue"] == 1
+
+    generation.rmdir()
+    packet = checkpoint_local_evidence_v2(
+        tmp_path,
+        now=datetime.now(timezone.utc) + timedelta(seconds=1),
+    )
+    assert packet["attestations"][0]["metrics"]["cleanup_residue"] == 0
 
 
 def test_local_evidence_rejects_cross_session_assignment_cohort_drift(tmp_path):

@@ -43,6 +43,8 @@ EVIDENCE_ATTESTATION_SCHEMA_V2 = (
 MAX_OBSERVATION_RECORD_BYTES_V2 = 16 * 1024
 MAX_PENDING_OBSERVATIONS_V2 = 512
 MAX_PENDING_OBSERVATION_BYTES_V2 = 8 * 1024 * 1024
+MAX_REJECTED_OBSERVATIONS_V2 = 512
+MAX_REJECTED_OBSERVATION_BYTES_V2 = 8 * 1024 * 1024
 
 _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9._-]{8,64}")
 _CAPTURE_WIRE_FIELDS = frozenset({
@@ -653,11 +655,19 @@ class CheckpointObservationSpoolV2:
         *,
         max_pending: int = MAX_PENDING_OBSERVATIONS_V2,
         max_pending_bytes: int = MAX_PENDING_OBSERVATION_BYTES_V2,
+        max_rejected: int = MAX_REJECTED_OBSERVATIONS_V2,
+        max_rejected_bytes: int = MAX_REJECTED_OBSERVATION_BYTES_V2,
     ) -> None:
         if not 1 <= max_pending <= 10_000:
             raise ValueError("checkpoint observation pending limit is invalid")
         if not MAX_OBSERVATION_RECORD_BYTES_V2 <= max_pending_bytes <= 64 * 1024 * 1024:
             raise ValueError("checkpoint observation byte limit is invalid")
+        if not 1 <= max_rejected <= 10_000:
+            raise ValueError("checkpoint observation rejected limit is invalid")
+        if not MAX_OBSERVATION_RECORD_BYTES_V2 <= max_rejected_bytes <= 64 * 1024 * 1024:
+            raise ValueError(
+                "checkpoint observation rejected byte limit is invalid"
+            )
         self.root = Path(root).absolute()
         self.pending_root = self.root / "pending"
         self.rejected_root = self.root / "rejected"
@@ -665,6 +675,8 @@ class CheckpointObservationSpoolV2:
         self.delivery_health_root = self.root / "delivery-health"
         self.max_pending = max_pending
         self.max_pending_bytes = max_pending_bytes
+        self.max_rejected = max_rejected
+        self.max_rejected_bytes = max_rejected_bytes
         self._thread_lock = threading.Lock()
 
     def _prepare(self) -> None:
@@ -800,6 +812,20 @@ class CheckpointObservationSpoolV2:
         paths.sort()
         return [path for _, _, path in paths]
 
+    def _rejected_paths_unlocked(self) -> list[Path]:
+        self._prepare()
+        paths: list[tuple[int, str, Path]] = []
+        for path in self.rejected_root.iterdir():
+            if path.name.startswith(".") or path.suffix != ".json":
+                continue
+            try:
+                metadata = path.lstat()
+            except OSError:
+                continue
+            paths.append((metadata.st_mtime_ns, path.name, path))
+        paths.sort()
+        return [path for _, _, path in paths]
+
     def persist(self, payload: dict[str, Any]) -> bool:
         """Persist once; return False for an exact already-persisted replay."""
 
@@ -903,7 +929,30 @@ class CheckpointObservationSpoolV2:
             self._prepare()
             target = self.rejected_root / expected.name
             if target.exists() or target.is_symlink():
-                target = self.rejected_root / f"{operation_id}.{uuid.uuid4().hex}.json"
+                _, pending_raw = _read_private_record(expected)
+                _, rejected_raw = _read_private_record(target)
+                if pending_raw != rejected_raw:
+                    raise CheckpointObservationSpoolError(
+                        "checkpoint observation rejection identity conflicts",
+                    )
+                expected.unlink()
+                _fsync_directory(self.pending_root)
+                return
+            rejected = self._rejected_paths_unlocked()
+            rejected_bytes = 0
+            for item in rejected:
+                try:
+                    rejected_bytes += item.lstat().st_size
+                except OSError:
+                    continue
+            pending_bytes = expected.lstat().st_size
+            if (
+                len(rejected) >= self.max_rejected
+                or rejected_bytes + pending_bytes > self.max_rejected_bytes
+            ):
+                raise CheckpointObservationSpoolError(
+                    "checkpoint observation rejected spool is full",
+                )
             os.replace(expected, target)
             _fsync_directory(self.pending_root)
             _fsync_directory(self.rejected_root)
@@ -1257,8 +1306,12 @@ def _local_cleanup_residue(home: Path, assignment_id: str) -> int:
                     continue
                 total += sum(
                     1 for generation in generations.iterdir()
-                    if re.fullmatch(r"generation-[0-9]{20}", generation.name)
-                    is None
+                    if (
+                        re.fullmatch(
+                            r"generation-[0-9]{20}", generation.name,
+                        ) is None
+                        or scope == "shadow"
+                    )
                 )
         except OSError:
             total += 1
@@ -1489,6 +1542,9 @@ __all__ = [
     "CheckpointObservationSpoolV2",
     "MAX_OBSERVATION_RECORD_BYTES_V2",
     "MAX_PENDING_OBSERVATIONS_V2",
+    "MAX_PENDING_OBSERVATION_BYTES_V2",
+    "MAX_REJECTED_OBSERVATIONS_V2",
+    "MAX_REJECTED_OBSERVATION_BYTES_V2",
     "OBSERVATION_SPOOL_SCHEMA_V2",
     "ObservationDeliveryResultV2",
     "checkpoint_local_evidence_v2",

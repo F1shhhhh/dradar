@@ -86,6 +86,7 @@ class _Coordinator:
     def __init__(self) -> None:
         self.started = threading.Event()
         self.stopped = threading.Event()
+        self.released = threading.Event()
 
     async def run(self, mainline, **_kwargs):
         self.started.set()
@@ -93,6 +94,9 @@ class _Coordinator:
             return await mainline
         finally:
             self.stopped.set()
+
+    async def release_local_snapshots(self):
+        self.released.set()
 
 
 def test_live_controller_has_a_bounded_non_authoritative_lifetime() -> None:
@@ -104,6 +108,7 @@ def test_live_controller_has_a_bounded_non_authoritative_lifetime() -> None:
     assert coordinator.started.wait(1)
     controller.close(timeout=1)
     assert coordinator.stopped.wait(1)
+    assert coordinator.released.wait(1)
 
 
 def test_live_controller_swallows_shadow_exception() -> None:
@@ -113,6 +118,9 @@ def test_live_controller_swallows_shadow_exception() -> None:
             if callable(close):
                 close()
             raise RuntimeError("shadow-only failure")
+
+        async def release_local_snapshots(self):
+            raise RuntimeError("shadow-only cleanup failure")
 
     controller = LiveCheckpointShadowControllerV2(
         Broken(), initial_delay_sec=0, interval_sec=0.01,

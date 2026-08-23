@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import dradar.checkpoint_shadow_v2 as shadow_runtime
 from dradar.api_client import ApiError
 from dradar.checkpoint_runtime_v2 import (
     CheckpointObservationV2,
@@ -313,6 +314,113 @@ def test_restore_test_reports_capture_before_nonpaid_restore(tmp_path: Path) -> 
     assert sink.payloads[1]["paid_execution_started"] is False
     assert sink.payloads[1]["authoritative"] is False
     assert sink.payloads[1]["source_capture_id"] == sink.payloads[0]["capture_id"]
+
+
+@pytest.mark.parametrize("mode", ["observe", "restore-test"])
+def test_clean_consumed_shadow_snapshot_is_released_off_mainline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    coordinator, _plane, _sink = _coordinator(tmp_path, mode)
+    released = []
+
+    def release(storage_root, published, **identity):
+        released.append((storage_root, published, identity))
+        return True
+
+    monkeypatch.setattr(
+        shadow_runtime, "release_shadow_generation_v2", release,
+    )
+
+    async def exercise():
+        async def mainline():
+            await asyncio.sleep(0.02)
+            return "done"
+
+        assert await coordinator.run(
+            mainline(), initial_delay_sec=0, interval_sec=0.01,
+            maximum_captures=1,
+        ) == "done"
+        await coordinator.release_local_snapshots()
+
+    asyncio.run(exercise())
+    assert len(released) == 1
+    assert released[0][0] == coordinator.data_plane.storage_root
+    assert released[0][2] == {
+        "expected_identity_fingerprint": coordinator._identity.fingerprint,
+        "expected_checkpoint_abi": "dradar-checkpoint-v2/codex/1",
+    }
+
+
+def test_restore_skipped_by_dynamic_downgrade_preserves_local_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assignment = _assignment("restore-test")
+    api = IdentityApi(assignment)
+    original_activation = api.checkpoint_v2_activation
+
+    def changing_activation(payload):
+        response = original_activation(payload)
+        api.current_mode = "observe"
+        return response
+
+    api.checkpoint_v2_activation = changing_activation
+    coordinator, plane, _sink = _coordinator(
+        tmp_path, "restore-test", api=api,
+    )
+    released = []
+    monkeypatch.setattr(
+        shadow_runtime,
+        "release_shadow_generation_v2",
+        lambda *args, **kwargs: released.append((args, kwargs)),
+    )
+
+    async def exercise():
+        async def mainline():
+            await asyncio.sleep(0.02)
+            return "done"
+
+        assert await coordinator.run(
+            mainline(), initial_delay_sec=0, interval_sec=0.01,
+            maximum_captures=1,
+        ) == "done"
+        await coordinator.release_local_snapshots()
+
+    asyncio.run(exercise())
+    assert plane.captures == 1
+    assert plane.restores == 0
+    assert released == []
+
+
+def test_unrecorded_capture_is_preserved_for_local_diagnosis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, plane, sink = _coordinator(tmp_path, "observe")
+    sink.record_checkpoint_observation = lambda _payload: False
+    released = []
+    monkeypatch.setattr(
+        shadow_runtime,
+        "release_shadow_generation_v2",
+        lambda *args, **kwargs: released.append((args, kwargs)),
+    )
+
+    async def exercise():
+        async def mainline():
+            await asyncio.sleep(0.02)
+            return "done"
+
+        assert await coordinator.run(
+            mainline(), initial_delay_sec=0, interval_sec=0.01,
+            maximum_captures=1,
+        ) == "done"
+        await coordinator.release_local_snapshots()
+
+    asyncio.run(exercise())
+    assert plane.captures == 1
+    assert released == []
 
 
 def test_server_can_downgrade_restore_test_to_observe_per_sample(

@@ -36,10 +36,13 @@ from .checkpoint_runtime_v2 import (
     CheckpointRestoreRequestV2,
     HarnessCheckpointExporterV2,
     HarnessCheckpointRestorerV2,
+    PublishedCheckpointV2,
     checkpoint_observation_payload_v2,
     checkpoint_restore_observation_payload_v2,
     new_capture_request_v2,
     next_shadow_generation_v2,
+    record_local_checkpoint_failure_v2,
+    release_shadow_generation_v2,
     run_mainline_with_periodic_shadow_captures_v2,
 )
 from .checkpoint_v2 import (
@@ -168,6 +171,9 @@ class CheckpointShadowCoordinatorV2:
         self.restorer_factory = restorer_factory
         self._identity: ExecutionIdentityV2 | None = None
         self._identity_lock = asyncio.Lock()
+        self._release_candidates: list[
+            tuple[PublishedCheckpointV2, str, str]
+        ] = []
 
     async def _finalized_identity(self) -> ExecutionIdentityV2:
         if self._identity is not None:
@@ -231,11 +237,13 @@ class CheckpointShadowCoordinatorV2:
                         pass
         return self._identity
 
-    def _record(self, payload: dict[str, object]) -> None:
+    def _record(self, payload: dict[str, object]) -> bool:
         try:
-            self.observation_sink.record_checkpoint_observation(dict(payload))
+            return bool(
+                self.observation_sink.record_checkpoint_observation(dict(payload))
+            )
         except Exception:
-            pass
+            return False
 
     async def _sample_activation(
         self,
@@ -322,13 +330,13 @@ class CheckpointShadowCoordinatorV2:
         capture_request: CheckpointCaptureRequestV2,
         capture_observation: CheckpointObservationV2,
         activation: CheckpointActivationV2,
-    ) -> None:
+    ) -> CheckpointRestoreObservationV2 | None:
         if (
             not activation.offline_restore_enabled
             or capture_observation.published is None
             or self.restorer_factory is None
         ):
-            return
+            return None
         restore_id = f"restore-{new_operation_id()[:48]}"
         restore_request = CheckpointRestoreRequestV2(
             published=capture_observation.published,
@@ -371,8 +379,46 @@ class CheckpointShadowCoordinatorV2:
                 ),
             )
         except Exception:
-            return
-        self._record(payload)
+            return None
+        return observation if self._record(payload) else None
+
+    async def release_local_snapshots(self) -> None:
+        """Release only clean, fully consumed shadow generations.
+
+        Failed or authorization-skipped RESTORE_TEST generations remain local
+        for incident diagnosis.  Cleanup runs in the shadow controller thread
+        after sampling stops, so hashing or filesystem latency can never delay
+        the paid process/result path.
+        """
+
+        candidates, self._release_candidates = self._release_candidates, []
+        for index, (
+            published, identity_fingerprint, checkpoint_abi,
+        ) in enumerate(candidates):
+            try:
+                await asyncio.to_thread(
+                    release_shadow_generation_v2,
+                    self.data_plane.storage_root,
+                    published,
+                    expected_identity_fingerprint=identity_fingerprint,
+                    expected_checkpoint_abi=checkpoint_abi,
+                )
+            except asyncio.CancelledError:
+                self._release_candidates.extend(candidates[index:])
+                raise
+            except Exception as exc:
+                try:
+                    record_local_checkpoint_failure_v2(
+                        self.data_plane.storage_root,
+                        exc=exc,
+                        stage="retention",
+                        code="shadow_release_failed",
+                    )
+                except Exception:
+                    # Diagnostic persistence is optional evidence too.  A bad
+                    # local evidence lane cannot stop later candidates from
+                    # being released or escape into the paid mainline.
+                    pass
 
     async def capture(self, _sample_generation: int) -> CheckpointObservationV2:
         """Capture one generation; every failure remains shadow-only."""
@@ -455,6 +501,7 @@ class CheckpointShadowCoordinatorV2:
         started = time.monotonic()
         observation = await self.data_plane.observe_capture(request, self.exporter)
         elapsed_ms = min(86_400_000, int((time.monotonic() - started) * 1000))
+        capture_recorded = False
         try:
             payload = checkpoint_observation_payload_v2(
                 request,
@@ -473,7 +520,8 @@ class CheckpointShadowCoordinatorV2:
         except Exception:
             pass
         else:
-            self._record(payload)
+            capture_recorded = self._record(payload)
+        restore_observation: CheckpointRestoreObservationV2 | None = None
         if observation.status == "sealed" and activation.offline_restore_enabled:
             try:
                 restore_activation = await self._sample_activation(identity)
@@ -481,9 +529,26 @@ class CheckpointShadowCoordinatorV2:
                 # A missing current decision can only remove optional work.
                 # The sealed capture remains local evidence for later audit.
                 return observation
-            await self._observe_restore(
+            restore_observation = await self._observe_restore(
                 request, observation, restore_activation,
             )
+        if (
+            observation.status == "sealed"
+            and observation.published is not None
+            and capture_recorded
+            and (
+                not activation.offline_restore_enabled
+                or (
+                    restore_observation is not None
+                    and restore_observation.status == "verified"
+                )
+            )
+        ):
+            self._release_candidates.append((
+                observation.published,
+                identity.fingerprint,
+                identity.checkpoint_abi,
+            ))
         return observation
 
     async def run(
