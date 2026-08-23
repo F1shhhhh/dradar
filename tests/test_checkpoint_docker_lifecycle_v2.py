@@ -108,7 +108,8 @@ def _docker(container: str, script: str) -> subprocess.CompletedProcess[str]:
 def _start_container(container: str) -> None:
     started = subprocess.run(
         ["docker", "run", "-d", "--rm", "--name", container,
-         "--entrypoint", "/bin/sh", IMAGE, "-c", "sleep 300"],
+         "--network", "none", "--entrypoint", "/bin/sh", IMAGE,
+         "-c", "sleep 300"],
         check=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -330,7 +331,8 @@ def test_live_job_discovery_and_fresh_image_restore_for_native_kimi(
     job_root.mkdir(mode=0o700)
     subprocess.run(
         ["docker", "run", "-d", "--rm", "--name", seed,
-         "--entrypoint", "/bin/sh", IMAGE, "-c", "sleep 300"],
+         "--network", "none", "--entrypoint", "/bin/sh", IMAGE,
+         "-c", "sleep 300"],
         check=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -365,6 +367,7 @@ GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.invalid \
         subprocess.run(
             [
                 "docker", "run", "-d", "--rm", "--name", live,
+                "--network", "none",
                 "--mount", f"type=bind,src={job_root},dst=/logs",
                 "--entrypoint", "/bin/sh", image_tag, "-c", "sleep 300",
             ],
