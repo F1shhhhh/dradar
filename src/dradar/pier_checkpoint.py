@@ -727,6 +727,18 @@ class DurableCheckpoint:
                     "checkpoint snapshot did not stop cleanly\n",
                     encoding="utf-8",
                 )
+        # Snapshot commands may run as root when the task image has no default
+        # user.  Hand the bind-mounted checkpoint back to the trusted host
+        # owner before any host-side validation traverses provider-state.
+        host_stat = self.host_dir.parent.stat()
+        await agent.exec_as_root(
+            environment,
+            command=(
+                f"chown -R {host_stat.st_uid}:{host_stat.st_gid} "
+                f"{shlex.quote(str(remote))}"
+            ),
+            env=env,
+        )
         try:
             if snapshot_stopped:
                 self._remove_sensitive_artifacts()

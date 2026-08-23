@@ -736,13 +736,27 @@ class DshMinimal(BaseInstalledAgent):
             failure = exc
             raise
         finally:
-            await checkpoint.finish(
-                self,
-                environment,
-                env,
-                completed=failure is None,
-                failure=failure,
-            )
+            try:
+                await checkpoint.finish(
+                    self,
+                    environment,
+                    env,
+                    completed=failure is None,
+                    failure=failure,
+                )
+            finally:
+                # DSH can run as root in images without a declared default
+                # user.  Pier later traverses all agent logs on the host, so
+                # return DSH_HOME to the host logs owner before post-run.
+                host_stat = self.logs_dir.stat()
+                await self.exec_as_root(
+                    environment,
+                    command=(
+                        f"chown -R {host_stat.st_uid}:{host_stat.st_gid} "
+                        f"{shlex.quote(remote_home)}"
+                    ),
+                    env=env,
+                )
 
     def populate_context_post_run(self, context: AgentContext) -> None:
         # DSH rc.6 does not expose a stable ATIF event stream. Keep this false
