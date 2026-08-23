@@ -9,7 +9,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from dradar import artifact_staging, checkpoints, pending, runloop
+from dradar import artifact_staging, checkpoints, pending, refill, runloop
 from dradar.api_client import ApiClient
 
 
@@ -197,6 +197,30 @@ def test_scan_reads_extended_harness_identity(tmp_path: Path):
     assert item.session_id == "session-12345678"
 
 
+def test_scan_omitted_provider_state_forces_workspace_only_resume(tmp_path: Path):
+    item = _make_checkpoint(
+        tmp_path,
+        "a" * 32,
+        manifest_overrides={
+            "harness": "zcode",
+            "provider": "bigmodel-coding-plan",
+            "session_id": "zcode-session-1234",
+        },
+    )
+    (item.checkpoint_dir / "session-id").write_text(
+        "zcode-sidecar-1234\n", encoding="utf-8",
+    )
+    (item.checkpoint_dir / "session-omitted-sensitive").write_text(
+        "provider state omitted\n", encoding="utf-8",
+    )
+    _privatize_checkpoint_tree(item.trial_dir, item.checkpoint_dir)
+
+    loaded = checkpoints.scan(tmp_path)[0]
+
+    assert loaded.valid
+    assert loaded.session_id is None
+
+
 def test_scan_reads_session_from_safe_sidecar(tmp_path: Path):
     item = _make_checkpoint(
         tmp_path,
@@ -308,6 +332,8 @@ def test_scan_rejects_checkpoint_with_snapshot_lock(tmp_path: Path):
 
     assert not loaded.valid
     assert loaded.phase == "invalid"
+    assert loaded.assignment_id == item.assignment_id
+    assert loaded.checkpoint_id == item.checkpoint_id
     assert "snapshot is incomplete" in (loaded.invalid_reason or "")
 
 
@@ -324,7 +350,128 @@ def test_scan_rejects_dangling_snapshot_lock(tmp_path: Path):
 
     assert not loaded.valid
     assert loaded.phase == "invalid"
+    assert loaded.assignment_id == item.assignment_id
+    assert loaded.checkpoint_id == item.checkpoint_id
     assert "snapshot is incomplete" in (loaded.invalid_reason or "")
+
+
+def test_invalid_checkpoint_opens_refill_circuit_and_keeps_terminal_evidence(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    aid = "6" * 32
+    original = _make_checkpoint(
+        tmp_path,
+        aid,
+        phase="running",
+        manifest_overrides={
+            "harness": "zcode",
+            "provider": "bigmodel-coding-plan",
+            "model": "glm-5.3",
+            "effort": "high",
+        },
+    )
+    lock = original.checkpoint_dir / "snapshot.lock"
+    lock.mkdir(mode=0o700)
+    item = checkpoints.find_latest(tmp_path, aid)
+    assert item is not None and not item.valid
+    assignment = {
+        **_assignment(aid),
+        "agent": "zcode",
+        "provider": "bigmodel-coding-plan",
+        "model": "glm-5.3",
+        "effort": "high",
+    }
+    refill.configure(
+        tmp_path,
+        volunteer_id="v1",
+        refill_to=1,
+        max_tasks=5,
+        quota_tier="plus",
+        max_estimated_quota_pct=None,
+        active=[assignment],
+        refill_harness="zcode",
+        refill_model="glm-5.3",
+        refill_effort="high",
+    )
+    client = _RecoveryClient(assignment)
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+
+    paused = runloop._pause_checkpoint_quietly(client, assignment)
+
+    assert isinstance(paused, runloop._CheckpointPauseFailure)
+    assert paused.family == "checkpoint_invalid"
+    assert paused.discard_confirmed
+    assert client.discards == [(
+        aid, original.checkpoint_id, 0, "invalid",
+    )]
+    plan = refill.load(tmp_path)
+    assert plan["status"] == refill.FAULTED_STATE
+    assert plan["circuit"]["failure_family"] == "checkpoint_invalid"
+    assert checkpoints.is_terminal(tmp_path, item)
+    assert item.job_dir.is_dir()
+    assert checkpoints.find_latest(tmp_path, aid) is None
+
+
+@pytest.mark.parametrize("discard_status", [None, 409])
+def test_invalid_pause_discard_failure_stays_retryable(
+    tmp_path: Path, monkeypatch, discard_status: int | None,
+) -> None:
+    aid = "7" * 32
+    original = _make_checkpoint(
+        tmp_path,
+        aid,
+        phase="running",
+        manifest_overrides={
+            "harness": "zcode",
+            "provider": "bigmodel-coding-plan",
+            "model": "glm-5.3",
+            "effort": "high",
+        },
+    )
+    (original.checkpoint_dir / "snapshot.lock").mkdir(mode=0o700)
+    assignment = {
+        **_assignment(aid),
+        "agent": "zcode",
+        "provider": "bigmodel-coding-plan",
+        "model": "glm-5.3",
+        "effort": "high",
+    }
+    refill.configure(
+        tmp_path,
+        volunteer_id="v1",
+        refill_to=1,
+        max_tasks=5,
+        quota_tier="plus",
+        max_estimated_quota_pct=None,
+        active=[assignment],
+        refill_harness="zcode",
+        refill_model="glm-5.3",
+        refill_effort="high",
+    )
+
+    class OfflineDiscardClient(_RecoveryClient):
+        def checkpoint_discard(
+            self, assignment_id, checkpoint_id, generation, reason,
+        ):
+            self.discards.append((
+                assignment_id, checkpoint_id, generation, reason,
+            ))
+            raise runloop.ApiError(
+                "discard state is not confirmed", status_code=discard_status,
+            )
+
+    client = OfflineDiscardClient(assignment)
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+
+    paused = runloop._pause_checkpoint_quietly(client, assignment)
+
+    assert isinstance(paused, runloop._CheckpointPauseFailure)
+    assert paused.family == "checkpoint_invalid"
+    assert not paused.discard_confirmed
+    assert refill.load(tmp_path)["status"] == refill.FAULTED_STATE
+    retryable = checkpoints.find_latest(tmp_path, aid)
+    assert retryable is not None and not retryable.valid
+    assert not checkpoints.is_terminal(tmp_path, retryable)
 
 
 def test_scan_reads_atomically_published_generation(tmp_path: Path):
@@ -801,6 +948,37 @@ def test_persist_generation_rejects_manifest_replacement_without_washing_phase(
     assert persisted["phase"] == "invalid"
     assert persisted["model"] == "attacker-model"
     assert persisted["resume_generation"] == 99
+
+
+def test_persist_generation_scrubs_session_suppressed_by_omission_marker(
+    tmp_path: Path,
+) -> None:
+    item = _make_checkpoint(
+        tmp_path,
+        "2" * 32,
+        generation=1,
+        manifest_overrides={
+            "harness": "zcode",
+            "provider": "bigmodel-coding-plan",
+            "session_id": "stale-zcode-session",
+        },
+    )
+    payload = item.checkpoint_dir / "session-omitted-sensitive"
+    payload.write_text("provider state omitted\n", encoding="utf-8")
+    _privatize_checkpoint_tree(item.trial_dir, item.checkpoint_dir)
+    workspace_only = checkpoints.find_latest(tmp_path, item.assignment_id)
+    assert workspace_only is not None
+    assert workspace_only.valid
+    assert workspace_only.session_id is None
+
+    persisted = checkpoints.persist_resume_generation(
+        tmp_path, workspace_only, 2,
+    )
+
+    manifest = json.loads(persisted.manifest_path.read_text(encoding="utf-8"))
+    assert "session_id" not in manifest
+    assert persisted.session_id is None
+    assert persisted.resume_generation == 2
 
 
 def test_resume_uses_server_generation_and_persists_fence_before_runner(
@@ -1474,7 +1652,7 @@ def test_healthy_local_run_holds_assignment_lock_before_checkpoint_resume(
     assert result == ["failed"]
 
 
-def test_invalid_checkpoint_discards_server_lease_and_all_local_copies(
+def test_invalid_checkpoint_discards_server_lease_but_keeps_terminal_evidence(
     tmp_path: Path, monkeypatch,
 ):
     aid = "5" * 32
@@ -1487,9 +1665,75 @@ def test_invalid_checkpoint_discards_server_lease_and_all_local_copies(
     outcome = runloop._resume_one_checkpoint(
         client, invalid, assignment, _args(), tmp_path / "tasks", None,
     )
-    assert outcome == "discarded"
+    assert outcome == "checkpoint-invalid"
     assert client.discards[0][3] == "invalid"
-    assert checkpoints.scan(tmp_path) == []
+    kept = checkpoints.scan(tmp_path)
+    assert len(kept) == 1
+    assert checkpoints.is_terminal(tmp_path, kept[0])
+    assert checkpoints.find_latest(tmp_path, aid) is None
+
+
+@pytest.mark.parametrize("discard_status", [None, 409])
+def test_invalid_resume_discard_failure_only_retries_discard(
+    tmp_path: Path, monkeypatch, discard_status: int | None,
+) -> None:
+    aid = "4" * 32
+    item = _make_checkpoint(
+        tmp_path,
+        aid,
+        manifest_overrides={
+            "harness": "zcode",
+            "provider": "bigmodel-coding-plan",
+            "model": "glm-5.3",
+            "effort": "low",
+        },
+    )
+    item.manifest_path.write_text("{broken", encoding="utf-8")
+    assignment = {
+        **_assignment(aid),
+        "agent": "zcode",
+        "provider": "bigmodel-coding-plan",
+        "model": "glm-5.3",
+        "effort": "low",
+    }
+    refill.configure(
+        tmp_path,
+        volunteer_id="v1",
+        refill_to=1,
+        max_tasks=5,
+        quota_tier="plus",
+        max_estimated_quota_pct=None,
+        active=[assignment],
+        refill_harness="zcode",
+        refill_model="glm-5.3",
+        refill_effort="low",
+    )
+
+    class OfflineDiscardClient(_RecoveryClient):
+        def checkpoint_discard(
+            self, assignment_id, checkpoint_id, generation, reason,
+        ):
+            self.discards.append((
+                assignment_id, checkpoint_id, generation, reason,
+            ))
+            raise runloop.ApiError(
+                "discard state is not confirmed", status_code=discard_status,
+            )
+
+    client = OfflineDiscardClient(assignment)
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+
+    for expected_attempts in (1, 2):
+        retryable = checkpoints.find_latest(tmp_path, aid)
+        assert retryable is not None and not retryable.valid
+        outcome = runloop._resume_one_checkpoint(
+            client, retryable, assignment, _args(), tmp_path / "tasks", None,
+        )
+        assert outcome == "paused"
+        assert len(client.discards) == expected_attempts
+        assert client.resumes == []
+        assert not checkpoints.is_terminal(tmp_path, retryable)
+    assert refill.load(tmp_path)["status"] == refill.FAULTED_STATE
 
 
 def test_cleanup_only_removes_server_settled_unprotected_jobs(

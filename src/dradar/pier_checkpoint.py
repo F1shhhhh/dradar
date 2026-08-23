@@ -1158,14 +1158,16 @@ def _capture_script(
     probe = ""
     if session_probe:
         probe = f"""
-session_id=$({session_probe} 2>/dev/null || true)
-case "$session_id" in
-  ''|*[!A-Za-z0-9._:-]*) ;;
-  *)
-    if [ "${{#session_id}}" -ge 8 ] && [ "${{#session_id}}" -le 160 ]; then
-      printf '%s\\n' "$session_id" > "$staging/session-id"
-    fi ;;
-esac
+if [ ! -e "$staging/session-omitted-sensitive" ]; then
+  session_id=$({session_probe} 2>/dev/null || true)
+  case "$session_id" in
+    ''|*[!A-Za-z0-9._:-]*) ;;
+    *)
+      if [ "${{#session_id}}" -ge 8 ] && [ "${{#session_id}}" -le 160 ]; then
+        printf '%s\\n' "$session_id" > "$staging/session-id"
+      fi ;;
+  esac
+fi
 """
     expected_groups = " ".join(str(value) for value in agent_identity.groups)
     copies = "\n".join(copy_lines)
@@ -2221,6 +2223,11 @@ class DurableCheckpoint:
 
     def _previous_session_id(self, previous_dir: Path) -> str | None:
         previous_dir = _snapshot_payload_dir(previous_dir)
+        # Provider-state omission deliberately downgrades recovery to the
+        # workspace only.  A bare native session id without its matching
+        # provider files is not a valid resume contract.
+        if self._marker_present(previous_dir, "session-omitted-sensitive"):
+            return None
         candidates = [self.previous.get("session_id") if self.previous else None]
         path = _safe_path(previous_dir, "session-id")
         if path.is_file() and path.stat().st_size <= 512:
@@ -2551,15 +2558,24 @@ class DurableCheckpoint:
             candidate = _safe_path(stage, name)
             if not candidate.is_file():
                 raise CheckpointError(f"checkpoint staging is missing {name}")
-        rejected_marker = any(
-            self._marker_present(stage, name)
-            for name in ("invalid-secret", "session-omitted-sensitive")
-        )
-        if rejected_marker:
+        if self._marker_present(stage, "invalid-secret"):
             self._mark_invalid_secret(
                 "credential-shaped content detected in checkpoint staging",
             )
             raise CheckpointError("checkpoint contains rejected credential data")
+        if self._marker_present(stage, "session-omitted-sensitive"):
+            # This marker means the capture program already removed native
+            # provider state before publication.  The workspace artifacts are
+            # still a safe checkpoint, but the marker must never coexist with
+            # the supposedly omitted directory.
+            provider_state = _safe_path(stage, "provider-state")
+            if _lexists(provider_state):
+                self._mark_invalid_snapshot(
+                    "checkpoint provider state conflicts with omission marker",
+                )
+                raise CheckpointError(
+                    "checkpoint provider-state omission is inconsistent",
+                )
         tracked_scan = _safe_path(stage, _TRACKED_SCAN_ARTIFACT)
         if not tracked_scan.is_file():
             raise CheckpointError(
@@ -2598,8 +2614,22 @@ class DurableCheckpoint:
             raise CheckpointError("checkpoint generation copy already exists")
         try:
             _copy_seized_tree(stage, copied)
-            if isinstance(session_id, str) and _SESSION_ID_RE.fullmatch(session_id):
-                sidecar = copied / "session-id"
+            native_state_omitted = self._marker_present(
+                copied, "session-omitted-sensitive",
+            )
+            sidecar = copied / "session-id"
+            if native_state_omitted:
+                if _lexists(sidecar):
+                    _validate_regular_tree(
+                        sidecar, label="checkpoint staged session id",
+                    )
+                    if not sidecar.is_file():
+                        raise CheckpointError("checkpoint staged session id is unsafe")
+                    sidecar.unlink()
+            elif (
+                isinstance(session_id, str)
+                and _SESSION_ID_RE.fullmatch(session_id)
+            ):
                 if _lexists(sidecar):
                     _validate_regular_tree(
                         sidecar, label="checkpoint staged session id",
@@ -3181,7 +3211,19 @@ class DurableCheckpoint:
             self._mark_invalid_snapshot(
                 "checkpoint generation could not be resolved at finish",
             )
-        if selected_session is None:
+        native_state_omitted = False
+        try:
+            native_state_omitted = self._marker_present(
+                payload_dir, "session-omitted-sensitive",
+            )
+        except CheckpointError:
+            snapshot_stopped = False
+            self._mark_invalid_snapshot(
+                "checkpoint provider-state omission marker is unsafe",
+            )
+        if native_state_omitted:
+            selected_session = None
+        if selected_session is None and not native_state_omitted:
             sidecar = payload_dir / "session-id"
             try:
                 if _lexists(sidecar):

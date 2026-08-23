@@ -101,6 +101,7 @@ class FakeDurableCheckpoint(DurableCheckpoint):
     """Exercise lifecycle logic without requiring a real Pier container."""
 
     fail_snapshot = False
+    omit_provider_state = False
 
     async def _install_runtime(
         self, agent, environment, env, checkpoint_id: str,
@@ -136,7 +137,15 @@ class FakeDurableCheckpoint(DurableCheckpoint):
         (stage / "last_heartbeat").write_text(
             "2026-08-23T00:00:00Z\n", encoding="utf-8",
         )
-        (stage / "provider-state").mkdir(exist_ok=True)
+        if self.omit_provider_state:
+            provider_state = stage / "provider-state"
+            if provider_state.exists():
+                shutil.rmtree(provider_state)
+            (stage / "session-omitted-sensitive").write_text(
+                "provider state omitted\n", encoding="utf-8",
+            )
+        else:
+            (stage / "provider-state").mkdir(exist_ok=True)
         if not (stage / "workspace.patch").exists():
             (stage / "workspace.patch").write_bytes(b"")
         if not (stage / "untracked.tar.gz").exists():
@@ -981,6 +990,36 @@ def test_checkpoint_finish_never_persists_credential_shaped_session_id(
             assert secret_bytes not in (Path(current) / name).read_bytes()
 
 
+def test_checkpoint_finish_omitted_provider_state_suppresses_native_session(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(tmp_path / "agent")
+    manager.omit_provider_state = True
+    agent = FakeAgent()
+    environment = FakeEnvironment()
+
+    async def scenario() -> None:
+        await manager.start(agent, environment, {})
+        await manager.finish(
+            agent,
+            environment,
+            {},
+            completed=False,
+            failure=RuntimeError("interrupt"),
+            session_id="zcode-session-1234",
+        )
+
+    asyncio.run(scenario())
+
+    manifest = json.loads((manager.host_dir / "checkpoint.json").read_text())
+    payload = _snapshot_payload_dir(manager.host_dir)
+    assert manifest["phase"] == "paused"
+    assert "session_id" not in manifest
+    assert (payload / "session-omitted-sensitive").is_file()
+    assert not (payload / "provider-state").exists()
+    assert not (payload / "session-id").exists()
+
+
 def test_runtime_tree_handoff_uses_captured_host_owner(
     tmp_path: Path,
 ) -> None:
@@ -1407,6 +1446,104 @@ def test_capture_script_captures_workspace_state_and_session(tmp_path: Path) -> 
     assert (
         stage2 / "provider-state/sessions/wire.jsonl"
     ).read_text() == '{"round":2}\n'
+
+
+def test_sensitive_provider_state_degrades_to_workspace_only_checkpoint(
+    tmp_path: Path,
+) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    subprocess.run(["git", "init", "-q", str(worktree)], check=True)
+    tracked = worktree / "tracked.txt"
+    tracked.write_text("before\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(worktree), "add", "tracked.txt"], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(worktree), "-c", "user.name=DRadar Test",
+            "-c", "user.email=test@dradar.invalid", "commit", "-qm", "base",
+        ],
+        check=True,
+    )
+    base = subprocess.run(
+        ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    tracked.write_text("after\n", encoding="utf-8")
+    state = tmp_path / "native-state"
+    state.mkdir()
+    (state / "rollout.jsonl").write_text(
+        '{"credential":"eyJabcdefghij.abcdefghij.abcdefghij"}\n',
+        encoding="utf-8",
+    )
+    session_source = tmp_path / "session-source"
+    session_source.write_text("session-abcdefgh\n", encoding="utf-8")
+
+    manager = _manager(tmp_path / "trial" / "agent")
+    manager.host_dir.mkdir(mode=0o700)
+    manager.staging_host_dir.mkdir(mode=0o700)
+    generation = "c" * 32
+    stage = manager._stage_path(generation)
+    stage.mkdir(mode=0o700)
+    script = tmp_path / "capture.sh"
+    script.write_text(
+        _capture_script(
+            workdir=str(worktree),
+            state_paths=(StatePath("zcode-rollout", str(state)),),
+            session_probe=f"cat {session_source}",
+            agent_identity=AgentIdentity(
+                os.getuid(), os.getgid(), _numeric_groups(),
+            ),
+        ),
+        encoding="utf-8",
+    )
+
+    subprocess.run(["sh", str(script), str(stage), base], check=True)
+
+    assert (stage / "session-omitted-sensitive").is_file()
+    assert not (stage / "provider-state").exists()
+    assert not (stage / "session-id").exists()
+    manager._promote_stage(generation, session_id="session-explicit-1234")
+    payload = _snapshot_payload_dir(manager.host_dir)
+    assert (payload / "session-omitted-sensitive").is_file()
+    assert not (payload / "provider-state").exists()
+    assert not (payload / "session-id").exists()
+    assert (payload / "workspace.patch").is_file()
+    assert not (manager.host_dir / "invalid-secret").exists()
+
+
+def test_provider_state_cannot_coexist_with_omission_marker(tmp_path: Path) -> None:
+    manager = _manager(tmp_path / "trial" / "agent")
+    manager.host_dir.mkdir(mode=0o700)
+    manager.staging_host_dir.mkdir(mode=0o700)
+    generation = "d" * 32
+    stage = manager._stage_path(generation)
+    stage.mkdir(mode=0o700)
+    (stage / "progress-summary.txt").write_text("test\n", encoding="utf-8")
+    (stage / "last_heartbeat").write_text(
+        "2026-08-23T00:00:00Z\n", encoding="utf-8",
+    )
+    (stage / "workspace.patch").write_bytes(b"")
+    with tarfile.open(stage / "untracked.tar.gz", "w:gz"):
+        pass
+    (stage / checkpoint_mod._TRACKED_SCAN_ARTIFACT).write_bytes(b"")
+    (stage / "session-omitted-sensitive").write_text(
+        "provider state omitted\n", encoding="utf-8",
+    )
+    (stage / "provider-state").mkdir()
+    for current, directories, files in os.walk(stage):
+        Path(current).chmod(0o700)
+        for name in directories:
+            (Path(current) / name).chmod(0o700)
+        for name in files:
+            (Path(current) / name).chmod(0o600)
+
+    with pytest.raises(CheckpointError, match="omission is inconsistent"):
+        manager._promote_stage(generation)
+
+    assert (manager.host_dir / "invalid-snapshot").is_file()
+    assert not (manager.host_dir / "current-generation").exists()
 
 
 def test_capture_disables_configured_textconv(

@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -103,6 +104,15 @@ _CHECKPOINT_BACKOFF_BASE_SECONDS = 30.0
 _CHECKPOINT_BACKOFF_MAX_SECONDS = 600.0
 _CHECKPOINT_RESUME_REPLAY_ATTEMPTS = 3
 _CHECKPOINT_RESUME_REPLAY_DELAY_SECONDS = 0.25
+
+
+@dataclass(frozen=True)
+class _CheckpointPauseFailure:
+    """A non-resumable checkpoint failure that stopped automatic refill."""
+
+    family: str
+    item: checkpoints.Checkpoint
+    discard_confirmed: bool
 
 # Cloudflare's common request-body ceiling is 100 MB. Keep enough headroom
 # for multipart boundaries and form fields so an optional trajectory bundle
@@ -1804,17 +1814,22 @@ def _discard_checkpoint_quietly(
             assignment_id, checkpoint_id, generation, reason=reason,
         )
     except ApiError as exc:
-        # Already expired/submitted/not found means there is no live cell left
-        # for this local copy to protect. A transport failure is ambiguous, so
-        # keep the checkpoint and try again on the next startup.
-        if exc.status_code == 404:
+        # A compatibility endpoint miss, a stale generation fence, a mismatched
+        # checkpoint id, and an already-settled assignment can all surface as
+        # 404/409/410 across server versions.  Treat the response as terminal
+        # only after the authoritative active list proves the lease is gone;
+        # otherwise keep the local item so the next startup retries cleanup.
+        if exc.status_code in (404, 409, 410):
             try:
                 if assignment_id in _active_by_id(client):
-                    print("  server does not support checkpoint discard yet; kept locally")
+                    print(
+                        "  server still reports the checkpoint lease active after "
+                        "discard was rejected; kept locally for a safe retry"
+                    )
                     return False
             except ApiError:
                 return False
-        if exc.status_code not in (404, 409, 410):
+        else:
             print(f"  couldn't discard checkpoint {item.checkpoint_id or '?'}: {exc}; kept locally")
             return False
     if preserve_local:
@@ -1826,7 +1841,7 @@ def _discard_checkpoint_quietly(
 
 def _pause_checkpoint_quietly(
     client: ApiClient, assignment: dict,
-) -> checkpoints.Checkpoint | None:
+) -> checkpoints.Checkpoint | _CheckpointPauseFailure | None:
     item = checkpoints.find_latest(HOME, assignment["assignment_id"])
     if item is None:
         return None
@@ -1841,15 +1856,23 @@ def _pause_checkpoint_quietly(
                 f"  completed checkpoint artifact staging will retry on resume ({exc})"
             )
     if not item.valid or not item.checkpoint_id:
-        _discard_checkpoint_quietly(
-            client, item, assignment, reason="invalid",
+        family = "checkpoint_invalid"
+        refill_plan.open_circuit(HOME, assignment, family)
+        discarded = _discard_checkpoint_quietly(
+            client, item, assignment, reason="invalid", preserve_local=True,
         )
-        return None
+        if discarded:
+            checkpoints.mark_terminal(HOME, item)
+        return _CheckpointPauseFailure(family, item, discarded)
     if item.phase == "incompatible":
-        _discard_checkpoint_quietly(
-            client, item, assignment, reason="incompatible",
+        family = "checkpoint_incompatible"
+        refill_plan.open_circuit(HOME, assignment, family)
+        discarded = _discard_checkpoint_quietly(
+            client, item, assignment, reason="incompatible", preserve_local=True,
         )
-        return None
+        if discarded:
+            checkpoints.mark_terminal(HOME, item)
+        return _CheckpointPauseFailure(family, item, discarded)
     try:
         client.checkpoint_pause(
             assignment["assignment_id"], item.checkpoint_id,
@@ -2040,7 +2063,14 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                   "the build failed twice — check your network/proxy and re-run "
                   "`dradar resume` (still free: the agent never started), or "
                   "use `dradar release` if you do not want to keep the cell")
-            if _pause_checkpoint_quietly(client, assignment) is None:
+            paused = _pause_checkpoint_quietly(client, assignment)
+            if isinstance(paused, _CheckpointPauseFailure):
+                print(
+                    f"checkpoint infrastructure failed ({paused.family}); "
+                    "local evidence was kept and automatic refill was faulted"
+                )
+                return paused.family.replace("_", "-")
+            if paused is None:
                 _mark_stopped_quietly(
                     client, assignment, failure_kind="environment_build_failed",
                 )
@@ -2049,6 +2079,12 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             failure_kind = classify_exception_message(str(exc))
             terminal_outcome = _terminal_failure_outcome(failure_kind)
             item = _pause_checkpoint_quietly(client, assignment)
+            if isinstance(item, _CheckpointPauseFailure):
+                print(
+                    f"trial stopped by {item.family}; local evidence was kept "
+                    "and automatic refill was faulted"
+                )
+                return item.family.replace("_", "-")
             if item is not None:
                 print(f"trial interrupted: {exc}\n"
                       f"checkpoint {item.checkpoint_id} was kept; `dradar resume` "
@@ -2075,7 +2111,8 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             # the interrupt up. Otherwise the UI reports a resumable lease
             # while every later ``dradar resume`` sees it as already checked
             # out and has nothing it can start.
-            if _pause_checkpoint_quietly(client, assignment) is None:
+            paused = _pause_checkpoint_quietly(client, assignment)
+            if paused is None:
                 _mark_stopped_quietly(
                     client,
                     assignment,
@@ -2178,6 +2215,12 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
     item = checkpoints.find_latest(HOME, assignment["assignment_id"])
     if interrupted and item is not None and item.phase != "agent_completed":
         saved = _pause_checkpoint_quietly(client, assignment)
+        if isinstance(saved, _CheckpointPauseFailure):
+            print(
+                f"trial stopped by {saved.family}; local evidence was kept "
+                "and automatic refill was faulted"
+            )
+            return saved.family.replace("_", "-")
         if saved is not None:
             print(f"trial interrupted; checkpoint {saved.checkpoint_id} was kept — "
                   "the next `dradar resume` continues instead of submitting a partial run")
@@ -2441,8 +2484,24 @@ def _resume_one_checkpoint(
                 print(f"  {assignment_id}: no active server lease; removed stale local checkpoint")
                 return "discarded"
             if not item.valid or checkpoints.is_expired(item):
-                reason = "expired" if checkpoints.is_expired(item) else "invalid"
+                # Invalidity is an infrastructure fault even when the stale
+                # timestamp also crosses the ordinary TTL.  Do not let age
+                # downgrade it to routine expiry and bypass the circuit.
+                reason = "invalid" if not item.valid else "expired"
                 print(f"  {assignment_id}: checkpoint is {reason}; reopening the cell")
+                if reason == "invalid":
+                    refill_plan.open_circuit(
+                        HOME, assignment, "checkpoint_invalid",
+                    )
+                    discarded = _discard_checkpoint_quietly(
+                        client, item, assignment, reason=reason,
+                        preserve_local=True,
+                    )
+                    if discarded:
+                        checkpoints.mark_terminal(HOME, item)
+                    return (
+                        "checkpoint-invalid" if discarded else "paused"
+                    )
                 if _discard_checkpoint_quietly(
                     client, item, assignment, reason=reason,
                 ):
@@ -2450,11 +2509,18 @@ def _resume_one_checkpoint(
                 return "paused"
             if item.phase == "incompatible":
                 print(f"  {assignment_id}: checkpoint is incompatible; reopening the cell")
-                if _discard_checkpoint_quietly(
+                refill_plan.open_circuit(
+                    HOME, assignment, "checkpoint_incompatible",
+                )
+                discarded = _discard_checkpoint_quietly(
                     client, item, assignment, reason="incompatible",
-                ):
-                    return "discarded"
-                return "paused"
+                    preserve_local=True,
+                )
+                if discarded:
+                    checkpoints.mark_terminal(HOME, item)
+                return (
+                    "checkpoint-incompatible" if discarded else "paused"
+                )
             if item.checkpoint_dir != item.trial_dir / "checkpoint":
                 print(
                     f"  {assignment_id}: legacy agent-mounted checkpoint is "
@@ -2813,6 +2879,18 @@ def cmd_refill_status(args) -> int:
         print(f"  selected batch: {complete}/{len(seed_ids)} submitted before auto-refill")
     if plan.get("stop_reason"):
         print(f"  note: {plan['stop_reason']}")
+    circuit = plan.get("circuit")
+    if isinstance(circuit, dict) and circuit.get("state") == "open":
+        scope = "/".join(
+            str(value) for value in (
+                circuit.get("harness"), circuit.get("provider"),
+            ) if value
+        ) or "saved scope"
+        print(
+            f"  circuit: open  scope={scope}  "
+            f"family={circuit.get('failure_family', '?')}  "
+            f"observations={circuit.get('observation_count', 1)}"
+        )
     return 0
 
 
@@ -3712,6 +3790,12 @@ def _run_batch(args, client: ApiClient, tasks_root: Path, active: list[dict],
                 "task checkout"
             )
             break
+        if outcome in {"checkpoint-invalid", "checkpoint-incompatible"}:
+            print(
+                "stopping this batch after a checkpoint infrastructure fault; "
+                "later cells were left untouched and the local evidence was kept"
+            )
+            break
     ok = all(o in ("submitted", "interrupted") for o in results)
     return 0 if ok else 1
 
@@ -4092,11 +4176,23 @@ def _prepare_batch(args, client: ApiClient) -> tuple[list[dict], bool]:
         # The parent configured the shared plan before launching us. Rewriting
         # it from every child would reset its counters and race its file lock.
         if wants_refill and not refill_plan.is_running(HOME):
+            saved = refill_plan.load(HOME)
+            if saved and saved.get("status") == refill_plan.FAULTED_STATE:
+                print(
+                    "continuous refill circuit is open; this worker will not "
+                    "check out or run another held task"
+                )
+                args.refill = False
+                return [], free_pick
             print("continuous refill plan is no longer active; draining held tasks only")
             args.refill = False
     else:
         try:
             active = _setup_refill(args, client, active, free_pick)
+        except refill_plan.RefillCircuitOpen as exc:
+            print(f"continuous refill not started: {exc}")
+            args.refill = False
+            return [], free_pick
         except refill_plan.RefillError as exc:
             # Setup validation belongs to this invocation. It must never mutate
             # an already-active shared plan owned by other parallel workers.

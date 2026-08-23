@@ -16,16 +16,24 @@ from typing import Iterator
 from uuid import uuid4
 
 from .api_client import ApiError
-from .providers import validate_refill_scope
+from .providers import REFILL_HARNESS_PROVIDERS, validate_refill_scope
 
 SCHEMA_VERSION = 1
 PLAN_FILE = "refill-plan.json"
 LOCK_FILE = "refill-plan.lock"
 RUNNING_STATES = {"active", "draining"}
+FAULTED_STATE = "faulted"
+CHECKPOINT_FAULT_FAMILIES = frozenset({
+    "checkpoint_invalid", "checkpoint_incompatible",
+})
 TIERS = ("plus", "pro-5x", "pro-20x")
 
 
 class RefillError(RuntimeError):
+    pass
+
+
+class RefillCircuitOpen(RefillError):
     pass
 
 
@@ -100,6 +108,78 @@ def _save_unlocked(home: Path, plan: dict) -> None:
         fh.write("\n")
     os.chmod(tmp, 0o600)
     os.replace(tmp, path)
+
+
+def open_circuit(
+    home: Path,
+    assignment: dict,
+    failure_family: str,
+) -> dict | None:
+    """Latch a scoped refill plan after a checkpoint infrastructure fault.
+
+    The DRADAR_HOME is already the account boundary.  Persist the remaining
+    key dimensions so a restart, CLI upgrade, task change, or effort change
+    cannot silently turn the same harness/provider fault back into claims.
+    Only the explicit user-facing ``dradar refill stop`` command discards the
+    saved plan and rearms a later campaign.
+    """
+
+    if failure_family not in CHECKPOINT_FAULT_FAMILIES:
+        raise RefillError(f"unsupported refill circuit family: {failure_family}")
+    harness = assignment.get("agent") or "codex"
+    provider = assignment.get("provider")
+    if not isinstance(harness, str) or not harness:
+        return None
+    if provider is not None and not isinstance(provider, str):
+        provider = None
+    expected_provider = REFILL_HARNESS_PROVIDERS.get(harness)
+    if provider is None:
+        provider = expected_provider
+    elif expected_provider is not None and provider != expected_provider:
+        return None
+    with _locked(home):
+        plan = _load_unlocked(home)
+        if not plan or not plan.get("refill_harness"):
+            return None
+        if plan.get("refill_harness") != harness:
+            return None
+        now = _now()
+        current = plan.get("circuit")
+        same_fault = bool(
+            isinstance(current, dict)
+            and current.get("state") == "open"
+            and current.get("volunteer_id") == plan.get("volunteer_id")
+            and current.get("harness") == harness
+            and current.get("provider") == provider
+            and current.get("failure_family") == failure_family
+        )
+        if same_fault:
+            current["observation_count"] = int(
+                current.get("observation_count") or 1,
+            ) + 1
+            current["last_observed_at"] = now
+        elif not (
+            isinstance(current, dict) and current.get("state") == "open"
+        ):
+            plan["circuit"] = {
+                "state": "open",
+                "volunteer_id": plan.get("volunteer_id"),
+                "harness": harness,
+                "provider": provider,
+                "failure_family": failure_family,
+                "opened_at": now,
+                "last_observed_at": now,
+                "observation_count": 1,
+                "assignment_id": assignment.get("assignment_id"),
+            }
+        plan["status"] = FAULTED_STATE
+        plan["stop_reason"] = (
+            f"{failure_family} circuit open for {harness}/"
+            f"{provider or 'default'}; run `dradar refill stop` after the "
+            "checkpoint fault is fixed to explicitly rearm"
+        )
+        _save_unlocked(home, plan)
+        return plan
 
 
 def _estimate_pct(assignment: dict, tier: str, windows: dict | None) -> float | None:
@@ -223,6 +303,20 @@ def configure(
     with _locked(home):
         current = _load_unlocked(home)
         replaced_plan_id = None
+        if current and isinstance(current.get("circuit"), dict):
+            circuit = current["circuit"]
+            if circuit.get("state") == "open":
+                fault_scope = "/".join(
+                    str(value) for value in (
+                        circuit.get("harness"), circuit.get("provider"),
+                    ) if value
+                ) or "saved scope"
+                raise RefillCircuitOpen(
+                    f"refill circuit is open for {fault_scope} after "
+                    f"{circuit.get('failure_family') or 'a checkpoint fault'}; "
+                    "fix the checkpoint path, then run `dradar refill stop` "
+                    "to explicitly rearm a new campaign"
+                )
         if (current and not current.get("refill_harness")
                 and refill_harness is not None
                 and current.get("status") in RUNNING_STATES):
@@ -422,8 +516,15 @@ def stop(
         plan = _load_unlocked(home)
         if not plan:
             return None
-        plan["status"] = "stopped"
-        plan["stop_reason"] = reason
+        circuit_open = bool(
+            isinstance(plan.get("circuit"), dict)
+            and plan["circuit"].get("state") == "open"
+        )
+        if circuit_open and not discard:
+            plan["status"] = FAULTED_STATE
+        else:
+            plan["status"] = "stopped"
+            plan["stop_reason"] = reason
         if plan.get("refill_harness") and not discard:
             _save_unlocked(home, plan)
             return plan
