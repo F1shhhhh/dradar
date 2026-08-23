@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import dradar.checkpoint_observation_v2 as checkpoint_observation
 from dradar.api_client import ApiError
 from dradar.checkpoint_observation_v2 import (
     CheckpointObservationReporterV2,
@@ -611,6 +612,25 @@ def test_reporter_delivery_health_survives_restart(tmp_path):
     assert health["dropped"] == 0
 
 
+def test_delivery_health_can_update_at_exact_global_file_cap(tmp_path):
+    spool = CheckpointObservationSpoolV2(
+        tmp_path / "observations", max_total_files=2,
+    )
+    spool.record_delivery_health(
+        "assignment-0001", ObservationDeliveryResultV2(persisted=1),
+    )
+
+    spool.record_delivery_health(
+        "assignment-0001", ObservationDeliveryResultV2(acknowledged=1),
+    )
+
+    health = json.loads(
+        (spool.delivery_health_root / "assignment-0001.json").read_text(),
+    )
+    assert health["persisted"] == 1
+    assert health["acknowledged"] == 1
+
+
 def test_old_server_404_is_retryable_for_future_upgrade(tmp_path):
     payload = _payload()
     api = FakeObservationApi([ApiError("not found", status_code=404)])
@@ -850,6 +870,48 @@ def test_local_evidence_emits_content_bound_mainline_impact_attestation(tmp_path
     serialized = json.dumps(packet)
     assert str(tmp_path) not in serialized
     assert "assignment-0001" not in serialized
+
+
+def test_local_evidence_uses_process_lock_and_reports_spool_pressure(
+    tmp_path, monkeypatch,
+):
+    reporter = CheckpointObservationReporterV2(FakeObservationApi(), tmp_path)
+    assert reporter.register_cohort(_cohort_registration()) is True
+    calls = []
+    real_lock = checkpoint_observation._process_lock
+
+    def observed_lock(root):
+        calls.append(root)
+        return real_lock(root)
+
+    monkeypatch.setattr(checkpoint_observation, "_process_lock", observed_lock)
+    monkeypatch.setattr(
+        checkpoint_observation, "MAX_OBSERVATION_SPOOL_FILES_V2", 1,
+    )
+
+    packet = checkpoint_local_evidence_v2(
+        tmp_path, now=datetime.now(timezone.utc) + timedelta(seconds=1),
+    )
+
+    assert calls == [reporter.spool.root]
+    outbox = next(
+        item for item in packet["attestations"]
+        if item["kind"] == "outbox_health"
+    )
+    assert outbox["metrics"]["spool_files"] >= 2
+    assert outbox["metrics"]["spool_file_limit"] == 1
+    assert outbox["metrics"]["spool_capacity_pressure"] == 1
+
+
+def test_local_evidence_refuses_existing_spool_without_lock(tmp_path):
+    root = tmp_path / "checkpoint-v2" / "observations"
+    root.mkdir(parents=True, mode=0o700)
+    root.chmod(0o700)
+
+    with pytest.raises(
+        CheckpointObservationSpoolError, match="evidence is incomplete",
+    ):
+        checkpoint_local_evidence_v2(tmp_path)
 
 
 def test_incomplete_or_unregistered_mainline_sample_cannot_look_healthy(tmp_path):

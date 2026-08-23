@@ -909,6 +909,59 @@ def _read_private_json(path: Path) -> tuple[dict[str, Any], bytes]:
     return value, encoded
 
 
+def _private_spool_usage(root: Path) -> tuple[int, int]:
+    """Return exact private-tree usage or refuse an unsafe/unreadable tree."""
+
+    files = 0
+    total_bytes = 0
+    try:
+        for current, directory_names, file_names in os.walk(
+            root, topdown=True, followlinks=False,
+        ):
+            current_path = Path(current)
+            for name in directory_names:
+                path = current_path / name
+                metadata = path.lstat()
+                if path.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+                    raise CheckpointObservationSpoolError(
+                        "checkpoint observation spool tree is unsafe",
+                    )
+                if hasattr(os, "getuid") and (
+                    metadata.st_uid != os.getuid()
+                    or stat.S_IMODE(metadata.st_mode) & 0o077
+                ):
+                    raise CheckpointObservationSpoolError(
+                        "checkpoint observation spool tree is not private",
+                    )
+            for name in file_names:
+                path = current_path / name
+                metadata = path.lstat()
+                if (
+                    path.is_symlink()
+                    or not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_nlink != 1
+                ):
+                    raise CheckpointObservationSpoolError(
+                        "checkpoint observation spool tree is unsafe",
+                    )
+                if hasattr(os, "getuid") and (
+                    metadata.st_uid != os.getuid()
+                    or stat.S_IMODE(metadata.st_mode) != 0o600
+                ):
+                    raise CheckpointObservationSpoolError(
+                        "checkpoint observation spool tree is not private",
+                    )
+                files += 1
+                total_bytes += metadata.st_size
+    except CheckpointObservationSpoolError:
+        raise
+    except OSError as exc:
+        raise CheckpointObservationSpoolError(
+            "checkpoint observation spool tree is unreadable",
+        ) from exc
+    return files, total_bytes
+
+
 class CheckpointObservationSpoolV2:
     """A bounded private outbox, safe for multiple local worker processes."""
 
@@ -1195,8 +1248,11 @@ class CheckpointObservationSpoolV2:
                 updated[field] = total
             encoded = _canonical_delivery_health(updated)
             self._assert_total_capacity_unlocked(
-                additional_files=1,
-                additional_bytes=len(encoded),
+                additional_files=0 if target_exists else 1,
+                additional_bytes=(
+                    max(0, len(encoded) - len(raw))
+                    if target_exists else len(encoded)
+                ),
             )
             _atomic_private_record(target, encoded)
 
@@ -1252,60 +1308,7 @@ class CheckpointObservationSpoolV2:
                 "checkpoint observation capacity delta is invalid",
             )
         self._prepare()
-        files = 0
-        total_bytes = 0
-        try:
-            for current, directory_names, file_names in os.walk(
-                self.root, topdown=True, followlinks=False,
-            ):
-                current_path = Path(current)
-                for name in directory_names:
-                    path = current_path / name
-                    metadata = path.lstat()
-                    if path.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
-                        raise CheckpointObservationSpoolError(
-                            "checkpoint observation spool tree is unsafe",
-                        )
-                    if hasattr(os, "getuid") and (
-                        metadata.st_uid != os.getuid()
-                        or stat.S_IMODE(metadata.st_mode) & 0o077
-                    ):
-                        raise CheckpointObservationSpoolError(
-                            "checkpoint observation spool tree is not private",
-                        )
-                for name in file_names:
-                    path = current_path / name
-                    metadata = path.lstat()
-                    if (
-                        path.is_symlink()
-                        or not stat.S_ISREG(metadata.st_mode)
-                        or metadata.st_nlink != 1
-                    ):
-                        raise CheckpointObservationSpoolError(
-                            "checkpoint observation spool tree is unsafe",
-                        )
-                    if hasattr(os, "getuid") and (
-                        metadata.st_uid != os.getuid()
-                        or stat.S_IMODE(metadata.st_mode) != 0o600
-                    ):
-                        raise CheckpointObservationSpoolError(
-                            "checkpoint observation spool tree is not private",
-                        )
-                    files += 1
-                    total_bytes += metadata.st_size
-                    if (
-                        files + additional_files > self.max_total_files
-                        or total_bytes + additional_bytes > self.max_total_bytes
-                    ):
-                        raise CheckpointObservationSpoolError(
-                            "checkpoint observation total spool is full",
-                        )
-        except CheckpointObservationSpoolError:
-            raise
-        except OSError as exc:
-            raise CheckpointObservationSpoolError(
-                "checkpoint observation spool tree is unreadable",
-            ) from exc
+        files, total_bytes = _private_spool_usage(self.root)
         if (
             files + additional_files > self.max_total_files
             or total_bytes + additional_bytes > self.max_total_bytes
@@ -1858,7 +1861,7 @@ def _local_cleanup_residue(home: Path, assignment_id: str) -> int:
     return total
 
 
-def checkpoint_local_evidence_v2(
+def _checkpoint_local_evidence_unlocked_v2(
     home: Path,
     *,
     since: datetime | None = None,
@@ -1910,6 +1913,11 @@ def checkpoint_local_evidence_v2(
             raise CheckpointObservationSpoolError(
                 "checkpoint local evidence is incomplete",
             )
+    spool_files, spool_bytes = _private_spool_usage(root)
+    spool_capacity_pressure = int(
+        spool_files * 10 >= MAX_OBSERVATION_SPOOL_FILES_V2 * 9
+        or spool_bytes * 10 >= MAX_OBSERVATION_SPOOL_BYTES_V2 * 9
+    )
     allowed_root_entries = {
         ".lock", "cohorts", "pending", "rejected", "delivery-health",
         "mainline-impact",
@@ -2145,6 +2153,11 @@ def checkpoint_local_evidence_v2(
             "diagnostic_records": diagnostics,
             "unstructured_diagnostics": unstructured_diagnostics,
             "cleanup_residue": cleanup_residue,
+            "spool_files": spool_files,
+            "spool_bytes": spool_bytes,
+            "spool_file_limit": MAX_OBSERVATION_SPOOL_FILES_V2,
+            "spool_byte_limit": MAX_OBSERVATION_SPOOL_BYTES_V2,
+            "spool_capacity_pressure": spool_capacity_pressure,
         }
         artifact = hashlib.sha256(json.dumps(
             source, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
@@ -2172,6 +2185,11 @@ def checkpoint_local_evidence_v2(
                 "diagnostic_records": diagnostics,
                 "unstructured_diagnostics": unstructured_diagnostics,
                 "cleanup_residue": cleanup_residue,
+                "spool_files": spool_files,
+                "spool_bytes": spool_bytes,
+                "spool_file_limit": MAX_OBSERVATION_SPOOL_FILES_V2,
+                "spool_byte_limit": MAX_OBSERVATION_SPOOL_BYTES_V2,
+                "spool_capacity_pressure": spool_capacity_pressure,
             },
         })
     for key in sorted(impact_groups):
@@ -2242,6 +2260,47 @@ def checkpoint_local_evidence_v2(
         "unregistered_records": unregistered_records,
         "scan_errors": scan_errors,
     }
+
+
+def checkpoint_local_evidence_v2(
+    home: Path,
+    *,
+    since: datetime | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Build one process-consistent, read-only local evidence snapshot."""
+
+    home = Path(home).absolute()
+    root = home / "checkpoint-v2" / "observations"
+    if not root.exists():
+        return _checkpoint_local_evidence_unlocked_v2(
+            home, since=since, now=now,
+        )
+    _private_directory(root, create=False)
+    lock_path = root / ".lock"
+    try:
+        metadata = lock_path.lstat()
+    except OSError as exc:
+        raise CheckpointObservationSpoolError(
+            "checkpoint local evidence is incomplete",
+        ) from exc
+    if (
+        lock_path.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_size != 1
+        or hasattr(os, "getuid") and (
+            metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        )
+    ):
+        raise CheckpointObservationSpoolError(
+            "checkpoint local evidence lock is unsafe",
+        )
+    with _process_lock(root):
+        return _checkpoint_local_evidence_unlocked_v2(
+            home, since=since, now=now,
+        )
 
 
 def cmd_checkpoint_audit(args) -> int:
