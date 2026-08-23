@@ -1139,18 +1139,48 @@ def _local_diagnostic_counts(home: Path, assignment_id: str) -> tuple[int, int]:
 
 
 def _local_cleanup_residue(home: Path, assignment_id: str) -> int:
-    root = home / "checkpoint-v2" / "shadow" / assignment_id
     total = 0
-    for relative in (".downloads", ".restore"):
-        path = root / relative
-        try:
-            if path.is_dir() and not path.is_symlink():
-                total += sum(
-                    1 for item in path.iterdir()
-                    if not item.name.startswith(".")
-                )
-            elif path.exists() or path.is_symlink():
+    for scope in ("shadow", "authoritative"):
+        root = home / "checkpoint-v2" / scope / assignment_id
+        for relative in (".downloads", ".restore"):
+            path = root / relative
+            try:
+                if path.is_dir() and not path.is_symlink():
+                    total += sum(1 for _item in path.iterdir())
+                elif path.exists() or path.is_symlink():
+                    total += 1
+            except OSError:
                 total += 1
+
+        checkpoints = root / "checkpoints"
+        try:
+            if not checkpoints.exists() and not checkpoints.is_symlink():
+                continue
+            if checkpoints.is_symlink() or not checkpoints.is_dir():
+                total += 1
+                continue
+            for checkpoint_root in checkpoints.iterdir():
+                if checkpoint_root.is_symlink() or not checkpoint_root.is_dir():
+                    total += 1
+                    continue
+                for child in checkpoint_root.iterdir():
+                    if child.name in {"CURRENT", "PUBLICATION.lock", "generations"}:
+                        continue
+                    # Incomplete incoming/CURRENT/retention marker writes and
+                    # unknown transaction artifacts are all promotion-blocking
+                    # residue.  The audit is read-only and never removes them.
+                    total += 1
+                generations = checkpoint_root / "generations"
+                if not generations.exists() and not generations.is_symlink():
+                    continue
+                if generations.is_symlink() or not generations.is_dir():
+                    total += 1
+                    continue
+                total += sum(
+                    1 for generation in generations.iterdir()
+                    if re.fullmatch(r"generation-[0-9]{20}", generation.name)
+                    is None
+                )
         except OSError:
             total += 1
     return total

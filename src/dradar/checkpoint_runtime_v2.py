@@ -925,6 +925,54 @@ def _write_deterministic_archive(
     _fsync_directory(destination.parent)
 
 
+@contextmanager
+def _container_seal_lock(destination_archive: Path):
+    """Serialize one final export without a crash-sticky lock directory."""
+
+    lock_path = destination_archive.with_name(
+        f".{destination_archive.name}.lock"
+    )
+    flags = os.O_RDWR | os.O_CREAT
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise CheckpointDataPlaneError("seal", "seal_lock_failed") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            lock_path.is_symlink()
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+        ):
+            raise CheckpointDataPlaneError("seal", "seal_lock_unsafe")
+        if os.name == "posix" and metadata.st_uid != os.getuid():
+            raise CheckpointDataPlaneError("seal", "seal_lock_unsafe")
+        os.fchmod(descriptor, 0o600)
+        if os.name == "nt":  # pragma: no cover - container runtime is POSIX
+            import msvcrt
+            if metadata.st_size == 0:
+                os.write(descriptor, b"\0")
+                os.fsync(descriptor)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if os.name == "nt":  # pragma: no cover - container runtime is POSIX
+                import msvcrt
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
 def seal_checkpoint_export_v2(
     source_root: Path,
     destination_archive: Path,
@@ -957,55 +1005,138 @@ def seal_checkpoint_export_v2(
             raise CheckpointDataPlaneError("seal", "container_storage_cross_device")
     except OSError as exc:
         raise CheckpointDataPlaneError("seal", "container_storage_unavailable") from exc
-    if destination_archive.exists() or destination_archive.is_symlink():
-        raise CheckpointDataPlaneError("seal", "export_already_exists")
     needles = tuple(
         value if isinstance(value, bytes) else value.encode("utf-8")
         for value in sensitive_values
         if isinstance(value, (str, bytes)) and len(value) >= 8
     )
-    seal_parent = destination_archive.parent / f".sealed-{request.capture_id}"
-    if seal_parent.exists() or seal_parent.is_symlink():
-        raise CheckpointDataPlaneError("seal", "seal_stage_exists")
-    payload = seal_parent / PAYLOAD_ROOT
-    seal_parent.mkdir(mode=0o700, parents=False)
-    seal_parent.chmod(0o700)
+    with _container_seal_lock(destination_archive):
+        if destination_archive.exists() or destination_archive.is_symlink():
+            return _recover_existing_sealed_export_v2(
+                destination_archive,
+                request,
+                sensitive_values=needles,
+                limits=limits,
+                container_export_root=container_export_root,
+            )
+        # The lock provides live-writer exclusion.  A unique transaction root
+        # means kill -9/power loss cannot leave a pathname that blocks the
+        # exact capture on restart; abandoned roots remain inert evidence.
+        seal_parent = destination_archive.parent / (
+            f".sealed-{request.capture_id}-{uuid.uuid4().hex}.part"
+        )
+        payload = seal_parent / PAYLOAD_ROOT
+        seal_parent.mkdir(mode=0o700, parents=False)
+        seal_parent.chmod(0o700)
+        try:
+            directories, files, total_bytes = _copy_source_tree(
+                source_root,
+                payload,
+                limits=limits,
+                sensitive_values=needles,
+            )
+            manifest = _manifest_for(request, directories, files, total_bytes)
+            manifest_bytes = _canonical_json(manifest)
+            if len(manifest_bytes) > limits.max_manifest_bytes:
+                raise CheckpointDataPlaneError("seal", "manifest_size_limit")
+            manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+            _write_deterministic_archive(
+                payload,
+                manifest_bytes,
+                destination_archive,
+                directories=directories,
+                files=files,
+            )
+            archive_sha256, archive_size = _sha256_file(
+                destination_archive,
+                max_bytes=limits.max_archive_bytes,
+            )
+            return ContainerSealedExportV2(
+                capture_id=request.capture_id,
+                remote_path=destination_archive.as_posix(),
+                archive_sha256=archive_sha256,
+                archive_size=archive_size,
+                manifest_sha256=manifest_sha256,
+                capture_storage="container_native",
+            )
+        except BaseException:
+            destination_archive.unlink(missing_ok=True)
+            raise
+        finally:
+            shutil.rmtree(seal_parent, ignore_errors=True)
+
+
+def _recover_existing_sealed_export_v2(
+    archive_path: Path,
+    request: CheckpointCaptureRequestV2,
+    *,
+    sensitive_values: tuple[bytes, ...],
+    limits: CheckpointPackageLimitsV2,
+    container_export_root: Path,
+) -> ContainerSealedExportV2:
+    """Resume only an exact, fully verified atomic seal from a dead writer."""
+
     try:
-        directories, files, total_bytes = _copy_source_tree(
-            source_root,
-            payload,
-            limits=limits,
-            sensitive_values=needles,
-        )
-        manifest = _manifest_for(request, directories, files, total_bytes)
-        manifest_bytes = _canonical_json(manifest)
-        if len(manifest_bytes) > limits.max_manifest_bytes:
-            raise CheckpointDataPlaneError("seal", "manifest_size_limit")
-        manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
-        _write_deterministic_archive(
-            payload,
-            manifest_bytes,
-            destination_archive,
-            directories=directories,
-            files=files,
-        )
         archive_sha256, archive_size = _sha256_file(
-            destination_archive,
-            max_bytes=limits.max_archive_bytes,
+            archive_path, max_bytes=limits.max_archive_bytes,
         )
-        return ContainerSealedExportV2(
+        with archive_path.open("rb") as raw:
+            with gzip.GzipFile(fileobj=raw, mode="rb") as zipped:
+                with tarfile.open(fileobj=zipped, mode="r|") as archive:
+                    first = next(iter(archive), None)
+                    if (
+                        first is None
+                        or first.name.rstrip("/") != MANIFEST_NAME
+                        or not first.isfile()
+                        or first.issym()
+                        or first.islnk()
+                        or first.size > limits.max_manifest_bytes
+                        or stat.S_IMODE(first.mode) != 0o600
+                    ):
+                        raise CheckpointDataPlaneError(
+                            "seal", "existing_export_manifest_invalid",
+                        )
+                    source = archive.extractfile(first)
+                    if source is None:
+                        raise CheckpointDataPlaneError(
+                            "seal", "existing_export_manifest_invalid",
+                        )
+                    manifest_bytes = source.read(limits.max_manifest_bytes + 1)
+                    if len(manifest_bytes) != first.size:
+                        raise CheckpointDataPlaneError(
+                            "seal", "existing_export_manifest_invalid",
+                        )
+        manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+        _parse_manifest(manifest_bytes, request, limits=limits)
+        recovered = ContainerSealedExportV2(
             capture_id=request.capture_id,
-            remote_path=destination_archive.as_posix(),
+            remote_path=archive_path.as_posix(),
             archive_sha256=archive_sha256,
             archive_size=archive_size,
             manifest_sha256=manifest_sha256,
             capture_storage="container_native",
         )
-    except BaseException:
-        destination_archive.unlink(missing_ok=True)
+        verification_root = container_export_root / (
+            f".recover-{request.capture_id}-{uuid.uuid4().hex}.part"
+        )
+        try:
+            _extract_verified_archive(
+                archive_path,
+                verification_root,
+                request,
+                recovered,
+                limits=limits,
+                sensitive_values=sensitive_values,
+            )
+        finally:
+            shutil.rmtree(verification_root, ignore_errors=True)
+        return recovered
+    except CheckpointDataPlaneError:
         raise
-    finally:
-        shutil.rmtree(seal_parent, ignore_errors=True)
+    except (OSError, EOFError, tarfile.TarError, gzip.BadGzipFile) as exc:
+        raise CheckpointDataPlaneError(
+            "seal", "existing_export_invalid",
+        ) from exc
 
 
 def _assert_private_directory(path: Path, *, stage: str) -> None:
@@ -1149,6 +1280,7 @@ def _extract_verified_archive(
     export: ContainerSealedExportV2,
     *,
     limits: CheckpointPackageLimitsV2,
+    sensitive_values: tuple[bytes, ...] = (),
 ) -> tuple[str, int, dict[str, object]]:
     archive_sha256, archive_size = _sha256_file(
         archive_path, max_bytes=limits.max_archive_bytes,
@@ -1255,7 +1387,7 @@ def _extract_verified_archive(
                                 if not chunk:
                                     raise CheckpointDataPlaneError("verify", "file_member_truncated")
                                 scan = overlap + chunk
-                                if _GENERIC_SECRET_RE.search(scan):
+                                if _contains_secret(scan, sensitive_values):
                                     raise CheckpointDataPlaneError("verify", "secret_detected")
                                 overlap = scan[-512:]
                                 digest.update(chunk)
@@ -1277,7 +1409,7 @@ def _extract_verified_archive(
                         if relative == "untracked.tar.gz":
                             _validate_nested_untracked_archive(
                                 target,
-                                sensitive_values=(),
+                                sensitive_values=sensitive_values,
                                 limits=limits,
                                 stage="verify",
                             )
@@ -1462,7 +1594,13 @@ def publish_checkpoint_export_v2(
     _ensure_private_directory(checkpoint_root, stage="publish")
     _ensure_private_directory(generations, stage="publish")
     target = generations / f"generation-{request.snapshot_generation:020d}"
-    incoming = checkpoint_root / f".incoming-{request.capture_id}"
+    # The capture ID is content identity, not a reusable staging pathname.
+    # A hard process crash cannot run our finally block, so a unique private
+    # transaction directory lets the same exact capture retry without being
+    # permanently blocked by an incomplete predecessor.
+    incoming = checkpoint_root / (
+        f".incoming-{request.capture_id}-{uuid.uuid4().hex}.part"
+    )
     target_existed = False
     if incoming.exists() or incoming.is_symlink():
         raise CheckpointDataPlaneError("publish", "incoming_stage_exists")
@@ -2819,9 +2957,13 @@ class CheckpointDataPlaneV2:
                 raise CheckpointDataPlaneError("seal", "archive_size_limit")
             incoming_root = self.storage_root / ".downloads"
             _ensure_private_directory(incoming_root, stage="download")
-            download = incoming_root / f"{request.capture_id}.tar.gz.part"
-            if download.exists() or download.is_symlink():
-                raise CheckpointDataPlaneError("download", "download_target_exists")
+            # A unique target is essential for kill -9/power-loss recovery:
+            # an abandoned partial transfer is never interpreted as input and
+            # cannot block an exact capture replay. Stale parts remain inert
+            # diagnostics until bounded storage maintenance removes them.
+            download = incoming_root / (
+                f"{request.capture_id}-{uuid.uuid4().hex}.tar.gz.part"
+            )
             stage = "download"
             await exporter.download_export(
                 export,

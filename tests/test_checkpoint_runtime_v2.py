@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import gzip
 import hashlib
 import io
@@ -9,6 +10,8 @@ import os
 import shutil
 import stat
 import tarfile
+import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -691,6 +694,134 @@ def test_container_export_is_deterministic_for_same_capture(tmp_path: Path) -> N
     assert first_export.manifest_sha256 == second_export.manifest_sha256
 
 
+def test_container_seal_recovers_exact_export_after_atomic_rename_crash(
+    tmp_path: Path,
+) -> None:
+    request = _request()
+    source = _source(tmp_path)
+    export_root = tmp_path / "exports"
+    export_root.mkdir(mode=0o700)
+    archive = export_root / "snapshot.tar.gz"
+    first = seal_checkpoint_export_v2(
+        source, archive, request, container_export_root=export_root,
+    )
+    archive_bytes = archive.read_bytes()
+
+    # Simulate a hard crash after the final archive rename but before the
+    # process could remove its private copy stage or return the seal receipt.
+    abandoned_stage = export_root / f".sealed-{request.capture_id}"
+    abandoned_stage.mkdir(mode=0o700)
+    (abandoned_stage / "partial").write_bytes(b"incomplete predecessor")
+
+    recovered = seal_checkpoint_export_v2(
+        source, archive, request, container_export_root=export_root,
+    )
+
+    assert recovered == first
+    assert archive.read_bytes() == archive_bytes
+    assert abandoned_stage.is_dir()
+    assert not list(export_root.glob(f".recover-{request.capture_id}-*.part"))
+
+
+def test_container_seal_abandoned_stage_does_not_block_restart(
+    tmp_path: Path,
+) -> None:
+    request = _request()
+    source = _source(tmp_path)
+    export_root = tmp_path / "exports"
+    export_root.mkdir(mode=0o700)
+    abandoned_stage = export_root / (
+        f".sealed-{request.capture_id}-{'0' * 32}.part"
+    )
+    abandoned_stage.mkdir(mode=0o700)
+    (abandoned_stage / "partial").write_bytes(b"incomplete predecessor")
+    archive = export_root / "snapshot.tar.gz"
+
+    exported = seal_checkpoint_export_v2(
+        source, archive, request, container_export_root=export_root,
+    )
+
+    assert archive.is_file()
+    assert exported.archive_sha256 == hashlib.sha256(
+        archive.read_bytes(),
+    ).hexdigest()
+    assert abandoned_stage.is_dir()
+    assert not [
+        path for path in export_root.glob(
+            f".sealed-{request.capture_id}-*.part",
+        )
+        if path != abandoned_stage
+    ]
+
+
+def test_container_seal_serializes_duplicate_live_writers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _request()
+    source = _source(tmp_path)
+    export_root = tmp_path / "exports"
+    export_root.mkdir(mode=0o700)
+    archive = export_root / "snapshot.tar.gz"
+    real_copy = runtime._copy_source_tree
+    guard = threading.Lock()
+    active = 0
+    maximum_active = 0
+
+    def observed_copy(*args, **kwargs):
+        nonlocal active, maximum_active
+        with guard:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        try:
+            time.sleep(0.03)
+            return real_copy(*args, **kwargs)
+        finally:
+            with guard:
+                active -= 1
+
+    monkeypatch.setattr(runtime, "_copy_source_tree", observed_copy)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(
+                seal_checkpoint_export_v2,
+                source,
+                archive,
+                request,
+                container_export_root=export_root,
+            )
+            for _index in range(2)
+        ]
+        exports = [future.result(timeout=5) for future in futures]
+
+    assert exports[0] == exports[1]
+    assert maximum_active == 1
+    assert not list(export_root.glob(f".sealed-{request.capture_id}-*.part"))
+
+
+def test_container_seal_never_overwrites_invalid_existing_export(
+    tmp_path: Path,
+) -> None:
+    request = _request()
+    source = _source(tmp_path)
+    export_root = tmp_path / "exports"
+    export_root.mkdir(mode=0o700)
+    archive = export_root / "snapshot.tar.gz"
+    invalid = b"preserve-corrupt-evidence"
+    archive.write_bytes(invalid)
+    archive.chmod(0o600)
+
+    with pytest.raises(
+        CheckpointDataPlaneError, match="existing_export_invalid",
+    ):
+        seal_checkpoint_export_v2(
+            source, archive, request, container_export_root=export_root,
+        )
+
+    assert archive.read_bytes() == invalid
+    assert not list(export_root.glob(f".recover-{request.capture_id}-*.part"))
+
+
 @pytest.mark.parametrize("kind", ["symlink", "hardlink", "fifo"])
 def test_container_seal_rejects_non_regular_state(
     tmp_path: Path, kind: str,
@@ -846,6 +977,45 @@ def test_download_failure_is_observed_and_never_published(tmp_path: Path) -> Non
     assert observed.mainline_may_continue is True
     assert observed.remote_cleanup == "discarded"
     assert not (tmp_path / "host/checkpoints/checkpoint-0001").exists()
+
+
+def test_abandoned_download_and_publication_stages_do_not_block_exact_replay(
+    tmp_path: Path,
+) -> None:
+    host = tmp_path / "host"
+    downloads = host / ".downloads"
+    checkpoint_root = host / "checkpoints" / "checkpoint-0001"
+    downloads.mkdir(parents=True, mode=0o700)
+    checkpoint_root.mkdir(parents=True, mode=0o700)
+    for directory in (host, downloads, host / "checkpoints", checkpoint_root):
+        directory.chmod(0o700)
+    abandoned_download = (
+        downloads / ("capture-0001-" + "0" * 32 + ".tar.gz.part")
+    )
+    abandoned_download.write_bytes(b"truncated")
+    abandoned_download.chmod(0o600)
+    abandoned_publish = checkpoint_root / (
+        ".incoming-capture-0001-" + "0" * 32 + ".part"
+    )
+    abandoned_publish.mkdir(mode=0o700)
+
+    plane = CheckpointDataPlaneV2(
+        activation=_activation("observe"), storage_root=host,
+    )
+    observed = asyncio.run(plane.observe_capture(
+        _request(), FakeExporter(tmp_path / "container"),
+    ))
+
+    assert observed.status == "sealed"
+    assert observed.published is not None
+    assert observed.published.root.is_dir()
+    assert abandoned_download.is_file()
+    assert abandoned_publish.is_dir()
+    active_parts = [
+        path for path in downloads.iterdir()
+        if path != abandoned_download
+    ]
+    assert active_parts == []
 
 
 def test_typed_failure_writes_only_bounded_local_diagnostics(

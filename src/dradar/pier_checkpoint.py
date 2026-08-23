@@ -386,6 +386,7 @@ class CheckpointV2PreProviderBarrier:
     def __init__(self, gate_dir: str | os.PathLike[str] | None) -> None:
         self.gate = CheckpointV2PaidExecutionGate(gate_dir)
         self._restored = False
+        self._restore_attempted = False
         self._restore_receipt_sha256: str | None = None
         self._session_id: str | None = None
         self._payload_root: Path | None = None
@@ -633,10 +634,18 @@ class CheckpointV2PreProviderBarrier:
             return None
         if self._restored:
             return self._session_id
+        if self._restore_attempted:
+            raise CheckpointError(
+                "checkpoint v2 partial restore cannot be retried in place"
+            )
         contract = self.gate._contract()
         if contract["action"] == "fresh":
             self._restored = True
             return None
+        # A resume mutates the disposable Harness worktree and native state.
+        # Any failure must terminate this Pier/container; retrying in place
+        # could apply the same patch twice or mix partial Provider state.
+        self._restore_attempted = True
         payload, progress = self._validated_payload(contract)
         needles = tuple(
             value if isinstance(value, bytes) else value.encode("utf-8")

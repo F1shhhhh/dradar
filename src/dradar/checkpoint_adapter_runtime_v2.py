@@ -477,6 +477,29 @@ def _validate_clean_restore_worktree(worktree: Path, base_commit: str) -> None:
         raise CheckpointDataPlaneError("restore", "restore_worktree_not_clean")
 
 
+def _rollback_partial_restore_v2(worktree: Path, base_commit: str) -> None:
+    """Return a previously verified clean worktree to its exact base.
+
+    Restore inputs never include ignored paths, so ``git clean -ffd`` removes
+    only untracked material introduced by this transaction while preserving
+    image/runtime-specific ignored files that existed before it.
+    """
+
+    _git_text(
+        worktree,
+        ["reset", "--hard", base_commit],
+        max_bytes=64 * 1024,
+        stage="restore",
+    )
+    _git_text(
+        worktree,
+        ["clean", "-ffd", "--"],
+        max_bytes=4 * 1024 * 1024,
+        stage="restore",
+    )
+    _validate_clean_restore_worktree(worktree, base_commit)
+
+
 def create_adapter_capture_root_v2(
     *,
     filesystem_root: Path,
@@ -694,6 +717,7 @@ def restore_adapter_capture_offline_v2(
         raise CheckpointDataPlaneError("restore", "restore_state_root_exists")
     state_root.mkdir(mode=0o700, parents=True)
     state_root.chmod(0o700)
+    worktree_mutation_started = False
     try:
         _validate_base_commit(worktree, base_commit, stage="restore")
         _validate_clean_restore_worktree(worktree, base_commit)
@@ -714,6 +738,7 @@ def restore_adapter_capture_offline_v2(
             raise CheckpointDataPlaneError("restore", "adapter_progress_invalid")
         patch = payload / "workspace.patch"
         if patch.stat().st_size:
+            worktree_mutation_started = True
             for arguments in (
                 ["apply", "--check", "--binary", os.fspath(patch)],
                 ["apply", "--binary", os.fspath(patch)],
@@ -726,6 +751,7 @@ def restore_adapter_capture_offline_v2(
                         max_bytes=64 * 1024,
                         stage="restore",
                     )
+        worktree_mutation_started = True
         restored_untracked = _restore_untracked_archive(
             payload / "untracked.tar.gz", worktree, limits=limits,
         )
@@ -766,8 +792,25 @@ def restore_adapter_capture_offline_v2(
             recovery_capability=capability,
             restored_untracked_files=restored_untracked,
         )
-    except BaseException:
-        shutil.rmtree(state_root, ignore_errors=True)
+    except BaseException as primary_error:
+        cleanup_failed = False
+        if worktree_mutation_started:
+            try:
+                _rollback_partial_restore_v2(worktree, base_commit)
+            except BaseException:
+                cleanup_failed = True
+        try:
+            shutil.rmtree(state_root)
+        except FileNotFoundError:
+            pass
+        except BaseException:
+            cleanup_failed = True
+        if state_root.exists() or state_root.is_symlink():
+            cleanup_failed = True
+        if cleanup_failed:
+            raise CheckpointDataPlaneError(
+                "restore", "restore_rollback_failed",
+            ) from primary_error
         raise
 
 

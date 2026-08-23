@@ -353,6 +353,36 @@ def test_local_evidence_reports_assignment_scoped_backlog_and_drops(tmp_path):
     assert "offline" not in serialized
 
 
+def test_local_evidence_counts_hidden_crash_residue_in_both_storage_lanes(
+    tmp_path,
+):
+    reporter = CheckpointObservationReporterV2(
+        FakeObservationApi(), tmp_path,
+    )
+    assert reporter.register_cohort(_cohort_registration()) is True
+    for scope in ("shadow", "authoritative"):
+        assignment = tmp_path / "checkpoint-v2" / scope / "assignment-0001"
+        downloads = assignment / ".downloads"
+        downloads.mkdir(parents=True, mode=0o700)
+        (downloads / f"capture-0001-{scope}.tar.gz.part").write_bytes(
+            b"partial",
+        )
+        checkpoint = assignment / "checkpoints" / "checkpoint-0001"
+        generations = checkpoint / "generations"
+        generations.mkdir(parents=True, mode=0o700)
+        (checkpoint / f".incoming-capture-0001-{scope}.part").mkdir(
+            mode=0o700,
+        )
+        (generations / f".retention-generation-{scope}").mkdir(mode=0o700)
+
+    packet = checkpoint_local_evidence_v2(
+        tmp_path,
+        now=datetime.now(timezone.utc) + timedelta(seconds=1),
+    )
+
+    assert packet["attestations"][0]["metrics"]["cleanup_residue"] == 6
+
+
 def test_local_evidence_rejects_cross_session_assignment_cohort_drift(tmp_path):
     spool = CheckpointObservationSpoolV2(
         tmp_path / "checkpoint-v2" / "observations",

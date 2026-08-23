@@ -292,6 +292,82 @@ def test_checkpoint_v2_resume_barrier_restores_before_paid_grant(
     ]
 
 
+def test_checkpoint_v2_partial_restore_is_never_retried_in_place(
+    tmp_path: Path,
+) -> None:
+    restore_root, manifest_sha256 = _v2_restore_fixture(tmp_path)
+    gate_dir = tmp_path / "paid-gate-partial-restore"
+    gate_dir.mkdir(mode=0o700)
+    gate_dir.chmod(0o700)
+    _private_json(gate_dir / "contract.json", {
+        "schema": "dradar-checkpoint-paid-gate-contract-v2",
+        "assignment_id": "assignment-0001",
+        "gate_nonce": "3" * 32,
+        "action": "resume",
+        "session_id": "session-0001",
+        "owner_epoch": 3,
+        "reconcile_operation_id": "reconcile-operation-0001",
+        "job_root": str(tmp_path / "work" / "jobs" / "aassignment-0001"),
+        "restore_root": str(restore_root),
+        "manifest_sha256": manifest_sha256,
+        "identity_fingerprint": "a" * 64,
+        "checkpoint_abi": "dradar-checkpoint-v2/codex/1",
+        "recovery_capability": "NATIVE_VALID",
+        "native_state_schema": "codex-session/1",
+        "restore_adapter_version": "codex-restorer-v2/1",
+        "restore_receipt_sha256": "e" * 64,
+    })
+
+    class FailingRestoreAgent:
+        def __init__(self) -> None:
+            self.commands = []
+
+        async def exec_as_agent(self, _environment, command, env, **_kwargs):
+            del env
+            self.commands.append(command)
+            if "rev-parse HEAD" in command:
+                return SimpleNamespace(stdout=BASE_COMMIT + "\n", return_code=0)
+            if "git -C /app apply --check" in command:
+                raise RuntimeError("injected restore interruption")
+            return SimpleNamespace(stdout="", return_code=0)
+
+        async def exec_as_root(self, _environment, command, env, **_kwargs):
+            del command, env
+            return SimpleNamespace(stdout="", return_code=0)
+
+    class RestoreEnvironment:
+        default_user = "1000:1000"
+
+        async def upload_file(self, _source, _destination):
+            return None
+
+        async def upload_dir(self, _source, _destination):
+            return None
+
+    barrier = CheckpointV2PreProviderBarrier(str(gate_dir))
+    agent = FailingRestoreAgent()
+    environment = RestoreEnvironment()
+    with pytest.raises(RuntimeError, match="restore interruption"):
+        asyncio.run(barrier.restore_if_requested(
+            agent,
+            environment,
+            {},
+            state_paths=(StatePath("sessions", "/tmp/codex/sessions"),),
+        ))
+    command_count = len(agent.commands)
+
+    with pytest.raises(CheckpointError, match="cannot be retried in place"):
+        asyncio.run(barrier.restore_if_requested(
+            agent,
+            environment,
+            {},
+            state_paths=(StatePath("sessions", "/tmp/codex/sessions"),),
+        ))
+
+    assert len(agent.commands) == command_count
+    assert not (gate_dir / "request.json").exists()
+
+
 class FakeAgent:
     def __init__(
         self,

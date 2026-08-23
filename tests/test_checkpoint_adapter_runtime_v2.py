@@ -262,6 +262,59 @@ def test_restore_requires_a_clean_exact_base_worktree(tmp_path: Path):
     assert (restore / "local.txt").read_text() == "must not be overwritten\n"
 
 
+def test_partial_restore_rolls_worktree_back_before_fresh_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, source, base, contract, _summary, request, published = (
+        _capture_publish(tmp_path)
+    )
+    restore = tmp_path / "rollback-restore"
+    _git(tmp_path, "clone", "-q", os.fspath(source), os.fspath(restore))
+    restore.chmod(0o700)
+    state = tmp_path / "rollback-state"
+    real_copytree = shutil.copytree
+
+    def fail_provider_state(source_path, destination_path, *args, **kwargs):
+        if Path(source_path).name == "sessions":
+            raise OSError("injected provider-state copy failure")
+        return real_copytree(source_path, destination_path, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "copytree", fail_provider_state)
+    with pytest.raises(OSError, match="provider-state copy failure"):
+        restore_adapter_capture_offline_v2(
+            published=published,
+            contract=contract,
+            destination_worktree=restore,
+            destination_state_root=state,
+            expected_identity_fingerprint=request.identity_fingerprint,
+            base_commit=base,
+        )
+
+    assert (restore / "tracked.txt").read_text() == "before\n"
+    assert not (restore / "generated").exists()
+    assert _git(
+        restore, "status", "--porcelain=v1", "--untracked-files=all",
+    ) == ""
+    assert _git(restore, "rev-parse", "HEAD") == base
+    assert not state.exists()
+
+    monkeypatch.setattr(shutil, "copytree", real_copytree)
+    recovered = restore_adapter_capture_offline_v2(
+        published=published,
+        contract=contract,
+        destination_worktree=restore,
+        destination_state_root=state,
+        expected_identity_fingerprint=request.identity_fingerprint,
+        base_commit=base,
+    )
+    assert recovered.paid_execution_started is False
+    assert (restore / "tracked.txt").read_text() == "after\n"
+    assert (restore / "generated/note.txt").read_text() == (
+        "untracked progress\n"
+    )
+
+
 def test_capture_is_deterministic_for_same_repository_state(tmp_path: Path):
     root, _worktree, base = _filesystem(tmp_path)
     contract = checkpoint_adapter_contract_v2("codex", "openai")
