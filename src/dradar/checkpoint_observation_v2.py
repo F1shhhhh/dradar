@@ -15,6 +15,7 @@ changed removes a pending entry.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import queue
@@ -25,6 +26,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Protocol
 
@@ -32,6 +34,12 @@ from .api_client import ApiError
 
 
 OBSERVATION_SPOOL_SCHEMA_V2 = "dradar-checkpoint-v2-observation-spool-v1"
+COHORT_REGISTRY_SCHEMA_V2 = "dradar-checkpoint-v2-cohort-registration-v1"
+DELIVERY_HEALTH_SCHEMA_V2 = "dradar-checkpoint-v2-delivery-health-v1"
+LOCAL_EVIDENCE_SCHEMA_V2 = "dradar-checkpoint-v2-local-evidence-v1"
+EVIDENCE_ATTESTATION_SCHEMA_V2 = (
+    "dradar-checkpoint-v2-evidence-attestation-v1"
+)
 MAX_OBSERVATION_RECORD_BYTES_V2 = 16 * 1024
 MAX_PENDING_OBSERVATIONS_V2 = 512
 MAX_PENDING_OBSERVATION_BYTES_V2 = 8 * 1024 * 1024
@@ -95,6 +103,22 @@ _RESTORE_WIRE_FIELDS = frozenset({
     "authoritative",
 })
 _STABLE_REJECTION_STATUS = frozenset({400, 409, 410, 422})
+_COHORT_FIELDS = (
+    "platform",
+    "container_backend",
+    "harness",
+    "provider",
+    "client_version",
+    "agent_version",
+    "runtime_profile",
+    "model_config_version",
+    "runtime_compatibility_digest",
+    "checkpoint_core_abi",
+    "checkpoint_abi",
+)
+_DELIVERY_FIELDS = (
+    "persisted", "acknowledged", "retryable", "rejected", "dropped",
+)
 
 
 class CheckpointObservationSpoolError(RuntimeError):
@@ -193,6 +217,126 @@ def _canonical_record(payload: dict[str, Any]) -> bytes:
     if len(encoded) > MAX_OBSERVATION_RECORD_BYTES_V2:
         raise CheckpointObservationSpoolError(
             "checkpoint observation record is too large",
+        )
+    return encoded
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _canonical_cohort_registration(value: dict[str, Any]) -> bytes:
+    expected = {
+        "schema", "assignment_id", "runner_session_id",
+        "identity_fingerprint", "registered_at", "cohort",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise CheckpointObservationSpoolError(
+            "checkpoint cohort registration fields are invalid",
+        )
+    if value["schema"] != COHORT_REGISTRY_SCHEMA_V2:
+        raise CheckpointObservationSpoolError(
+            "checkpoint cohort registration schema is invalid",
+        )
+    for field in ("assignment_id", "runner_session_id"):
+        item = value[field]
+        if not isinstance(item, str) or _IDENTIFIER_RE.fullmatch(item) is None:
+            raise CheckpointObservationSpoolError(
+                "checkpoint cohort registration identity is invalid",
+            )
+    fingerprint = value["identity_fingerprint"]
+    if (
+        not isinstance(fingerprint, str)
+        or len(fingerprint) != 64
+        or any(ch not in "0123456789abcdef" for ch in fingerprint)
+    ):
+        raise CheckpointObservationSpoolError(
+            "checkpoint cohort fingerprint is invalid",
+        )
+    try:
+        registered_at = datetime.fromisoformat(value["registered_at"])
+    except (TypeError, ValueError) as exc:
+        raise CheckpointObservationSpoolError(
+            "checkpoint cohort timestamp is invalid",
+        ) from exc
+    if registered_at.tzinfo is None:
+        raise CheckpointObservationSpoolError(
+            "checkpoint cohort timestamp is invalid",
+        )
+    cohort = value["cohort"]
+    if not isinstance(cohort, dict) or set(cohort) != set(_COHORT_FIELDS):
+        raise CheckpointObservationSpoolError(
+            "checkpoint cohort tuple is invalid",
+        )
+    for field, item in cohort.items():
+        if (
+            not isinstance(item, str)
+            or not item
+            or len(item) > 160
+            or "\x00" in item
+            or "\r" in item
+            or "\n" in item
+        ):
+            raise CheckpointObservationSpoolError(
+                f"checkpoint cohort {field} is invalid",
+            )
+    if cohort["checkpoint_core_abi"] != "dradar-checkpoint-core-v2/1":
+        raise CheckpointObservationSpoolError(
+            "checkpoint cohort core ABI is invalid",
+        )
+    try:
+        encoded = json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+            allow_nan=False,
+        ).encode("ascii")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise CheckpointObservationSpoolError(
+            "checkpoint cohort registration is not canonical JSON",
+        ) from exc
+    if len(encoded) > MAX_OBSERVATION_RECORD_BYTES_V2:
+        raise CheckpointObservationSpoolError(
+            "checkpoint cohort registration is too large",
+        )
+    return encoded
+
+
+def _canonical_delivery_health(value: dict[str, Any]) -> bytes:
+    expected = {
+        "schema", "first_observed_at", "last_observed_at",
+        *_DELIVERY_FIELDS,
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise CheckpointObservationSpoolError(
+            "checkpoint delivery health fields are invalid",
+        )
+    if value["schema"] != DELIVERY_HEALTH_SCHEMA_V2:
+        raise CheckpointObservationSpoolError(
+            "checkpoint delivery health schema is invalid",
+        )
+    for field in _DELIVERY_FIELDS:
+        metric = value[field]
+        if not isinstance(metric, int) or isinstance(metric, bool) or metric < 0:
+            raise CheckpointObservationSpoolError(
+                "checkpoint delivery health metric is invalid",
+            )
+    for field in ("first_observed_at", "last_observed_at"):
+        try:
+            parsed = datetime.fromisoformat(value[field])
+        except (TypeError, ValueError) as exc:
+            raise CheckpointObservationSpoolError(
+                "checkpoint delivery health timestamp is invalid",
+            ) from exc
+        if parsed.tzinfo is None:
+            raise CheckpointObservationSpoolError(
+                "checkpoint delivery health timestamp is invalid",
+            )
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        allow_nan=False,
+    ).encode("ascii")
+    if len(encoded) > MAX_OBSERVATION_RECORD_BYTES_V2:
+        raise CheckpointObservationSpoolError(
+            "checkpoint delivery health is too large",
         )
     return encoded
 
@@ -379,6 +523,114 @@ def _read_private_record(path: Path) -> tuple[dict[str, Any], bytes]:
     return value["payload"], encoded
 
 
+def _atomic_private_record(path: Path, encoded: bytes) -> None:
+    _private_directory(path.parent, create=True)
+    temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        view = memoryview(encoded)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short checkpoint evidence write")
+            view = view[written:]
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    except OSError as exc:
+        raise CheckpointObservationSpoolError(
+            "checkpoint evidence record could not be persisted",
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _read_private_json(path: Path) -> tuple[dict[str, Any], bytes]:
+    descriptor: int | None = None
+    try:
+        before = path.lstat()
+        if (
+            path.is_symlink()
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size > MAX_OBSERVATION_RECORD_BYTES_V2
+        ):
+            raise CheckpointObservationSpoolError(
+                "checkpoint evidence record is unsafe",
+            )
+        if hasattr(os, "getuid") and (
+            before.st_uid != os.getuid()
+            or stat.S_IMODE(before.st_mode) != 0o600
+        ):
+            raise CheckpointObservationSpoolError(
+                "checkpoint evidence record is not private",
+            )
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        opened = os.fstat(descriptor)
+        if (
+            (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            or not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+        ):
+            raise CheckpointObservationSpoolError(
+                "checkpoint evidence record changed",
+            )
+        chunks: list[bytes] = []
+        remaining = MAX_OBSERVATION_RECORD_BYTES_V2 + 1
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 16 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        encoded = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if (
+            len(encoded) > MAX_OBSERVATION_RECORD_BYTES_V2
+            or len(encoded) != after.st_size
+            or (after.st_dev, after.st_ino, after.st_mtime_ns)
+            != (opened.st_dev, opened.st_ino, opened.st_mtime_ns)
+        ):
+            raise CheckpointObservationSpoolError(
+                "checkpoint evidence record changed",
+            )
+        value = json.loads(encoded)
+    except CheckpointObservationSpoolError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise CheckpointObservationSpoolError(
+            "checkpoint evidence record is unreadable",
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if not isinstance(value, dict):
+        raise CheckpointObservationSpoolError(
+            "checkpoint evidence record is not an object",
+        )
+    return value, encoded
+
+
 class CheckpointObservationSpoolV2:
     """A bounded private outbox, safe for multiple local worker processes."""
 
@@ -396,6 +648,8 @@ class CheckpointObservationSpoolV2:
         self.root = Path(root).absolute()
         self.pending_root = self.root / "pending"
         self.rejected_root = self.root / "rejected"
+        self.cohort_root = self.root / "cohorts"
+        self.delivery_health_root = self.root / "delivery-health"
         self.max_pending = max_pending
         self.max_pending_bytes = max_pending_bytes
         self._thread_lock = threading.Lock()
@@ -404,6 +658,85 @@ class CheckpointObservationSpoolV2:
         _private_directory(self.root, create=True)
         _private_directory(self.pending_root, create=True)
         _private_directory(self.rejected_root, create=True)
+        _private_directory(self.cohort_root, create=True)
+        _private_directory(self.delivery_health_root, create=True)
+
+    def register_cohort(self, payload: dict[str, Any]) -> bool:
+        """Persist one exact finalized runtime/session tuple for local audit."""
+
+        value = dict(payload)
+        value["schema"] = COHORT_REGISTRY_SCHEMA_V2
+        assignment_id = value.get("assignment_id")
+        session_id = value.get("runner_session_id")
+        if (
+            not isinstance(assignment_id, str)
+            or _IDENTIFIER_RE.fullmatch(assignment_id) is None
+            or not isinstance(session_id, str)
+            or _IDENTIFIER_RE.fullmatch(session_id) is None
+        ):
+            raise CheckpointObservationSpoolError(
+                "checkpoint cohort registration identity is invalid",
+            )
+        with self._thread_lock, _process_lock(self.root):
+            self._prepare()
+            target = self.cohort_root / f"{assignment_id}.{session_id}.json"
+            if target.exists() or target.is_symlink():
+                existing, raw = _read_private_json(target)
+                value["registered_at"] = existing.get("registered_at")
+                encoded = _canonical_cohort_registration(value)
+                if _canonical_cohort_registration(existing) == encoded == raw:
+                    return False
+                raise CheckpointObservationSpoolError(
+                    "checkpoint cohort registration conflicts",
+                )
+            value.setdefault("registered_at", _now_iso())
+            encoded = _canonical_cohort_registration(value)
+            _atomic_private_record(target, encoded)
+            return True
+
+    def record_delivery_drops(
+        self, assignment_id: str, count: int,
+    ) -> None:
+        """Persist assignment-scoped queue/validation drops for audit."""
+
+        if _IDENTIFIER_RE.fullmatch(assignment_id) is None:
+            raise CheckpointObservationSpoolError(
+                "checkpoint delivery assignment is invalid",
+            )
+        if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+            raise CheckpointObservationSpoolError(
+                "checkpoint delivery drop count is invalid",
+            )
+        if count > 1_000_000:
+            raise CheckpointObservationSpoolError(
+                "checkpoint delivery drop count is too large",
+            )
+        with self._thread_lock, _process_lock(self.root):
+            self._prepare()
+            now = _now_iso()
+            target = self.delivery_health_root / f"{assignment_id}.json"
+            if target.exists():
+                current, raw = _read_private_json(target)
+                if _canonical_delivery_health(current) != raw:
+                    raise CheckpointObservationSpoolError(
+                        "checkpoint delivery health changed",
+                    )
+            else:
+                current = {
+                    "schema": DELIVERY_HEALTH_SCHEMA_V2,
+                    "first_observed_at": now,
+                    "last_observed_at": now,
+                    **{field: 0 for field in _DELIVERY_FIELDS},
+                }
+            updated = {
+                **current,
+                "last_observed_at": now,
+                "dropped": int(current["dropped"]) + count,
+            }
+            _atomic_private_record(
+                target,
+                _canonical_delivery_health(updated),
+            )
 
     def _pending_paths_unlocked(self) -> list[Path]:
         self._prepare()
@@ -558,10 +891,54 @@ class CheckpointObservationReporterV2:
         self._thread: threading.Thread | None = None
         self._stats_lock = threading.Lock()
         self._stats = ObservationDeliveryResultV2()
+        self._unpersisted_drops: dict[str, int] = {}
 
     def _add_stats(self, value: ObservationDeliveryResultV2) -> None:
         with self._stats_lock:
             self._stats = self._stats.plus(value)
+
+    def _record_drop(self, payload: object) -> None:
+        self._add_stats(ObservationDeliveryResultV2(dropped=1))
+        assignment_id = (
+            payload.get("assignment_id") if isinstance(payload, dict) else None
+        )
+        if (
+            isinstance(assignment_id, str)
+            and _IDENTIFIER_RE.fullmatch(assignment_id) is not None
+        ):
+            with self._stats_lock:
+                self._unpersisted_drops[assignment_id] = (
+                    self._unpersisted_drops.get(assignment_id, 0) + 1
+                )
+
+    def _flush_health(self) -> None:
+        with self._stats_lock:
+            pending = self._unpersisted_drops
+            self._unpersisted_drops = {}
+        if not pending:
+            return
+        failed: dict[str, int] = {}
+        for assignment_id, count in pending.items():
+            try:
+                self.spool.record_delivery_drops(assignment_id, count)
+            except Exception:
+                failed[assignment_id] = count
+        if failed:
+            with self._stats_lock:
+                for assignment_id, count in failed.items():
+                    self._unpersisted_drops[assignment_id] = (
+                        self._unpersisted_drops.get(assignment_id, 0) + count
+                    )
+
+    def register_cohort(self, payload: dict[str, Any]) -> bool:
+        """Persist exact finalized cohort facts; failure remains shadow-only."""
+
+        try:
+            return self.spool.register_cohort(payload)
+        except Exception:
+            self._record_drop(payload)
+            self._wake.set()
+            return False
 
     @property
     def stats(self) -> ObservationDeliveryResultV2:
@@ -586,7 +963,7 @@ class CheckpointObservationReporterV2:
             canonical = json.loads(encoded)["payload"]
             self._queue.put_nowait(canonical)
         except (CheckpointObservationSpoolError, queue.Full, ValueError, TypeError):
-            self._add_stats(ObservationDeliveryResultV2(dropped=1))
+            self._record_drop(payload)
             return False
         self._wake.set()
         return True
@@ -647,6 +1024,7 @@ class CheckpointObservationReporterV2:
         except Exception:
             result = result.plus(ObservationDeliveryResultV2(retryable=1))
             self._add_stats(result)
+            self._flush_health()
             return result
         for path, payload in pending:
             try:
@@ -675,6 +1053,7 @@ class CheckpointObservationReporterV2:
             else:
                 result = result.plus(ObservationDeliveryResultV2(acknowledged=1))
         self._add_stats(result)
+        self._flush_health()
         return result
 
     def _loop(self) -> None:
@@ -695,7 +1074,297 @@ class CheckpointObservationReporterV2:
             self._thread.join(timeout=max(0.0, min(float(timeout), 2.0)))
 
 
+def _private_json_files(path: Path) -> list[Path]:
+    _private_directory(path, create=False)
+    result: list[Path] = []
+    for item in path.iterdir():
+        if item.name.startswith("."):
+            continue
+        if item.suffix != ".json":
+            raise CheckpointObservationSpoolError(
+                "checkpoint evidence directory contains an unknown entry",
+            )
+        metadata = item.lstat()
+        if item.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+            raise CheckpointObservationSpoolError(
+                "checkpoint evidence directory contains an unsafe entry",
+            )
+        result.append(item)
+    return sorted(result, key=lambda item: item.name)
+
+
+def _local_diagnostic_counts(home: Path, assignment_id: str) -> tuple[int, int]:
+    path = (
+        home / "checkpoint-v2" / "shadow" / assignment_id
+        / "diagnostics.jsonl"
+    )
+    if not path.exists():
+        return 0, 0
+    try:
+        metadata = path.lstat()
+        if (
+            path.is_symlink()
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_size > 4 * 1024 * 1024
+        ):
+            return 1, 1
+        if hasattr(os, "getuid") and (
+            metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            return 1, 1
+        total = 0
+        unstructured = 0
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                total += 1
+                try:
+                    value = json.loads(line)
+                except json.JSONDecodeError:
+                    unstructured += 1
+                    continue
+                if (
+                    not isinstance(value, dict)
+                    or value.get("schema")
+                    != "dradar-checkpoint-local-diagnostic-v2"
+                    or not isinstance(value.get("stage"), str)
+                    or not isinstance(value.get("code"), str)
+                    or not isinstance(value.get("failure_type"), str)
+                    or not isinstance(value.get("diagnostic"), dict)
+                ):
+                    unstructured += 1
+        return total, unstructured
+    except (OSError, UnicodeError):
+        return 1, 1
+
+
+def _local_cleanup_residue(home: Path, assignment_id: str) -> int:
+    root = home / "checkpoint-v2" / "shadow" / assignment_id
+    total = 0
+    for relative in (".downloads", ".restore"):
+        path = root / relative
+        try:
+            if path.is_dir() and not path.is_symlink():
+                total += sum(
+                    1 for item in path.iterdir()
+                    if not item.name.startswith(".")
+                )
+            elif path.exists() or path.is_symlink():
+                total += 1
+        except OSError:
+            total += 1
+    return total
+
+
+def checkpoint_local_evidence_v2(
+    home: Path,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Build strict assignment-scoped outbox-health attestations locally.
+
+    The scan is read-only and emits counts/digests only.  It never includes a
+    local path, hostname, username, command, prompt, log line, or credential.
+    Passing the resulting JSON to the server report remains an explicit human
+    review action and cannot enable Checkpoint V2 by itself.
+    """
+
+    home = Path(home).absolute()
+    root = home / "checkpoint-v2" / "observations"
+    instant = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    if not root.exists():
+        return {
+            "schema": LOCAL_EVIDENCE_SCHEMA_V2,
+            "generated_at": instant.replace(microsecond=0).isoformat(),
+            "attestations": [],
+            "unregistered_records": 0,
+            "scan_errors": 0,
+        }
+    _private_directory(root, create=False)
+    cohort_root = root / "cohorts"
+    pending_root = root / "pending"
+    rejected_root = root / "rejected"
+    health_root = root / "delivery-health"
+    for path in (cohort_root, pending_root, rejected_root, health_root):
+        if not path.exists():
+            raise CheckpointObservationSpoolError(
+                "checkpoint local evidence is incomplete",
+            )
+
+    registrations: list[tuple[dict[str, Any], str]] = []
+    for path in _private_json_files(cohort_root):
+        value, encoded = _read_private_json(path)
+        if _canonical_cohort_registration(value) != encoded:
+            raise CheckpointObservationSpoolError(
+                "checkpoint cohort registration changed",
+            )
+        registrations.append((value, hashlib.sha256(encoded).hexdigest()))
+
+    observation_records: list[tuple[str, dict[str, Any], str]] = []
+    for state, directory in (("pending", pending_root), ("rejected", rejected_root)):
+        for path in _private_json_files(directory):
+            payload, encoded = _read_private_record(path)
+            observation_records.append((
+                state, payload, hashlib.sha256(encoded).hexdigest(),
+            ))
+
+    health: dict[str, tuple[dict[str, Any], str]] = {}
+    for path in _private_json_files(health_root):
+        value, encoded = _read_private_json(path)
+        if _canonical_delivery_health(value) != encoded:
+            raise CheckpointObservationSpoolError(
+                "checkpoint delivery health changed",
+            )
+        assignment_id = path.stem
+        if _IDENTIFIER_RE.fullmatch(assignment_id) is None:
+            raise CheckpointObservationSpoolError(
+                "checkpoint delivery health identity is invalid",
+            )
+        health[assignment_id] = (value, hashlib.sha256(encoded).hexdigest())
+
+    groups: dict[tuple[str, ...], list[tuple[dict[str, Any], str]]] = {}
+    assignment_ids: set[str] = set()
+    assignment_cohorts: dict[str, tuple[str, ...]] = {}
+    assignment_fingerprints: dict[str, str] = {}
+    for registration in registrations:
+        value = registration[0]
+        key = tuple(value["cohort"][field] for field in _COHORT_FIELDS)
+        assignment_id = value["assignment_id"]
+        fingerprint = value["identity_fingerprint"]
+        if (
+            assignment_id in assignment_cohorts
+            and assignment_cohorts[assignment_id] != key
+        ) or (
+            assignment_id in assignment_fingerprints
+            and assignment_fingerprints[assignment_id] != fingerprint
+        ):
+            raise CheckpointObservationSpoolError(
+                "checkpoint assignment cohort registration drifted",
+            )
+        if datetime.fromisoformat(value["registered_at"]) > instant:
+            raise CheckpointObservationSpoolError(
+                "checkpoint cohort registration is in the future",
+            )
+        assignment_cohorts[assignment_id] = key
+        assignment_fingerprints[assignment_id] = fingerprint
+        groups.setdefault(key, []).append(registration)
+        assignment_ids.add(assignment_id)
+    unregistered_records = sum(
+        payload.get("assignment_id") not in assignment_ids
+        for _, payload, _ in observation_records
+    ) + sum(assignment_id not in assignment_ids for assignment_id in health)
+
+    attestations: list[dict[str, Any]] = []
+    for key in sorted(groups):
+        cohort_registrations = groups[key]
+        cohort = dict(zip(_COHORT_FIELDS, key, strict=True))
+        assignments = {
+            value["assignment_id"] for value, _ in cohort_registrations
+        }
+        sessions = {
+            value["runner_session_id"] for value, _ in cohort_registrations
+        }
+        registered_at = [
+            datetime.fromisoformat(value["registered_at"]).astimezone(timezone.utc)
+            for value, _ in cohort_registrations
+        ]
+        pending = [
+            (payload, digest) for state, payload, digest in observation_records
+            if state == "pending" and payload.get("assignment_id") in assignments
+        ]
+        rejected = [
+            (payload, digest) for state, payload, digest in observation_records
+            if state == "rejected" and payload.get("assignment_id") in assignments
+        ]
+        drops = sum(
+            int(health[assignment_id][0]["dropped"])
+            for assignment_id in assignments if assignment_id in health
+        )
+        diagnostics = 0
+        unstructured_diagnostics = 0
+        cleanup_residue = 0
+        for assignment_id in assignments:
+            total, unstructured = _local_diagnostic_counts(home, assignment_id)
+            diagnostics += total
+            unstructured_diagnostics += unstructured
+            cleanup_residue += _local_cleanup_residue(home, assignment_id)
+        cleanup_residue += sum(
+            payload.get("remote_cleanup") == "failed"
+            for payload, _ in (*pending, *rejected)
+        )
+        pending_ages = [
+            max(0, int((instant - datetime.fromtimestamp(
+                (root / "pending" / f"{payload['operation_id']}.json").stat().st_mtime,
+                timezone.utc,
+            )).total_seconds()))
+            for payload, _ in pending
+        ]
+        source = {
+            "cohort": cohort,
+            "assignment_ids": sorted(assignments),
+            "runner_session_ids": sorted(sessions),
+            "registration_digests": sorted(
+                digest for _, digest in cohort_registrations
+            ),
+            "pending_digests": sorted(digest for _, digest in pending),
+            "rejected_digests": sorted(digest for _, digest in rejected),
+            "health_digests": sorted(
+                health[assignment_id][1]
+                for assignment_id in assignments if assignment_id in health
+            ),
+            "diagnostic_records": diagnostics,
+            "unstructured_diagnostics": unstructured_diagnostics,
+            "cleanup_residue": cleanup_residue,
+        }
+        artifact = hashlib.sha256(json.dumps(
+            source, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+            allow_nan=False,
+        ).encode("ascii")).hexdigest()
+        attestations.append({
+            "schema": EVIDENCE_ATTESTATION_SCHEMA_V2,
+            "attestation_id": f"local-outbox-{artifact[:40]}",
+            "kind": "outbox_health",
+            "cohort": cohort,
+            "observed_from": min(registered_at).replace(microsecond=0).isoformat(),
+            "observed_until": instant.replace(microsecond=0).isoformat(),
+            "artifact_sha256": artifact,
+            "metrics": {
+                "observation_processes": len(sessions),
+                "assignment_count": len(assignments),
+                "pending_records": len(pending),
+                "oldest_pending_seconds": max(pending_ages, default=0),
+                "rejected_records": len(rejected),
+                "dropped_records": drops,
+                "diagnostic_records": diagnostics,
+                "unstructured_diagnostics": unstructured_diagnostics,
+                "cleanup_residue": cleanup_residue,
+            },
+        })
+    return {
+        "schema": LOCAL_EVIDENCE_SCHEMA_V2,
+        "generated_at": instant.replace(microsecond=0).isoformat(),
+        "attestations": attestations,
+        "unregistered_records": unregistered_records,
+        "scan_errors": 0,
+    }
+
+
+def cmd_checkpoint_audit(_args) -> int:
+    """CLI wrapper for the privacy-bounded local evidence scan."""
+
+    from .local_config import HOME
+
+    try:
+        report = checkpoint_local_evidence_v2(HOME)
+    except (OSError, ValueError, CheckpointObservationSpoolError) as exc:
+        print(f"checkpoint evidence audit refused: {exc}")
+        return 1
+    print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
 __all__ = [
+    "COHORT_REGISTRY_SCHEMA_V2",
     "CheckpointObservationReporterV2",
     "CheckpointObservationSpoolError",
     "CheckpointObservationSpoolV2",
@@ -703,4 +1372,6 @@ __all__ = [
     "MAX_PENDING_OBSERVATIONS_V2",
     "OBSERVATION_SPOOL_SCHEMA_V2",
     "ObservationDeliveryResultV2",
+    "checkpoint_local_evidence_v2",
+    "cmd_checkpoint_audit",
 ]

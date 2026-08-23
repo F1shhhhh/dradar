@@ -21,6 +21,7 @@ import sys
 from . import __version__
 from .capacity import cmd_capacity
 from .cells import cmd_cells
+from .checkpoint_observation_v2 import cmd_checkpoint_audit
 from .doctor import cmd_doctor
 from .identity import cmd_link_github, cmd_login, cmd_rename, cmd_status
 from .image_cache import cmd_config_set, cmd_config_show
@@ -277,6 +278,11 @@ def main(argv: list[str] | None = None) -> int:
         "discard", help="delete a checkpoint and reopen its assignment cell")
     p_cp_discard.add_argument("checkpoint_id", metavar="ID")
     p_cp_discard.set_defaults(func=cmd_checkpoint_discard, lease_hint=True)
+    p_cp_audit = checkpoint_sub.add_parser(
+        "audit",
+        help="emit a read-only privacy-bounded Checkpoint V2 evidence packet",
+    )
+    p_cp_audit.set_defaults(func=cmd_checkpoint_audit)
 
     p_sessions = sub.add_parser(
         "sessions", help="manage opt-in local Codex session archives")

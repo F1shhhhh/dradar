@@ -2,6 +2,7 @@ import json
 import os
 import stat
 import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -10,6 +11,7 @@ from dradar.checkpoint_observation_v2 import (
     CheckpointObservationReporterV2,
     CheckpointObservationSpoolError,
     CheckpointObservationSpoolV2,
+    checkpoint_local_evidence_v2,
 )
 
 
@@ -111,6 +113,27 @@ def _restore_payload():
         "adapter_version": "codex-openai/v1",
         "paid_execution_started": False,
         "authoritative": False,
+    }
+
+
+def _cohort_registration():
+    return {
+        "assignment_id": "assignment-0001",
+        "runner_session_id": "session-0001",
+        "identity_fingerprint": "a" * 64,
+        "cohort": {
+            "platform": "macos",
+            "container_backend": "orbstack",
+            "harness": "codex",
+            "provider": "openai",
+            "client_version": "0.5.97",
+            "agent_version": "1.2.3",
+            "runtime_profile": "codex-runtime-v1",
+            "model_config_version": "codex-config-v1",
+            "runtime_compatibility_digest": "d" * 64,
+            "checkpoint_core_abi": "dradar-checkpoint-core-v2/1",
+            "checkpoint_abi": "codex-openai/v1",
+        },
     }
 
 
@@ -285,3 +308,63 @@ def test_background_close_has_a_hard_wait_bound(tmp_path):
     started = time.monotonic()
     reporter.close(timeout=0.02)
     assert time.monotonic() - started < 0.15
+
+
+def test_cohort_registration_is_private_idempotent_and_conflict_safe(tmp_path):
+    spool = CheckpointObservationSpoolV2(tmp_path / "observations")
+    payload = _cohort_registration()
+    assert spool.register_cohort(payload) is True
+    assert spool.register_cohort(payload) is False
+    path = next(spool.cohort_root.glob("*.json"))
+    if hasattr(os, "getuid"):
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    changed = json.loads(json.dumps(payload))
+    changed["cohort"]["platform"] = "linux"
+    with pytest.raises(CheckpointObservationSpoolError, match="conflicts"):
+        spool.register_cohort(changed)
+
+
+def test_local_evidence_reports_assignment_scoped_backlog_and_drops(tmp_path):
+    reporter = CheckpointObservationReporterV2(
+        FakeObservationApi([ApiError("offline")]), tmp_path, queue_size=1,
+    )
+    assert reporter.register_cohort(_cohort_registration()) is True
+    assert reporter.record(_payload()) is True
+    assert reporter.record(_payload("operation-0002", "capture-0002")) is False
+    flushed = reporter.flush_once()
+    assert flushed.retryable == 1
+
+    packet = checkpoint_local_evidence_v2(
+        tmp_path,
+        now=datetime.now(timezone.utc) + timedelta(seconds=1),
+    )
+    assert packet["schema"] == "dradar-checkpoint-v2-local-evidence-v1"
+    assert packet["unregistered_records"] == 0
+    assert len(packet["attestations"]) == 1
+    attestation = packet["attestations"][0]
+    assert attestation["kind"] == "outbox_health"
+    assert attestation["cohort"]["platform"] == "macos"
+    assert attestation["metrics"]["observation_processes"] == 1
+    assert attestation["metrics"]["pending_records"] == 1
+    assert attestation["metrics"]["dropped_records"] == 1
+    serialized = json.dumps(packet)
+    assert str(tmp_path) not in serialized
+    assert "offline" not in serialized
+
+
+def test_local_evidence_rejects_cross_session_assignment_cohort_drift(tmp_path):
+    spool = CheckpointObservationSpoolV2(
+        tmp_path / "checkpoint-v2" / "observations",
+    )
+    first = _cohort_registration()
+    second = json.loads(json.dumps(first))
+    second["runner_session_id"] = "session-0002"
+    second["cohort"]["platform"] = "linux"
+    assert spool.register_cohort(first)
+    assert spool.register_cohort(second)
+    with pytest.raises(CheckpointObservationSpoolError, match="drifted"):
+        checkpoint_local_evidence_v2(
+            tmp_path,
+            now=datetime.now(timezone.utc) + timedelta(seconds=1),
+        )

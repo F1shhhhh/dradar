@@ -164,9 +164,14 @@ class DataPlane:
 class Sink:
     def __init__(self):
         self.payloads = []
+        self.cohorts = []
 
     def record_checkpoint_observation(self, payload):
         self.payloads.append(payload)
+        return True
+
+    def register_checkpoint_cohort(self, payload):
+        self.cohorts.append(payload)
         return True
 
 
@@ -228,6 +233,20 @@ def test_observe_coordinator_keeps_mainline_authoritative_and_reports_capture(
     assert plane.restores == 0
     assert [item["observation_kind"] for item in sink.payloads] == ["capture"]
     assert sink.payloads[0]["authoritative"] is False
+    assert len(sink.cohorts) == 1
+    assert sink.cohorts[0]["cohort"] == {
+        "platform": "macos",
+        "container_backend": "orbstack",
+        "harness": "codex",
+        "provider": "openai",
+        "client_version": "0.5.98",
+        "agent_version": "1.2.3",
+        "runtime_profile": "runtime-profile-v2",
+        "model_config_version": "model-config-v2",
+        "runtime_compatibility_digest": "d" * 64,
+        "checkpoint_core_abi": CHECKPOINT_CORE_ABI_V2,
+        "checkpoint_abi": "dradar-checkpoint-v2/codex/1",
+    }
 
 
 def test_restore_test_reports_capture_before_nonpaid_restore(tmp_path: Path) -> None:

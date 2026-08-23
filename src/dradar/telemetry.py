@@ -143,6 +143,21 @@ class RunnerTelemetry:
         except Exception:
             return False
 
+    def register_checkpoint_cohort(self, payload: dict) -> bool:
+        """Bind local evidence to this exact runner session and cohort."""
+
+        with self._lock:
+            reporter = self._checkpoint_observation_reporter
+            session_id = self.session_id
+        if reporter is None:
+            return False
+        materialized = dict(payload)
+        materialized["runner_session_id"] = session_id
+        try:
+            return reporter.register_cohort(materialized)
+        except Exception:
+            return False
+
     def _show_notices(self, response: dict) -> None:
         """Print each bounded server notice at most once per runner process."""
         notices = response.get("notices")

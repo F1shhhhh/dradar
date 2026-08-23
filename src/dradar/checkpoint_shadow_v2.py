@@ -188,6 +188,45 @@ class CheckpointShadowCoordinatorV2:
                     ),
                 )
                 self._identity = receipt.identity
+                register = getattr(
+                    self.observation_sink,
+                    "register_checkpoint_cohort",
+                    None,
+                )
+                if callable(register):
+                    try:
+                        register({
+                            "assignment_id": receipt.identity.assignment_id,
+                            "identity_fingerprint": receipt.identity.fingerprint,
+                            "cohort": {
+                                "platform": self.runtime.platform,
+                                "container_backend": (
+                                    self.runtime.container_backend
+                                ),
+                                "harness": receipt.identity.harness,
+                                "provider": receipt.identity.provider,
+                                "client_version": self.runtime.client_version,
+                                "agent_version": receipt.identity.agent_version,
+                                "runtime_profile": (
+                                    receipt.identity.runtime_profile
+                                ),
+                                "model_config_version": (
+                                    receipt.identity.model_config_version
+                                ),
+                                "runtime_compatibility_digest": (
+                                    receipt.identity.runtime_compatibility_digest
+                                ),
+                                "checkpoint_core_abi": (
+                                    receipt.identity.checkpoint_core_abi
+                                ),
+                                "checkpoint_abi": receipt.identity.checkpoint_abi,
+                            },
+                        })
+                    except Exception:
+                        # Local evidence registration is itself shadow-only.
+                        # Capture remains useful to the mainline even when the
+                        # operator later has to mark this cohort incomplete.
+                        pass
         return self._identity
 
     def _record(self, payload: dict[str, object]) -> None:
