@@ -1353,13 +1353,18 @@ class ZCodeBigModel(BaseInstalledAgent):
                 for item in (remote_cli, remote_runner, instruction_path, remote_key)
             )
             if environment.default_user is not None:
-                await self._checkpoint.exec_root_maintenance(
-                    environment,
-                    command=(
-                        f"chown {shlex.quote(str(environment.default_user))} {targets} "
-                        f"&& chmod 600 {targets}"
-                    ),
+                command = (
+                    f"chown {shlex.quote(str(environment.default_user))} {targets} "
+                    f"&& chmod 600 {targets}"
                 )
+                if self._checkpoint.enabled:
+                    await self._checkpoint.exec_root_maintenance(
+                        environment, command=command,
+                    )
+                else:
+                    await self.exec_as_root(
+                        environment, command=command, env=env,
+                    )
             else:
                 await self.exec_as_agent(
                     environment, command=f"chmod 600 {targets}", env=env,

@@ -98,13 +98,16 @@ class DeepSeekCodex(DurableCodex):
             self._REMOTE_MODEL_CATALOG.as_posix(),
         )
         if environment.default_user is not None:
-            await self._durable_checkpoint.exec_root_maintenance(
-                environment,
-                command=(
-                    f"chown {shlex.quote(str(environment.default_user))} "
-                    f"{shlex.quote(self._REMOTE_MODEL_CATALOG.as_posix())}"
-                ),
+            command = (
+                f"chown {shlex.quote(str(environment.default_user))} "
+                f"{shlex.quote(self._REMOTE_MODEL_CATALOG.as_posix())}"
             )
+            if self._durable_checkpoint.enabled:
+                await self._durable_checkpoint.exec_root_maintenance(
+                    environment, command=command,
+                )
+            else:
+                await self.exec_as_root(environment, command=command, env=env)
         # Re-check inside the real task container, as the same user that will
         # launch Codex. This catches a failed/truncated upload or unreadable
         # ownership before any paid model request can be made.

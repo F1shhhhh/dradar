@@ -67,7 +67,7 @@ from .runner import (
     check_task_content_hash, classify_exception_message,
     codex_trajectory_bundle_usage,
     diagnose_exception, ensure_pier, ensure_tasks_root,
-    local_deep_swe_commit, run_trial,
+    durable_checkpoint_rollout_enabled, local_deep_swe_commit, run_trial,
     summarize_result, sync_deep_swe_commit, trial_artifact_paths,
 )
 from .scrub import (
@@ -2591,6 +2591,21 @@ def _resume_one_checkpoint(
                     ),
                 )
 
+            if not durable_checkpoint_rollout_enabled():
+                paused = _pause_checkpoint_quietly(client, assignment)
+                if isinstance(paused, _CheckpointPauseFailure):
+                    print(
+                        f"  {assignment_id}: saved checkpoint is "
+                        f"{paused.family}; automatic refill remains faulted"
+                    )
+                    return paused.family.replace("_", "-")
+                print(
+                    f"  {assignment_id}: durable checkpoint resume is "
+                    "temporarily disabled in this release; the checkpoint "
+                    "was kept and no model session was started"
+                )
+                return "paused"
+
             generation = max(
                 item.resume_generation,
                 int(assignment.get("resume_generation") or 0),
@@ -3353,6 +3368,8 @@ def _assignment_is_recoverable_checkpoint(
     local state *ahead* of the server; that direction cannot be explained by
     the fail-closed compensation path.
     """
+    if not durable_checkpoint_rollout_enabled():
+        return False
     assignment_id = assignment.get("assignment_id")
     item = local.get(assignment_id) if assignment_id else None
     server_generation = assignment.get("resume_generation", 0)

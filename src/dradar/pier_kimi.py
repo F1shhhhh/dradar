@@ -738,15 +738,18 @@ class KimiCode(BaseInstalledAgent):
             )
         )
         if environment.default_user is not None and not self._shared_oauth:
-            await self._checkpoint.exec_root_maintenance(
-                environment,
-                command=(
-                    f"chown {shlex.quote(str(environment.default_user))} {targets} "
-                    f"&& chmod 600 {shlex.quote(remote_auth)} "
-                    f"{shlex.quote(remote_lock)} {shlex.quote(remote_config)} "
-                    f"&& chmod 500 {shlex.quote(remote_policy)}"
-                ),
+            command = (
+                f"chown {shlex.quote(str(environment.default_user))} {targets} "
+                f"&& chmod 600 {shlex.quote(remote_auth)} "
+                f"{shlex.quote(remote_lock)} {shlex.quote(remote_config)} "
+                f"&& chmod 500 {shlex.quote(remote_policy)}"
             )
+            if self._checkpoint.enabled:
+                await self._checkpoint.exec_root_maintenance(
+                    environment, command=command,
+                )
+            else:
+                await self.exec_as_root(environment, command=command, env=env)
         elif not self._shared_oauth:
             await self.exec_as_agent(
                 environment,
