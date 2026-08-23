@@ -2,6 +2,7 @@
 2026-07-14 — sessions get work from a server-side dispenser instead of
 racing over a shared batch snapshot)."""
 import dradar.runloop as runloop
+import pytest
 from dradar.api_client import ApiError
 
 from test_go_menu import FakeClient, _args, _patch_run
@@ -194,6 +195,88 @@ def test_multi_cell_resume_stops_after_failure_without_auto_flag(
 
     assert rc == 1
     assert attempts == ["bad"]
+    assert len(client._checkouts) == 1
+
+
+def test_preclaimed_waiting_queue_stops_after_second_same_zero_progress_failure(
+        monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)
+    monkeypatch.setenv(
+        runloop._REPEAT_FAILURE_STATE_ENV, str(tmp_path / "failure-state.json"),
+    )
+    attempts = []
+    signature = ("same-batch-runtime", "agent-command-failed:exit=1")
+
+    def run(_client, assignment, *_args, **_kwargs):
+        attempts.append(assignment["assignment_id"])
+        opened = runloop._observe_repeat_failure(
+            assignment, signature, success=False,
+        )
+        return "repeat-agent-failure" if opened else "interrupted"
+
+    monkeypatch.setattr(runloop, "_run_and_submit", run)
+    cells = [_cell("first"), _cell("second"), _cell("must-stay-waiting")]
+    client = CheckoutClient(
+        {"active": cells, "free_pick": True},
+        [
+            {"assignment": cells[0], "held": 3, "unstarted": 2},
+            {"assignment": cells[1], "held": 3, "unstarted": 1},
+            {"assignment": cells[2], "held": 3, "unstarted": 0},
+        ],
+    )
+
+    assert runloop._run_checkout_loop(_args(), client, tmp_path, cells) == 1
+    assert attempts == ["first", "second"]
+    assert len(client._checkouts) == 1
+    assert client.stopped == []
+    assert "safety circuit opened" in capsys.readouterr().out
+
+
+def test_repeat_failure_stops_refill_before_second_replenishment(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)
+    monkeypatch.setenv(
+        runloop._REPEAT_FAILURE_STATE_ENV, str(tmp_path / "failure-state.json"),
+    )
+    monkeypatch.setattr(runloop.refill_plan, "is_running", lambda _home: True)
+    stopped = []
+    replenished = []
+    monkeypatch.setattr(
+        runloop.refill_plan, "stop",
+        lambda _home, reason: stopped.append(reason),
+    )
+    monkeypatch.setattr(runloop.refill_plan, "mark_submitted", lambda *_a: None)
+    monkeypatch.setattr(
+        runloop.refill_plan, "refill_once",
+        lambda *_a: replenished.append(True) or {"claimed": 0, "held": 2},
+    )
+    monkeypatch.setattr(runloop, "_load_config", lambda: {})
+    monkeypatch.setattr(runloop, "_disk_allows_refill", lambda _cfg: True)
+    signature = ("same-batch-runtime", "agent-command-failed:exit=1")
+
+    def run(_client, assignment, *_args, **_kwargs):
+        opened = runloop._observe_repeat_failure(
+            assignment, signature, success=False,
+        )
+        return "repeat-agent-failure" if opened else "interrupted"
+
+    monkeypatch.setattr(runloop, "_run_and_submit", run)
+    cells = [_cell("first"), _cell("second"), _cell("must-stay-waiting")]
+    client = CheckoutClient(
+        {"active": cells, "free_pick": True},
+        [
+            {"assignment": cells[0], "held": 3, "unstarted": 2},
+            {"assignment": cells[1], "held": 3, "unstarted": 1},
+            {"assignment": cells[2], "held": 3, "unstarted": 0},
+        ],
+    )
+    args = _args()
+    args.refill = True
+    args.worker_child = False
+
+    assert runloop._run_checkout_loop(args, client, tmp_path, cells) == 1
+    assert replenished == [True]
+    assert stopped == ["account stop: repeat-agent-failure"]
     assert len(client._checkouts) == 1
 
 

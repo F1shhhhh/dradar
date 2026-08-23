@@ -201,6 +201,64 @@ def test_only_supervised_worker_skips_busy_checkpoint_and_drains_waiting_work(
         assert "checking for a different waiting task" in output
 
 
+def test_recovery_repeat_failure_stops_before_waiting_checkout(monkeypatch):
+    checked_out = []
+    monkeypatch.setattr(runloop, "_load_config", lambda: {})
+    monkeypatch.setattr(runloop, "_client", lambda *_a, **_k: object())
+    monkeypatch.setattr(runloop, "tasks_root_from_config", lambda _cfg: object())
+    monkeypatch.setattr(runloop, "RunnerTelemetry", _Telemetry)
+    monkeypatch.setattr(runloop, "acquire_run_lock", lambda _home: None)
+    monkeypatch.setattr(runloop, "sweep_orphan_compose", lambda *_a: None)
+    monkeypatch.setattr(
+        runloop, "_maintain_image_cache", lambda *_a, **_k: True,
+    )
+    monkeypatch.setattr(runloop, "ensure_tasks_root", lambda _root: None)
+    monkeypatch.setattr(runloop, "ensure_pier", lambda: None)
+    monkeypatch.setattr(runloop, "_ensure_egress_runtime", lambda **_k: None)
+    monkeypatch.setattr(runloop, "_retry_pending_uploads", lambda _client: None)
+    monkeypatch.setattr(
+        runloop, "_resume_local_checkpoints",
+        lambda *_a, **_k: (["repeat-agent-failure"], True),
+    )
+    monkeypatch.setattr(
+        runloop, "_go_menu", lambda *_a, **_k: checked_out.append(True) or 0,
+    )
+
+    assert runloop.cmd_go(_args(workers=1, auto=None)) == 1
+    assert checked_out == []
+
+
+def test_checkpoint_recovery_stops_before_third_item_after_repeat_failure(
+        monkeypatch, tmp_path):
+    items = {
+        name: SimpleNamespace(assignment_id=name)
+        for name in ("first", "second", "must-not-resume")
+    }
+    monkeypatch.setattr(
+        runloop.checkpoints, "latest_by_assignment", lambda _home: items,
+    )
+    monkeypatch.setattr(
+        runloop, "_active_by_id", lambda _client: {name: {} for name in items},
+    )
+    attempted = []
+    outcomes = iter(("interrupted", "repeat-agent-failure"))
+
+    def resume(_client, item, *_args, **_kwargs):
+        attempted.append(item.assignment_id)
+        return next(outcomes)
+
+    monkeypatch.setattr(runloop, "_resume_one_checkpoint", resume)
+    args = _args(workers=1, auto=None)
+
+    results, found = runloop._resume_local_checkpoints(
+        object(), args, tmp_path, None,
+    )
+
+    assert found is True
+    assert results == ["interrupted", "repeat-agent-failure"]
+    assert attempted == ["first", "second"]
+
+
 def test_egress_preflight_failure_happens_before_checkout(monkeypatch):
     checked_out = []
     monkeypatch.setattr(runloop, "_load_config", lambda: {})
