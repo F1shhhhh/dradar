@@ -210,8 +210,8 @@ def test_pompeii_multiplier_stretches_90_minute_pack_to_120_minutes(tmp_path):
     assert 7199.0 < multiplier * 5400.0 <= runner_mod.POMPEII_AGENT_TIMEOUT_SEC
 
 
-def test_kimi_pompeii_multiplier_stretches_pack_to_180_minutes(tmp_path):
-    for pack_timeout_sec, expected_multiplier in ((7200.0, 1.5), (5400.0, 2.0)):
+def test_kimi_pompeii_multiplier_stretches_pack_to_240_minutes(tmp_path):
+    for pack_timeout_sec, expected_multiplier in ((7200.0, 2.0), (5400.0, 2.666666)):
         task = _task_with_toml(
             tmp_path,
             task_id=f"kimi-{int(pack_timeout_sec)}",
@@ -224,9 +224,11 @@ def test_kimi_pompeii_multiplier_stretches_pack_to_180_minutes(tmp_path):
         }
         multiplier = runner_mod._agent_timeout_multiplier(assignment, task)
         assert multiplier == expected_multiplier
+        effective_timeout = multiplier * pack_timeout_sec
         assert (
-            multiplier * pack_timeout_sec
-            == runner_mod.KIMI_POMPEII_AGENT_TIMEOUT_SEC
+            runner_mod.KIMI_POMPEII_AGENT_TIMEOUT_SEC - 1
+            < effective_timeout
+            <= runner_mod.KIMI_POMPEII_AGENT_TIMEOUT_SEC
         )
 
 
@@ -238,14 +240,14 @@ def test_pompeii_timeout_requires_readable_task_config(tmp_path):
         runner_mod._agent_timeout_multiplier(assignment, task)
 
 
-def test_kimi_pompeii_timeout_error_reports_180_minute_limit(tmp_path):
+def test_kimi_pompeii_timeout_error_reports_240_minute_limit(tmp_path):
     task = tmp_path / "no-toml-kimi"
     task.mkdir()
     assignment = {
         "agent": runner_mod.KIMI_AGENT,
         "benchmark_id": runner_mod.POMPEII_BENCHMARK_ID,
     }
-    with pytest.raises(RunnerError, match="180-minute execution limit"):
+    with pytest.raises(RunnerError, match="240-minute execution limit"):
         runner_mod._agent_timeout_multiplier(assignment, task)
 
 
