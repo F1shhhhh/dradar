@@ -22,6 +22,16 @@ def _verified_runner_platform(monkeypatch):
     monkeypatch.setattr(
         runner, "_observed_platform_backend", lambda: ("linux", "docker"),
     )
+    monkeypatch.setattr(
+        runner,
+        "_runner_environment",
+        lambda: {
+            "python": {"implementation": "cpython", "version": "3.12.0"},
+            "platform": {"system": "linux", "machine": "x86_64"},
+            "docker": {"client": {"version": "1"}, "server": {"version": "1"}},
+            "packages": [{"name": "pytest", "version": "9.1.1"}],
+        },
+    )
 
 
 def _cohort() -> dict[str, str]:
@@ -138,12 +148,18 @@ def test_runner_executes_fixed_complete_plan_and_writes_private_results(
     assert all(case["status"] == "passed" for case in result["cases"])
     assert result["network_isolated"] is True
     assert result["provider_credentials_present"] is False
+    assert len(result["runner_environment_sha256"]) == 64
     assert stat.S_IMODE(output.stat().st_mode) == 0o600
     logs = list(output.parent.glob(f".{output.name}.logs-*"))
     assert len(logs) == 1
     assert stat.S_IMODE(logs[0].stat().st_mode) == 0o700
     assert not (logs[0] / "exact-sources").exists()
-    log_files = list(logs[0].glob("*.json"))
+    environment_log = logs[0] / "runner-environment.json"
+    assert stat.S_IMODE(environment_log.stat().st_mode) == 0o600
+    log_files = [
+        path for path in logs[0].glob("*.json")
+        if path != environment_log
+    ]
     assert len(log_files) == sum(
         len(probes)
         for probes in runner.lifecycle_probe_plan_v2(_cohort()).values()

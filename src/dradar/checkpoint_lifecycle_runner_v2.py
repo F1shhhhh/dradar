@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import hashlib
 import io
+import importlib.metadata
 import json
 import os
+import platform
 import shutil
 import socket
 import stat
@@ -312,6 +314,65 @@ def _observed_platform_backend() -> tuple[str, str]:
         raise ValueError("lifecycle runner cannot verify its Docker backend") from exc
 
 
+def _runner_environment() -> dict[str, Any]:
+    packages = sorted({
+        (
+            str(distribution.metadata.get("Name") or "").lower(),
+            str(distribution.version),
+        )
+        for distribution in importlib.metadata.distributions()
+        if distribution.metadata.get("Name")
+    })
+    if not packages or len(packages) > 10_000 or any(
+        not name or len(name) > 200 or len(version) > 200
+        for name, version in packages
+    ):
+        raise ValueError("lifecycle runner package inventory is invalid")
+    try:
+        raw = subprocess.run(
+            ["docker", "version", "--format", "{{json .}}"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+        ).stdout
+        docker = json.loads(raw)
+        if not isinstance(docker, Mapping):
+            raise ValueError("lifecycle runner Docker response is invalid")
+        selected_docker = {
+            side.lower(): {
+                field: value.get(field)
+                for field in ("Version", "ApiVersion", "Os", "Arch")
+            }
+            for side in ("Client", "Server")
+            if isinstance((value := docker.get(side)), Mapping)
+        }
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        raise ValueError("lifecycle runner Docker environment is unavailable") from exc
+    if set(selected_docker) != {"client", "server"} or any(
+        not all(isinstance(value, str) and value for value in facts.values())
+        for facts in selected_docker.values()
+    ):
+        raise ValueError("lifecycle runner Docker environment is invalid")
+    return {
+        "python": {
+            "implementation": sys.implementation.name,
+            "version": platform.python_version(),
+            "abi": getattr(sys.implementation, "cache_tag", None),
+            "byteorder": sys.byteorder,
+        },
+        "platform": {
+            "system": platform.system().lower(),
+            "machine": platform.machine().lower(),
+        },
+        "docker": selected_docker,
+        "packages": [
+            {"name": name, "version": version}
+            for name, version in packages
+        ],
+    }
+
+
 def _git_revision(root: Path) -> str:
     root = root.resolve(strict=True)
     status = subprocess.run(
@@ -582,6 +643,10 @@ def run_lifecycle_matrix_v2(
     }
     plan = lifecycle_probe_plan_v2(cohort)
     suite_digest = _test_suite_digest(roots, plan)
+    environment = _runner_environment()
+    environment_digest = hashlib.sha256(
+        _canonical_bytes(environment),
+    ).hexdigest()
     output = Path(output_path).absolute()
     if output.exists() or output.is_symlink():
         raise ValueError("lifecycle result output already exists")
@@ -594,6 +659,12 @@ def run_lifecycle_matrix_v2(
         raise ValueError("lifecycle result output must be outside source trees")
     logs = output.parent / f".{output.name}.logs-{uuid.uuid4().hex}"
     _private_directory(logs, create=True)
+    _write_private_once(
+        logs / "runner-environment.json",
+        json.dumps(
+            environment, ensure_ascii=True, indent=2, sort_keys=True,
+        ).encode("ascii"),
+    )
     sandbox_home = logs / "sandbox-home"
     _private_directory(sandbox_home, create=True)
     materialized_root = logs / "exact-sources"
@@ -689,6 +760,7 @@ def run_lifecycle_matrix_v2(
         "observed_until": observed_until.isoformat(),
         "source_revisions": revisions,
         "test_suite_sha256": suite_digest,
+        "runner_environment_sha256": environment_digest,
         "runner_instance_digest": hashlib.sha256(os.urandom(32)).hexdigest(),
         "network_isolated": True,
         "provider_credentials_present": False,

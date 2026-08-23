@@ -181,6 +181,7 @@ def build_lifecycle_matrix_bundle_v2(
     observed_until: datetime,
     source_revisions: Mapping[str, Any],
     test_suite_sha256: str,
+    runner_environment_sha256: str,
     runner_instance_digest: str,
     network_isolated: bool,
     provider_credentials_present: bool,
@@ -219,6 +220,9 @@ def build_lifecycle_matrix_bundle_v2(
         "source_revisions": _source_revisions(source_revisions),
         "test_suite_sha256": _digest(
             test_suite_sha256, field="test suite digest",
+        ),
+        "runner_environment_sha256": _digest(
+            runner_environment_sha256, field="runner environment digest",
         ),
         "runner_instance_digest": _digest(
             runner_instance_digest, field="runner instance digest",
@@ -308,7 +312,8 @@ def load_lifecycle_matrix_results_v2(path: str | os.PathLike[str]) -> dict[str, 
     value = _read_private_results(Path(path))
     expected = {
         "schema", "cohort", "cases", "observed_from", "observed_until",
-        "source_revisions", "test_suite_sha256", "runner_instance_digest",
+        "source_revisions", "test_suite_sha256", "runner_environment_sha256",
+        "runner_instance_digest",
         "network_isolated", "provider_credentials_present",
     }
     if set(value) != expected or value["schema"] != LIFECYCLE_RESULTS_SCHEMA_V2:
@@ -325,6 +330,7 @@ def load_lifecycle_matrix_results_v2(path: str | os.PathLike[str]) -> dict[str, 
         observed_until=observed_until,
         source_revisions=value["source_revisions"],
         test_suite_sha256=value["test_suite_sha256"],
+        runner_environment_sha256=value["runner_environment_sha256"],
         runner_instance_digest=value["runner_instance_digest"],
         network_isolated=value["network_isolated"],
         provider_credentials_present=value["provider_credentials_present"],

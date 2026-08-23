@@ -21,10 +21,10 @@ from dradar.cli import main as cli_main
 NOW = datetime(2026, 8, 23, 8, 0, tzinfo=timezone.utc)
 SINCE = NOW - timedelta(hours=3)
 PROTOCOL_VECTOR_ARTIFACT_SHA256 = (
-    "ae08565e8dd528038168cfdaee532e881dd7578a922010ef46ec4514bae71480"
+    "8feecf8009a23e91b7b0a482926b4d9ad0e629e2d88a8942789cc58e6d32a509"
 )
 PROTOCOL_VECTOR_ARTIFACT_ID = (
-    "lifecycle-matrix-d8b3c89b107beb54e6640f9ae650b50499b6f3af"
+    "lifecycle-matrix-be8b227e5e90b0dafb6bdc197989fc8915c9c4d5"
 )
 
 
@@ -70,6 +70,7 @@ def _bundle(**updates):
             "server": "d" * 40,
         },
         "test_suite_sha256": "b" * 64,
+        "runner_environment_sha256": "e" * 64,
         "runner_instance_digest": "c" * 64,
         "network_isolated": True,
         "provider_credentials_present": False,
@@ -90,6 +91,7 @@ def _results() -> dict[str, object]:
             "server": "d" * 40,
         },
         "test_suite_sha256": "b" * 64,
+        "runner_environment_sha256": "e" * 64,
         "runner_instance_digest": "c" * 64,
         "network_isolated": True,
         "provider_credentials_present": False,
