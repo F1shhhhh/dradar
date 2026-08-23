@@ -210,11 +210,42 @@ def test_pompeii_multiplier_stretches_90_minute_pack_to_120_minutes(tmp_path):
     assert 7199.0 < multiplier * 5400.0 <= runner_mod.POMPEII_AGENT_TIMEOUT_SEC
 
 
+def test_kimi_pompeii_multiplier_stretches_pack_to_180_minutes(tmp_path):
+    for pack_timeout_sec, expected_multiplier in ((7200.0, 1.5), (5400.0, 2.0)):
+        task = _task_with_toml(
+            tmp_path,
+            task_id=f"kimi-{int(pack_timeout_sec)}",
+            timeout_sec=pack_timeout_sec,
+        )
+        assignment = {
+            "agent": runner_mod.KIMI_AGENT,
+            "benchmark_id": runner_mod.POMPEII_BENCHMARK_ID,
+            "est_minutes": 120,
+        }
+        multiplier = runner_mod._agent_timeout_multiplier(assignment, task)
+        assert multiplier == expected_multiplier
+        assert (
+            multiplier * pack_timeout_sec
+            == runner_mod.KIMI_POMPEII_AGENT_TIMEOUT_SEC
+        )
+
+
 def test_pompeii_timeout_requires_readable_task_config(tmp_path):
     task = tmp_path / "no-toml"
     task.mkdir()
     assignment = {"benchmark_id": runner_mod.POMPEII_BENCHMARK_ID}
     with pytest.raises(RunnerError, match="120-minute execution limit"):
+        runner_mod._agent_timeout_multiplier(assignment, task)
+
+
+def test_kimi_pompeii_timeout_error_reports_180_minute_limit(tmp_path):
+    task = tmp_path / "no-toml-kimi"
+    task.mkdir()
+    assignment = {
+        "agent": runner_mod.KIMI_AGENT,
+        "benchmark_id": runner_mod.POMPEII_BENCHMARK_ID,
+    }
+    with pytest.raises(RunnerError, match="180-minute execution limit"):
         runner_mod._agent_timeout_multiplier(assignment, task)
 
 
@@ -1692,15 +1723,29 @@ def test_pompeii_outer_watchdog_leaves_setup_outside_agent_budget():
         runner_mod.POMPEII_AGENT_TIMEOUT_SEC
         + runner_mod.POMPEII_OUTER_WATCHDOG_SLACK_SEC
     )
-    for agent in (
-        "codex", runner_mod.KIMI_AGENT, runner_mod.GROK_AGENT,
-        runner_mod.ZCODE_AGENT,
-    ):
+    for agent in ("codex", runner_mod.GROK_AGENT, runner_mod.ZCODE_AGENT):
         assert _effective_trial_timeout_sec({
             "agent": agent,
             "benchmark_id": runner_mod.POMPEII_BENCHMARK_ID,
             "est_minutes": 5,
         }) == expected
+
+    kimi_expected = (
+        runner_mod.KIMI_POMPEII_AGENT_TIMEOUT_SEC
+        + runner_mod.POMPEII_OUTER_WATCHDOG_SLACK_SEC
+    )
+    assert _effective_trial_timeout_sec({
+        "agent": runner_mod.KIMI_AGENT,
+        "benchmark_id": runner_mod.POMPEII_BENCHMARK_ID,
+        "est_minutes": 5,
+    }) == kimi_expected
+
+
+def test_kimi_non_pompeii_keeps_subscription_timeout_policy():
+    assert _effective_trial_timeout_sec({
+        "agent": runner_mod.KIMI_AGENT,
+        "est_minutes": 5,
+    }) == 7200
 
 
 def test_summarize_result_exception_info_present(tmp_path):
