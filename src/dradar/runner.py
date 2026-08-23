@@ -228,6 +228,7 @@ not wait for or invoke `/tests/pre_artifacts.sh`, and do not create or inspect
 POMPEII_BENCHMARK_ID = "pompeii-adjacency"
 POMPEII_SOFT_BUDGET_SEC = 90 * 60
 POMPEII_AGENT_TIMEOUT_SEC = 120 * 60
+KIMI_POMPEII_AGENT_TIMEOUT_SEC = 180 * 60
 POMPEII_TERMINAL_HEAVY_TIMEOUT_SEC = 10 * 60
 POMPEII_FINALIZATION_RESERVE_SEC = 10 * 60
 POMPEII_OUTER_WATCHDOG_SLACK_SEC = 15 * 60
@@ -871,28 +872,36 @@ def _task_agent_timeout_sec(task_path: Path) -> float | None:
     return data.get("agent", {}).get("timeout_sec")
 
 
+def pompeii_agent_timeout_sec(assignment: dict) -> int:
+    """Return the hard agent budget for one Pompeii assignment."""
+    if assignment.get("agent") == KIMI_AGENT:
+        return KIMI_POMPEII_AGENT_TIMEOUT_SEC
+    return POMPEII_AGENT_TIMEOUT_SEC
+
+
 def _agent_timeout_multiplier(assignment: dict, task_path: Path) -> float:
     """Resolve Pier's agent watchdog multiplier for one assignment.
 
     Ordinary benchmarks stretch the task timeout to stay behind DRadar's outer
-    watchdog. Pompeii uses one benchmark-wide 120-minute hard budget regardless
-    of whether an installed task pack declares the older 90-minute watchdog or
-    the refreshed two-hour watchdog.
+    watchdog. Pompeii normalizes the installed task timeout to the assignment's
+    hard budget regardless of whether the pack declares the older 90-minute
+    watchdog or the refreshed two-hour watchdog.
     """
     base = _task_agent_timeout_sec(task_path)
     if not base:
         if assignment.get("benchmark_id") == POMPEII_BENCHMARK_ID:
+            hard_budget_sec = pompeii_agent_timeout_sec(assignment)
             raise RunnerError(
                 "Pompeii tasks require a readable [agent].timeout_sec so the "
-                "120-minute execution limit can be enforced"
+                f"{hard_budget_sec // 60}-minute execution limit can be enforced"
             )
         return 1.0
     if assignment.get("benchmark_id") == POMPEII_BENCHMARK_ID:
         # Managed Pompeii packs in the field declare either 5400s or 7200s.
-        # Normalize both at launch so every model receives the same two-hour
-        # hard limit. Floor the serialized ratio so unusual task defaults can
-        # stop a fraction early, never after 120m.
-        raw = POMPEII_AGENT_TIMEOUT_SEC / base
+        # Normalize both at launch to the assignment-specific hard limit. Floor
+        # the serialized ratio so unusual task defaults can stop a fraction
+        # early, never after that limit.
+        raw = pompeii_agent_timeout_sec(assignment) / base
         return math.floor(raw * 1_000_000) / 1_000_000
     watchdog_sec = _effective_trial_timeout_sec(assignment) + 60
     raw = watchdog_sec / base
@@ -2532,7 +2541,7 @@ def _effective_trial_timeout_sec(assignment: dict) -> int:
     if assignment.get("benchmark_id") == POMPEII_BENCHMARK_ID:
         # The outer watchdog starts before image/environment setup while Pier's
         # hard agent deadline starts at agent execution. Keep setup outside the
-        # promised two-hour execution budget instead of undercutting it.
+        # promised execution budget instead of undercutting it.
         ordinary = (
             _subscription_trial_timeout_sec(assignment)
             if assignment.get("agent") in BETA_SUBSCRIPTION_AGENTS
@@ -2540,7 +2549,8 @@ def _effective_trial_timeout_sec(assignment: dict) -> int:
         )
         return max(
             ordinary,
-            POMPEII_AGENT_TIMEOUT_SEC + POMPEII_OUTER_WATCHDOG_SLACK_SEC,
+            pompeii_agent_timeout_sec(assignment)
+            + POMPEII_OUTER_WATCHDOG_SLACK_SEC,
         )
     agent = assignment.get("agent")
     if agent == ZCODE_AGENT:

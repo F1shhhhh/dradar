@@ -59,7 +59,7 @@ from .providers import (
 )
 from .runner import (
     CODEX_TRAJECTORY_BUNDLE_SCHEMA, DIAG_ADVICE, BuildFlakeError, RunnerError,
-    POMPEII_AGENT_TIMEOUT_SEC, POMPEII_BENCHMARK_ID,
+    POMPEII_BENCHMARK_ID,
     POMPEII_FINALIZATION_RESERVE_SEC, POMPEII_SOFT_BUDGET_SEC,
     POMPEII_TERMINAL_HEAVY_TIMEOUT_SEC,
     build_codex_trajectory_bundle, build_kimi_trajectory_bundle,
@@ -67,7 +67,8 @@ from .runner import (
     check_task_content_hash, classify_exception_message,
     codex_trajectory_bundle_usage,
     diagnose_exception, ensure_pier, ensure_tasks_root,
-    durable_checkpoint_rollout_enabled, local_deep_swe_commit, run_trial,
+    durable_checkpoint_rollout_enabled, local_deep_swe_commit,
+    pompeii_agent_timeout_sec, run_trial,
     summarize_result, sync_deep_swe_commit, trial_artifact_paths,
 )
 from .scrub import (
@@ -2423,7 +2424,7 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
     if assignment.get("benchmark_id") == POMPEII_BENCHMARK_ID:
         meta.update({
             "soft_budget_sec": POMPEII_SOFT_BUDGET_SEC,
-            "hard_budget_sec": POMPEII_AGENT_TIMEOUT_SEC,
+            "hard_budget_sec": pompeii_agent_timeout_sec(assignment),
             "terminal_tool_timeout_cap_sec": POMPEII_TERMINAL_HEAVY_TIMEOUT_SEC,
             "finalization_reserve_sec": POMPEII_FINALIZATION_RESERVE_SEC,
         })
