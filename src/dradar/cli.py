@@ -22,6 +22,7 @@ from . import __version__
 from .capacity import cmd_capacity
 from .cells import cmd_cells
 from .checkpoint_lifecycle_evidence_v2 import cmd_checkpoint_lifecycle_bundle
+from .checkpoint_lifecycle_runner_v2 import cmd_checkpoint_lifecycle_run
 from .checkpoint_observation_v2 import cmd_checkpoint_audit
 from .doctor import cmd_doctor
 from .identity import cmd_link_github, cmd_login, cmd_rename, cmd_status
@@ -296,6 +297,25 @@ def main(argv: list[str] | None = None) -> int:
         help="private JSON result file produced by the lifecycle runner",
     )
     p_cp_lifecycle.set_defaults(func=cmd_checkpoint_lifecycle_bundle)
+    p_cp_lifecycle_run = checkpoint_sub.add_parser(
+        "lifecycle-run",
+        help=(
+            "run the fixed credential-free crash-cut matrix from exact clean "
+            "client/server sources"
+        ),
+    )
+    p_cp_lifecycle_run.add_argument("--cohort", required=True)
+    p_cp_lifecycle_run.add_argument("--output", required=True)
+    p_cp_lifecycle_run.add_argument("--client-source", required=True)
+    p_cp_lifecycle_run.add_argument("--server-source", required=True)
+    p_cp_lifecycle_run.add_argument(
+        "--client-python", default=sys.executable,
+    )
+    p_cp_lifecycle_run.add_argument("--server-python", required=True)
+    p_cp_lifecycle_run.add_argument(
+        "--probe-timeout-sec", type=float, default=600.0,
+    )
+    p_cp_lifecycle_run.set_defaults(func=cmd_checkpoint_lifecycle_run)
 
     p_sessions = sub.add_parser(
         "sessions", help="manage opt-in local Codex session archives")

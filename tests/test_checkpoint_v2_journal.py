@@ -1286,6 +1286,93 @@ def test_offline_restore_needs_explicit_commit_before_paid_permit(
     assert len(api.calls) == 2
 
 
+def test_resume_commit_response_loss_replays_exact_paid_permit(
+    tmp_path: Path,
+) -> None:
+    digest = "d" * 64
+    reserve_response = {
+        "ok": True,
+        "assignment_id": "assignment-0001",
+        "checkpoint_id": "checkpoint-0001",
+        "snapshot_generation": 4,
+        "checkpoint_core_abi": CHECKPOINT_CORE_ABI_V2,
+        "checkpoint_abi": "dradar-checkpoint-v2/codex/1",
+        "compatibility_fingerprint": "c" * 64,
+        "requester_machine_fingerprint": "f" * 64,
+        "reservation_nonce": "1" * 32,
+        "owner_session_id": "session-0002",
+        "owner_epoch": 8,
+        "owner_lease_expires_at": "2030-01-01T00:00:00+00:00",
+        "execution_state": "resume_reserved",
+        "paid_execution_authorized": False,
+    }
+    paid_response = {
+        "ok": True,
+        "assignment_id": "assignment-0001",
+        "checkpoint_id": "checkpoint-0001",
+        "snapshot_generation": 4,
+        "restore_receipt_sha256": None,
+        "owner_session_id": "session-0002",
+        "owner_epoch": 8,
+        "owner_lease_expires_at": "2030-01-01T01:00:00+00:00",
+        "execution_state": "running",
+        "usage_segment_id": "usage-segment-0002",
+        "usage_schema": "dradar-checkpoint-usage-segment-v2",
+        "paid_execution_authorized": True,
+    }
+    api = FakeApi([
+        reserve_response,
+        ApiError("simulated committed response loss", status_code=503),
+        paid_response,
+    ])
+    journal = CheckpointV2Journal(tmp_path)
+    machine = CheckpointV2StateMachine(
+        _assignment(), api=api, journal=journal,
+        activation=_on_activation(),
+    )
+    offline = machine.reserve_offline_restore(
+        session_id="session-0002",
+        expected_owner_epoch=7,
+        checkpoint_id="checkpoint-0001",
+        snapshot_generation=4,
+        manifest_sha256=digest,
+        requester_machine_fingerprint="f" * 64,
+        operation_id="response-loss-reserve-0001",
+    )
+    receipt = completed_restore_receipt(
+        offline,
+        restore_adapter_version="test-adapter-v2",
+        restored_manifest_sha256=digest,
+    )
+    paid_response["restore_receipt_sha256"] = receipt.receipt_sha256
+    operation_id = "response-loss-resume-commit-0001"
+    with pytest.raises(ApiError, match="committed response loss"):
+        machine.commit_paid_resume(
+            offline, receipt=receipt, operation_id=operation_id,
+        )
+    pending = journal.load("assignment-0001", operation_id)
+    assert pending.state == "PENDING"
+    assert pending.response is None
+
+    paid = machine.commit_paid_resume(
+        offline, receipt=receipt, operation_id=operation_id,
+    )
+    assert paid.source == "resume"
+    assert paid.usage_segment_id == "usage-segment-0002"
+    assert [command for command, _payload in api.calls] == [
+        "resume-reserve", "resume-commit", "resume-commit",
+    ]
+    assert api.calls[-2][1] == api.calls[-1][1]
+    assert api.calls[-1][1]["operation_id"] == operation_id
+    acknowledged = journal.load("assignment-0001", operation_id)
+    assert acknowledged.state == "ACKNOWLEDGED"
+    assert acknowledged.response == {
+        **paid_response,
+        "certification_id": "certification-test-0001",
+        "certification_digest": "c" * 64,
+    }
+
+
 def test_restore_receipt_rejects_wrong_manifest_before_paid_network(
     tmp_path: Path,
 ) -> None:

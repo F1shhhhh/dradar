@@ -25,14 +25,15 @@ from .checkpoint_observation_v2 import (
 
 
 LIFECYCLE_ARTIFACT_SCHEMA_V2 = (
-    "dradar-checkpoint-v2-lifecycle-matrix-artifact-v1"
+    "dradar-checkpoint-v2-lifecycle-matrix-artifact-v2"
 )
 LIFECYCLE_BUNDLE_SCHEMA_V2 = (
-    "dradar-checkpoint-v2-reviewed-evidence-bundle-v1"
+    "dradar-checkpoint-v2-reviewed-evidence-bundle-v2"
 )
 LIFECYCLE_RESULTS_SCHEMA_V2 = (
-    "dradar-checkpoint-v2-lifecycle-matrix-results-v1"
+    "dradar-checkpoint-v2-lifecycle-matrix-results-v2"
 )
+LIFECYCLE_SOURCE_COMPONENTS_V2 = ("client", "server")
 LIFECYCLE_CASE_IDS_V2 = frozenset({
     "owner_checkout_precommit",
     "owner_start_precommit",
@@ -145,6 +146,22 @@ def _case(value: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _source_revisions(value: Mapping[str, Any]) -> dict[str, str]:
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != set(LIFECYCLE_SOURCE_COMPONENTS_V2)
+    ):
+        raise ValueError("lifecycle evidence source revisions are invalid")
+    return {
+        component: _digest(
+            value[component],
+            field=f"{component} source revision",
+            lengths=(40, 64),
+        )
+        for component in LIFECYCLE_SOURCE_COMPONENTS_V2
+    }
+
+
 def _metrics(cases: Sequence[Mapping[str, Any]]) -> dict[str, int]:
     return {
         "crash_cuts_passed": sum(case["status"] == "passed" for case in cases),
@@ -162,7 +179,7 @@ def build_lifecycle_matrix_bundle_v2(
     cases: Sequence[Mapping[str, Any]],
     observed_from: datetime,
     observed_until: datetime,
-    source_commit: str,
+    source_revisions: Mapping[str, Any],
     test_suite_sha256: str,
     runner_instance_digest: str,
     network_isolated: bool,
@@ -199,9 +216,7 @@ def build_lifecycle_matrix_bundle_v2(
         "platform": normalized_cohort["platform"],
         "container_backend": normalized_cohort["container_backend"],
         "client_version": normalized_cohort["client_version"],
-        "source_commit": _digest(
-            source_commit, field="source commit", lengths=(40, 64),
-        ),
+        "source_revisions": _source_revisions(source_revisions),
         "test_suite_sha256": _digest(
             test_suite_sha256, field="test suite digest",
         ),
@@ -293,7 +308,7 @@ def load_lifecycle_matrix_results_v2(path: str | os.PathLike[str]) -> dict[str, 
     value = _read_private_results(Path(path))
     expected = {
         "schema", "cohort", "cases", "observed_from", "observed_until",
-        "source_commit", "test_suite_sha256", "runner_instance_digest",
+        "source_revisions", "test_suite_sha256", "runner_instance_digest",
         "network_isolated", "provider_credentials_present",
     }
     if set(value) != expected or value["schema"] != LIFECYCLE_RESULTS_SCHEMA_V2:
@@ -308,7 +323,7 @@ def load_lifecycle_matrix_results_v2(path: str | os.PathLike[str]) -> dict[str, 
         cases=value["cases"],
         observed_from=observed_from,
         observed_until=observed_until,
-        source_commit=value["source_commit"],
+        source_revisions=value["source_revisions"],
         test_suite_sha256=value["test_suite_sha256"],
         runner_instance_digest=value["runner_instance_digest"],
         network_isolated=value["network_isolated"],
@@ -333,6 +348,7 @@ __all__ = [
     "LIFECYCLE_BUNDLE_SCHEMA_V2",
     "LIFECYCLE_CASE_IDS_V2",
     "LIFECYCLE_RESULTS_SCHEMA_V2",
+    "LIFECYCLE_SOURCE_COMPONENTS_V2",
     "LIFECYCLE_ZERO_METRICS_V2",
     "build_lifecycle_matrix_bundle_v2",
     "cmd_checkpoint_lifecycle_bundle",

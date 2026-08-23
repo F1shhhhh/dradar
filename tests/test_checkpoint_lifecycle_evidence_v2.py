@@ -21,10 +21,10 @@ from dradar.cli import main as cli_main
 NOW = datetime(2026, 8, 23, 8, 0, tzinfo=timezone.utc)
 SINCE = NOW - timedelta(hours=3)
 PROTOCOL_VECTOR_ARTIFACT_SHA256 = (
-    "30b9ef8849e2f513dfa55ad9bebb1bb5b057f973af292fabf76756cdfe85420b"
+    "ae08565e8dd528038168cfdaee532e881dd7578a922010ef46ec4514bae71480"
 )
 PROTOCOL_VECTOR_ARTIFACT_ID = (
-    "lifecycle-matrix-8b5761197e01eae2cd6d042028da033a776ba08a"
+    "lifecycle-matrix-d8b3c89b107beb54e6640f9ae650b50499b6f3af"
 )
 
 
@@ -65,7 +65,10 @@ def _bundle(**updates):
         "cases": _cases(),
         "observed_from": SINCE - timedelta(minutes=1),
         "observed_until": NOW + timedelta(minutes=1),
-        "source_commit": "a" * 40,
+        "source_revisions": {
+            "client": "a" * 40,
+            "server": "d" * 40,
+        },
         "test_suite_sha256": "b" * 64,
         "runner_instance_digest": "c" * 64,
         "network_isolated": True,
@@ -82,7 +85,10 @@ def _results() -> dict[str, object]:
         "cases": _cases(),
         "observed_from": (SINCE - timedelta(minutes=1)).isoformat(),
         "observed_until": (NOW + timedelta(minutes=1)).isoformat(),
-        "source_commit": "a" * 40,
+        "source_revisions": {
+            "client": "a" * 40,
+            "server": "d" * 40,
+        },
         "test_suite_sha256": "b" * 64,
         "runner_instance_digest": "c" * 64,
         "network_isolated": True,
@@ -159,6 +165,21 @@ def test_lifecycle_bundle_rejects_cohort_or_case_drift() -> None:
     cases[0]["case_id"] = "unreviewed-cut"
     with pytest.raises(ValueError, match="case id"):
         _bundle(cases=cases)
+
+
+@pytest.mark.parametrize(
+    "source_revisions",
+    [
+        {"client": "a" * 40},
+        {"client": "a" * 40, "server": "not-a-revision"},
+        {"client": "a" * 40, "server": "d" * 40, "worker": "e" * 40},
+    ],
+)
+def test_lifecycle_bundle_requires_exact_client_and_server_revisions(
+    source_revisions,
+) -> None:
+    with pytest.raises(ValueError, match="source revision"):
+        _bundle(source_revisions=source_revisions)
 
 
 def test_private_runner_results_round_trip_through_the_cli(tmp_path, capsys) -> None:
