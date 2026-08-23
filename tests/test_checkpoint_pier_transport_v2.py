@@ -223,6 +223,53 @@ def test_pier_transport_capture_download_publish_and_discard(tmp_path: Path):
     ).exists()
 
 
+def test_pier_transport_install_failure_is_stage_specific_and_local_only(
+    tmp_path: Path,
+) -> None:
+    root, _worktree, base = _container(tmp_path)
+
+    class FailingInstallEnvironment(LocalPierEnvironment):
+        async def exec(self, *, command, user, env, cwd, timeout_sec):
+            if ".pyz.upload" in command and "/helper.pyz" in command:
+                return _Result(
+                    23,
+                    stdout="untrusted install stdout",
+                    stderr="untrusted install stderr",
+                )
+            return await super().exec(
+                command=command,
+                user=user,
+                env=env,
+                cwd=cwd,
+                timeout_sec=timeout_sec,
+            )
+
+    environment = FailingInstallEnvironment(root)
+    contract = checkpoint_adapter_contract_v2("codex", "openai")
+    exporter = PierContainerCheckpointExporterV2(
+        environment,
+        contract=contract,
+        base_commit=base,
+        session_id="thread-0001",
+        _test_filesystem_root=root,
+    )
+    plane = CheckpointDataPlaneV2(
+        activation=negotiate_checkpoint_activation_v2(
+            local_mode="observe", server_mode="observe",
+        ),
+        storage_root=tmp_path / "host",
+    )
+    observed = asyncio.run(plane.observe_capture(_request(), exporter))
+
+    assert observed.status == "failed"
+    assert observed.stage == "capture"
+    assert observed.code == "transport_helper_install_failed"
+    diagnostic = (tmp_path / "host" / "diagnostics.jsonl").read_text()
+    assert '"operation":"helper_install"' in diagnostic
+    assert '"exit_code":23' in diagnostic
+    assert "untrusted install" not in diagnostic
+
+
 def test_pier_transport_offline_restore_never_starts_paid_execution(tmp_path: Path):
     source_root, source_worktree, base = _container(tmp_path / "source")
     contract = checkpoint_adapter_contract_v2("codex", "openai")

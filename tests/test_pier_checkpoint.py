@@ -24,6 +24,8 @@ from dradar.pier_checkpoint import (
     AgentIdentity,
     CheckpointError,
     CheckpointIncompatibleError,
+    CheckpointV2PaidExecutionGate,
+    CheckpointV2PreProviderBarrier,
     DurableCheckpoint,
     StatePath,
     UnsafeAgentLog,
@@ -36,6 +38,258 @@ from dradar.pier_checkpoint import (
 
 
 BASE_COMMIT = "a" * 40
+
+
+def _private_json(path: Path, value: dict) -> None:
+    path.write_text(
+        json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+
+
+def test_checkpoint_v2_paid_gate_blocks_until_exact_grant(tmp_path: Path) -> None:
+    gate_dir = tmp_path / "paid-gate"
+    gate_dir.mkdir(mode=0o700)
+    gate_dir.chmod(0o700)
+    contract = {
+        "schema": "dradar-checkpoint-paid-gate-contract-v2",
+        "assignment_id": "assignment-0001",
+        "gate_nonce": "1" * 32,
+        "action": "fresh",
+        "session_id": "session-0001",
+        "owner_epoch": 3,
+        "reconcile_operation_id": "reconcile-operation-0001",
+        "job_root": str(tmp_path / "work" / "jobs" / "aassignment-0001"),
+    }
+    _private_json(gate_dir / "contract.json", contract)
+    gate = CheckpointV2PaidExecutionGate(str(gate_dir))
+
+    async def exercise() -> None:
+        waiter = asyncio.create_task(gate.authorize_provider_start(timeout_sec=2))
+        request_path = gate_dir / "request.json"
+        for _index in range(100):
+            if request_path.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert request_path.is_file()
+        assert not waiter.done()
+        request_sha256 = hashlib.sha256(request_path.read_bytes()).hexdigest()
+        _private_json(gate_dir / "grant.json", {
+            "schema": "dradar-checkpoint-paid-gate-grant-v2",
+            "assignment_id": "assignment-0001",
+            "gate_nonce": "1" * 32,
+            "request_sha256": request_sha256,
+            "owner_epoch": 3,
+            "usage_segment_id": "usage-segment-0001",
+            "paid_execution_authorized": True,
+        })
+        await waiter
+        # Provider retries inside the same paid epoch do not ask for a second
+        # owner transition or create another gate request.
+        await gate.authorize_provider_start(timeout_sec=1)
+
+    asyncio.run(exercise())
+
+
+def test_checkpoint_v2_paid_gate_rejects_unbound_grant(tmp_path: Path) -> None:
+    gate_dir = tmp_path / "paid-gate"
+    gate_dir.mkdir(mode=0o700)
+    gate_dir.chmod(0o700)
+    _private_json(gate_dir / "contract.json", {
+        "schema": "dradar-checkpoint-paid-gate-contract-v2",
+        "assignment_id": "assignment-0001",
+        "gate_nonce": "1" * 32,
+        "action": "fresh",
+        "session_id": "session-0001",
+        "owner_epoch": 3,
+        "reconcile_operation_id": "reconcile-operation-0001",
+        "job_root": str(tmp_path / "work" / "jobs" / "aassignment-0001"),
+    })
+    _private_json(gate_dir / "grant.json", {
+        "schema": "dradar-checkpoint-paid-gate-grant-v2",
+        "assignment_id": "assignment-0001",
+        "gate_nonce": "1" * 32,
+        "request_sha256": "0" * 64,
+        "owner_epoch": 3,
+        "usage_segment_id": "usage-segment-0001",
+        "paid_execution_authorized": True,
+    })
+    with pytest.raises(CheckpointError, match="grant is invalid"):
+        asyncio.run(
+            CheckpointV2PaidExecutionGate(str(gate_dir)).authorize_provider_start(
+                timeout_sec=1,
+            )
+        )
+
+
+def _v2_restore_fixture(tmp_path: Path) -> tuple[Path, str]:
+    root = tmp_path / "generation-00000000000000000001"
+    payload = root / "payload"
+    sessions = payload / "provider-state" / "sessions"
+    sessions.mkdir(parents=True, mode=0o700)
+    for directory in (root, payload, payload / "provider-state", sessions):
+        directory.chmod(0o700)
+    files = {
+        "workspace.patch": b"diff --git a/a b/a\n",
+        "progress.json": json.dumps({
+            "schema": "dradar-checkpoint-adapter-progress-v2",
+            "harness": "codex",
+            "provider": "openai",
+            "checkpoint_abi": "dradar-checkpoint-v2/codex/1",
+            "base_commit": BASE_COMMIT,
+            "captured_at": "2026-08-23T12:00:00+00:00",
+            "session_id_present": True,
+            "native_artifacts": ["sessions"],
+            "recovery_capability": "NATIVE_VALID",
+            "workspace_patch_bytes": 22,
+            "untracked_files": 0,
+            "untracked_bytes": 0,
+        }, sort_keys=True, separators=(",", ":")).encode() + b"\n",
+        "session-id": b"thread-session-0001\n",
+        "provider-state/sessions/state.json": b'{"turn":2}\n',
+    }
+    archive_path = payload / "untracked.tar.gz"
+    with tarfile.open(archive_path, "w:gz"):
+        pass
+    files["untracked.tar.gz"] = archive_path.read_bytes()
+    for relative, data in files.items():
+        path = payload / relative
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path.write_bytes(data)
+        path.chmod(0o600)
+    directories = ["provider-state", "provider-state/sessions"]
+    manifest_files = []
+    total = 0
+    for relative, data in sorted(files.items()):
+        total += len(data)
+        manifest_files.append({
+            "path": relative,
+            "size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "mode": 0o600,
+        })
+    manifest = {
+        "schema": "dradar-checkpoint-export-v2",
+        "protocol_version": 2,
+        "checkpoint_core_abi": "dradar-checkpoint-core-v2/1",
+        "checkpoint_abi": "dradar-checkpoint-v2/codex/1",
+        "checkpoint_id": "checkpoint-0001",
+        "checkpoint_lineage_id": "lineage-0001",
+        "snapshot_generation": 1,
+        "capture_id": "capture-0001",
+        "identity_fingerprint": "a" * 64,
+        "recovery_capability": "NATIVE_VALID",
+        "native_state_schema": "codex-session/1",
+        "captured_at": "2026-08-23T12:00:00+00:00",
+        "capture_storage": "container_native",
+        "directories": directories,
+        "files": manifest_files,
+        "file_count": len(manifest_files),
+        "total_bytes": total,
+    }
+    manifest_bytes = json.dumps(
+        manifest, sort_keys=True, separators=(",", ":"),
+    ).encode() + b"\n"
+    (root / "manifest.json").write_bytes(manifest_bytes)
+    (root / "manifest.json").chmod(0o600)
+    return root, hashlib.sha256(manifest_bytes).hexdigest()
+
+
+def test_checkpoint_v2_resume_barrier_restores_before_paid_grant(
+    tmp_path: Path,
+) -> None:
+    restore_root, manifest_sha256 = _v2_restore_fixture(tmp_path)
+    gate_dir = tmp_path / "paid-gate-resume"
+    gate_dir.mkdir(mode=0o700)
+    gate_dir.chmod(0o700)
+    receipt_sha256 = "e" * 64
+    _private_json(gate_dir / "contract.json", {
+        "schema": "dradar-checkpoint-paid-gate-contract-v2",
+        "assignment_id": "assignment-0001",
+        "gate_nonce": "2" * 32,
+        "action": "resume",
+        "session_id": "session-0001",
+        "owner_epoch": 3,
+        "reconcile_operation_id": "reconcile-operation-0001",
+        "job_root": str(tmp_path / "work" / "jobs" / "aassignment-0001"),
+        "restore_root": str(restore_root),
+        "manifest_sha256": manifest_sha256,
+        "identity_fingerprint": "a" * 64,
+        "checkpoint_abi": "dradar-checkpoint-v2/codex/1",
+        "recovery_capability": "NATIVE_VALID",
+        "native_state_schema": "codex-session/1",
+        "restore_adapter_version": "codex-restorer-v2/1",
+        "restore_receipt_sha256": receipt_sha256,
+    })
+
+    class _RestoreAgent:
+        def __init__(self):
+            self.commands = []
+            self.root_commands = []
+
+        async def exec_as_agent(self, _environment, command, env, **_kwargs):
+            del env
+            self.commands.append(command)
+            return SimpleNamespace(
+                stdout=(BASE_COMMIT + "\n") if "rev-parse HEAD" in command else "",
+                return_code=0,
+            )
+
+        async def exec_as_root(self, _environment, command, env, **_kwargs):
+            del env
+            self.root_commands.append(command)
+            return SimpleNamespace(stdout="", return_code=0)
+
+    class _RestoreEnvironment:
+        default_user = "1000:1000"
+
+        def __init__(self):
+            self.files = []
+            self.directories = []
+
+        async def upload_file(self, source, destination):
+            self.files.append((Path(source), destination))
+
+        async def upload_dir(self, source, destination):
+            self.directories.append((Path(source), destination))
+
+    barrier = CheckpointV2PreProviderBarrier(str(gate_dir))
+    agent = _RestoreAgent()
+    environment = _RestoreEnvironment()
+
+    async def exercise() -> None:
+        session_id = await barrier.restore_if_requested(
+            agent,
+            environment,
+            {},
+            state_paths=(StatePath("sessions", "/tmp/codex/sessions"),),
+        )
+        assert session_id == "thread-session-0001"
+        waiter = asyncio.create_task(barrier.authorize_provider_start())
+        request_path = gate_dir / "request.json"
+        for _index in range(100):
+            if request_path.exists():
+                break
+            await asyncio.sleep(0.01)
+        request = json.loads(request_path.read_text())
+        assert request["restore_receipt_sha256"] == receipt_sha256
+        _private_json(gate_dir / "grant.json", {
+            "schema": "dradar-checkpoint-paid-gate-grant-v2",
+            "assignment_id": "assignment-0001",
+            "gate_nonce": "2" * 32,
+            "request_sha256": hashlib.sha256(request_path.read_bytes()).hexdigest(),
+            "owner_epoch": 4,
+            "usage_segment_id": "usage-segment-resume-0001",
+            "paid_execution_authorized": True,
+        })
+        await waiter
+
+    asyncio.run(exercise())
+    assert any("git -C /app apply --check" in command for command in agent.commands)
+    assert environment.directories == [
+        (restore_root / "payload/provider-state/sessions", "/tmp/codex/sessions")
+    ]
 
 
 class FakeAgent:

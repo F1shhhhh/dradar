@@ -14,6 +14,7 @@ CONTAINER_HELPER_SCHEMA_V2 = "dradar-checkpoint-container-helper-v2"
 _BUNDLED_MODULES = (
     "checkpoint_activation_v2.py",
     "checkpoint_adapters_v2.py",
+    "checkpoint_protocol_types_v2.py",
     "checkpoint_runtime_v2.py",
     "checkpoint_adapter_runtime_v2.py",
 )

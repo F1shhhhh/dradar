@@ -29,13 +29,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Awaitable, Callable, Iterable, Protocol
+from typing import Awaitable, Callable, Iterable, Mapping, Protocol
 
 from .checkpoint_activation_v2 import (
     CHECKPOINT_CORE_ABI_V2,
     CheckpointActivationV2,
 )
-from .checkpoint_v2 import (
+from .checkpoint_protocol_types_v2 import (
     CheckpointGenerationRefV2,
     CheckpointRetentionAcknowledgementV2,
 )
@@ -149,9 +149,22 @@ DEFAULT_RETENTION_POLICY_V2 = CheckpointRetentionPolicyV2()
 
 
 class CheckpointDataPlaneError(RuntimeError):
-    """Typed, bounded checkpoint failure safe for aggregate telemetry."""
+    """Typed checkpoint failure with optional local-only diagnostics.
 
-    def __init__(self, stage: str, code: str) -> None:
+    ``stage`` and ``code`` are the only fields exported to aggregate server
+    telemetry.  ``diagnostic`` is deliberately restricted to bounded scalar
+    facts (exit code, byte counts and content digests) so callers may persist
+    useful local evidence without copying arbitrary command output, paths or
+    Provider data into the protocol.
+    """
+
+    def __init__(
+        self,
+        stage: str,
+        code: str,
+        *,
+        diagnostic: Mapping[str, str | int | bool] | None = None,
+    ) -> None:
         if stage not in {
             "capture", "seal", "download", "verify", "publish", "cleanup",
             "restore", "retention",
@@ -159,9 +172,30 @@ class CheckpointDataPlaneError(RuntimeError):
             raise ValueError("checkpoint data-plane stage is invalid")
         if re.fullmatch(r"[a-z][a-z0-9_]{2,63}", code) is None:
             raise ValueError("checkpoint data-plane code is invalid")
+        bounded: dict[str, str | int | bool] = {}
+        if diagnostic is not None:
+            if not isinstance(diagnostic, Mapping) or len(diagnostic) > 16:
+                raise ValueError("checkpoint diagnostic is invalid")
+            for key, value in diagnostic.items():
+                if (
+                    not isinstance(key, str)
+                    or re.fullmatch(r"[a-z][a-z0-9_]{1,47}", key) is None
+                    or any(
+                        marker in key
+                        for marker in (
+                            "token", "secret", "password", "credential",
+                            "authorization", "api_key",
+                        )
+                    )
+                    or not isinstance(value, (str, int, bool))
+                    or isinstance(value, str) and len(value) > 160
+                ):
+                    raise ValueError("checkpoint diagnostic is invalid")
+                bounded[key] = value
         super().__init__(f"checkpoint {stage} failed ({code})")
         self.stage = stage
         self.code = code
+        self.diagnostic = bounded
 
 
 @dataclass(frozen=True)
@@ -1802,6 +1836,171 @@ def revalidate_published_checkpoint_v2(
     return manifest
 
 
+def load_exact_published_checkpoint_v2(
+    storage_root: Path,
+    *,
+    checkpoint_id: str,
+    checkpoint_lineage_id: str,
+    snapshot_generation: int,
+    capture_id: str,
+    manifest_sha256: str,
+    expected_identity_fingerprint: str,
+    expected_checkpoint_core_abi: str,
+    expected_checkpoint_abi: str,
+    expected_recovery_capability: str,
+    expected_native_state_schema: str | None,
+    limits: CheckpointPackageLimitsV2 = DEFAULT_PACKAGE_LIMITS_V2,
+) -> PublishedCheckpointV2:
+    """Load and fully revalidate one exact server-selected generation.
+
+    No ``CURRENT`` pointer or neighbouring directory participates.  This is
+    the restart-safe counterpart of the in-memory publication receipt: all
+    identity supplied by the server is matched against both the publication
+    receipt and the sealed manifest before any restore adapter is invoked.
+    """
+
+    if (
+        _IDENTIFIER_RE.fullmatch(checkpoint_id) is None
+        or _IDENTIFIER_RE.fullmatch(checkpoint_lineage_id) is None
+        or _IDENTIFIER_RE.fullmatch(capture_id) is None
+        or not isinstance(snapshot_generation, int)
+        or isinstance(snapshot_generation, bool)
+        or snapshot_generation < 0
+        or _DIGEST_RE.fullmatch(manifest_sha256) is None
+        or _DIGEST_RE.fullmatch(expected_identity_fingerprint) is None
+        or expected_checkpoint_core_abi != CHECKPOINT_CORE_ABI_V2
+        or _ABI_RE.fullmatch(expected_checkpoint_abi) is None
+        or expected_recovery_capability not in {
+            "NATIVE_VALID", "WORKSPACE_ONLY",
+        }
+        or (
+            expected_native_state_schema is not None
+            and _NATIVE_SCHEMA_RE.fullmatch(expected_native_state_schema) is None
+        )
+    ):
+        raise CheckpointDataPlaneError(
+            "restore", "selected_generation_descriptor_invalid",
+        )
+    storage_root = Path(os.path.abspath(storage_root))
+    checkpoints = storage_root / "checkpoints"
+    checkpoint_root = checkpoints / checkpoint_id
+    generations = checkpoint_root / "generations"
+    for directory in (
+        storage_root, checkpoints, checkpoint_root, generations,
+    ):
+        _assert_private_directory(directory, stage="restore")
+    target = generations / f"generation-{snapshot_generation:020d}"
+    receipt_path = target / "publication.json"
+    try:
+        receipt_metadata = receipt_path.lstat()
+        receipt_bytes = receipt_path.read_bytes()
+    except OSError as exc:
+        raise CheckpointDataPlaneError(
+            "restore", "publication_receipt_invalid",
+        ) from exc
+    if (
+        receipt_path.is_symlink()
+        or not stat.S_ISREG(receipt_metadata.st_mode)
+        or receipt_metadata.st_nlink != 1
+        or len(receipt_bytes) > 4096
+        or (
+            os.name == "posix"
+            and stat.S_IMODE(receipt_metadata.st_mode) != 0o600
+        )
+    ):
+        raise CheckpointDataPlaneError(
+            "restore", "publication_receipt_invalid",
+        )
+    try:
+        receipt = json.loads(receipt_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CheckpointDataPlaneError(
+            "restore", "publication_receipt_invalid",
+        ) from exc
+    if (
+        not isinstance(receipt, dict)
+        or set(receipt) != {
+            "schema", "checkpoint_id", "snapshot_generation", "capture_id",
+            "manifest_sha256", "archive_sha256", "authoritative",
+        }
+        or receipt.get("schema") != "dradar-checkpoint-publication-v2"
+        or receipt.get("checkpoint_id") != checkpoint_id
+        or receipt.get("snapshot_generation") != snapshot_generation
+        or receipt.get("capture_id") != capture_id
+        or receipt.get("manifest_sha256") != manifest_sha256
+        or _DIGEST_RE.fullmatch(str(receipt.get("archive_sha256"))) is None
+        or receipt.get("authoritative") is not True
+    ):
+        raise CheckpointDataPlaneError(
+            "restore", "publication_receipt_invalid",
+        )
+    manifest_path = target / MANIFEST_NAME
+    archive_path = target / "export.tar.gz"
+    try:
+        manifest_metadata = manifest_path.lstat()
+        manifest_bytes = manifest_path.read_bytes()
+        archive_metadata = archive_path.lstat()
+    except OSError as exc:
+        raise CheckpointDataPlaneError(
+            "restore", "published_snapshot_missing",
+        ) from exc
+    if (
+        manifest_path.is_symlink()
+        or not stat.S_ISREG(manifest_metadata.st_mode)
+        or manifest_metadata.st_nlink != 1
+        or len(manifest_bytes) > limits.max_manifest_bytes
+        or hashlib.sha256(manifest_bytes).hexdigest() != manifest_sha256
+        or archive_path.is_symlink()
+        or not stat.S_ISREG(archive_metadata.st_mode)
+        or archive_metadata.st_nlink != 1
+        or archive_metadata.st_size <= 0
+        or archive_metadata.st_size > limits.max_archive_bytes
+    ):
+        raise CheckpointDataPlaneError(
+            "restore", "selected_generation_material_invalid",
+        )
+    try:
+        preliminary = json.loads(manifest_bytes)
+        file_count = preliminary["file_count"]
+        payload_bytes = preliminary["total_bytes"]
+    except (KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CheckpointDataPlaneError(
+            "restore", "published_manifest_invalid",
+        ) from exc
+    published = PublishedCheckpointV2(
+        checkpoint_id=checkpoint_id,
+        snapshot_generation=snapshot_generation,
+        capture_id=capture_id,
+        root=target,
+        payload_root=target / PAYLOAD_ROOT,
+        archive_path=archive_path,
+        manifest_sha256=manifest_sha256,
+        archive_sha256=str(receipt["archive_sha256"]),
+        archive_bytes=int(archive_metadata.st_size),
+        file_count=file_count,
+        payload_bytes=payload_bytes,
+        authoritative=True,
+        selected=True,
+    )
+    manifest = revalidate_published_checkpoint_v2(
+        published,
+        expected_identity_fingerprint=expected_identity_fingerprint,
+        expected_checkpoint_abi=expected_checkpoint_abi,
+        limits=limits,
+    )
+    if (
+        manifest.get("checkpoint_lineage_id") != checkpoint_lineage_id
+        or manifest.get("checkpoint_core_abi") != expected_checkpoint_core_abi
+        or manifest.get("recovery_capability")
+        != expected_recovery_capability
+        or manifest.get("native_state_schema") != expected_native_state_schema
+    ):
+        raise CheckpointDataPlaneError(
+            "restore", "selected_generation_identity_mismatch",
+        )
+    return published
+
+
 _RETENTION_RELEASE_SCHEMA_V2 = "dradar-checkpoint-retention-release-v2"
 
 
@@ -2237,6 +2436,71 @@ def _bounded_failure_type(exc: BaseException) -> str:
     return value if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", value) else "Exception"
 
 
+def _record_local_checkpoint_failure_v2(
+    storage_root: Path,
+    *,
+    exc: BaseException,
+    stage: str,
+    code: str,
+) -> None:
+    """Best-effort private diagnostic journal; never affects mainline work.
+
+    Arbitrary exception strings and command output are intentionally omitted.
+    A typed transport may attach only bounded scalar facts such as an exit
+    status and stdout/stderr digests.  The file is capped rather than rotated
+    so diagnostics cannot turn a checkpoint failure into disk pressure.
+    """
+
+    try:
+        root = Path(storage_root)
+        _ensure_private_directory(root, stage="cleanup")
+        path = root / "diagnostics.jsonl"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(path, flags, 0o600)
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_size >= 2 * 1024 * 1024
+            ):
+                return
+            diagnostic = (
+                dict(exc.diagnostic)
+                if isinstance(exc, CheckpointDataPlaneError)
+                else {}
+            )
+            payload = {
+                "schema": "dradar-checkpoint-local-diagnostic-v2",
+                "at": datetime.now(timezone.utc).replace(
+                    microsecond=0,
+                ).isoformat(),
+                "stage": stage,
+                "code": code,
+                "failure_type": _bounded_failure_type(exc),
+                "diagnostic": diagnostic,
+            }
+            encoded = json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            ).encode("ascii") + b"\n"
+            if len(encoded) <= 4096:
+                os.write(descriptor, encoded)
+                os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except BaseException:
+        # OBSERVE/RESTORE_TEST diagnostics are strictly subordinate to the
+        # normal trial, including when the diagnostic root itself is broken.
+        return
+
+
 def checkpoint_observation_failure_family_v2(code: str | None) -> str:
     """Collapse local detail into one stable, low-cardinality server family."""
 
@@ -2552,6 +2816,12 @@ class CheckpointDataPlaneV2:
                 stage, code = exc.stage, exc.code
             else:
                 code = f"{stage}_failed"
+            _record_local_checkpoint_failure_v2(
+                self.storage_root,
+                exc=exc,
+                stage=stage,
+                code=code,
+            )
             cleanup = (
                 await self._discard_export(exporter, export)
                 if export is not None else "not_needed"
@@ -2629,6 +2899,12 @@ class CheckpointDataPlaneV2:
                 stage, code = exc.stage, exc.code
             else:
                 stage, code = "restore", "restore_failed"
+            _record_local_checkpoint_failure_v2(
+                self.storage_root,
+                exc=exc,
+                stage=stage,
+                code=code,
+            )
             return CheckpointRestoreObservationV2(
                 status="failed",
                 restore_id=request.restore_id,
@@ -2876,6 +3152,7 @@ __all__ = [
     "checkpoint_observation_payload_v2",
     "checkpoint_restore_observation_payload_v2",
     "publish_checkpoint_export_v2",
+    "load_exact_published_checkpoint_v2",
     "revalidate_published_checkpoint_v2",
     "run_mainline_with_shadow_checkpoint_v2",
     "run_mainline_with_periodic_shadow_captures_v2",

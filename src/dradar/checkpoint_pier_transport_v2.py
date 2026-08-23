@@ -9,6 +9,7 @@ as untrusted bounded JSON; stdout/stderr are never forwarded into telemetry.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -48,6 +49,26 @@ _ROOT_ENV = {
     "GIT_CONFIG_GLOBAL": "/dev/null",
     "GIT_CONFIG_SYSTEM": "/dev/null",
 }
+
+
+def _root_exec_diagnostic(
+    result: object,
+    *,
+    operation: str,
+) -> dict[str, str | int | bool]:
+    """Return local-only comparison facts without persisting command output."""
+
+    diagnostic: dict[str, str | int | bool] = {"operation": operation}
+    return_code = getattr(result, "return_code", None)
+    if isinstance(return_code, int) and not isinstance(return_code, bool):
+        diagnostic["exit_code"] = return_code
+    for label in ("stdout", "stderr"):
+        value = getattr(result, label, None)
+        if isinstance(value, str):
+            encoded = value.encode("utf-8", errors="replace")
+            diagnostic[f"{label}_bytes"] = len(encoded)
+            diagnostic[f"{label}_sha256"] = hashlib.sha256(encoded).hexdigest()
+    return diagnostic
 
 
 class PierCheckpointEnvironmentV2(Protocol):
@@ -144,6 +165,8 @@ class _PierHelperTransportV2:
         *,
         stage: str,
         timeout_sec: int = 120,
+        failure_code: str = "transport_root_exec_failed",
+        diagnostic_operation: str = "root_exec",
     ) -> Any:
         clean = (
             "/usr/bin/env -i "
@@ -164,7 +187,14 @@ class _PierHelperTransportV2:
         except asyncio.CancelledError:
             raise
         except BaseException as exc:
-            raise CheckpointDataPlaneError(stage, "transport_root_exec_failed") from exc
+            raise CheckpointDataPlaneError(
+                stage,
+                failure_code,
+                diagnostic={
+                    "operation": diagnostic_operation,
+                    "transport_exception": type(exc).__name__[:64],
+                },
+            ) from exc
         if getattr(result, "return_code", None) != 0:
             # The helper emits only structured stage/code JSON.  Parse it when
             # possible but never persist arbitrary root stdout/stderr.
@@ -173,14 +203,26 @@ class _PierHelperTransportV2:
             except CheckpointDataPlaneError as exc:
                 if exc.code != "helper_response_invalid":
                     raise
-            raise CheckpointDataPlaneError(stage, "transport_root_exec_failed")
+            raise CheckpointDataPlaneError(
+                stage,
+                failure_code,
+                diagnostic=_root_exec_diagnostic(
+                    result,
+                    operation=diagnostic_operation,
+                ),
+            )
         return result
 
     async def _cleanup_noexcept(self, command: str) -> None:
         """Reap one exact cleanup through caller cancellation without leaking."""
 
         task = asyncio.create_task(
-            self._exec_root(command, stage="cleanup"),
+            self._exec_root(
+                command,
+                stage="cleanup",
+                failure_code="transport_cleanup_failed",
+                diagnostic_operation="cleanup",
+            ),
             name="dradar-checkpoint-v2-cleanup",
         )
         while not task.done():
@@ -252,12 +294,19 @@ class _PierHelperTransportV2:
             f"/usr/bin/rm -f -- {quoted['bundle_upload']} {quoted['spec_upload']}"
         )
         try:
-            await self._exec_root(install, stage=operation)
+            await self._exec_root(
+                install,
+                stage=operation,
+                failure_code="transport_helper_install_failed",
+                diagnostic_operation="helper_install",
+            )
             result = await self._exec_root(
                 f"/usr/bin/python3 {shlex.quote(str(bundle_remote))} "
                 f"{shlex.quote(str(spec_remote))}",
                 stage=operation,
                 timeout_sec=timeout_sec,
+                failure_code="transport_helper_exec_failed",
+                diagnostic_operation="helper_execute",
             )
             return _parse_helper_response(
                 getattr(result, "stdout", None), operation=operation,
@@ -323,7 +372,12 @@ class PierContainerCheckpointExporterV2(_PierHelperTransportV2):
             f"test ! -e {shlex.quote(str(capture_root))}; "
             f"test ! -e {shlex.quote(str(export_path))}"
         )
-        await self._exec_root(setup, stage="capture")
+        await self._exec_root(
+            setup,
+            stage="capture",
+            failure_code="transport_capture_setup_failed",
+            diagnostic_operation="capture_setup",
+        )
         spec: dict[str, object] = {
             "schema": CONTAINER_HELPER_SCHEMA_V2,
             "operation": "capture",
@@ -419,6 +473,8 @@ class PierContainerCheckpointExporterV2(_PierHelperTransportV2):
         await self._exec_root(
             f"set -eu; /usr/bin/rm -f -- {shlex.quote(export.remote_path)}",
             stage="cleanup",
+            failure_code="transport_cleanup_failed",
+            diagnostic_operation="discard_export",
         )
 
 
@@ -479,6 +535,8 @@ class PierContainerCheckpointRestorerV2(_PierHelperTransportV2):
             f"test ! -e {shlex.quote(str(operation_root))}; "
             f"/usr/bin/install -d -o 0 -g 0 -m 0700 {shlex.quote(str(operation_root))}",
             stage="restore",
+            failure_code="transport_restore_setup_failed",
+            diagnostic_operation="restore_setup",
         )
         upload = f"/tmp/.dradar-cpv2-{request.restore_id}.archive.upload"
         try:
@@ -491,6 +549,8 @@ class PierContainerCheckpointRestorerV2(_PierHelperTransportV2):
                 f"/usr/bin/install -o 0 -g 0 -m 0600 {shlex.quote(upload)} "
                 f"{shlex.quote(str(archive_remote))}; /usr/bin/rm -f -- {shlex.quote(upload)}",
                 stage="restore",
+                failure_code="transport_restore_upload_failed",
+                diagnostic_operation="restore_upload",
             )
             exported = ContainerSealedExportV2(
                 capture_id=capture_request.capture_id,

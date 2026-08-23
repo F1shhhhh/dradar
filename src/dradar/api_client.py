@@ -30,6 +30,8 @@ _CHECKPOINT_V2_COMMANDS = frozenset({
     "resume-reserve",
     "resume-commit",
     "resume-abort",
+    "fresh-fallback",
+    "paid-gate-reconcile",
     "fallback-generation",
     "discard",
     "failure",

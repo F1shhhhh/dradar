@@ -27,6 +27,7 @@ from pier.models.trial.paths import EnvironmentPaths
 try:
     from _dradar_pier_checkpoint import (
         CheckpointError,
+        CheckpointV2PreProviderBarrier,
         DurableCheckpoint,
         StatePath,
         _snapshot_payload_dir,
@@ -36,6 +37,7 @@ except ModuleNotFoundError as exc:  # Source-tree unit tests.
         raise
     from dradar.pier_checkpoint import (
         CheckpointError,
+        CheckpointV2PreProviderBarrier,
         DurableCheckpoint,
         StatePath,
         _snapshot_payload_dir,
@@ -461,6 +463,7 @@ class DurableCodex(Codex):
         checkpoint_path = kwargs.get("checkpoint_path")
         checkpoint_interval_sec = kwargs.get("checkpoint_interval_sec", 30)
         checkpoint_workdir = kwargs.get("checkpoint_workdir", "/app")
+        checkpoint_v2_gate_dir = kwargs.get("checkpoint_v2_gate_dir")
         super().__init__(*args, **kwargs)
         if not hasattr(self, "_checkpoint_enabled"):
             self._checkpoint_enabled = checkpoint_enabled
@@ -517,6 +520,9 @@ class DurableCodex(Codex):
             ),
             sensitive_values=sensitive_values,
             session_probe=_CODEX_SESSION_PROBE,
+        )
+        self._checkpoint_v2_barrier = CheckpointV2PreProviderBarrier(
+            checkpoint_v2_gate_dir,
         )
         self._checkpoint_finalizer_task: asyncio.Task[None] | None = None
         self._upstream_phase = "idle"
@@ -902,6 +908,7 @@ class DurableCodex(Codex):
 
         self._upstream_phase = "model"
         try:
+            await self._checkpoint_v2_barrier.authorize_provider_start()
             await super()._run_with_capacity_resume(*args, **kwargs)
         finally:
             self._upstream_phase = "post-model"
@@ -949,8 +956,32 @@ class DurableCodex(Codex):
         root_thread_id = await self._durable_checkpoint.start(
             self, environment, env,
         )
+        v2_session_id = await self._checkpoint_v2_barrier.restore_if_requested(
+            self,
+            environment,
+            env,
+            state_paths=(
+                StatePath(
+                    "sessions",
+                    (self._REMOTE_CODEX_HOME / "sessions").as_posix(),
+                ),
+            ),
+            sensitive_values=self._durable_checkpoint.sensitive_values,
+            workdir=self._checkpoint_workdir,
+        )
         self._upstream_phase = "post-start"
         self._checkpoint_manifest_path = self._durable_checkpoint.manifest_path
+        if v2_session_id is not None:
+            payload = self._checkpoint_v2_barrier.payload_root
+            if payload is None:
+                raise CheckpointError(
+                    "checkpoint v2 Codex payload disappeared after restore"
+                )
+            self._resume_checkpoint_path = payload
+            return {
+                "sessions_dir": "provider-state/sessions",
+                "root_thread_id": v2_session_id,
+            }, v2_session_id
         previous = self._durable_checkpoint.previous
         previous_dir = self._durable_checkpoint.previous_dir
         if previous is None or previous_dir is None:

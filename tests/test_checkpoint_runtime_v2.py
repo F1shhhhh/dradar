@@ -16,6 +16,7 @@ import pytest
 
 import dradar.checkpoint_runtime_v2 as runtime
 from dradar.checkpoint_v2 import (
+    CHECKPOINT_CORE_ABI_V2,
     CheckpointGenerationRefV2,
     CheckpointRetentionAcknowledgementV2,
     negotiate_checkpoint_activation_v2,
@@ -34,6 +35,7 @@ from dradar.checkpoint_runtime_v2 import (
     publish_checkpoint_export_v2,
     checkpoint_observation_payload_v2,
     checkpoint_restore_observation_payload_v2,
+    load_exact_published_checkpoint_v2,
     next_shadow_generation_v2,
     run_mainline_with_periodic_shadow_captures_v2,
     run_mainline_with_shadow_checkpoint_v2,
@@ -321,6 +323,16 @@ def test_observe_mode_seals_verifies_and_publishes_non_authoritative_snapshot(
     assert receipt["authoritative"] is False
     assert exporter.discarded == 1
     assert not list((tmp_path / "host" / ".downloads").iterdir())
+    assert next_shadow_generation_v2(
+        plane.storage_root, "checkpoint-0001",
+    ) == 2
+    assert observed.published.root == (
+        plane.storage_root
+        / "checkpoints"
+        / "checkpoint-0001"
+        / "generations"
+        / "generation-00000000000000000001"
+    )
 
     payload = checkpoint_observation_payload_v2(
         _request(),
@@ -459,6 +471,44 @@ def test_authoritative_generations_are_never_pruned_locally(
         assert observed.published.authoritative is True
         roots.append(observed.published.root)
     assert all(path.is_dir() for path in roots)
+
+
+def test_restart_loads_only_the_exact_server_selected_generation(
+    tmp_path: Path,
+) -> None:
+    storage_root, published = _authoritative_generations(tmp_path, 1)
+    expected = published[0]
+    loaded = load_exact_published_checkpoint_v2(
+        storage_root,
+        checkpoint_id="checkpoint-0001",
+        checkpoint_lineage_id="lineage-0001",
+        snapshot_generation=1,
+        capture_id="capture-auth-0001",
+        manifest_sha256=expected.manifest_sha256,
+        expected_identity_fingerprint="a" * 64,
+        expected_checkpoint_core_abi=CHECKPOINT_CORE_ABI_V2,
+        expected_checkpoint_abi="dradar-checkpoint-v2/zcode/1",
+        expected_recovery_capability="NATIVE_VALID",
+        expected_native_state_schema="zcode-session/1",
+    )
+    assert loaded == expected
+
+    with pytest.raises(
+        CheckpointDataPlaneError, match="publication_receipt_invalid",
+    ):
+        load_exact_published_checkpoint_v2(
+            storage_root,
+            checkpoint_id="checkpoint-0001",
+            checkpoint_lineage_id="lineage-0001",
+            snapshot_generation=1,
+            capture_id="capture-wrong-0001",
+            manifest_sha256=expected.manifest_sha256,
+            expected_identity_fingerprint="a" * 64,
+            expected_checkpoint_core_abi=CHECKPOINT_CORE_ABI_V2,
+            expected_checkpoint_abi="dradar-checkpoint-v2/zcode/1",
+            expected_recovery_capability="NATIVE_VALID",
+            expected_native_state_schema="zcode-session/1",
+        )
 
 
 def test_server_ack_deletes_only_exact_released_generation_and_replays(
@@ -795,6 +845,56 @@ def test_download_failure_is_observed_and_never_published(tmp_path: Path) -> Non
     assert observed.mainline_may_continue is True
     assert observed.remote_cleanup == "discarded"
     assert not (tmp_path / "host/checkpoints/checkpoint-0001").exists()
+
+
+def test_typed_failure_writes_only_bounded_local_diagnostics(
+    tmp_path: Path,
+) -> None:
+    exporter = FakeExporter(tmp_path / "container")
+    exporter.capture_error = CheckpointDataPlaneError(
+        "capture",
+        "transport_helper_install_failed",
+        diagnostic={
+            "operation": "helper_install",
+            "exit_code": 1,
+            "stderr_bytes": 27,
+            "stderr_sha256": "a" * 64,
+        },
+    )
+    plane = CheckpointDataPlaneV2(
+        activation=_activation("observe"), storage_root=tmp_path / "host",
+    )
+    observed = asyncio.run(plane.observe_capture(_request(), exporter))
+
+    assert observed.status == "failed"
+    assert observed.code == "transport_helper_install_failed"
+    diagnostic_path = tmp_path / "host" / "diagnostics.jsonl"
+    assert stat.S_IMODE(diagnostic_path.stat().st_mode) == 0o600
+    record = json.loads(diagnostic_path.read_text(encoding="utf-8"))
+    assert record == {
+        "at": record["at"],
+        "code": "transport_helper_install_failed",
+        "diagnostic": {
+            "exit_code": 1,
+            "operation": "helper_install",
+            "stderr_bytes": 27,
+            "stderr_sha256": "a" * 64,
+        },
+        "failure_type": "CheckpointDataPlaneError",
+        "schema": "dradar-checkpoint-local-diagnostic-v2",
+        "stage": "capture",
+    }
+
+
+def test_local_diagnostic_contract_rejects_sensitive_or_unbounded_fields() -> None:
+    with pytest.raises(ValueError, match="diagnostic"):
+        CheckpointDataPlaneError(
+            "capture", "transport_failed", diagnostic={"api_key": "secret"},
+        )
+    with pytest.raises(ValueError, match="diagnostic"):
+        CheckpointDataPlaneError(
+            "capture", "transport_failed", diagnostic={"detail": "x" * 161},
+        )
 
 
 def test_corrupt_archive_is_rejected_without_selecting_a_generation(

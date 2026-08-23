@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import dradar.checkpoint_docker_runtime_v2 as docker_runtime
 from dradar.checkpoint_docker_runtime_v2 import (
     DockerCliCheckpointEnvironmentV2,
     DockerCliDisposableCheckpointRestorerV2,
@@ -30,6 +31,29 @@ def _inspection(container_id: str, mount: Path, *, running: bool = True) -> dict
         "State": {"Running": running},
         "Mounts": [{"Type": "bind", "Source": str(mount)}],
     }
+
+
+def test_docker_failure_preserves_only_local_comparison_facts(monkeypatch) -> None:
+    monkeypatch.setattr(
+        docker_runtime.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=17,
+            stdout="container output that must not be persisted",
+            stderr="credential-shaped raw failure that must not be persisted",
+        ),
+    )
+    with pytest.raises(CheckpointDataPlaneError) as raised:
+        docker_runtime._run_docker_v2(["inspect", CONTAINER_A])
+
+    assert raised.value.code == "docker_transport_failed"
+    assert raised.value.diagnostic["operation"] == "inspect"
+    assert raised.value.diagnostic["exit_code"] == 17
+    assert raised.value.diagnostic["stdout_bytes"] > 0
+    assert raised.value.diagnostic["stderr_bytes"] > 0
+    assert len(raised.value.diagnostic["stdout_sha256"]) == 64
+    assert len(raised.value.diagnostic["stderr_sha256"]) == 64
+    assert "raw failure" not in repr(raised.value.diagnostic)
 
 
 def test_discovery_requires_one_exact_job_bound_container(

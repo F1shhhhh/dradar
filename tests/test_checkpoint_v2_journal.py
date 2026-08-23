@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from dradar import checkpoints
 from dradar.api_client import ApiError
 from dradar.checkpoint_v2 import (
     CHECKPOINT_CORE_ABI_V2,
@@ -17,6 +18,7 @@ from dradar.checkpoint_v2 import (
     CheckpointV2Journal,
     CheckpointV2JournalError,
     CheckpointV2OperationConflict,
+    CheckpointV2OrdinaryFallback,
     CheckpointV2ProtocolError,
     CheckpointRolloutModeV2,
     CheckpointV2StateMachine,
@@ -25,11 +27,13 @@ from dradar.checkpoint_v2 import (
     FinalizedIdentityReceiptV2,
     PaidExecutionPermit,
     SealedCheckpointV2,
+    SelectedCheckpointGenerationV2,
     UsageEventV2,
     UsageSegmentEvidenceV2,
     checkpoint_policy_v2,
     checkpoint_machine_fingerprint,
     checkpoint_activation_from_assignment_v2,
+    acknowledge_completed_result_retention_v2,
     completed_restore_receipt,
     finalize_execution_identity_v2,
     negotiate_checkpoint_activation_v2,
@@ -46,7 +50,35 @@ class FakeApi:
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, BaseException):
             raise outcome
+        if isinstance(outcome, dict):
+            outcome = dict(outcome)
+            if command == "checkout":
+                outcome.setdefault(
+                    "checkpoint_v2_authoritative_activated", True,
+                )
+                outcome.setdefault("checkpoint_protocol_version", 2)
+            if command in {
+                "checkout", "start", "resume-reserve", "resume-commit",
+            } and outcome.get("checkpoint_v2_authoritative_activated") is not False:
+                outcome.setdefault("certification_id", "certification-test-0001")
+                outcome.setdefault("certification_digest", "c" * 64)
         return outcome
+
+
+def test_journal_uses_thread_serialization_when_outer_assignment_lock_is_held(
+    tmp_path: Path,
+) -> None:
+    assignment_id = "assignment-lock-0001"
+    journal = CheckpointV2Journal(
+        tmp_path,
+        assignment_lock_already_held=True,
+    )
+    with checkpoints.assignment_lock(tmp_path, assignment_id):
+        entry = journal.begin("checkout", {
+            "assignment_id": assignment_id,
+            "operation_id": "operation-lock-0001",
+        })
+    assert entry.state == "PENDING"
 
 
 @pytest.mark.parametrize(
@@ -130,6 +162,10 @@ def _checkout_ack():
     return {
         "ok": True,
         "assignment_id": "assignment-0001",
+        "checkpoint_v2_authoritative_activated": True,
+        "checkpoint_protocol_version": 2,
+        "certification_id": "certification-test-0001",
+        "certification_digest": "c" * 64,
         "owner_epoch": 1,
         "execution_state": "preparing",
         "paid_execution_authorized": False,
@@ -154,6 +190,15 @@ def _usage_ledger_ack(
         "n_output_tokens": totals[2] if complete else None,
         "ledger_sha256": digest,
     }
+
+
+def test_usage_ledger_rejects_cache_tokens_above_input_tokens() -> None:
+    ledger = _usage_ledger_ack(totals=(10, 11, 3))
+    with pytest.raises(
+        CheckpointV2ProtocolError,
+        match="usage ledger acknowledgement is inconsistent",
+    ):
+        CheckpointV2StateMachine._usage_ledger_facts({"usage_ledger": ledger})
 
 
 def _assignment(
@@ -199,6 +244,63 @@ def _on_activation() -> CheckpointActivationV2:
     return negotiate_checkpoint_activation_v2(
         local_mode="on", server_mode="on",
     )
+
+
+def _paused_assignment(**descriptor_overrides):
+    assignment = _assignment()
+    assignment["execution_state"] = "paused"
+    assignment["checkpoint_id"] = "checkpoint-0001"
+    fingerprint = ExecutionIdentityV2.from_assignment(assignment).fingerprint
+    descriptor = {
+        "descriptor_schema": "dradar-checkpoint-selected-generation-v2",
+        "checkpoint_id": "checkpoint-0001",
+        "checkpoint_lineage_id": "lineage-0001",
+        "snapshot_generation": 4,
+        "capture_id": "capture-0001",
+        "manifest_schema": 2,
+        "manifest_sha256": "d" * 64,
+        "compatibility_fingerprint": fingerprint,
+        "recovery_capability": "NATIVE_VALID",
+        "native_state_schema": "codex-session/1",
+        "storage_scope": "machine_local",
+        "writer_machine_fingerprint": "f" * 64,
+        "sync_state": "local_only",
+        "checkpoint_core_abi": CHECKPOINT_CORE_ABI_V2,
+        "checkpoint_abi": "dradar-checkpoint-v2/codex/1",
+    }
+    descriptor.update(descriptor_overrides)
+    assignment["checkpoint_v2_selected_generation"] = descriptor
+    return assignment
+
+
+def test_selected_generation_is_exact_and_machine_reachable() -> None:
+    selected = SelectedCheckpointGenerationV2.from_assignment(
+        _paused_assignment(),
+    )
+    assert selected.checkpoint_id == "checkpoint-0001"
+    assert selected.snapshot_generation == 4
+    selected.assert_reachable_from("f" * 64)
+    with pytest.raises(CheckpointV2ProtocolError, match="unreachable"):
+        selected.assert_reachable_from("e" * 64)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"manifest_sha256": "bad"}, "invalid manifest_sha256"),
+        ({"compatibility_fingerprint": "e" * 64}, "execution identity"),
+        ({"checkpoint_abi": "dradar-checkpoint-v2/dsh/1"}, "execution identity"),
+        ({"recovery_capability": "NONE"}, "not resumable"),
+        ({"manifest_schema": 3}, "generation/schema"),
+    ],
+)
+def test_selected_generation_rejects_ambiguous_or_incompatible_facts(
+    overrides: dict, message: str,
+) -> None:
+    with pytest.raises(CheckpointV2ProtocolError, match=message):
+        SelectedCheckpointGenerationV2.from_assignment(
+            _paused_assignment(**overrides),
+        )
 
 
 def _sealed_generation(
@@ -636,6 +738,135 @@ def test_typed_fresh_flow_issues_paid_permit_only_after_start(tmp_path: Path) ->
     assert [command for command, _ in api.calls] == ["checkout", "start"]
 
 
+def test_uncertified_authoritative_invitation_returns_typed_ordinary_fallback(
+    tmp_path: Path,
+) -> None:
+    assignment = _assignment()
+    assignment["checkpoint_protocol_version"] = 1
+    api = FakeApi([{
+        "ok": True,
+        "assignment_id": assignment["assignment_id"],
+        "checkpoint_v2_authoritative_activated": False,
+        "checkpoint_protocol_version": 1,
+        "fallback_to_ordinary": True,
+        "fallback_observation_mode": "observe",
+        "reason": "checkpoint_v2_cohort_not_certified",
+        "assignment_unchanged": True,
+        "paid_execution_authorized": False,
+    }])
+    machine = CheckpointV2StateMachine(
+        assignment,
+        api=api,
+        journal=CheckpointV2Journal(tmp_path),
+        activation=_on_activation(),
+    )
+    with pytest.raises(CheckpointV2OrdinaryFallback) as caught:
+        machine.checkout(
+            session_id="session-0001",
+            operation_id="ordinary-fallback-0001",
+        )
+    assert caught.value.observation_mode == "observe"
+    assert machine.certification_id is None
+    assert machine.certification_digest is None
+    assert len(api.calls) == 1
+
+
+def test_paused_recovery_can_atomically_fall_back_to_fresh_v1(
+    tmp_path: Path,
+) -> None:
+    api = FakeApi([{
+        "ok": True,
+        "assignment_id": "assignment-0001",
+        "checkpoint_v2_authoritative_activated": False,
+        "checkpoint_protocol_version": 1,
+        "fallback_to_ordinary": True,
+        "fallback_observation_mode": "observe",
+        "reason": "archive_invalid",
+        "assignment_restarted_fresh": True,
+        "assignment_unchanged": False,
+        "owner_epoch": 4,
+        "resume_generation": 2,
+        "execution_state": "waiting",
+        "checkpoint_evidence_retained": True,
+        "paid_execution_authorized": False,
+    }])
+    machine = CheckpointV2StateMachine(
+        _assignment(),
+        api=api,
+        journal=CheckpointV2Journal(tmp_path),
+        activation=_on_activation(),
+    )
+    fallback = machine.fallback_to_ordinary_fresh(
+        session_id="session-0001",
+        expected_owner_epoch=3,
+        reason="archive_invalid",
+        operation_id="fresh-fallback-0001",
+    )
+    assert fallback.assignment_restarted_fresh is True
+    assert fallback.owner_epoch == 4
+    assert fallback.resume_generation == 2
+    assert fallback.reason == "archive_invalid"
+    assert api.calls == [("fresh-fallback", {
+        "assignment_id": "assignment-0001",
+        "operation_id": "fresh-fallback-0001",
+        "session_id": "session-0001",
+        "expected_owner_epoch": 3,
+        "reason": "archive_invalid",
+    })]
+
+
+def test_owner_renewal_preserves_exact_paid_permit_and_is_free_only(
+    tmp_path: Path,
+) -> None:
+    checkout = _checkout_ack()
+    checkout.update({
+        "owner_session_id": "session-0001",
+        "owner_lease_expires_at": "2030-01-01T00:00:00+00:00",
+    })
+    api = FakeApi([
+        checkout,
+        {
+            "ok": True,
+            "assignment_id": "assignment-0001",
+            "owner_session_id": "session-0001",
+            "owner_epoch": 1,
+            "owner_lease_expires_at": "2030-01-01T00:10:00+00:00",
+            "execution_state": "running",
+            "usage_segment_id": "usage-segment-0001",
+            "usage_schema": "dradar-checkpoint-usage-segment-v2",
+            "paid_execution_authorized": True,
+        },
+        {
+            "ok": True,
+            "assignment_id": "assignment-0001",
+            "owner_session_id": "session-0001",
+            "owner_epoch": 1,
+            "owner_lease_expires_at": "2030-01-01T00:20:00+00:00",
+            "execution_state": "running",
+            "paid_execution_authorized": False,
+        },
+    ])
+    machine = CheckpointV2StateMachine(
+        _assignment(), api=api, journal=CheckpointV2Journal(tmp_path),
+        activation=_on_activation(),
+    )
+    free = machine.checkout(
+        session_id="session-0001", operation_id="renew-checkout-0001",
+    )
+    paid = machine.start_paid(free, operation_id="renew-start-0001")
+    renewed = machine.renew_owner(
+        paid, operation_id="renew-owner-operation-0001",
+    )
+
+    assert isinstance(renewed, PaidExecutionPermit)
+    assert renewed.usage_segment_id == paid.usage_segment_id
+    assert renewed.owner_epoch == paid.owner_epoch
+    assert renewed.owner_lease_expires_at == "2030-01-01T00:20:00+00:00"
+    assert [command for command, _ in api.calls] == [
+        "checkout", "start", "renew",
+    ]
+
+
 def test_usage_evidence_is_content_bound_and_rejects_duplicate_events() -> None:
     permit = PaidExecutionPermit(
         assignment_id="assignment-0001",
@@ -935,6 +1166,15 @@ def test_completed_result_is_bound_before_checkpoint_finalize(
             "owner_epoch": 1,
             "owner_lease_expires_at": "2030-01-01T00:30:00+00:00",
             "execution_state": "running",
+            "segment_usage": {
+                "ledger_scope": "segment_delta",
+                "observed_event_count": 1,
+                "novel_event_count": 1,
+                "duplicate_event_count": 0,
+                "n_input_tokens": 10,
+                "n_cache_tokens": 2,
+                "n_output_tokens": 3,
+            },
             "usage_ledger": _usage_ledger_ack(),
             "assignment_unchanged": True,
             "paid_execution_authorized": False,
@@ -1133,6 +1373,48 @@ def test_retention_result_evidence_requires_exact_durable_submission_ack(
     assert acknowledged.result_evidence_release is True
     assert acknowledged.upload_intent_id == intent_id
     assert acknowledged.submission_id == "submission-0001"
+
+
+def test_result_only_retention_replays_without_live_owner_object(
+    tmp_path: Path,
+) -> None:
+    response = {
+        "ok": True,
+        "assignment_id": "assignment-0001",
+        "operation_id": "retention-result-replay-0001",
+        "owner_epoch_observed": 4,
+        "current_owner_epoch": 5,
+        "delete_generations": [],
+        "retain_generations": [],
+        "result_evidence_release": True,
+        "upload_intent_id": "e" * 64,
+        "submission_id": "submission-result-0001",
+        "assignment_unchanged": True,
+        "paid_execution_authorized": False,
+    }
+    api = FakeApi([response])
+    journal = CheckpointV2Journal(tmp_path)
+
+    first = acknowledge_completed_result_retention_v2(
+        assignment_id="assignment-0001",
+        owner_epoch_observed=4,
+        upload_intent_id="e" * 64,
+        operation_id="retention-result-replay-0001",
+        api=api,
+        journal=journal,
+    )
+    replay = acknowledge_completed_result_retention_v2(
+        assignment_id="assignment-0001",
+        owner_epoch_observed=4,
+        upload_intent_id="e" * 64,
+        operation_id="retention-result-replay-0001",
+        api=api,
+        journal=journal,
+    )
+
+    assert first == replay
+    assert first.submission_id == "submission-result-0001"
+    assert len(api.calls) == 1
 
 
 def test_permit_from_another_identity_is_rejected_before_network(

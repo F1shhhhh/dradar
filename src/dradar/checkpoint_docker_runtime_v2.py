@@ -14,6 +14,7 @@ the restore and cannot create a false-positive restart result.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -76,10 +77,39 @@ def _run_docker_v2(
             timeout=timeout_sec,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise CheckpointDataPlaneError(stage, "docker_transport_unavailable") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise CheckpointDataPlaneError(
+            stage,
+            "docker_transport_unavailable",
+            diagnostic={
+                "operation": arguments[0] if arguments else "unknown",
+                "transport_exception": "TimeoutExpired",
+            },
+        ) from exc
+    except OSError as exc:
+        raise CheckpointDataPlaneError(
+            stage,
+            "docker_transport_unavailable",
+            diagnostic={
+                "operation": arguments[0] if arguments else "unknown",
+                "transport_exception": type(exc).__name__[:64],
+            },
+        ) from exc
     if result.returncode != 0:
-        raise CheckpointDataPlaneError(stage, "docker_transport_failed")
+        stdout = result.stdout.encode("utf-8", errors="replace")
+        stderr = result.stderr.encode("utf-8", errors="replace")
+        raise CheckpointDataPlaneError(
+            stage,
+            "docker_transport_failed",
+            diagnostic={
+                "operation": arguments[0] if arguments else "unknown",
+                "exit_code": result.returncode,
+                "stdout_bytes": len(stdout),
+                "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
+                "stderr_bytes": len(stderr),
+                "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+            },
+        )
     if len(result.stdout.encode("utf-8", errors="ignore")) > 2 * 1024 * 1024:
         raise CheckpointDataPlaneError(stage, "docker_response_oversized")
     return result

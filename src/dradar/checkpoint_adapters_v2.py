@@ -72,12 +72,17 @@ class HarnessCheckpointContractV2:
     restorer_version: str
     native_state_schema: str
     native_resume_required: bool
+    usage_ledger_scope: str
     artifacts: tuple[NativeStateArtifactV2, ...]
     credential_exclusion_paths: tuple[str, ...]
 
     def __post_init__(self) -> None:
         if self.checkpoint_abi != f"dradar-checkpoint-v2/{self.harness}/1":
             raise ValueError("checkpoint adapter ABI does not match Harness")
+        if self.usage_ledger_scope not in {
+            "assignment_cumulative", "segment_delta",
+        }:
+            raise ValueError("checkpoint adapter usage ledger scope is invalid")
         names = [item.name for item in self.artifacts]
         if len(names) != len(set(names)):
             raise ValueError("checkpoint adapter has duplicate artifact names")
@@ -118,6 +123,7 @@ _CONTRACTS = {
         restorer_version="dradar-codex-checkpoint-restore-v2/1",
         native_state_schema="codex-sessions/1",
         native_resume_required=False,
+        usage_ledger_scope="assignment_cumulative",
         artifacts=(
             NativeStateArtifactV2(
                 "sessions", "/tmp/codex-home/sessions", "directory", True,
@@ -136,6 +142,7 @@ _CONTRACTS = {
         restorer_version="dradar-deepseek-codex-checkpoint-restore-v2/1",
         native_state_schema="codex-sessions/1",
         native_resume_required=False,
+        usage_ledger_scope="assignment_cumulative",
         artifacts=(
             NativeStateArtifactV2(
                 "sessions", "/tmp/codex-home/sessions", "directory", True,
@@ -154,6 +161,7 @@ _CONTRACTS = {
         restorer_version="dradar-dsh-checkpoint-restore-v2/1",
         native_state_schema="dsh-sessions/1",
         native_resume_required=True,
+        usage_ledger_scope="assignment_cumulative",
         artifacts=(
             NativeStateArtifactV2(
                 "dsh-sessions", "/logs/agent/dsh-home/sessions",
@@ -174,6 +182,7 @@ _CONTRACTS = {
         restorer_version="dradar-kimi-checkpoint-restore-v2/1",
         native_state_schema="kimi-k3-sessions/1",
         native_resume_required=True,
+        usage_ledger_scope="segment_delta",
         artifacts=(
             NativeStateArtifactV2(
                 "sessions", "/tmp/dradar-kimi-home/sessions",
@@ -198,6 +207,7 @@ _CONTRACTS = {
         restorer_version="dradar-zcode-checkpoint-restore-v2/1",
         native_state_schema="zcode-rollout/1",
         native_resume_required=False,
+        usage_ledger_scope="segment_delta",
         artifacts=(
             NativeStateArtifactV2(
                 "xdg-data", "/tmp/dradar-zcode-home/data",

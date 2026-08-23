@@ -28,6 +28,7 @@ from . import (
     image_cache, pending, refill as refill_plan,
 )
 from .api_client import ApiClient, ApiError
+from .checkpoint_v2 import CheckpointV2OrdinaryFallback
 from .identity import _client
 from .local_config import (
     DEFAULT_BENCHMARK, HOME, _load_config, tasks_root_from_config,
@@ -58,7 +59,8 @@ from .providers import (
     validate_refill_scope,
 )
 from .runner import (
-    CODEX_TRAJECTORY_BUNDLE_SCHEMA, DIAG_ADVICE, BuildFlakeError, RunnerError,
+    CODEX_TRAJECTORY_BUNDLE_SCHEMA, DIAG_ADVICE, BuildFlakeError,
+    CheckpointV2PaidGateFaultedError, RunnerError,
     POMPEII_BENCHMARK_ID,
     POMPEII_FINALIZATION_RESERVE_SEC, POMPEII_SOFT_BUDGET_SEC,
     POMPEII_TERMINAL_HEAVY_TIMEOUT_SEC,
@@ -76,7 +78,11 @@ from .scrub import (
     scrub_json_bytes,
 )
 from .session_archive import archive_after_submit
-from .submission_intent import submission_payload_manifest, upload_intent_id
+from .submission_intent import (
+    checkpoint_v2_submission_payload_manifest,
+    submission_payload_manifest,
+    upload_intent_id,
+)
 from .telemetry import RunnerTelemetry
 from .taskpacks import TaskPackError, ensure_benchmark_task_pack
 
@@ -1401,7 +1407,11 @@ def _bundled_completed_outcome(
 
 
 def _upload_trial(
-    client: ApiClient, entry: dict, *, ask_cleanup: bool = False,
+    client: ApiClient,
+    entry: dict,
+    *,
+    ask_cleanup: bool = False,
+    checkpoint_v2_owner=None,
 ) -> str:
     """Scrub + upload one trial's artifacts, described by a pending-ledger
     entry dict (assignment_id/nonce/task_id/trial_dir/meta/outcome/job_dir/
@@ -1421,6 +1431,15 @@ def _upload_trial(
     scrubbing writes to a fresh tempdir, so a later retry re-scrubs from the
     same byte-verified original."""
     entry = dict(entry)
+    checkpoint_v2_facts = entry.get("checkpoint_v2")
+    if checkpoint_v2_facts is not None and not isinstance(
+        checkpoint_v2_facts, dict,
+    ):
+        print("checkpoint V2 pending result metadata is malformed; kept unchanged")
+        return "upload-failed"
+    checkpoint_v2_upload = (
+        checkpoint_v2_owner is not None or checkpoint_v2_facts is not None
+    )
     assignment_id = entry["assignment_id"]
     task_id = entry.get("task_id", "?")
     outcome = entry.get("outcome", "completed")
@@ -1446,6 +1465,11 @@ def _upload_trial(
 
     def settle_terminal_local_failure() -> None:
         """Keep evidence but make a non-retryable local result runnable again."""
+        if checkpoint_v2_upload:
+            # A V2 completed result is server-fenced by its upload intent.
+            # Legacy mark_stopped would bypass that reconciliation state and
+            # could reopen/refill a cell whose paid result is still durable.
+            return
         _mark_stopped_quietly(client, entry)
         item = checkpoints.find_latest(HOME, assignment_id)
         if item is not None:
@@ -1455,6 +1479,83 @@ def _upload_trial(
                 checkpoints.mark_terminal_job(HOME, job_dir)
             except ValueError:
                 pass
+
+    def settle_checkpoint_v2_retention(
+        submission_id: str | None,
+    ) -> bool:
+        """Release result bytes only after an exact server retention ack."""
+
+        if not checkpoint_v2_upload:
+            return True
+        facts = entry.get("checkpoint_v2")
+        if not isinstance(facts, dict):
+            return False
+        if isinstance(submission_id, str) and submission_id:
+            facts["submission_id"] = submission_id
+        if checkpoint_v2_owner is None:
+            from .checkpoint_v2 import (
+                CheckpointV2Journal,
+                acknowledge_completed_result_retention_v2,
+                new_operation_id,
+            )
+
+            operation_id = facts.get("retention_operation_id")
+            if not isinstance(operation_id, str) or not operation_id:
+                operation_id = new_operation_id()
+                facts["retention_operation_id"] = operation_id
+                facts["retention_pending"] = True
+                pending.record(HOME, entry)
+            try:
+                acknowledgement = acknowledge_completed_result_retention_v2(
+                    assignment_id=assignment_id,
+                    owner_epoch_observed=facts.get("owner_epoch"),
+                    upload_intent_id=facts.get("upload_intent_id"),
+                    operation_id=operation_id,
+                    api=client,
+                    journal=CheckpointV2Journal(HOME),
+                )
+            except Exception as exc:
+                facts["retention_pending"] = True
+                facts["retention_failure_type"] = type(exc).__name__[:64]
+                pending.record(HOME, entry)
+                return False
+            if (
+                submission_id is not None
+                and acknowledgement.submission_id != submission_id
+            ):
+                facts["retention_pending"] = True
+                facts["retention_failure_type"] = (
+                    "SubmissionIdentityMismatch"
+                )
+                pending.record(HOME, entry)
+                return False
+            facts["submission_id"] = acknowledgement.submission_id
+            facts["retention_pending"] = False
+            facts.pop("retention_failure_type", None)
+            pending.record(HOME, entry)
+            return True
+        try:
+            released_submission_id = (
+                checkpoint_v2_owner.release_after_submission()
+            )
+        except Exception as exc:
+            facts["retention_pending"] = True
+            facts["retention_failure_type"] = type(exc).__name__[:64]
+            pending.record(HOME, entry)
+            return False
+        if (
+            submission_id is not None
+            and released_submission_id != submission_id
+        ):
+            facts["retention_pending"] = True
+            facts["retention_failure_type"] = "SubmissionIdentityMismatch"
+            pending.record(HOME, entry)
+            return False
+        facts["submission_id"] = released_submission_id
+        facts["retention_pending"] = False
+        facts.pop("retention_failure_type", None)
+        pending.record(HOME, entry)
+        return True
 
     # Persist intent before touching either artifact copy. If this process is
     # interrupted while making the durable source or atomic staged copy, the
@@ -1658,7 +1759,191 @@ def _upload_trial(
             if submit_bundle is not None:
                 submit_kwargs["trajectory_bundle"] = submit_bundle
             runner_session_id = entry.get("runner_session_id")
-            if runner_session_id:
+            if checkpoint_v2_upload:
+                if outcome != "completed":
+                    print(
+                        f"  {task_id}: checkpoint V2 will not upload an "
+                        "interrupted result; sealed recovery evidence was kept"
+                    )
+                    return "checkpoint-v2-paused"
+                if checkpoint_v2_facts is None:
+                    if checkpoint_v2_owner is None:
+                        print(
+                            f"  {task_id}: checkpoint V2 result owner is "
+                            "unavailable; completed evidence was kept"
+                        )
+                        return "upload-failed"
+                    occurred_at = entry.get("checkpoint_v2_usage_occurred_at")
+                    if not isinstance(occurred_at, str) or not occurred_at:
+                        occurred_at = datetime.now(timezone.utc).replace(
+                            microsecond=0,
+                        ).isoformat()
+                        entry["checkpoint_v2_usage_occurred_at"] = occurred_at
+                        pending.record(HOME, entry)
+                    try:
+                        usage_receipt = checkpoint_v2_owner.finalize_usage(
+                            n_input_tokens=upload_meta.get("n_input_tokens"),
+                            n_cache_tokens=upload_meta.get("n_cache_tokens"),
+                            n_output_tokens=upload_meta.get("n_output_tokens"),
+                            token_usage_events=upload_meta.get(
+                                "token_usage_events"
+                            ),
+                            request_usage_complete=upload_meta.get(
+                                "request_usage_complete"
+                            ),
+                            request_usage_observed=upload_meta.get(
+                                "request_usage_observed"
+                            ),
+                            occurred_at=occurred_at,
+                            complete=(
+                                upload_meta.get("usage_aggregation_complete")
+                                is not False
+                            ),
+                        )
+                    except Exception as exc:
+                        print(
+                            f"  {task_id}: checkpoint V2 usage finalization "
+                            f"failed ({type(exc).__name__}); completed result "
+                            "was kept and no upload was attempted"
+                        )
+                        return "upload-failed"
+                    upload_meta["checkpoint_usage_ledger_sha256"] = (
+                        usage_receipt.usage_ledger_sha256
+                    )
+                    upload_meta["checkpoint_usage_ledger_complete"] = (
+                        usage_receipt.usage_ledger_complete
+                    )
+                    v2_projected_bytes = _estimated_upload_body_bytes(
+                        upload_patch,
+                        traj_scrubbed,
+                        result_scrubbed,
+                        submit_bundle,
+                        upload_meta,
+                    )
+                    if (
+                        v2_projected_bytes > _UPLOAD_BODY_BUDGET_BYTES
+                        and submit_bundle is not None
+                    ):
+                        entry["omit_trajectory_bundle"] = True
+                        pending.record(HOME, entry)
+                        submit_bundle = None
+                        continue
+                    if v2_projected_bytes > _UPLOAD_BODY_BUDGET_BYTES:
+                        print(
+                            f"  {task_id}: checkpoint V2 required upload body "
+                            "exceeds the safe request budget; completed evidence "
+                            "was kept before result-ready"
+                        )
+                        return "upload-failed"
+                    permit = checkpoint_v2_owner.permit
+                    if permit is None:
+                        print(
+                            f"  {task_id}: checkpoint V2 owner disappeared "
+                            "before result binding; evidence was kept"
+                        )
+                        return "upload-failed"
+                    manifest = checkpoint_v2_submission_payload_manifest(
+                        assignment_id=assignment_id,
+                        session_id=permit.session_id,
+                        owner_epoch=permit.owner_epoch,
+                        outcome=outcome,
+                        meta=upload_meta,
+                        patch=upload_patch,
+                        trajectory=traj_scrubbed,
+                        result=result_scrubbed,
+                        trajectory_bundle=submit_bundle,
+                    )
+                    calculated_intent_id = upload_intent_id(manifest)
+                    try:
+                        completed = checkpoint_v2_owner.declare_result_ready(
+                            upload_intent_id=calculated_intent_id,
+                        )
+                    except Exception as exc:
+                        print(
+                            f"  {task_id}: checkpoint V2 result-ready "
+                            f"transition failed ({type(exc).__name__}); "
+                            "completed evidence was kept"
+                        )
+                        return "upload-failed"
+                    checkpoint_v2_facts = {
+                        "protocol_version": 2,
+                        "owner_epoch": completed.owner_epoch,
+                        "session_id": completed.session_id,
+                        "upload_intent_id": completed.upload_intent_id,
+                        "usage_ledger_sha256": completed.usage_ledger_sha256,
+                        "usage_ledger_complete": (
+                            usage_receipt.usage_ledger_complete
+                        ),
+                        "manifest": manifest,
+                    }
+                    entry["checkpoint_v2"] = checkpoint_v2_facts
+                    pending.record(HOME, entry)
+                else:
+                    owner_epoch = checkpoint_v2_facts.get("owner_epoch")
+                    session_id = checkpoint_v2_facts.get("session_id")
+                    calculated_intent_id = checkpoint_v2_facts.get(
+                        "upload_intent_id"
+                    )
+                    usage_ledger_sha256 = checkpoint_v2_facts.get(
+                        "usage_ledger_sha256"
+                    )
+                    usage_ledger_complete = checkpoint_v2_facts.get(
+                        "usage_ledger_complete"
+                    )
+                    if (
+                        not isinstance(owner_epoch, int)
+                        or isinstance(owner_epoch, bool)
+                        or owner_epoch < 0
+                        or not isinstance(session_id, str)
+                        or not session_id
+                        or not isinstance(calculated_intent_id, str)
+                        or len(calculated_intent_id) != 64
+                        or not isinstance(usage_ledger_sha256, str)
+                        or len(usage_ledger_sha256) != 64
+                        or not isinstance(usage_ledger_complete, bool)
+                    ):
+                        print(
+                            f"  {task_id}: checkpoint V2 pending result "
+                            "identity is incomplete; evidence was kept"
+                        )
+                        return "upload-failed"
+                    upload_meta["checkpoint_usage_ledger_sha256"] = (
+                        usage_ledger_sha256
+                    )
+                    upload_meta["checkpoint_usage_ledger_complete"] = (
+                        usage_ledger_complete
+                    )
+                    manifest = checkpoint_v2_submission_payload_manifest(
+                        assignment_id=assignment_id,
+                        session_id=session_id,
+                        owner_epoch=owner_epoch,
+                        outcome=outcome,
+                        meta=upload_meta,
+                        patch=upload_patch,
+                        trajectory=traj_scrubbed,
+                        result=result_scrubbed,
+                        trajectory_bundle=submit_bundle,
+                    )
+                    if (
+                        checkpoint_v2_facts.get("manifest") != manifest
+                        or upload_intent_id(manifest) != calculated_intent_id
+                    ):
+                        print(
+                            f"  {task_id}: checkpoint V2 completed payload "
+                            "changed after result-ready; evidence was kept"
+                        )
+                        return "upload-failed"
+                submit_kwargs = {
+                    "owner_epoch": checkpoint_v2_facts["owner_epoch"],
+                    "session_id": checkpoint_v2_facts["session_id"],
+                    "upload_intent_id": checkpoint_v2_facts[
+                        "upload_intent_id"
+                    ],
+                    "outcome": outcome,
+                }
+                if submit_bundle is not None:
+                    submit_kwargs["trajectory_bundle"] = submit_bundle
+            elif runner_session_id:
                 manifest = submission_payload_manifest(
                     assignment_id=assignment_id,
                     session_id=runner_session_id,
@@ -1713,13 +1998,18 @@ def _upload_trial(
                     pending.record(HOME, entry)
                     submit_kwargs["upload_intent_id"] = calculated_intent_id
             try:
-                ack = client.submit(
+                submit_method = (
+                    client.submit_checkpoint_v2
+                    if checkpoint_v2_upload else client.submit
+                )
+                ack = submit_method(
                     assignment_id, entry["nonce"], upload_patch, traj_scrubbed,
                     result_scrubbed, upload_meta, **submit_kwargs,
                 )
                 break
             except ApiError as exc:
-                if (submit_bundle is not None
+                if (not checkpoint_v2_upload
+                        and submit_bundle is not None
                         and _is_trajectory_bundle_rejection(exc)):
                     # The bundle is optional. Persist the downgrade before the
                     # second request so a crash/transport failure cannot make
@@ -1735,7 +2025,8 @@ def _upload_trial(
                     )
                     continue
 
-                if (submit_bundle is None
+                if (not checkpoint_v2_upload
+                        and submit_bundle is None
                         and _is_trajectory_bundle_required(exc)):
                     # An older/strict server can reject the optional bundle
                     # and then reject the one-shot reduced request for not
@@ -1760,11 +2051,33 @@ def _upload_trial(
                     # Some earlier attempt actually landed server-side even
                     # though THIS process never saw the response — good news.
                     print(f"  {task_id}: already submitted (an earlier attempt landed) — clearing it")
+                    if not settle_checkpoint_v2_retention(None):
+                        print(
+                            f"  {task_id}: submission is durable, but local "
+                            "checkpoint/result evidence remains until an exact "
+                            "retention acknowledgement can be replayed"
+                        )
+                        return "submitted-retention-pending"
                     if not ask_cleanup:
                         archive_after_submit(HOME, entry)
                     pending.remove(HOME, assignment_id)
                     cleanup_settled()
+                    if (
+                        checkpoint_v2_upload
+                        and job_dir
+                        and outcome == "completed"
+                        and not entry.get("keep", False)
+                        and not ask_cleanup
+                    ):
+                        shutil.rmtree(job_dir, ignore_errors=True)
                     return "submitted"
+                if checkpoint_v2_upload:
+                    print(
+                        f"  {task_id}: checkpoint V2 upload was not "
+                        f"acknowledged ({exc}); completed result and its exact "
+                        "intent were kept for reconciliation"
+                    )
+                    return "upload-failed"
                 if exc.status_code == 410:
                     print(f"  {task_id}: lease expired, unsalvageable — the cell reopened "
                           "for someone else, dropping it")
@@ -1792,6 +2105,12 @@ def _upload_trial(
                       "(`dradar retry-upload`)")
                 return "upload-failed"
 
+    if not settle_checkpoint_v2_retention(ack.get("submission_id")):
+        print(
+            f"  {task_id}: submitted successfully, but local checkpoint/result "
+            "evidence was preserved because retention acknowledgement is pending"
+        )
+        return "submitted-retention-pending"
     if not ask_cleanup:
         archive_after_submit(HOME, entry)
     pending.remove(HOME, assignment_id)
@@ -2124,11 +2443,11 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
     if (
         not isinstance(checkpoint_protocol, int)
         or isinstance(checkpoint_protocol, bool)
-        or checkpoint_protocol != 1
+        or checkpoint_protocol not in {1, 2}
     ):
         print(
             "refusing to start this assignment: its checkpoint ownership "
-            "protocol requires a newer live execution path. Local evidence "
+            "protocol is unsupported. Local evidence "
             "and the server lease were left unchanged; no model quota was used."
         )
         return "checkpoint-reader-blocked"
@@ -2158,6 +2477,83 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                 "machine; refusing to start a duplicate model session"
             )
             return "busy"
+    checkpoint_v2_orphan_fallback = False
+    if (
+        checkpoint_protocol == 2
+        and assignment.get("execution_state")
+        in {"preparing", "resume_reserved", "running", "result_ready"}
+    ):
+        try:
+            from .checkpoint_activation_v2 import (
+                checkpoint_activation_from_assignment_v2,
+            )
+            from .checkpoint_owner_runtime_v2 import (
+                reconcile_orphaned_paid_gate_v2,
+            )
+            from .runner import _cleanup_terminated_pier_containers
+
+            reconciliation_activation = (
+                checkpoint_activation_from_assignment_v2(
+                    assignment,
+                    local_mode=assignment.get(
+                        "checkpoint_v2_rollout_mode", "off"
+                    ),
+                )
+            )
+            reconciliation = reconcile_orphaned_paid_gate_v2(
+                assignment,
+                activation=reconciliation_activation,
+                api=client,
+                home=HOME,
+                cleanup_containers=_cleanup_terminated_pier_containers,
+            )
+        except Exception as exc:
+            refill_plan.open_circuit(
+                HOME, assignment, "checkpoint_orphan_reconcile_blocked",
+            )
+            print(
+                "refusing to start: a prior checkpoint V2 process could not "
+                f"be safely fenced and reconciled ({type(exc).__name__}); "
+                "automatic refill is faulted and no new model was started"
+            )
+            return "checkpoint-v2-faulted"
+        if reconciliation is None:
+            print(
+                "refusing to start: checkpoint V2 orphan state disappeared "
+                "during reconciliation; no new model was started"
+            )
+            return "checkpoint-reader-blocked"
+        if reconciliation["outcome"] == "fresh_fallback":
+            assignment.update({
+                "checkpoint_protocol_version": 1,
+                "checkpoint_id": None,
+                "execution_state": "waiting",
+                "owner_session_id": None,
+                "owner_epoch": reconciliation["owner_epoch"],
+                "resume_generation": reconciliation["resume_generation"],
+            })
+            checkpoint_protocol = 1
+            resume_checkpoint = None
+            checkpoint_v2_orphan_fallback = True
+            print(
+                "reconciled the prior free checkpoint gate; continuing this "
+                "lease as an ordinary fresh run with shadow observation"
+            )
+        elif reconciliation["outcome"] == "completed_result_preserved":
+            print(
+                "checkpoint V2 already owns a completed result; refusing to "
+                "rerun the model while the existing upload is recovered"
+            )
+            return "checkpoint-v2-result-ready"
+        else:
+            refill_plan.open_circuit(
+                HOME, assignment, "checkpoint_reconcile_ambiguous",
+            )
+            print(
+                "the prior checkpoint V2 paid epoch was fenced as faulted; "
+                "automatic refill is blocked and no new model was started"
+            )
+            return "checkpoint-v2-faulted"
     hash_match = check_task_content_hash(assignment, tasks_root)
     if hash_match is False and not getattr(args, "allow_task_drift", False):
         print(
@@ -2169,20 +2565,31 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         _mark_stopped_quietly(client, assignment)
         return "task-content-mismatch"
     checkpoint_shadow_factory = None
+    checkpoint_owner_factory = None
+    checkpoint_owner_holder: dict[str, object] = {}
     local_checkpoint_v2_mode = os.environ.get(
         "DRADAR_CHECKPOINT_V2_MODE", "off",
     ).strip()
+    if checkpoint_v2_orphan_fallback:
+        local_checkpoint_v2_mode = "observe"
     if local_checkpoint_v2_mode.lower().replace("-", "_") != "off":
         try:
+            from .checkpoint_activation_v2 import (
+                checkpoint_activation_from_assignment_v2,
+            )
             from .checkpoint_live_v2 import (
                 build_live_checkpoint_shadow_v2,
                 checkpoint_live_activation_v2,
             )
 
-            activation = checkpoint_live_activation_v2(
-                assignment,
-                local_mode=local_checkpoint_v2_mode,
+            activation = checkpoint_activation_from_assignment_v2(
+                assignment, local_mode=local_checkpoint_v2_mode,
             )
+            if checkpoint_protocol == 1 and not activation.authoritative:
+                activation = checkpoint_live_activation_v2(
+                    assignment,
+                    local_mode=local_checkpoint_v2_mode,
+                )
         except Exception as exc:
             # An explicitly authoritative assignment must never fall through
             # to the legacy paid runner. Other shadow configuration errors are
@@ -2204,7 +2611,42 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                 )
                 return "checkpoint-reader-blocked"
             activation = None
-        if activation is not None and activation.capture_enabled and telemetry:
+        if (
+            activation is not None
+            and activation.authoritative
+            and checkpoint_protocol in {1, 2}
+        ):
+            if telemetry is None:
+                print(
+                    "refusing to start: checkpoint V2 ownership requires a "
+                    "registered runner session; no model quota was used"
+                )
+                return "checkpoint-reader-blocked"
+
+            def checkpoint_owner_factory(effective_assignment, job_root):
+                from .checkpoint_owner_runtime_v2 import (
+                    AuthoritativeCheckpointRunV2,
+                )
+
+                owner = AuthoritativeCheckpointRunV2(
+                    assignment=assignment,
+                    effective_assignment=effective_assignment,
+                    activation=activation,
+                    api=client,
+                    telemetry=telemetry,
+                    home=HOME,
+                    job_root=job_root,
+                    assignment_lock_held=True,
+                )
+                checkpoint_owner_holder["owner"] = owner
+                return owner
+        elif checkpoint_protocol == 2:
+            print(
+                "refusing to start: checkpoint V2 ownership was not jointly "
+                "authorized by the server and this client; no model quota was used"
+            )
+            return "checkpoint-reader-blocked"
+        elif activation is not None and activation.capture_enabled and telemetry:
             def checkpoint_shadow_factory(effective_assignment, job_root):
                 return build_live_checkpoint_shadow_v2(
                     assignment=assignment,
@@ -2215,9 +2657,17 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                     home=HOME,
                     job_root=job_root,
                 )
+    if checkpoint_protocol == 2 and checkpoint_owner_factory is None:
+        print(
+            "refusing to start: this checkpoint V2 assignment requires an "
+            "explicit local CANARY/ON opt-in; no model quota was used"
+        )
+        return "checkpoint-reader-blocked"
     work_dir = HOME / "work"
     print("running trial (this can take a while)...")
-    for attempt in (1, 2):
+    build_flake_failures = 0
+    fallback_used = False
+    for _attempt in range(3):
         try:
             art = run_trial(
                 assignment, tasks_root, work_dir, dev_agent=args.dev_agent,
@@ -2230,15 +2680,75 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                     resume_checkpoint.checkpoint_dir if resume_checkpoint else None
                 ),
                 checkpoint_shadow_factory=checkpoint_shadow_factory,
+                checkpoint_owner_factory=checkpoint_owner_factory,
             )
             break
+        except CheckpointV2OrdinaryFallback as exc:
+            owner = checkpoint_owner_holder.get("owner")
+            if (
+                fallback_used
+                or owner is None
+                or not exc.assignment_restarted_fresh
+                or not isinstance(exc.owner_epoch, int)
+                or not isinstance(exc.resume_generation, int)
+                or owner.permit is not None
+            ):
+                print(
+                    "checkpoint V2 restore fallback could not be reconciled; "
+                    "the preserved evidence and lease were left for retry"
+                )
+                return "checkpoint-reader-blocked"
+            fresh_facts = {
+                "checkpoint_protocol_version": 1,
+                "checkpoint_id": None,
+                "execution_state": "waiting",
+                "owner_epoch": exc.owner_epoch,
+                "resume_generation": exc.resume_generation,
+            }
+            assignment.update(fresh_facts)
+            fallback_owner = owner
+            checkpoint_owner_holder.clear()
+            checkpoint_owner_factory = None
+            resume_checkpoint = None
+
+            def checkpoint_shadow_factory(
+                _effective_assignment, _job_root,
+            ):
+                return fallback_owner.build_ordinary_fallback_shadow()
+
+            fallback_used = True
+            if exc.reason == "operator_disable":
+                print(
+                    "checkpoint V2 authority was disabled before Provider "
+                    "start; retrying this lease as an ordinary fresh run while "
+                    "retaining checkpoint evidence"
+                )
+            else:
+                print(
+                    "checkpoint V2 restore preflight failed before Provider "
+                    "start; retrying this lease as an ordinary fresh run while "
+                    "retaining checkpoint evidence"
+                )
+            continue
         except BuildFlakeError as exc:
+            build_flake_failures += 1
+            owner = checkpoint_owner_holder.get("owner")
+            if owner is not None and owner.permit is not None:
+                try:
+                    owner.pause_last_sealed()
+                except Exception:
+                    pass
+                print(
+                    f"trial environment failed after checkpoint V2 start ({exc}); "
+                    "the owner was settled without invalidating the assignment"
+                )
+                return "checkpoint-v2-faulted"
             # The image build died before the agent ran — a free failure
             # (zero quota), and mirror flakes usually pass on the second
             # attempt, so retry once automatically instead of bouncing the
             # volunteer. A second flake in a row is likely a real network
             # problem worth a human look.
-            if attempt == 1:
+            if build_flake_failures == 1:
                 print(f"environment build failed ({exc})\n"
                       "no quota was consumed — retrying once automatically...")
                 continue
@@ -2258,7 +2768,28 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                     client, assignment, failure_kind="environment_build_failed",
                 )
             return "environment-build-failed"
+        except CheckpointV2PaidGateFaultedError as exc:
+            refill_plan.open_circuit(
+                HOME, assignment, "checkpoint_reconcile_ambiguous",
+            )
+            print(
+                f"trial stopped before a safe Provider ownership outcome "
+                f"could be proven ({exc}); automatic refill is faulted and "
+                "ordinary retry is blocked to prevent duplicate spend"
+            )
+            return "checkpoint-v2-faulted"
         except RunnerError as exc:
+            owner = checkpoint_owner_holder.get("owner")
+            if owner is not None and owner.permit is not None:
+                try:
+                    owner.pause_last_sealed()
+                except Exception:
+                    pass
+                print(
+                    f"trial stopped under checkpoint V2 ownership: {exc}; "
+                    "sealed evidence was preserved and the assignment was not invalidated"
+                )
+                return "checkpoint-v2-paused"
             failure_kind = classify_exception_message(str(exc))
             terminal_outcome = _terminal_failure_outcome(failure_kind)
             item = _pause_checkpoint_quietly(client, assignment)
@@ -2288,6 +2819,13 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             )
             return terminal_outcome or "failed"
         except (KeyboardInterrupt, EOFError):
+            owner = checkpoint_owner_holder.get("owner")
+            if owner is not None and owner.permit is not None:
+                try:
+                    owner.pause_last_sealed()
+                except Exception:
+                    pass
+                raise
             # A user can interrupt before an agent has produced a resumable
             # checkpoint (notably DSH minimal mode). In that case there is no
             # local recovery path, so undo the checkout stamp before bubbling
@@ -2570,7 +3108,7 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         and not args.keep
         and not getattr(args, "yes", False)
         and not getattr(args, "parallel", False)
-    ))
+    ), checkpoint_v2_owner=art.checkpoint_v2_owner)
     circuit_opened = _observe_repeat_failure(
         assignment,
         repeat_failure,
