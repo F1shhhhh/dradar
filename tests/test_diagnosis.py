@@ -134,6 +134,33 @@ def test_diagnose_unrecognized_has_no_kind(tmp_path):
     assert d["kind"] is None and d["tail"]
 
 
+def test_diagnose_preserves_only_exit_code_when_command_header_leaves_tail(
+        tmp_path):
+    message = "Command failed (exit 17): codex exec\n" + "\n".join(
+        f"potentially sensitive output line {index}" for index in range(12)
+    )
+
+    diagnostic = diagnose_exception(_result(tmp_path, message))
+
+    assert diagnostic["exit_code"] == 17
+    assert len(diagnostic["tail"]) == 6
+    assert all("Command failed" not in line for line in diagnostic["tail"])
+
+
+@pytest.mark.parametrize(
+    ("message", "exc_type"),
+    [
+        ("Command failed (exit 17): codex exec", "AgentError"),
+        ("Command failed (exit 0): codex exec", "NonZeroAgentExitCodeError"),
+        ("Command failed (exit 1234567): codex exec", "NonZeroAgentExitCodeError"),
+    ],
+)
+def test_diagnose_rejects_untrusted_or_unbounded_exit_codes(
+        tmp_path, message, exc_type):
+    diagnostic = diagnose_exception(_result(tmp_path, message, exc_type=exc_type))
+    assert "exit_code" not in diagnostic
+
+
 def test_diagnose_empty_without_exception(tmp_path):
     p = tmp_path / "result.json"
     p.write_text(json.dumps({"agent_result": {}}))

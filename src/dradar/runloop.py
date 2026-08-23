@@ -379,6 +379,13 @@ def _repeat_failure_state_path() -> Path | None:
 
 
 def _agent_exit_code(diag: dict) -> int | None:
+    structured = diag.get("exit_code")
+    if (
+        isinstance(structured, int)
+        and not isinstance(structured, bool)
+        and structured != 0
+    ):
+        return structured
     text = "\n".join(str(line) for line in diag.get("tail", ()))
     match = re.search(
         r"(?:command\s+failed\s*\(\s*exit|exit(?:ed)?(?:\s+with)?"
@@ -410,7 +417,7 @@ def _repeat_failure_signature(
     if diag.get("type") != "NonZeroAgentExitCodeError":
         return None
     exit_code = _agent_exit_code(diag)
-    if exit_code is None:
+    if exit_code in (None, 0):
         return None
     progress = (
         stats.get("n_agent_steps"), stats.get("n_input_tokens"),

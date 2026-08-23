@@ -3593,9 +3593,30 @@ def classify_exception_message(message: str) -> str | None:
     return None
 
 
+_AGENT_COMMAND_EXIT_RE = re.compile(
+    r"\bcommand failed \(exit\s+(-?\d{1,6})\):",
+    flags=re.IGNORECASE,
+)
+
+
+def _agent_command_exit_code(
+    exception_type: object,
+    message: object,
+) -> int | None:
+    """Derive one bounded integer without retaining the full exception text."""
+    if exception_type != "NonZeroAgentExitCodeError" or not isinstance(message, str):
+        return None
+    match = _AGENT_COMMAND_EXIT_RE.search(message)
+    if match is None:
+        return None
+    exit_code = int(match.group(1))
+    return exit_code if exit_code != 0 else None
+
+
 def diagnose_exception(result_path: Path | None) -> dict:
     """Classify a trial's recorded exception for honest console reporting:
-    {} when there is none, else {type, tail, kind} where kind is one of
+    {} when there is none, else {type, tail, kind, optional exit_code} where
+    kind is one of
     stale-agent | insufficient-balance | quota-limit | rate-limit | auth |
     model-capacity | provider-transport | provider-temporary |
     agent-deadline | None
@@ -3615,8 +3636,17 @@ def diagnose_exception(result_path: Path | None) -> dict:
     kind = classify_exception_message(msg)
     if kind is None and info.get("exception_type") == "AgentTimeoutError":
         kind = "agent-deadline"
+    exception_type = info.get("exception_type")
     tail = [ln.strip() for ln in msg.splitlines() if ln.strip()][-6:]
-    return {"type": info.get("exception_type"), "kind": kind, "tail": tail}
+    diagnostic = {"type": exception_type, "kind": kind, "tail": tail}
+    # The command header can precede many lines of tool output and therefore
+    # disappear from the bounded console tail.  Preserve only its numeric exit
+    # code so the repeated-zero-progress circuit sees the same authoritative
+    # signal as the server without retaining or propagating sensitive output.
+    exit_code = _agent_command_exit_code(exception_type, msg)
+    if exit_code is not None:
+        diagnostic["exit_code"] = exit_code
+    return diagnostic
 
 
 def is_insufficient_balance_message(message: str) -> bool:
