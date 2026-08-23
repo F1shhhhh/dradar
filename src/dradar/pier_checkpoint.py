@@ -1710,8 +1710,18 @@ class DurableCheckpoint:
         )
         self.session_probe = session_probe
         self.workdir = workdir
-        self.host_uid = os.getuid()
-        self.host_gid = os.getgid()
+        getuid = getattr(os, "getuid", None)
+        getgid = getattr(os, "getgid", None)
+        if self.enabled and (not callable(getuid) or not callable(getgid)):
+            raise CheckpointError(
+                "durable checkpoints require POSIX host ownership support",
+            )
+        # Native Windows has neither os.getuid() nor os.getgid().  A disabled
+        # rollout is a strict no-op and must therefore remain constructible on
+        # Windows; zero is only a dormant sentinel and is rejected by the
+        # enabled prepare_agent_environment() path.
+        self.host_uid = getuid() if callable(getuid) else 0
+        self.host_gid = getgid() if callable(getgid) else 0
         self.logs_dir = logs_dir
         self.trial_dir = logs_dir.parent
         self.host_dir = self.trial_dir / "checkpoint"

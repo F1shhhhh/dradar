@@ -1005,8 +1005,16 @@ def build_pier_command(
         _ensure_deepseek_agent_module(home)
         agent_args = ["--agent-import-path", DEEPSEEK_AGENT_IMPORT_PATH]
     elif agent == "codex" and provider == DEFAULT_CODEX_PROVIDER:
-        _ensure_codex_agent_module(home)
-        agent_args = ["--agent-import-path", CODEX_AGENT_IMPORT_PATH]
+        if bool(assignment.get("_durable_checkpoint_enabled", True)):
+            _ensure_codex_agent_module(home)
+            agent_args = ["--agent-import-path", CODEX_AGENT_IMPORT_PATH]
+        else:
+            # The private adapter exists solely to add durable checkpoints to
+            # Pier's stock Codex agent.  Keeping it in the disabled rollout
+            # made native Windows import POSIX-only checkpoint machinery even
+            # though no checkpoint could be created.  Use the known-good
+            # upstream path until the cross-platform rollout is re-enabled.
+            agent_args = ["--agent", "codex"]
     elif agent == GROK_AGENT:
         _validate_grok_assignment(assignment)
         _ensure_grok_agent_module(home)
@@ -3222,6 +3230,7 @@ def run_trial(
                 work_dir
                 if effective_agent == "codex"
                 and codex_provider == DEFAULT_CODEX_PROVIDER
+                and checkpoint_enabled
                 else None
             ),
             deepseek_module_dir=(
