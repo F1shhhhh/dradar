@@ -1849,6 +1849,23 @@ class DurableCheckpoint:
                 "previous checkpoint is not in host-private storage",
             )
 
+    def prepare_host_layout(self) -> None:
+        """Normalize and verify the host layout before trusted local writes.
+
+        Some adapters must publish fixed host-authored inputs through
+        ``AgentLogStore`` before :meth:`start` seals ``/logs/agent`` for the
+        untrusted model process.  Keep that early write on the exact same
+        no-follow, numeric-owner, and private-mode boundary as checkpoint
+        publication.  Ordinary non-checkpoint Pier runs retain their existing
+        compatibility permissions and remain subject to ``AgentLogStore``'s
+        own fail-closed validation.
+        """
+
+        if not self.enabled:
+            return
+        self._normalize_host_layout()
+        self._validate_host_layout()
+
     def _event(self, event: str, **detail: Any) -> None:
         if self.manifest_path is None:
             return
@@ -2905,8 +2922,7 @@ class DurableCheckpoint:
             return None
         if not isinstance(self.assignment_id, str) or not self.assignment_id:
             raise CheckpointError("checkpoint assignment id is required")
-        self._normalize_host_layout()
-        self._validate_host_layout()
+        self.prepare_host_layout()
         self._validate_previous_host_layout()
         self.agent_identity = await self.prepare_agent_environment(
             agent, environment, env,

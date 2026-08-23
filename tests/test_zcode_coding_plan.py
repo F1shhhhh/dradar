@@ -323,15 +323,19 @@ def test_zcode_adapter_source_has_fixed_security_contract() -> None:
     assert "sensitive_values=(key_value,)" in source
     assert "await self._checkpoint.start(self, environment, env)" in source
     assert "await self._checkpoint.finish_durably(" in source
-    # start() deliberately seals /logs/agent as root-owned; every host-side
-    # AgentLogStore write needed to launch ZCode must precede that transition.
+    # start() deliberately seals /logs/agent as root-owned. The shared host
+    # layout preflight must run before every host-side AgentLogStore write
+    # needed to launch ZCode, and those writes must precede that transition.
+    prepare_host_layout = source.index(
+        "self._checkpoint.prepare_host_layout()"
+    )
     runner_write = source.index("log_store.replace_text(local_runner")
     instruction_write = source.index("log_store.replace_text(local_instruction")
     checkpoint_start = source.index(
         "resume_session_id = await self._checkpoint.start(self, environment, env)"
     )
-    assert runner_write < checkpoint_start
-    assert instruction_write < checkpoint_start
+    assert prepare_host_layout < runner_write < checkpoint_start
+    assert prepare_host_layout < instruction_write < checkpoint_start
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX no-follow file semantics")

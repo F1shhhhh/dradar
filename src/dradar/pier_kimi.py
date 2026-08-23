@@ -720,6 +720,7 @@ class KimiCode(BaseInstalledAgent):
         )
         local_config = self.logs_dir / "kimi-config.toml"
         local_policy = self.logs_dir / "kimi-policy.py"
+        self._checkpoint.prepare_host_layout()
         log_store = AgentLogStore(self.logs_dir)
         log_store.replace_text(local_config, KIMI_CONFIG)
         log_store.replace_text(local_policy, KIMI_POLICY)

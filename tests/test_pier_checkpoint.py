@@ -20,11 +20,13 @@ import pytest
 
 import dradar.pier_checkpoint as checkpoint_mod
 from dradar.pier_checkpoint import (
+    AgentLogStore,
     AgentIdentity,
     CheckpointError,
     CheckpointIncompatibleError,
     DurableCheckpoint,
     StatePath,
+    UnsafeAgentLog,
     _capture_script,
     _snapshot_payload_dir,
     _supervisor_script,
@@ -613,6 +615,86 @@ def test_checkpoint_normalizes_pier_world_writable_host_logs_directory(
 
     assert stat.S_IMODE(manager.logs_dir.stat().st_mode) == 0o700
     assert stat.S_IMODE(manager.trial_dir.stat().st_mode) == 0o700
+
+
+def test_checkpoint_prepares_host_layout_before_agent_log_store_write(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(tmp_path / "trial" / "agent")
+    manager.logs_dir.chmod(0o777)
+    manager.trial_dir.chmod(0o777)
+    config = manager.logs_dir / "host-authored-config.toml"
+
+    with pytest.raises(UnsafeAgentLog, match="parent is not host-private"):
+        AgentLogStore(manager.logs_dir).replace_text(config, "enabled = true\n")
+
+    manager.prepare_host_layout()
+    manager.prepare_host_layout()
+
+    assert manager.manifest_path is None
+    assert not manager.host_dir.exists()
+    assert stat.S_IMODE(manager.logs_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(manager.trial_dir.stat().st_mode) == 0o700
+    assert AgentLogStore(manager.logs_dir).replace_text(
+        config, "enabled = true\n",
+    )
+    assert config.read_text(encoding="utf-8") == "enabled = true\n"
+    assert stat.S_IMODE(config.stat().st_mode) == 0o600
+
+
+def test_disabled_checkpoint_host_layout_preflight_is_strict_noop(
+    tmp_path: Path,
+) -> None:
+    trial = tmp_path / "world-writable-trial"
+    logs = trial / "not-the-agent-directory"
+    logs.mkdir(parents=True, mode=0o777)
+    trial.chmod(0o777)
+    logs.chmod(0o777)
+    manager = DurableCheckpoint(
+        logs_dir=logs,
+        enabled=False,
+        assignment_id=None,
+        task_id=None,
+        model=None,
+        effort=None,
+        harness="test-harness",
+        provider="test-provider",
+        agent_version="1.2.3",
+    )
+
+    manager.prepare_host_layout()
+
+    assert stat.S_IMODE(trial.stat().st_mode) == 0o777
+    assert stat.S_IMODE(logs.stat().st_mode) == 0o777
+    assert not manager.host_dir.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX no-follow directory semantics")
+def test_checkpoint_host_layout_preflight_rejects_symlinked_agent_dir(
+    tmp_path: Path,
+) -> None:
+    trial = tmp_path / "trial"
+    trial.mkdir(mode=0o700)
+    target = tmp_path / "outside-agent"
+    target.mkdir(mode=0o700)
+    logs = trial / "agent"
+    logs.symlink_to(target, target_is_directory=True)
+    manager = FakeDurableCheckpoint(
+        logs_dir=logs,
+        enabled=True,
+        assignment_id="assignment-123",
+        task_id="task-1",
+        model="model-1",
+        effort="high",
+        harness="test-harness",
+        provider="test-provider",
+        agent_version="1.2.3",
+    )
+
+    with pytest.raises(CheckpointError, match="host layout is unreadable"):
+        manager.prepare_host_layout()
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o700
 
 
 @pytest.mark.parametrize(
