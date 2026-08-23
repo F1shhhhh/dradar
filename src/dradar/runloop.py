@@ -2731,7 +2731,6 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                 "machine; refusing to start a duplicate model session"
             )
             return "busy"
-    checkpoint_v2_orphan_fallback = False
     if (
         checkpoint_protocol == 2
         and assignment.get("execution_state")
@@ -2799,10 +2798,9 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             })
             checkpoint_protocol = 1
             resume_checkpoint = None
-            checkpoint_v2_orphan_fallback = True
             print(
                 "reconciled the prior free checkpoint gate; continuing this "
-                "lease as an ordinary fresh run with shadow observation"
+                "lease as an ordinary fresh run"
             )
         elif reconciliation["outcome"] == "completed_result_preserved":
             print(
@@ -2836,8 +2834,6 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
     local_checkpoint_v2_mode = os.environ.get(
         "DRADAR_CHECKPOINT_V2_MODE", "off",
     ).strip()
-    if checkpoint_v2_orphan_fallback:
-        local_checkpoint_v2_mode = "observe"
     if local_checkpoint_v2_mode.lower().replace("-", "_") != "off":
         try:
             from .checkpoint_activation_v2 import (

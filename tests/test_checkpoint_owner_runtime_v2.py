@@ -1798,6 +1798,93 @@ def test_runloop_retries_restore_preflight_failure_as_fresh_v1(
     assert uploaded[0]["resume_generation"] == 8
 
 
+def test_runloop_orphan_fresh_fallback_respects_explicit_local_off(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    job_dir = home / "work" / "jobs" / "aassignment-orphan-off-0001"
+    trial_dir = job_dir / "trial"
+    artifacts = trial_dir / "artifacts"
+    artifacts.mkdir(parents=True)
+    patch = artifacts / "model.patch"
+    patch.write_text(
+        "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -0,0 +1 @@\n+x\n",
+        encoding="utf-8",
+    )
+    assignment = {
+        **_assignment(),
+        "assignment_id": "assignment-orphan-off-0001",
+        "nonce": "nonce-orphan-off-0001",
+        "execution_state": "preparing",
+        "owner_epoch": 1,
+    }
+    assignment["execution_identity"] = {
+        **assignment["execution_identity"],
+        "task_content_sha256": assignment["task_content_hash"],
+    }
+    art = TrialArtifacts(
+        job_dir=job_dir,
+        trial_dir=trial_dir,
+        patch=patch,
+        trajectory=None,
+        result=None,
+        returncode=0,
+        duration_sec=1.0,
+        log_path=home / "pier.log",
+        codex_cli_version="0.150.0",
+    )
+    observed = {}
+
+    def fake_run_trial(*_args, **kwargs):
+        observed["owner"] = kwargs.get("checkpoint_owner_factory")
+        observed["shadow"] = kwargs.get("checkpoint_shadow_factory")
+        observed["protocol"] = assignment["checkpoint_protocol_version"]
+        return art
+
+    monkeypatch.setattr(runloop, "HOME", home)
+    monkeypatch.setattr(runloop, "check_task_content_hash", lambda *_args: True)
+    monkeypatch.setenv("DRADAR_CHECKPOINT_V2_MODE", "off")
+    monkeypatch.setattr(runloop, "run_trial", fake_run_trial)
+    monkeypatch.setattr(
+        "dradar.checkpoint_owner_runtime_v2.reconcile_orphaned_paid_gate_v2",
+        lambda *_args, **_kwargs: {
+            "outcome": "fresh_fallback",
+            "owner_epoch": 2,
+            "resume_generation": 1,
+        },
+    )
+    monkeypatch.setattr(
+        runloop.artifact_staging, "ensure_staged_patch", lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        runloop.image_cache, "record_trial_images", lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(runloop, "summarize_result", lambda *_args: {})
+    monkeypatch.setattr(
+        runloop, "_upload_trial", lambda *_args, **_kwargs: "submitted",
+    )
+    args = argparse.Namespace(
+        dev_agent=None,
+        allow_task_drift=False,
+        keep=False,
+        yes=True,
+        parallel=False,
+        archive_session=False,
+    )
+
+    outcome = runloop._run_and_submit(
+        _UploadClient(), assignment, tmp_path, args, "commit-test",
+        telemetry=_Telemetry(),
+    )
+
+    assert outcome == "submitted"
+    assert observed == {"owner": None, "shadow": None, "protocol": 1}
+    assert assignment["checkpoint_id"] is None
+    assert assignment["owner_epoch"] == 2
+    assert assignment["resume_generation"] == 1
+
+
 def test_runloop_faults_refill_after_ambiguous_paid_gate(
     monkeypatch,
     tmp_path: Path,
