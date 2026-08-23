@@ -6,6 +6,7 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -283,6 +284,96 @@ def test_runner_refuses_without_isolation_or_with_credentials(
             server_python=Path(sys.executable),
         )
     assert not output.exists()
+
+
+def test_macos_network_isolation_requires_marker_and_inherited_kernel_denial(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        runner.socket, "if_nameindex", lambda: [(1, "lo0"), (2, "en0")],
+    )
+    monkeypatch.setattr(runner, "platform_family", lambda: "macos")
+    monkeypatch.setattr(
+        runner, "_macos_sandbox_profile", lambda: ("profile", "a" * 64),
+    )
+    monkeypatch.setattr(runner, "_inet_outbound_denied", lambda: True)
+    monkeypatch.setattr(
+        runner, "_subprocess_inet_outbound_denied", lambda: True,
+    )
+    monkeypatch.delenv(runner._MACOS_SANDBOX_MARKER_ENV, raising=False)
+    assert runner._network_isolated() is False
+
+    monkeypatch.setenv(runner._MACOS_SANDBOX_MARKER_ENV, "a" * 64)
+    assert runner._network_isolated() is True
+    monkeypatch.setattr(
+        runner, "_subprocess_inet_outbound_denied", lambda: False,
+    )
+    assert runner._network_isolated() is False
+
+
+def test_docker_unix_socket_requires_owned_nonwritable_socket(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    endpoint = Path("/tmp") / f"cpv2-{os.getpid()}-{id(tmp_path)}.sock"
+    listener = runner.socket.socket(runner.socket.AF_UNIX)
+    listener.bind(os.fspath(endpoint))
+    try:
+        monkeypatch.setattr(
+            runner.subprocess,
+            "run",
+            lambda *args, **kwargs: subprocess.CompletedProcess(
+                args[0], 0, f"unix://{endpoint}\n".encode(), b"",
+            ),
+        )
+        assert runner._docker_unix_socket() == endpoint.resolve()
+        endpoint.chmod(0o777)
+        with pytest.raises(ValueError, match="unsafe"):
+            runner._docker_unix_socket()
+    finally:
+        listener.close()
+        endpoint.unlink(missing_ok=True)
+
+
+def test_macos_cli_reexec_uses_deny_profile_and_strict_environment(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(runner, "platform_family", lambda: "macos")
+    monkeypatch.setattr(
+        runner, "_macos_sandbox_profile", lambda: ("deny-profile", "b" * 64),
+    )
+    monkeypatch.setattr(
+        runner, "_provider_credentials_present", lambda: False,
+    )
+    monkeypatch.delenv(runner._MACOS_SANDBOX_MARKER_ENV, raising=False)
+    monkeypatch.setenv("UNRELATED_SECRET", "must-not-cross")
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["environment"] = kwargs["env"]
+        return subprocess.CompletedProcess(command, 17)
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    args = SimpleNamespace(
+        cohort=tmp_path / "cohort.json",
+        output=tmp_path / "results.json",
+        client_source=tmp_path / "client",
+        server_source=tmp_path / "server",
+        client_python=tmp_path / "client-python",
+        server_python=tmp_path / "server-python",
+        probe_timeout_sec=90,
+    )
+    assert runner._run_in_macos_sandbox(args) == 17
+    assert captured["command"][:3] == [
+        "/usr/bin/sandbox-exec", "-p", "deny-profile",
+    ]
+    assert "--probe-timeout-sec" in captured["command"]
+    assert captured["environment"][
+        runner._MACOS_SANDBOX_MARKER_ENV
+    ] == "b" * 64
+    assert "UNRELATED_SECRET" not in captured["environment"]
 
 
 def test_runner_refuses_dirty_source_and_existing_output(

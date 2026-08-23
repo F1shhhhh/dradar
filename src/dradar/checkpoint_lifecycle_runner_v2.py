@@ -40,6 +40,11 @@ from .telemetry import platform_family
 
 MAX_LIFECYCLE_LOG_BYTES_V2 = 1024 * 1024
 LIFECYCLE_PROBE_PLAN_VERSION_V2 = "checkpoint-v2-crash-cut-plan-v1"
+_MACOS_SANDBOX_MARKER_ENV = (
+    "DRADAR_CHECKPOINT_V2_MACOS_SANDBOX_SHA256"
+)
+_MACOS_SANDBOX_EXEC = Path("/usr/bin/sandbox-exec")
+_INET_DENIED_ERRNOS = frozenset({1, 13})
 LIFECYCLE_PROBES_V2: dict[str, tuple[tuple[str, str], ...]] = {
     "owner_checkout_precommit": ((
         "server",
@@ -292,15 +297,189 @@ def _read_private_json(path: Path) -> Mapping[str, Any]:
     return value
 
 
+def _inet_outbound_denied() -> bool:
+    """Return true only when the kernel denies IPv4 and IPv6 outbound use."""
+
+    targets = (
+        (socket.AF_INET, ("192.0.2.1", 9)),
+        (socket.AF_INET6, ("2001:db8::1", 9)),
+    )
+    for family, target in targets:
+        candidate = None
+        try:
+            candidate = socket.socket(family, socket.SOCK_STREAM)
+            candidate.settimeout(0.05)
+            result = candidate.connect_ex(target)
+        except OSError as exc:
+            result = exc.errno
+        finally:
+            if candidate is not None:
+                candidate.close()
+        if result not in _INET_DENIED_ERRNOS:
+            return False
+    return True
+
+
+def _subprocess_inet_outbound_denied() -> bool:
+    """Prove that the network denial is inherited by runner descendants."""
+
+    probe = (
+        "import socket,sys\n"
+        "ok=True\n"
+        "for family,target in ((socket.AF_INET,('192.0.2.1',9)),"
+        "(socket.AF_INET6,('2001:db8::1',9))):\n"
+        " s=None\n"
+        " try:\n"
+        "  s=socket.socket(family,socket.SOCK_STREAM);s.settimeout(.05)\n"
+        "  result=s.connect_ex(target)\n"
+        " except OSError as exc:\n"
+        "  result=exc.errno\n"
+        " finally:\n"
+        "  s.close() if s is not None else None\n"
+        " ok=ok and result in (1,13)\n"
+        "sys.exit(0 if ok else 1)\n"
+    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-I", "-c", probe],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0
+
+
+def _docker_unix_socket() -> Path:
+    try:
+        completed = subprocess.run(
+            [
+                "docker", "context", "inspect", "--format",
+                '{{(index .Endpoints "docker").Host}}',
+            ],
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError("macOS lifecycle Docker context is unavailable") from exc
+    endpoint = completed.stdout.decode("utf-8", errors="strict").strip()
+    if not endpoint.startswith("unix://"):
+        raise ValueError("macOS lifecycle Docker endpoint is not a Unix socket")
+    raw_path = endpoint.removeprefix("unix://")
+    if (
+        not raw_path.startswith("/")
+        or len(raw_path) > 1024
+        or any(character in raw_path for character in ('\x00', '\n', '\r'))
+    ):
+        raise ValueError("macOS lifecycle Docker socket path is invalid")
+    path = Path(raw_path).resolve(strict=True)
+    metadata = path.stat()
+    if (
+        not stat.S_ISSOCK(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        raise ValueError("macOS lifecycle Docker socket is unsafe")
+    return path
+
+
+def _macos_sandbox_profile() -> tuple[str, str]:
+    executable = _MACOS_SANDBOX_EXEC.resolve(strict=True)
+    metadata = executable.stat()
+    if (
+        executable != _MACOS_SANDBOX_EXEC
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or not os.access(executable, os.X_OK)
+    ):
+        raise ValueError("macOS lifecycle sandbox executable is unsafe")
+    docker_socket = os.fspath(_docker_unix_socket())
+    quoted_socket = json.dumps(docker_socket, ensure_ascii=True)
+    profile = " ".join((
+        "(version 1)",
+        "(allow default)",
+        "(deny network*)",
+        "(allow network-outbound",
+        f"(remote unix-socket (path {quoted_socket})))",
+    ))
+    return profile, hashlib.sha256(profile.encode("utf-8")).hexdigest()
+
+
 def _network_isolated() -> bool:
-    """Require a real network namespace containing loopback interfaces only."""
+    """Verify a loopback-only namespace or an inherited macOS deny sandbox."""
 
     try:
         names = [name for _index, name in socket.if_nameindex()]
     except OSError:
         return False
     loopback_names = {"lo", "lo0"}
-    return bool(names) and all(name in loopback_names for name in names)
+    if bool(names) and all(name in loopback_names for name in names):
+        return True
+    if platform_family() != "macos":
+        return False
+    try:
+        _profile, expected_digest = _macos_sandbox_profile()
+    except (OSError, ValueError):
+        return False
+    return (
+        os.environ.get(_MACOS_SANDBOX_MARKER_ENV) == expected_digest
+        and _inet_outbound_denied()
+        and _subprocess_inet_outbound_denied()
+    )
+
+
+def _macos_sandbox_environment(profile_digest: str) -> dict[str, str]:
+    allowed = {
+        name: os.environ[name]
+        for name in (
+            "DOCKER_CONFIG", "DOCKER_CONTEXT", "DOCKER_HOST",
+            "DRADAR_CHECKPOINT_V2_DOCKER_IMAGE", "HOME", "LANG", "LC_ALL",
+            "PATH", "PYTHONPATH", "TMPDIR",
+        )
+        if os.environ.get(name)
+    }
+    allowed.update({
+        _MACOS_SANDBOX_MARKER_ENV: profile_digest,
+        "PYTHONNOUSERSITE": "1",
+    })
+    return allowed
+
+
+def _run_in_macos_sandbox(args) -> int | None:
+    """Re-exec the CLI under the system deny-network sandbox on macOS."""
+
+    if (
+        platform_family() != "macos"
+        or os.environ.get(_MACOS_SANDBOX_MARKER_ENV)
+    ):
+        return None
+    if _provider_credentials_present():
+        raise ValueError("lifecycle runner has Provider credentials")
+    profile, profile_digest = _macos_sandbox_profile()
+    command = [
+        os.fspath(_MACOS_SANDBOX_EXEC), "-p", profile,
+        sys.executable, "-m", "dradar.cli", "checkpoint", "lifecycle-run",
+        "--cohort", os.fspath(Path(args.cohort).absolute()),
+        "--output", os.fspath(Path(args.output).absolute()),
+        "--client-source", os.fspath(Path(args.client_source).absolute()),
+        "--server-source", os.fspath(Path(args.server_source).absolute()),
+        "--client-python", os.fspath(Path(args.client_python).absolute()),
+        "--server-python", os.fspath(Path(args.server_python).absolute()),
+        "--probe-timeout-sec", str(float(args.probe_timeout_sec)),
+    ]
+    completed = subprocess.run(
+        command,
+        check=False,
+        env=_macos_sandbox_environment(profile_digest),
+    )
+    return int(completed.returncode)
 
 
 def _provider_credentials_present() -> bool:
@@ -779,6 +958,9 @@ def run_lifecycle_matrix_v2(
 
 def cmd_checkpoint_lifecycle_run(args) -> int:
     try:
+        sandboxed = _run_in_macos_sandbox(args)
+        if sandboxed is not None:
+            return sandboxed
         results = run_lifecycle_matrix_v2(
             cohort_path=Path(args.cohort),
             output_path=Path(args.output),
