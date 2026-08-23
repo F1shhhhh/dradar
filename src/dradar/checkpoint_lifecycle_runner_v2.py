@@ -69,11 +69,23 @@ LIFECYCLE_PROBES_V2: dict[str, tuple[tuple[str, str], ...]] = {
             "test_v2_cross_process_paid_gate_reconcile_faults_committed_start_without_replay",
         ),
     ),
-    "capture_interrupted": ((
-        "client",
-        "tests/test_checkpoint_runtime_v2.py::"
-        "test_capture_cancellation_reaps_remote_export",
-    ),),
+    "capture_interrupted": (
+        (
+            "client",
+            "tests/test_checkpoint_runtime_v2.py::"
+            "test_capture_cancellation_reaps_remote_export",
+        ),
+        (
+            "client",
+            "tests/test_checkpoint_shadow_v2.py::"
+            "test_kill_switch_stops_future_samples_without_touching_mainline",
+        ),
+        (
+            "server",
+            "tests/test_checkpoint_v2_foundation.py::"
+            "test_shadow_activation_rechecks_downgrade_and_immediate_kill_switch",
+        ),
+    ),
     "seal_interrupted": ((
         "client",
         "tests/test_checkpoint_runtime_v2.py::"
@@ -99,6 +111,11 @@ LIFECYCLE_PROBES_V2: dict[str, tuple[tuple[str, str], ...]] = {
             "client",
             "tests/test_pier_checkpoint.py::"
             "test_checkpoint_v2_partial_restore_is_never_retried_in_place",
+        ),
+        (
+            "client",
+            "tests/test_checkpoint_shadow_v2.py::"
+            "test_rollout_is_rechecked_after_capture_before_offline_restore",
         ),
     ),
     "restore_before_paid_commit": (

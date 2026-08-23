@@ -432,6 +432,19 @@ class ApiClient:
             timeout=3.0,
         )
 
+    def checkpoint_v2_activation(
+        self, payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Recheck the current shadow ceiling before doing local work."""
+
+        if not isinstance(payload, dict):
+            raise TypeError("checkpoint v2 activation must be a dictionary")
+        return self._post(
+            "/api/v2/assignment/checkpoint/activation",
+            json=dict(payload),
+            timeout=3.0,
+        )
+
     def checkpoint_v2_restore_observation(
         self, payload: dict[str, Any],
     ) -> dict[str, Any]:

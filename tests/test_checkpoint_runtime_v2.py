@@ -1926,3 +1926,30 @@ def test_periodic_shadow_sampler_locally_stops_after_repeated_failures() -> None
         assert all(item.code == "observer_failed" for item in observed)
 
     asyncio.run(scenario())
+
+
+def test_periodic_shadow_sampler_stops_immediately_when_activation_is_disabled(
+    ) -> None:
+    async def scenario() -> None:
+        attempts = []
+
+        async def mainline():
+            await asyncio.sleep(0.04)
+            return "completed"
+
+        async def capture(generation: int):
+            attempts.append(generation)
+            return runtime.CheckpointObservationV2(
+                status="skipped", capture_id=None,
+            )
+
+        result = await run_mainline_with_periodic_shadow_captures_v2(
+            mainline(), capture,
+            initial_delay_sec=0,
+            interval_sec=0.01,
+            maximum_captures=20,
+        )
+        assert result == "completed"
+        assert attempts == [1]
+
+    asyncio.run(scenario())

@@ -3257,6 +3257,8 @@ async def run_mainline_with_periodic_shadow_captures_v2(
                 )
             report(observation)
             last = observation
+            if observation.status == "skipped":
+                return last
             failures = failures + 1 if observation.status == "failed" else 0
             if failures >= consecutive_failure_limit:
                 return last

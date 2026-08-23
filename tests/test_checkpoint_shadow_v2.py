@@ -60,10 +60,22 @@ def _assignment(mode: str) -> dict:
 
 
 class IdentityApi:
-    def __init__(self, assignment: dict, *, error: Exception | None = None):
+    def __init__(
+        self,
+        assignment: dict,
+        *,
+        error: Exception | None = None,
+        current_mode: str | None = None,
+        kill_switch: bool = False,
+    ):
         self.assignment = assignment
         self.error = error
         self.calls = []
+        self.activation_calls = []
+        self.current_mode = current_mode or assignment[
+            "checkpoint_v2_rollout_mode"
+        ]
+        self.kill_switch = kill_switch
 
     def checkpoint_v2_command(self, command, payload):
         self.calls.append((command, dict(payload)))
@@ -100,6 +112,39 @@ class IdentityApi:
             ),
             "identity_fingerprint": identity.fingerprint,
             "assignment_ownership_unchanged": True,
+            "paid_execution_authorized": False,
+        }
+
+    def checkpoint_v2_activation(self, payload):
+        self.activation_calls.append(dict(payload))
+        if self.error is not None:
+            raise self.error
+        ranks = {
+            "off": 0, "observe": 1, "restore_test": 2,
+            "canary": 3, "on": 4,
+        }
+        snapshot = self.assignment["checkpoint_v2_rollout_mode"]
+        current = "off" if self.kill_switch else self.current_mode
+        effective = min((snapshot, current), key=ranks.__getitem__)
+        capture = ranks[effective] >= ranks["observe"]
+        restore = ranks[effective] >= ranks["restore_test"]
+        reason = (
+            "kill_switch" if self.kill_switch
+            else "enabled" if capture else "rollout_lowered"
+        )
+        return {
+            "ok": True,
+            "assignment_id": payload["assignment_id"],
+            "identity_fingerprint": payload["identity_fingerprint"],
+            "requested_rollout_mode": payload["requested_rollout_mode"],
+            "assignment_snapshot_mode": snapshot,
+            "current_server_mode": current,
+            "effective_rollout_mode": effective,
+            "capture_authorized": capture,
+            "restore_test_authorized": restore,
+            "kill_switch_active": self.kill_switch,
+            "reason": reason,
+            "assignment_unchanged": True,
             "paid_execution_authorized": False,
         }
 
@@ -267,6 +312,81 @@ def test_restore_test_reports_capture_before_nonpaid_restore(tmp_path: Path) -> 
     assert sink.payloads[1]["paid_execution_started"] is False
     assert sink.payloads[1]["authoritative"] is False
     assert sink.payloads[1]["source_capture_id"] == sink.payloads[0]["capture_id"]
+
+
+def test_server_can_downgrade_restore_test_to_observe_per_sample(
+    tmp_path: Path,
+) -> None:
+    assignment = _assignment("restore-test")
+    api = IdentityApi(assignment, current_mode="observe")
+    coordinator, plane, sink = _coordinator(
+        tmp_path, "restore-test", api=api,
+    )
+
+    async def mainline():
+        await asyncio.sleep(0.02)
+        return "done"
+
+    assert asyncio.run(coordinator.run(
+        mainline(), initial_delay_sec=0, interval_sec=0.01,
+        maximum_captures=1,
+    )) == "done"
+    assert plane.captures == 1
+    assert plane.restores == 0
+    assert sink.payloads[0]["rollout_mode"] == "observe"
+
+
+def test_rollout_is_rechecked_after_capture_before_offline_restore(
+    tmp_path: Path,
+) -> None:
+    assignment = _assignment("restore-test")
+    api = IdentityApi(assignment)
+    original_activation = api.checkpoint_v2_activation
+
+    def changing_activation(payload):
+        response = original_activation(payload)
+        api.current_mode = "observe"
+        return response
+
+    api.checkpoint_v2_activation = changing_activation
+    coordinator, plane, sink = _coordinator(
+        tmp_path, "restore-test", api=api,
+    )
+
+    async def mainline():
+        await asyncio.sleep(0.02)
+        return "done"
+
+    assert asyncio.run(coordinator.run(
+        mainline(), initial_delay_sec=0, interval_sec=0.01,
+        maximum_captures=1,
+    )) == "done"
+    assert plane.captures == 1
+    assert plane.restores == 0
+    assert len(api.activation_calls) == 2
+    assert [item["observation_kind"] for item in sink.payloads] == ["capture"]
+
+
+def test_kill_switch_stops_future_samples_without_touching_mainline(
+    tmp_path: Path,
+) -> None:
+    assignment = _assignment("restore-test")
+    api = IdentityApi(assignment, kill_switch=True)
+    coordinator, plane, sink = _coordinator(
+        tmp_path, "restore-test", api=api,
+    )
+
+    async def mainline():
+        await asyncio.sleep(0.04)
+        return "authoritative-result"
+
+    assert asyncio.run(coordinator.run(
+        mainline(), initial_delay_sec=0, interval_sec=0.01,
+        maximum_captures=10,
+    )) == "authoritative-result"
+    assert plane.captures == plane.restores == 0
+    assert sink.payloads == []
+    assert len(api.activation_calls) == 1
 
 
 def test_identity_failure_never_replaces_mainline_result_or_calls_exporter(

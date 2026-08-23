@@ -22,7 +22,9 @@ from . import __version__
 from .api_client import ApiClient
 from .checkpoint_activation_v2 import (
     CheckpointActivationV2,
+    CheckpointRolloutModeV2,
     CheckpointV2ProtocolError,
+    negotiate_checkpoint_activation_v2,
 )
 from .checkpoint_runtime_v2 import (
     CheckpointCaptureRequestV2,
@@ -235,13 +237,94 @@ class CheckpointShadowCoordinatorV2:
         except Exception:
             pass
 
+    async def _sample_activation(
+        self,
+        identity: ExecutionIdentityV2,
+    ) -> CheckpointActivationV2:
+        response = await asyncio.to_thread(
+            self.api.checkpoint_v2_activation,
+            {
+                "assignment_id": identity.assignment_id,
+                "identity_fingerprint": identity.fingerprint,
+                "requested_rollout_mode": "observe",
+            },
+        )
+        expected = {
+            "ok", "assignment_id", "identity_fingerprint",
+            "requested_rollout_mode", "assignment_snapshot_mode",
+            "current_server_mode", "effective_rollout_mode",
+            "capture_authorized", "restore_test_authorized",
+            "kill_switch_active", "reason", "assignment_unchanged",
+            "paid_execution_authorized",
+        }
+        if not isinstance(response, Mapping) or set(response) != expected:
+            raise CheckpointV2ProtocolError(
+                "checkpoint shadow activation response is invalid"
+            )
+        if (
+            response["ok"] is not True
+            or response["assignment_id"] != identity.assignment_id
+            or response["identity_fingerprint"] != identity.fingerprint
+            or response["requested_rollout_mode"] != "observe"
+            or response["assignment_unchanged"] is not True
+            or response["paid_execution_authorized"] is not False
+            or not isinstance(response["capture_authorized"], bool)
+            or not isinstance(response["restore_test_authorized"], bool)
+            or not isinstance(response["kill_switch_active"], bool)
+            or response["reason"] not in {
+                "enabled", "kill_switch", "rollout_lowered",
+                "assignment_inactive",
+            }
+        ):
+            raise CheckpointV2ProtocolError(
+                "checkpoint shadow activation response is inconsistent"
+            )
+        effective = CheckpointRolloutModeV2.parse(
+            response["effective_rollout_mode"], source="server effective",
+        )
+        snapshot = CheckpointRolloutModeV2.parse(
+            response["assignment_snapshot_mode"], source="assignment snapshot",
+        )
+        CheckpointRolloutModeV2.parse(
+            response["current_server_mode"], source="current server",
+        )
+        if (
+            effective > snapshot
+            or effective > self.activation.effective_mode
+        ):
+            raise CheckpointV2ProtocolError(
+                "checkpoint shadow activation attempted an upgrade"
+            )
+        sample = negotiate_checkpoint_activation_v2(
+            local_mode=self.activation.local_mode,
+            server_mode=effective,
+            controlled_account=self.activation.controlled_account,
+        )
+        if sample.authoritative:
+            raise CheckpointV2ProtocolError(
+                "checkpoint shadow activation became authoritative"
+            )
+        if (
+            response["capture_authorized"] != sample.capture_enabled
+            or response["restore_test_authorized"]
+            != sample.offline_restore_enabled
+            or response["kill_switch_active"]
+            != (effective == CheckpointRolloutModeV2.OFF
+                and response["reason"] == "kill_switch")
+        ):
+            raise CheckpointV2ProtocolError(
+                "checkpoint shadow activation permissions are inconsistent"
+            )
+        return sample
+
     async def _observe_restore(
         self,
         capture_request: CheckpointCaptureRequestV2,
         capture_observation: CheckpointObservationV2,
+        activation: CheckpointActivationV2,
     ) -> None:
         if (
-            not self.activation.offline_restore_enabled
+            not activation.offline_restore_enabled
             or capture_observation.published is None
             or self.restorer_factory is None
         ):
@@ -276,7 +359,7 @@ class CheckpointShadowCoordinatorV2:
                 capture_request,
                 restore_request,
                 observation,
-                self.activation,
+                activation,
                 CheckpointObservationRuntimeV2(
                     assignment_id=self.assignment["assignment_id"],
                     operation_id=new_operation_id(),
@@ -304,6 +387,18 @@ class CheckpointShadowCoordinatorV2:
                 code="identity_finalization_failed",
                 failure_type=type(exc).__name__[:64] or "Exception",
             )
+        try:
+            activation = await self._sample_activation(identity)
+        except Exception as exc:
+            return CheckpointObservationV2(
+                status="failed",
+                capture_id=None,
+                stage="capture",
+                code="activation_check_failed",
+                failure_type=type(exc).__name__[:64] or "Exception",
+            )
+        if not activation.capture_enabled:
+            return CheckpointObservationV2(status="skipped", capture_id=None)
         checkpoint_id, lineage_id = _stable_shadow_ids(
             identity.assignment_id,
             identity.fingerprint,
@@ -364,7 +459,7 @@ class CheckpointShadowCoordinatorV2:
             payload = checkpoint_observation_payload_v2(
                 request,
                 observation,
-                self.activation,
+                activation,
                 CheckpointObservationRuntimeV2(
                     assignment_id=identity.assignment_id,
                     operation_id=new_operation_id(),
@@ -379,8 +474,16 @@ class CheckpointShadowCoordinatorV2:
             pass
         else:
             self._record(payload)
-        if observation.status == "sealed":
-            await self._observe_restore(request, observation)
+        if observation.status == "sealed" and activation.offline_restore_enabled:
+            try:
+                restore_activation = await self._sample_activation(identity)
+            except Exception:
+                # A missing current decision can only remove optional work.
+                # The sealed capture remains local evidence for later audit.
+                return observation
+            await self._observe_restore(
+                request, observation, restore_activation,
+            )
         return observation
 
     async def run(
