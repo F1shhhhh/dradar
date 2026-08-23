@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from pathlib import Path
 
 import pytest
@@ -342,10 +343,13 @@ def test_rollout_is_rechecked_after_capture_before_offline_restore(
     assignment = _assignment("restore-test")
     api = IdentityApi(assignment)
     original_activation = api.checkpoint_v2_activation
+    restore_decision_seen = threading.Event()
 
     def changing_activation(payload):
         response = original_activation(payload)
         api.current_mode = "observe"
+        if len(api.activation_calls) == 2:
+            restore_decision_seen.set()
         return response
 
     api.checkpoint_v2_activation = changing_activation
@@ -354,8 +358,11 @@ def test_rollout_is_rechecked_after_capture_before_offline_restore(
     )
 
     async def mainline():
-        await asyncio.sleep(0.02)
-        return "done"
+        for _attempt in range(1000):
+            if restore_decision_seen.is_set():
+                return "done"
+            await asyncio.sleep(0.001)
+        raise AssertionError("restore activation decision was not observed")
 
     assert asyncio.run(coordinator.run(
         mainline(), initial_delay_sec=0, interval_sec=0.01,
@@ -372,13 +379,25 @@ def test_kill_switch_stops_future_samples_without_touching_mainline(
 ) -> None:
     assignment = _assignment("restore-test")
     api = IdentityApi(assignment, kill_switch=True)
+    activation_seen = threading.Event()
+    original_activation = api.checkpoint_v2_activation
+
+    def observed_activation(payload):
+        response = original_activation(payload)
+        activation_seen.set()
+        return response
+
+    api.checkpoint_v2_activation = observed_activation
     coordinator, plane, sink = _coordinator(
         tmp_path, "restore-test", api=api,
     )
 
     async def mainline():
-        await asyncio.sleep(0.04)
-        return "authoritative-result"
+        for _attempt in range(1000):
+            if activation_seen.is_set():
+                return "authoritative-result"
+            await asyncio.sleep(0.001)
+        raise AssertionError("kill-switch activation decision was not observed")
 
     assert asyncio.run(coordinator.run(
         mainline(), initial_delay_sec=0, interval_sec=0.01,
