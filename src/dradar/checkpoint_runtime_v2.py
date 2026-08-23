@@ -1157,7 +1157,12 @@ def _ensure_private_directory(path: Path, *, stage: str) -> None:
         return
     try:
         path.mkdir(mode=0o700, parents=True)
-        path.chmod(0o700)
+    except FileExistsError:
+        # Another process may have created the same storage level after our
+        # initial lstat.  Never chmod that raced path (it could have been
+        # replaced by a symlink); the authoritative postcondition check below
+        # accepts only our uid's non-symlink private directory.
+        pass
     except OSError as exc:
         raise CheckpointDataPlaneError(stage, "storage_create_failed") from exc
     _assert_private_directory(path, stage=stage)

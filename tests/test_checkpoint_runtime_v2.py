@@ -6,7 +6,9 @@ import gzip
 import hashlib
 import io
 import json
+import multiprocessing
 import os
+import queue
 import shutil
 import stat
 import tarfile
@@ -45,6 +47,66 @@ from dradar.checkpoint_runtime_v2 import (
     run_mainline_with_shadow_checkpoint_v2,
     seal_checkpoint_export_v2,
 )
+
+
+def _publish_checkpoint_process(
+    archive_path: str,
+    storage_root: str,
+    request: CheckpointCaptureRequestV2,
+    export: ContainerSealedExportV2,
+    start_event,
+    result_queue,
+    process_index: int,
+) -> None:
+    if not start_event.wait(timeout=30):
+        result_queue.put(("error", process_index, "barrier_timeout"))
+        return
+    try:
+        published = publish_checkpoint_export_v2(
+            Path(archive_path),
+            Path(storage_root),
+            request,
+            export,
+            authoritative=False,
+        )
+    except CheckpointDataPlaneError as exc:
+        result_queue.put(("error", process_index, exc.code))
+    except BaseException as exc:  # pragma: no cover - asserted in parent
+        result_queue.put((
+            "exception", process_index,
+            f"{type(exc).__name__}: {str(exc)[:256]}",
+        ))
+    else:
+        result_queue.put((
+            "ok", process_index, published.capture_id,
+            published.manifest_sha256, published.selected,
+        ))
+
+
+def _crash_publication_before_current_process(
+    archive_path: str,
+    storage_root: str,
+    request: CheckpointCaptureRequestV2,
+    export: ContainerSealedExportV2,
+    crash_reached,
+) -> None:
+    real_replace = runtime.os.replace
+
+    def crash_before_current(source, destination):
+        if Path(destination).name == "CURRENT":
+            crash_reached.set()
+            os._exit(93)
+        return real_replace(source, destination)
+
+    runtime.os.replace = crash_before_current
+    publish_checkpoint_export_v2(
+        Path(archive_path),
+        Path(storage_root),
+        request,
+        export,
+        authoritative=True,
+    )
+    os._exit(94)
 
 
 def _request(**updates) -> CheckpointCaptureRequestV2:
@@ -1218,6 +1280,164 @@ def test_same_generation_is_idempotent_but_conflicting_capture_is_rejected(
         )
     current = json.loads((store / request.checkpoint_id / "CURRENT").read_text())
     assert current["manifest_sha256"] == first.manifest_sha256
+
+
+@pytest.mark.parametrize("_attempt", range(8))
+def test_spawned_publishers_commit_one_generation_without_corruption(
+    tmp_path: Path,
+    _attempt: int,
+) -> None:
+    request, archive, exported = _seal(tmp_path / "first")
+    exported = replace(
+        exported,
+        remote_path="/run/dradar-checkpoint-v2/x/sealed/first.tar.gz",
+    )
+    conflicting_request = replace(request, capture_id="capture-0002")
+    _, conflicting_archive, conflicting_export = _seal(
+        tmp_path / "second", conflicting_request,
+    )
+    conflicting_export = replace(
+        conflicting_export,
+        remote_path="/run/dradar-checkpoint-v2/x/sealed/second.tar.gz",
+    )
+    store = tmp_path / "host"
+    context = multiprocessing.get_context("spawn")
+    start_event = context.Event()
+    result_queue = context.Queue()
+    inputs = (
+        (archive, request, exported),
+        (archive, request, exported),
+        (conflicting_archive, conflicting_request, conflicting_export),
+    )
+    processes = [
+        context.Process(
+            target=_publish_checkpoint_process,
+            args=(
+                str(item[0]), str(store), item[1], item[2],
+                start_event, result_queue, index,
+            ),
+        )
+        for index, item in enumerate(inputs)
+    ]
+    try:
+        for process in processes:
+            process.start()
+        start_event.set()
+        messages = []
+        for _ in processes:
+            try:
+                messages.append(result_queue.get(timeout=30))
+            except queue.Empty as exc:
+                raise AssertionError("publisher process did not report") from exc
+        for process in processes:
+            process.join(timeout=30)
+        assert all(not process.is_alive() for process in processes)
+        assert all(process.exitcode == 0 for process in processes)
+    finally:
+        start_event.set()
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+        result_queue.close()
+
+    assert not [message for message in messages if message[0] == "exception"]
+    successes = [message for message in messages if message[0] == "ok"]
+    conflicts = [message for message in messages if message[0] == "error"]
+    assert successes
+    winner_capture_id = successes[0][2]
+    assert {message[2] for message in successes} == {winner_capture_id}
+    assert all(
+        message[2] == "generation_conflict" for message in conflicts
+    ), messages
+    if winner_capture_id == request.capture_id:
+        assert len(successes) == 2
+        assert len(conflicts) == 1
+    else:
+        assert winner_capture_id == conflicting_request.capture_id
+        assert len(successes) == 1
+        assert len(conflicts) == 2
+
+    checkpoint_root = store / request.checkpoint_id
+    generations = list((checkpoint_root / "generations").iterdir())
+    assert [path.name for path in generations] == [
+        "generation-00000000000000000001",
+    ]
+    receipt = json.loads(
+        (generations[0] / "publication.json").read_text(encoding="utf-8")
+    )
+    assert receipt["capture_id"] == winner_capture_id
+    current = json.loads(
+        (checkpoint_root / "CURRENT").read_text(encoding="utf-8")
+    )
+    assert current["generation"] == 1
+    assert current["manifest_sha256"] == receipt["manifest_sha256"]
+    assert not list(checkpoint_root.glob(".incoming-*.part"))
+
+
+def test_hard_crash_while_publishing_recovers_exact_generation_on_restart(
+    tmp_path: Path,
+) -> None:
+    request, archive, exported = _seal(tmp_path / "fixture")
+    exported = replace(
+        exported,
+        remote_path="/run/dradar-checkpoint-v2/x/sealed/export.tar.gz",
+    )
+    storage_home = tmp_path / "host"
+    storage_home.mkdir(mode=0o700)
+    storage_home.chmod(0o700)
+    store = storage_home / "checkpoints"
+    context = multiprocessing.get_context("spawn")
+    crash_reached = context.Event()
+    process = context.Process(
+        target=_crash_publication_before_current_process,
+        args=(str(archive), str(store), request, exported, crash_reached),
+    )
+    try:
+        process.start()
+        assert crash_reached.wait(timeout=30)
+        process.join(timeout=30)
+        assert not process.is_alive()
+        assert process.exitcode == 93
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+
+    checkpoint_root = store / request.checkpoint_id
+    generation = (
+        checkpoint_root / "generations" /
+        "generation-00000000000000000001"
+    )
+    assert generation.is_dir()
+    assert not (checkpoint_root / "CURRENT").exists()
+    crash_evidence = list(checkpoint_root.glob(".CURRENT.*.part"))
+    assert len(crash_evidence) == 1
+
+    recovered = publish_checkpoint_export_v2(
+        archive, store, request, exported, authoritative=True,
+    )
+    assert recovered.root == generation
+    assert recovered.capture_id == request.capture_id
+    assert recovered.selected is True
+    assert load_exact_published_checkpoint_v2(
+        storage_home,
+        checkpoint_id=request.checkpoint_id,
+        checkpoint_lineage_id=request.checkpoint_lineage_id,
+        snapshot_generation=request.snapshot_generation,
+        capture_id=request.capture_id,
+        manifest_sha256=exported.manifest_sha256,
+        expected_identity_fingerprint=request.identity_fingerprint,
+        expected_checkpoint_core_abi=runtime.CHECKPOINT_CORE_ABI_V2,
+        expected_checkpoint_abi=request.checkpoint_abi,
+        expected_recovery_capability=request.recovery_capability,
+        expected_native_state_schema=request.native_state_schema,
+    ).root == generation
+    assert json.loads(
+        (checkpoint_root / "CURRENT").read_text(encoding="utf-8")
+    )["generation"] == 1
+    assert crash_evidence[0].is_file()
+    assert not list(checkpoint_root.glob(".incoming-*.part"))
 
 
 def test_publication_retries_after_crash_between_generation_and_current(
