@@ -28,6 +28,7 @@ from . import (
     image_cache, pending, refill as refill_plan,
 )
 from .api_client import ApiClient, ApiError
+from .checkpoint_observation_v2 import checkpoint_mainline_assignment_digest_v2
 from .checkpoint_v2 import CheckpointV2OrdinaryFallback
 from .identity import _client
 from .local_config import (
@@ -2585,6 +2586,106 @@ def _resume_checkpoint_with_ambiguous_replay(
     raise AssertionError("unreachable")
 
 
+def _complete_checkpoint_mainline_impact(
+    telemetry: RunnerTelemetry | None,
+    assignment: dict,
+    art,
+    *,
+    outcome: str,
+    upload_outcome: str,
+) -> bool:
+    """Settle optional impact evidence after submission or durable handoff."""
+
+    sample_id = getattr(art, "checkpoint_impact_sample_id", None)
+    complete = getattr(
+        telemetry, "complete_checkpoint_mainline_impact", None,
+    ) if telemetry is not None else None
+    if not isinstance(sample_id, str) or not callable(complete):
+        return False
+    acknowledged = upload_outcome in {
+        "submitted", "interrupted", "submitted-retention-pending",
+    }
+    try:
+        pending_preserved = any(
+            entry.get("assignment_id") == assignment.get("assignment_id")
+            for entry in pending.load(HOME)
+        )
+    except Exception:
+        pending_preserved = False
+    preserved = acknowledged or pending_preserved
+    comparable = preserved or upload_outcome not in {
+        "not-uploaded", "rejected", "provider-preflight-failed",
+    }
+    try:
+        assignment_digest = checkpoint_mainline_assignment_digest_v2(assignment)
+    except Exception:
+        return False
+    mainline_elapsed_ms = max(
+        1, min(7 * 24 * 60 * 60 * 1000, int(float(art.duration_sec) * 1000)),
+    )
+    sync_elapsed = getattr(art, "checkpoint_sync_elapsed_ms", 0)
+    if (
+        not isinstance(sync_elapsed, int)
+        or isinstance(sync_elapsed, bool)
+        or sync_elapsed < 0
+    ):
+        sync_elapsed = 0
+    return bool(complete(sample_id, {
+        "mainline_elapsed_ms": mainline_elapsed_ms,
+        "checkpoint_sync_elapsed_ms": min(
+            sync_elapsed, 7 * 24 * 60 * 60 * 1000,
+        ),
+        "outcome": outcome,
+        "result_preserved": preserved,
+        "assignment_state_sha256_after": assignment_digest,
+        "submission_preserved": preserved,
+        "comparable": comparable,
+        "exclusion_reason": (
+            None if comparable else "ordinary-result-not-submittable"
+        ),
+    }))
+
+
+@dataclass(frozen=True)
+class _CheckpointMainlineImpactArtifact:
+    checkpoint_impact_sample_id: str
+    checkpoint_sync_elapsed_ms: int
+    duration_sec: float
+
+
+def _complete_checkpoint_mainline_without_result(
+    telemetry: RunnerTelemetry | None,
+    assignment: dict,
+    controller: object | None,
+) -> bool:
+    """Settle a handled, non-submittable attempt without hiding a hard crash."""
+
+    sample_id = getattr(controller, "impact_sample_id", None)
+    elapsed_ms = getattr(controller, "mainline_elapsed_ms", 0)
+    sync_elapsed_ms = getattr(controller, "checkpoint_sync_elapsed_ms", 0)
+    if (
+        not isinstance(sample_id, str)
+        or not isinstance(elapsed_ms, int)
+        or isinstance(elapsed_ms, bool)
+        or elapsed_ms <= 0
+        or not isinstance(sync_elapsed_ms, int)
+        or isinstance(sync_elapsed_ms, bool)
+        or sync_elapsed_ms < 0
+    ):
+        return False
+    return _complete_checkpoint_mainline_impact(
+        telemetry,
+        assignment,
+        _CheckpointMainlineImpactArtifact(
+            checkpoint_impact_sample_id=sample_id,
+            checkpoint_sync_elapsed_ms=sync_elapsed_ms,
+            duration_sec=elapsed_ms / 1000,
+        ),
+        outcome="interrupted",
+        upload_outcome="not-uploaded",
+    )
+
+
 def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                     args, local_commit: str | None,
                     telemetry: RunnerTelemetry | None = None,
@@ -2729,6 +2830,7 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         _mark_stopped_quietly(client, assignment)
         return "task-content-mismatch"
     checkpoint_shadow_factory = None
+    checkpoint_shadow_holder: dict[str, object] = {}
     checkpoint_owner_factory = None
     checkpoint_owner_holder: dict[str, object] = {}
     local_checkpoint_v2_mode = os.environ.get(
@@ -2812,7 +2914,7 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             return "checkpoint-reader-blocked"
         elif activation is not None and activation.capture_enabled and telemetry:
             def checkpoint_shadow_factory(effective_assignment, job_root):
-                return build_live_checkpoint_shadow_v2(
+                controller = build_live_checkpoint_shadow_v2(
                     assignment=assignment,
                     effective_assignment=effective_assignment,
                     local_mode=local_checkpoint_v2_mode,
@@ -2821,6 +2923,9 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                     home=HOME,
                     job_root=job_root,
                 )
+                if controller is not None:
+                    checkpoint_shadow_holder["controller"] = controller
+                return controller
     if checkpoint_protocol == 2 and checkpoint_owner_factory is None:
         print(
             "refusing to start: this checkpoint V2 assignment requires an "
@@ -2848,6 +2953,11 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             )
             break
         except CheckpointV2OrdinaryFallback as exc:
+            _complete_checkpoint_mainline_without_result(
+                telemetry,
+                assignment,
+                checkpoint_shadow_holder.pop("controller", None),
+            )
             owner = checkpoint_owner_holder.get("owner")
             if (
                 fallback_used
@@ -2878,7 +2988,10 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             def checkpoint_shadow_factory(
                 _effective_assignment, _job_root,
             ):
-                return fallback_owner.build_ordinary_fallback_shadow()
+                controller = fallback_owner.build_ordinary_fallback_shadow()
+                if controller is not None:
+                    checkpoint_shadow_holder["controller"] = controller
+                return controller
 
             fallback_used = True
             if exc.reason == "operator_disable":
@@ -2895,6 +3008,11 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                 )
             continue
         except BuildFlakeError as exc:
+            _complete_checkpoint_mainline_without_result(
+                telemetry,
+                assignment,
+                checkpoint_shadow_holder.pop("controller", None),
+            )
             build_flake_failures += 1
             owner = checkpoint_owner_holder.get("owner")
             if owner is not None and owner.permit is not None:
@@ -2933,6 +3051,11 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                 )
             return "environment-build-failed"
         except CheckpointV2PaidGateFaultedError as exc:
+            _complete_checkpoint_mainline_without_result(
+                telemetry,
+                assignment,
+                checkpoint_shadow_holder.pop("controller", None),
+            )
             refill_plan.open_circuit(
                 HOME, assignment, "checkpoint_reconcile_ambiguous",
             )
@@ -2943,6 +3066,11 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             )
             return "checkpoint-v2-faulted"
         except RunnerError as exc:
+            _complete_checkpoint_mainline_without_result(
+                telemetry,
+                assignment,
+                checkpoint_shadow_holder.pop("controller", None),
+            )
             owner = checkpoint_owner_holder.get("owner")
             if owner is not None and owner.permit is not None:
                 try:
@@ -2983,6 +3111,11 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             )
             return terminal_outcome or "failed"
         except (KeyboardInterrupt, EOFError):
+            _complete_checkpoint_mainline_without_result(
+                telemetry,
+                assignment,
+                checkpoint_shadow_holder.pop("controller", None),
+            )
             owner = checkpoint_owner_holder.get("owner")
             if owner is not None and owner.permit is not None:
                 try:
@@ -3033,6 +3166,14 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                     "  checkout cleanup was not confirmed; this worker is still "
                     "stopping and will not take another task."
                 )
+            _complete_checkpoint_mainline_impact(
+                telemetry,
+                assignment,
+                art,
+                outcome="interrupted",
+                upload_outcome="provider-preflight-failed",
+            )
+            checkpoint_shadow_holder.pop("controller", None)
             return "provider-preflight-failed"
 
     # Make the authoritative source copy immediately after Pier returns,
@@ -3116,10 +3257,26 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                 f"trial stopped by {saved.family}; local evidence was kept "
                 "and automatic refill was faulted"
             )
+            _complete_checkpoint_mainline_impact(
+                telemetry,
+                assignment,
+                art,
+                outcome="interrupted",
+                upload_outcome="not-uploaded",
+            )
+            checkpoint_shadow_holder.pop("controller", None)
             return saved.family.replace("_", "-")
         if saved is not None:
             print(f"trial interrupted; checkpoint {saved.checkpoint_id} was kept — "
                   "the next `dradar resume` continues instead of submitting a partial run")
+            _complete_checkpoint_mainline_impact(
+                telemetry,
+                assignment,
+                art,
+                outcome="interrupted",
+                upload_outcome="not-uploaded",
+            )
+            checkpoint_shadow_holder.pop("controller", None)
             return terminal_outcome or "paused"
     outcome = "interrupted" if interrupted else "completed"
     if telemetry:
@@ -3274,6 +3431,14 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         and not getattr(args, "yes", False)
         and not getattr(args, "parallel", False)
     ), checkpoint_v2_owner=art.checkpoint_v2_owner)
+    _complete_checkpoint_mainline_impact(
+        telemetry,
+        assignment,
+        art,
+        outcome=outcome,
+        upload_outcome=upload_outcome,
+    )
+    checkpoint_shadow_holder.pop("controller", None)
     circuit_opened = _observe_repeat_failure(
         assignment,
         repeat_failure,

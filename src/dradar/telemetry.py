@@ -170,6 +170,37 @@ class RunnerTelemetry:
         except Exception:
             return False
 
+    def begin_checkpoint_mainline_impact(self, payload: dict) -> str | None:
+        """Open one crash-visible ordinary-run/shadow pair off the paid path."""
+
+        with self._lock:
+            reporter = self._checkpoint_observation_reporter
+            session_id = self.session_id
+        if reporter is None:
+            return None
+        materialized = dict(payload)
+        materialized["runner_session_id"] = session_id
+        try:
+            return reporter.begin_mainline_impact(materialized)
+        except Exception:
+            return None
+
+    def complete_checkpoint_mainline_impact(
+        self,
+        sample_id: str,
+        payload: dict,
+    ) -> bool:
+        """Finish a local pair after result handoff; evidence failure is inert."""
+
+        with self._lock:
+            reporter = self._checkpoint_observation_reporter
+        if reporter is None:
+            return False
+        try:
+            return reporter.complete_mainline_impact(sample_id, dict(payload))
+        except Exception:
+            return False
+
     def _show_notices(self, response: dict) -> None:
         """Print each bounded server notice at most once per runner process."""
         notices = response.get("notices")

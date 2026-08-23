@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import queue
 import re
@@ -36,6 +37,7 @@ from .api_client import ApiError
 OBSERVATION_SPOOL_SCHEMA_V2 = "dradar-checkpoint-v2-observation-spool-v1"
 COHORT_REGISTRY_SCHEMA_V2 = "dradar-checkpoint-v2-cohort-registration-v1"
 DELIVERY_HEALTH_SCHEMA_V2 = "dradar-checkpoint-v2-delivery-health-v1"
+MAINLINE_IMPACT_SCHEMA_V2 = "dradar-checkpoint-v2-mainline-impact-v1"
 LOCAL_EVIDENCE_SCHEMA_V2 = "dradar-checkpoint-v2-local-evidence-v1"
 EVIDENCE_ATTESTATION_SCHEMA_V2 = (
     "dradar-checkpoint-v2-evidence-attestation-v1"
@@ -133,6 +135,15 @@ CHECKPOINT_COHORT_FIELDS_V2 = (
 _DELIVERY_FIELDS = (
     "persisted", "acknowledged", "retryable", "rejected", "dropped",
 )
+_MAINLINE_ASSIGNMENT_FIELDS = (
+    "assignment_id",
+    "checkpoint_protocol_version",
+    "checkpoint_id",
+    "execution_state",
+    "owner_epoch",
+    "resume_generation",
+)
+_MAINLINE_OUTCOMES = frozenset({"completed", "interrupted"})
 
 
 class CheckpointObservationSpoolError(RuntimeError):
@@ -237,6 +248,191 @@ def _canonical_record(payload: dict[str, Any]) -> bytes:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def checkpoint_mainline_assignment_digest_v2(
+    assignment: dict[str, Any],
+) -> str:
+    """Hash only checkpoint authority fields; never persist task/user data."""
+
+    if not isinstance(assignment, dict):
+        raise CheckpointObservationSpoolError(
+            "checkpoint mainline assignment snapshot is invalid",
+        )
+    assignment_id = assignment.get("assignment_id")
+    if (
+        not isinstance(assignment_id, str)
+        or _IDENTIFIER_RE.fullmatch(assignment_id) is None
+    ):
+        raise CheckpointObservationSpoolError(
+            "checkpoint mainline assignment identity is invalid",
+        )
+    snapshot = {field: assignment.get(field) for field in _MAINLINE_ASSIGNMENT_FIELDS}
+    for field, value in snapshot.items():
+        if value is not None and not isinstance(value, (str, int)):
+            raise CheckpointObservationSpoolError(
+                f"checkpoint mainline assignment {field} is invalid",
+            )
+        if isinstance(value, bool):
+            raise CheckpointObservationSpoolError(
+                f"checkpoint mainline assignment {field} is invalid",
+            )
+        if isinstance(value, str) and (
+            len(value) > 200 or "\x00" in value or "\r" in value or "\n" in value
+        ):
+            raise CheckpointObservationSpoolError(
+                f"checkpoint mainline assignment {field} is invalid",
+            )
+    encoded = json.dumps(
+        snapshot,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _mainline_sample_id(
+    assignment_id: str,
+    runner_session_id: str,
+    identity_fingerprint: str,
+    attempt_id: str,
+) -> str:
+    encoded = (
+        f"dradar-checkpoint-v2-mainline:{assignment_id}:"
+        f"{runner_session_id}:{identity_fingerprint}:{attempt_id}"
+    ).encode("ascii")
+    return f"impact-{hashlib.sha256(encoded).hexdigest()[:48]}"
+
+
+def _canonical_mainline_impact(value: dict[str, Any]) -> bytes:
+    common = {
+        "schema", "sample_id", "assignment_id", "runner_session_id",
+        "identity_fingerprint", "attempt_id", "started_at", "state",
+        "assignment_state_sha256",
+    }
+    state = value.get("state") if isinstance(value, dict) else None
+    completed = {
+        "completed_at", "mainline_elapsed_ms", "checkpoint_sync_elapsed_ms",
+        "outcome", "result_preserved", "assignment_state_sha256_after",
+        "submission_preserved", "comparable", "exclusion_reason",
+    }
+    expected = common if state == "started" else common | completed
+    if (
+        not isinstance(value, dict)
+        or state not in {"started", "completed"}
+        or set(value) != expected
+        or value.get("schema") != MAINLINE_IMPACT_SCHEMA_V2
+    ):
+        raise CheckpointObservationSpoolError(
+            "checkpoint mainline impact fields are invalid",
+        )
+    for field in (
+        "sample_id", "assignment_id", "runner_session_id", "attempt_id",
+    ):
+        item = value[field]
+        if not isinstance(item, str) or _IDENTIFIER_RE.fullmatch(item) is None:
+            raise CheckpointObservationSpoolError(
+                "checkpoint mainline impact identity is invalid",
+            )
+    for field in ("identity_fingerprint", "assignment_state_sha256"):
+        item = value[field]
+        if (
+            not isinstance(item, str)
+            or len(item) != 64
+            or any(ch not in "0123456789abcdef" for ch in item)
+        ):
+            raise CheckpointObservationSpoolError(
+                "checkpoint mainline impact digest is invalid",
+            )
+    if value["sample_id"] != _mainline_sample_id(
+        value["assignment_id"],
+        value["runner_session_id"],
+        value["identity_fingerprint"],
+        value["attempt_id"],
+    ):
+        raise CheckpointObservationSpoolError(
+            "checkpoint mainline impact sample identity is invalid",
+        )
+    try:
+        started_at = datetime.fromisoformat(value["started_at"])
+    except (TypeError, ValueError) as exc:
+        raise CheckpointObservationSpoolError(
+            "checkpoint mainline impact timestamp is invalid",
+        ) from exc
+    if started_at.tzinfo is None:
+        raise CheckpointObservationSpoolError(
+            "checkpoint mainline impact timestamp is invalid",
+        )
+    if state == "completed":
+        after = value["assignment_state_sha256_after"]
+        if (
+            not isinstance(after, str)
+            or len(after) != 64
+            or any(ch not in "0123456789abcdef" for ch in after)
+        ):
+            raise CheckpointObservationSpoolError(
+                "checkpoint mainline impact digest is invalid",
+            )
+        try:
+            completed_at = datetime.fromisoformat(value["completed_at"])
+        except (TypeError, ValueError) as exc:
+            raise CheckpointObservationSpoolError(
+                "checkpoint mainline impact timestamp is invalid",
+            ) from exc
+        if completed_at.tzinfo is None or completed_at < started_at:
+            raise CheckpointObservationSpoolError(
+                "checkpoint mainline impact timestamp is invalid",
+            )
+        for field in ("mainline_elapsed_ms", "checkpoint_sync_elapsed_ms"):
+            metric = value[field]
+            if (
+                not isinstance(metric, int)
+                or isinstance(metric, bool)
+                or not 0 <= metric <= 7 * 24 * 60 * 60 * 1000
+            ):
+                raise CheckpointObservationSpoolError(
+                    "checkpoint mainline impact duration is invalid",
+                )
+        if value["mainline_elapsed_ms"] <= 0:
+            raise CheckpointObservationSpoolError(
+                "checkpoint mainline impact duration is invalid",
+            )
+        if value["outcome"] not in _MAINLINE_OUTCOMES or any(
+            not isinstance(value[field], bool)
+            for field in (
+                "result_preserved", "submission_preserved", "comparable",
+            )
+        ):
+            raise CheckpointObservationSpoolError(
+                "checkpoint mainline impact result is invalid",
+            )
+        exclusion_reason = value["exclusion_reason"]
+        if (
+            value["comparable"] is True and exclusion_reason is not None
+        ) or (
+            value["comparable"] is False
+            and (
+                not isinstance(exclusion_reason, str)
+                or _IDENTIFIER_RE.fullmatch(exclusion_reason) is None
+            )
+        ):
+            raise CheckpointObservationSpoolError(
+                "checkpoint mainline impact exclusion is invalid",
+            )
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("ascii")
+    if len(encoded) > MAX_OBSERVATION_RECORD_BYTES_V2:
+        raise CheckpointObservationSpoolError(
+            "checkpoint mainline impact record is too large",
+        )
+    return encoded
 
 
 def _canonical_cohort_registration(value: dict[str, Any]) -> bytes:
@@ -452,6 +648,71 @@ def _process_lock(root: Path) -> Iterator[None]:
             except OSError:
                 pass
         else:
+            try:
+                import fcntl
+
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            except (ImportError, OSError):
+                pass
+        os.close(descriptor)
+
+
+@contextmanager
+def _try_process_lock(root: Path) -> Iterator[bool]:
+    """Try the shared evidence lock once; optional mainline work never waits."""
+
+    _private_directory(root, create=True)
+    path = root / ".lock"
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+    except OSError as exc:
+        raise CheckpointObservationSpoolError(
+            "checkpoint observation spool lock failed",
+        ) from exc
+    windows_lock = False
+    acquired = False
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise CheckpointObservationSpoolError(
+                "checkpoint observation spool lock is unsafe",
+            )
+        if metadata.st_size == 0:
+            os.write(descriptor, b"\0")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        try:
+            import fcntl
+
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except BlockingIOError:
+                acquired = False
+        except ImportError:  # pragma: no cover - exercised on Windows CI
+            import msvcrt
+
+            try:
+                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                windows_lock = True
+                acquired = True
+            except OSError:
+                acquired = False
+        yield acquired
+    finally:
+        if acquired and windows_lock:  # pragma: no cover - Windows CI
+            try:
+                import msvcrt
+
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+        elif acquired:
             try:
                 import fcntl
 
@@ -681,6 +942,7 @@ class CheckpointObservationSpoolV2:
         self.rejected_root = self.root / "rejected"
         self.cohort_root = self.root / "cohorts"
         self.delivery_health_root = self.root / "delivery-health"
+        self.mainline_impact_root = self.root / "mainline-impact"
         self.max_pending = max_pending
         self.max_pending_bytes = max_pending_bytes
         self.max_rejected = max_rejected
@@ -695,6 +957,141 @@ class CheckpointObservationSpoolV2:
         _private_directory(self.rejected_root, create=True)
         _private_directory(self.cohort_root, create=True)
         _private_directory(self.delivery_health_root, create=True)
+        _private_directory(self.mainline_impact_root, create=True)
+
+    def begin_mainline_impact(self, payload: dict[str, Any]) -> str:
+        """Crash-durably open one shadow/mainline pair without waiting on locks."""
+
+        value = dict(payload)
+        value.update({
+            "schema": MAINLINE_IMPACT_SCHEMA_V2,
+            "state": "started",
+        })
+        assignment_id = value.get("assignment_id")
+        session_id = value.get("runner_session_id")
+        fingerprint = value.get("identity_fingerprint")
+        attempt_id = value.get("attempt_id")
+        if not all(isinstance(item, str) for item in (
+            assignment_id, session_id, fingerprint, attempt_id,
+        )):
+            raise CheckpointObservationSpoolError(
+                "checkpoint mainline impact identity is invalid",
+            )
+        value["sample_id"] = _mainline_sample_id(
+            assignment_id, session_id, fingerprint, attempt_id,
+        )
+        value.setdefault("started_at", _now_iso())
+        encoded = _canonical_mainline_impact(value)
+        if not self._thread_lock.acquire(blocking=False):
+            raise CheckpointObservationSpoolError(
+                "checkpoint mainline impact spool is busy",
+            )
+        try:
+            with _try_process_lock(self.root) as acquired:
+                if not acquired:
+                    raise CheckpointObservationSpoolError(
+                        "checkpoint mainline impact spool is busy",
+                    )
+                self._prepare()
+                target = self.mainline_impact_root / f"{value['sample_id']}.json"
+                if target.exists() or target.is_symlink():
+                    existing, raw = _read_private_json(target)
+                    if (
+                        _canonical_mainline_impact(existing) == raw
+                        and all(
+                            existing.get(field) == value.get(field)
+                            for field in (
+                                "sample_id", "assignment_id", "runner_session_id",
+                                "identity_fingerprint", "attempt_id",
+                                "assignment_state_sha256",
+                            )
+                        )
+                    ):
+                        self._assert_total_capacity_unlocked(
+                            additional_files=0, additional_bytes=0,
+                        )
+                        return value["sample_id"]
+                    raise CheckpointObservationSpoolError(
+                        "checkpoint mainline impact sample conflicts",
+                    )
+                self._assert_total_capacity_unlocked(
+                    additional_files=1, additional_bytes=len(encoded),
+                )
+                _atomic_private_record(target, encoded)
+                return value["sample_id"]
+        finally:
+            self._thread_lock.release()
+
+    def complete_mainline_impact(
+        self,
+        sample_id: str,
+        payload: dict[str, Any],
+    ) -> bool:
+        """Complete one exact pair; crashes leave the start marker visible."""
+
+        if not isinstance(sample_id, str) or _IDENTIFIER_RE.fullmatch(sample_id) is None:
+            raise CheckpointObservationSpoolError(
+                "checkpoint mainline impact sample identity is invalid",
+            )
+        completion_fields = {
+            "mainline_elapsed_ms", "checkpoint_sync_elapsed_ms", "outcome",
+            "result_preserved", "assignment_state_sha256_after",
+            "submission_preserved", "comparable", "exclusion_reason",
+        }
+        payload_fields = frozenset(payload) if isinstance(payload, dict) else None
+        if (
+            not isinstance(payload, dict)
+            or payload_fields not in {
+                frozenset(completion_fields),
+                frozenset(completion_fields | {"completed_at"}),
+            }
+        ):
+            raise CheckpointObservationSpoolError(
+                "checkpoint mainline impact completion fields are invalid",
+            )
+        if not self._thread_lock.acquire(blocking=False):
+            raise CheckpointObservationSpoolError(
+                "checkpoint mainline impact spool is busy",
+            )
+        try:
+            with _try_process_lock(self.root) as acquired:
+                if not acquired:
+                    raise CheckpointObservationSpoolError(
+                        "checkpoint mainline impact spool is busy",
+                    )
+                self._prepare()
+                target = self.mainline_impact_root / f"{sample_id}.json"
+                existing, raw = _read_private_json(target)
+                if _canonical_mainline_impact(existing) != raw:
+                    raise CheckpointObservationSpoolError(
+                        "checkpoint mainline impact sample changed",
+                    )
+                completed = {
+                    **existing,
+                    **dict(payload),
+                    "schema": MAINLINE_IMPACT_SCHEMA_V2,
+                    "sample_id": sample_id,
+                    "state": "completed",
+                }
+                completed.setdefault("completed_at", _now_iso())
+                encoded = _canonical_mainline_impact(completed)
+                if existing.get("state") == "completed":
+                    if raw == encoded:
+                        self._assert_total_capacity_unlocked(
+                            additional_files=0, additional_bytes=0,
+                        )
+                        return False
+                    raise CheckpointObservationSpoolError(
+                        "checkpoint mainline impact completion conflicts",
+                    )
+                self._assert_total_capacity_unlocked(
+                    additional_files=0,
+                    additional_bytes=max(0, len(encoded) - len(raw)),
+                )
+                _atomic_private_record(target, encoded)
+                return True
+        finally:
+            self._thread_lock.release()
 
     def register_cohort(self, payload: dict[str, Any]) -> bool:
         """Persist one exact finalized runtime/session tuple for local audit."""
@@ -1147,6 +1544,27 @@ class CheckpointObservationReporterV2:
             self._wake.set()
             return False
 
+    def begin_mainline_impact(self, payload: dict[str, Any]) -> str | None:
+        """Open a crash marker off the paid thread after cohort registration."""
+
+        try:
+            return self.spool.begin_mainline_impact(payload)
+        except Exception:
+            return None
+
+    def complete_mainline_impact(
+        self,
+        sample_id: str,
+        payload: dict[str, Any],
+    ) -> bool:
+        """Finish a pair without ever delaying on the shared evidence lock."""
+
+        try:
+            self.spool.complete_mainline_impact(sample_id, payload)
+            return True
+        except Exception:
+            return False
+
     @property
     def stats(self) -> ObservationDeliveryResultV2:
         with self._stats_lock:
@@ -1469,11 +1887,45 @@ def checkpoint_local_evidence_v2(
     pending_root = root / "pending"
     rejected_root = root / "rejected"
     health_root = root / "delivery-health"
+    impact_root = root / "mainline-impact"
     for path in (cohort_root, pending_root, rejected_root, health_root):
         if not path.exists():
             raise CheckpointObservationSpoolError(
                 "checkpoint local evidence is incomplete",
             )
+    allowed_root_entries = {
+        ".lock", "cohorts", "pending", "rejected", "delivery-health",
+        "mainline-impact",
+    }
+    scan_errors = 0
+    for item in root.iterdir():
+        if item.name not in allowed_root_entries:
+            scan_errors += 1
+            continue
+        if item.name == ".lock":
+            try:
+                metadata = item.lstat()
+                if (
+                    item.is_symlink()
+                    or not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_nlink != 1
+                    or hasattr(os, "getuid") and (
+                        metadata.st_uid != os.getuid()
+                        or stat.S_IMODE(metadata.st_mode) != 0o600
+                    )
+                ):
+                    scan_errors += 1
+            except OSError:
+                scan_errors += 1
+    for directory in (
+        cohort_root, pending_root, rejected_root, health_root, impact_root,
+    ):
+        if not directory.exists() and not directory.is_symlink():
+            continue
+        _private_directory(directory, create=False)
+        scan_errors += sum(
+            item.name.startswith(".") for item in directory.iterdir()
+        )
 
     registrations: list[tuple[dict[str, Any], str]] = []
     for path in _private_json_files(cohort_root):
@@ -1506,10 +1958,30 @@ def checkpoint_local_evidence_v2(
             )
         health[assignment_id] = (value, hashlib.sha256(encoded).hexdigest())
 
+    impact_records: list[tuple[dict[str, Any], str]] = []
+    if impact_root.exists() or impact_root.is_symlink():
+        _private_directory(impact_root, create=False)
+        for path in _private_json_files(impact_root):
+            value, encoded = _read_private_json(path)
+            if _canonical_mainline_impact(value) != encoded:
+                raise CheckpointObservationSpoolError(
+                    "checkpoint mainline impact sample changed",
+                )
+            if path.stem != value["sample_id"]:
+                raise CheckpointObservationSpoolError(
+                    "checkpoint mainline impact sample identity changed",
+                )
+            impact_records.append((
+                value, hashlib.sha256(encoded).hexdigest(),
+            ))
+
     groups: dict[tuple[str, ...], list[tuple[dict[str, Any], str]]] = {}
     assignment_ids: set[str] = set()
     assignment_cohorts: dict[str, tuple[str, ...]] = {}
     assignment_fingerprints: dict[str, str] = {}
+    session_registrations: dict[
+        tuple[str, str], tuple[tuple[str, ...], str, str, datetime]
+    ] = {}
     for registration in registrations:
         value = registration[0]
         key = tuple(
@@ -1533,12 +2005,59 @@ def checkpoint_local_evidence_v2(
             )
         assignment_cohorts[assignment_id] = key
         assignment_fingerprints[assignment_id] = fingerprint
+        session_key = (assignment_id, value["runner_session_id"])
+        current_session = session_registrations.get(session_key)
+        session_value = (
+            key,
+            fingerprint,
+            registration[1],
+            datetime.fromisoformat(value["registered_at"]).astimezone(
+                timezone.utc,
+            ),
+        )
+        if current_session is not None and current_session != session_value:
+            raise CheckpointObservationSpoolError(
+                "checkpoint runner session cohort registration drifted",
+            )
+        session_registrations[session_key] = session_value
         groups.setdefault(key, []).append(registration)
         assignment_ids.add(assignment_id)
     unregistered_records = sum(
         payload.get("assignment_id") not in assignment_ids
         for _, payload, _ in observation_records
     ) + sum(assignment_id not in assignment_ids for assignment_id in health)
+    impact_groups: dict[
+        tuple[str, ...], list[tuple[dict[str, Any], str, str]]
+    ] = {}
+    for sample, digest in impact_records:
+        registration = session_registrations.get((
+            sample["assignment_id"], sample["runner_session_id"],
+        ))
+        if (
+            registration is None
+            or registration[1] != sample["identity_fingerprint"]
+        ):
+            unregistered_records += 1
+            continue
+        sample_started = datetime.fromisoformat(sample["started_at"]).astimezone(
+            timezone.utc,
+        )
+        if sample_started < registration[3] or sample_started > instant:
+            raise CheckpointObservationSpoolError(
+                "checkpoint mainline impact sample time is invalid",
+            )
+        if (
+            sample["state"] == "completed"
+            and datetime.fromisoformat(sample["completed_at"]).astimezone(
+                timezone.utc,
+            ) > instant
+        ):
+            raise CheckpointObservationSpoolError(
+                "checkpoint mainline impact sample time is invalid",
+            )
+        impact_groups.setdefault(registration[0], []).append((
+            sample, digest, registration[2],
+        ))
 
     attestations: list[dict[str, Any]] = []
     for key in sorted(groups):
@@ -1633,12 +2152,67 @@ def checkpoint_local_evidence_v2(
                 "cleanup_residue": cleanup_residue,
             },
         })
+    for key in sorted(impact_groups):
+        samples = impact_groups[key]
+        cohort = dict(zip(CHECKPOINT_COHORT_FIELDS_V2, key, strict=True))
+        settled = [
+            sample for sample, _, _ in samples if sample["state"] == "completed"
+        ]
+        completed = [sample for sample in settled if sample["comparable"]]
+        ratios = sorted(
+            sample["checkpoint_sync_elapsed_ms"] / sample["mainline_elapsed_ms"]
+            for sample in completed
+        )
+        p95_ratio = (
+            ratios[max(0, math.ceil(0.95 * len(ratios)) - 1)]
+            if ratios else 0.0
+        )
+        source = {
+            "cohort": cohort,
+            "sample_digests": sorted(digest for _, digest, _ in samples),
+            "registration_digests": sorted({
+                registration_digest for _, _, registration_digest in samples
+            }),
+        }
+        artifact = hashlib.sha256(json.dumps(
+            source, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+            allow_nan=False,
+        ).encode("ascii")).hexdigest()
+        attestations.append({
+            "schema": EVIDENCE_ATTESTATION_SCHEMA_V2,
+            "attestation_id": f"local-impact-{artifact[:40]}",
+            "kind": "mainline_impact",
+            "cohort": cohort,
+            "observed_from": min(
+                datetime.fromisoformat(sample["started_at"])
+                for sample, _, _ in samples
+            ).astimezone(timezone.utc).replace(microsecond=0).isoformat(),
+            "observed_until": instant.replace(microsecond=0).isoformat(),
+            "artifact_sha256": artifact,
+            "metrics": {
+                "paired_samples": len(completed),
+                "incomplete_samples": len(samples) - len(settled),
+                "excluded_samples": len(settled) - len(completed),
+                "p95_added_latency_ratio": round(p95_ratio, 6),
+                "result_mismatches": sum(
+                    not sample["result_preserved"] for sample in completed
+                ),
+                "assignment_mutations": sum(
+                    sample["assignment_state_sha256_after"]
+                    != sample["assignment_state_sha256"]
+                    for sample in completed
+                ),
+                "submission_losses": sum(
+                    not sample["submission_preserved"] for sample in completed
+                ),
+            },
+        })
     return {
         "schema": LOCAL_EVIDENCE_SCHEMA_V2,
         "generated_at": instant.replace(microsecond=0).isoformat(),
         "attestations": attestations,
         "unregistered_records": unregistered_records,
-        "scan_errors": 0,
+        "scan_errors": scan_errors,
     }
 
 
@@ -1669,8 +2243,10 @@ __all__ = [
     "MAX_PENDING_OBSERVATION_BYTES_V2",
     "MAX_REJECTED_OBSERVATIONS_V2",
     "MAX_REJECTED_OBSERVATION_BYTES_V2",
+    "MAINLINE_IMPACT_SCHEMA_V2",
     "OBSERVATION_SPOOL_SCHEMA_V2",
     "ObservationDeliveryResultV2",
+    "checkpoint_mainline_assignment_digest_v2",
     "checkpoint_local_evidence_v2",
     "cmd_checkpoint_audit",
 ]

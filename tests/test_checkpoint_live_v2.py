@@ -87,6 +87,7 @@ class _Coordinator:
         self.started = threading.Event()
         self.stopped = threading.Event()
         self.released = threading.Event()
+        self.impact_sample_id = "impact-" + "1" * 48
 
     async def run(self, mainline, **_kwargs):
         self.started.set()
@@ -109,6 +110,9 @@ def test_live_controller_has_a_bounded_non_authoritative_lifetime() -> None:
     controller.close(timeout=1)
     assert coordinator.stopped.wait(1)
     assert coordinator.released.wait(1)
+    assert controller.impact_sample_id == coordinator.impact_sample_id
+    assert controller.checkpoint_sync_elapsed_ms >= 0
+    assert controller.mainline_elapsed_ms >= 1
 
 
 def test_live_controller_swallows_shadow_exception() -> None:

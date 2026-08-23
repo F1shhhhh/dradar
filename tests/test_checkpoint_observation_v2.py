@@ -15,6 +15,7 @@ from dradar.checkpoint_observation_v2 import (
     CheckpointObservationSpoolV2,
     ObservationDeliveryResultV2,
     checkpoint_local_evidence_v2,
+    checkpoint_mainline_assignment_digest_v2,
 )
 
 
@@ -186,6 +187,40 @@ def _cohort_registration():
             "checkpoint_core_abi": "dradar-checkpoint-core-v2/1",
             "checkpoint_abi": "codex-openai/v1",
         },
+    }
+
+
+def _mainline_start():
+    return {
+        "assignment_id": "assignment-0001",
+        "runner_session_id": "session-0001",
+        "identity_fingerprint": "a" * 64,
+        "attempt_id": "attempt-0001",
+        "assignment_state_sha256": checkpoint_mainline_assignment_digest_v2({
+            "assignment_id": "assignment-0001",
+            "checkpoint_protocol_version": 1,
+            "checkpoint_id": None,
+            "execution_state": "running",
+            "owner_epoch": 0,
+            "resume_generation": 0,
+        }),
+        "started_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+    }
+
+
+def _mainline_completion(start):
+    return {
+        "completed_at": (
+            datetime.fromisoformat(start["started_at"]) + timedelta(seconds=10)
+        ).isoformat(),
+        "mainline_elapsed_ms": 10_000,
+        "checkpoint_sync_elapsed_ms": 25,
+        "outcome": "completed",
+        "result_preserved": True,
+        "assignment_state_sha256_after": start["assignment_state_sha256"],
+        "submission_preserved": True,
+        "comparable": True,
+        "exclusion_reason": None,
     }
 
 
@@ -710,6 +745,183 @@ def test_reporter_treats_exact_cohort_replay_as_durably_registered(tmp_path):
     assert reporter.register_cohort(registration) is True
     assert reporter.register_cohort(registration) is True
     assert len(list(reporter.spool.cohort_root.glob("*.json"))) == 1
+
+
+def test_mainline_impact_pair_is_private_idempotent_and_conflict_safe(tmp_path):
+    spool = CheckpointObservationSpoolV2(tmp_path / "observations")
+    start = _mainline_start()
+
+    sample_id = spool.begin_mainline_impact(start)
+    assert spool.begin_mainline_impact(dict(start)) == sample_id
+    path = spool.mainline_impact_root / f"{sample_id}.json"
+    opened = json.loads(path.read_text())
+    assert opened["state"] == "started"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+    completion = _mainline_completion(start)
+    assert spool.complete_mainline_impact(sample_id, completion) is True
+    assert spool.complete_mainline_impact(sample_id, completion) is False
+    completed = json.loads(path.read_text())
+    assert completed["state"] == "completed"
+    assert completed["submission_preserved"] is True
+
+    with pytest.raises(CheckpointObservationSpoolError, match="conflicts"):
+        spool.complete_mainline_impact(
+            sample_id, dict(completion, submission_preserved=False),
+        )
+    assert json.loads(path.read_text()) == completed
+
+    with pytest.raises(CheckpointObservationSpoolError, match="fields"):
+        spool.complete_mainline_impact(
+            sample_id, dict(completion, assignment_id="assignment-evil"),
+        )
+    assert json.loads(path.read_text()) == completed
+
+
+def test_mainline_impact_attempts_are_distinct_and_share_the_global_cap(tmp_path):
+    spool = CheckpointObservationSpoolV2(
+        tmp_path / "observations",
+        max_total_files=3,
+    )
+    assert spool.register_cohort(_cohort_registration()) is True
+    first = _mainline_start()
+    first_id = spool.begin_mainline_impact(first)
+
+    # The lock, cohort and first impact record exactly fill the global file
+    # budget. Exact replay and completion remain possible at the cap.
+    assert spool.begin_mainline_impact(dict(first)) == first_id
+    completion = _mainline_completion(first)
+    assert spool.complete_mainline_impact(first_id, completion) is True
+    assert spool.complete_mainline_impact(first_id, completion) is False
+
+    second = dict(first, attempt_id="attempt-0002")
+    with pytest.raises(CheckpointObservationSpoolError, match="total spool is full"):
+        spool.begin_mainline_impact(second)
+
+
+def test_mainline_impact_completion_without_start_and_lock_contention_fail_open(
+    tmp_path,
+):
+    spool = CheckpointObservationSpoolV2(tmp_path / "observations")
+    start = _mainline_start()
+    sample_id = "impact-" + "1" * 48
+    with pytest.raises((CheckpointObservationSpoolError, FileNotFoundError)):
+        spool.complete_mainline_impact(sample_id, _mainline_completion(start))
+
+    spool._thread_lock.acquire()
+    try:
+        started = time.monotonic()
+        with pytest.raises(CheckpointObservationSpoolError, match="busy"):
+            spool.begin_mainline_impact(start)
+        assert time.monotonic() - started < 0.1
+    finally:
+        spool._thread_lock.release()
+
+
+def test_local_evidence_emits_content_bound_mainline_impact_attestation(tmp_path):
+    reporter = CheckpointObservationReporterV2(FakeObservationApi(), tmp_path)
+    registration = _cohort_registration()
+    assert reporter.register_cohort(registration) is True
+    start = _mainline_start()
+    sample_id = reporter.begin_mainline_impact(start)
+    assert sample_id is not None
+    assert reporter.complete_mainline_impact(
+        sample_id, _mainline_completion(start),
+    ) is True
+
+    packet = checkpoint_local_evidence_v2(
+        tmp_path,
+        now=datetime.fromisoformat(start["started_at"]) + timedelta(seconds=20),
+    )
+    impacts = [
+        item for item in packet["attestations"]
+        if item["kind"] == "mainline_impact"
+    ]
+    assert len(impacts) == 1
+    assert impacts[0]["metrics"] == {
+        "paired_samples": 1,
+        "incomplete_samples": 0,
+        "excluded_samples": 0,
+        "p95_added_latency_ratio": 0.0025,
+        "result_mismatches": 0,
+        "assignment_mutations": 0,
+        "submission_losses": 0,
+    }
+    serialized = json.dumps(packet)
+    assert str(tmp_path) not in serialized
+    assert "assignment-0001" not in serialized
+
+
+def test_incomplete_or_unregistered_mainline_sample_cannot_look_healthy(tmp_path):
+    reporter = CheckpointObservationReporterV2(FakeObservationApi(), tmp_path)
+    assert reporter.register_cohort(_cohort_registration()) is True
+    sample_id = reporter.begin_mainline_impact(_mainline_start())
+    assert sample_id is not None
+
+    packet = checkpoint_local_evidence_v2(
+        tmp_path, now=datetime.now(timezone.utc) + timedelta(seconds=1),
+    )
+    impact = next(
+        item for item in packet["attestations"]
+        if item["kind"] == "mainline_impact"
+    )
+    assert impact["metrics"]["paired_samples"] == 0
+    assert impact["metrics"]["incomplete_samples"] == 1
+
+    other = CheckpointObservationReporterV2(FakeObservationApi(), tmp_path / "other")
+    unregistered_id = other.begin_mainline_impact(_mainline_start())
+    assert unregistered_id is not None
+    unregistered = checkpoint_local_evidence_v2(
+        tmp_path / "other",
+        now=datetime.now(timezone.utc) + timedelta(seconds=1),
+    )
+    assert unregistered["unregistered_records"] == 1
+    assert all(
+        item["kind"] != "mainline_impact"
+        for item in unregistered["attestations"]
+    )
+
+
+def test_local_evidence_reports_hidden_crash_temporary_as_scan_error(tmp_path):
+    reporter = CheckpointObservationReporterV2(FakeObservationApi(), tmp_path)
+    assert reporter.register_cohort(_cohort_registration()) is True
+    hidden = reporter.spool.mainline_impact_root / ".impact-crash.tmp"
+    hidden.write_bytes(b"partial")
+    hidden.chmod(0o600)
+
+    packet = checkpoint_local_evidence_v2(
+        tmp_path, now=datetime.now(timezone.utc) + timedelta(seconds=1),
+    )
+
+    assert packet["scan_errors"] == 1
+    assert hidden.read_bytes() == b"partial"
+
+
+def test_local_evidence_rejects_future_or_predating_mainline_samples(tmp_path):
+    instant = datetime.now(timezone.utc).replace(microsecond=0)
+    reporter = CheckpointObservationReporterV2(FakeObservationApi(), tmp_path)
+    assert reporter.register_cohort(_cohort_registration()) is True
+    future = dict(
+        _mainline_start(),
+        started_at=(instant + timedelta(minutes=5)).isoformat(),
+    )
+    assert reporter.begin_mainline_impact(future) is not None
+    with pytest.raises(CheckpointObservationSpoolError, match="time is invalid"):
+        checkpoint_local_evidence_v2(
+            tmp_path, now=instant + timedelta(seconds=1),
+        )
+
+    other = CheckpointObservationReporterV2(FakeObservationApi(), tmp_path / "other")
+    assert other.register_cohort(_cohort_registration()) is True
+    predating = dict(
+        _mainline_start(),
+        started_at=(instant - timedelta(minutes=5)).isoformat(),
+    )
+    assert other.begin_mainline_impact(predating) is not None
+    with pytest.raises(CheckpointObservationSpoolError, match="time is invalid"):
+        checkpoint_local_evidence_v2(
+            tmp_path / "other", now=instant + timedelta(seconds=1),
+        )
 
 
 def test_local_evidence_reports_assignment_scoped_backlog_and_drops(tmp_path):

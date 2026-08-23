@@ -266,6 +266,8 @@ class TrialArtifacts:
     dsh_version: str | None = None
     dsh_artifact_binding: dict[str, object] | None = None
     checkpoint_v2_owner: object | None = None
+    checkpoint_impact_sample_id: str | None = None
+    checkpoint_sync_elapsed_ms: int = 0
 
 
 class RunnerError(RuntimeError):
@@ -3188,6 +3190,8 @@ def run_trial(
     timeout_sec = _effective_trial_timeout_sec(effective_assignment)
     terminal_error: RunnerError | None = None
     checkpoint_v2_owner = None
+    checkpoint_impact_sample_id: str | None = None
+    checkpoint_sync_elapsed_ms = 0
     live_error_offsets: dict[Path, int] = {}
     live_error_counts: dict[str, int] = {}
     watch_live_account_errors = (
@@ -3558,6 +3562,20 @@ def run_trial(
                         shadow_controller.close()
                     except Exception:
                         pass
+                    sample_id = getattr(
+                        shadow_controller, "impact_sample_id", None,
+                    )
+                    sync_elapsed = getattr(
+                        shadow_controller, "checkpoint_sync_elapsed_ms", 0,
+                    )
+                    if isinstance(sample_id, str):
+                        checkpoint_impact_sample_id = sample_id
+                    if (
+                        isinstance(sync_elapsed, int)
+                        and not isinstance(sync_elapsed, bool)
+                        and sync_elapsed >= 0
+                    ):
+                        checkpoint_sync_elapsed_ms = sync_elapsed
                 if checkpoint_v2_owner is not None:
                     try:
                         checkpoint_v2_owner.mainline_exited()
@@ -3727,6 +3745,8 @@ def run_trial(
         dsh_version=dsh_version,
         dsh_artifact_binding=dsh_artifact_binding,
         checkpoint_v2_owner=checkpoint_v2_owner,
+        checkpoint_impact_sample_id=checkpoint_impact_sample_id,
+        checkpoint_sync_elapsed_ms=checkpoint_sync_elapsed_ms,
     )
 
 

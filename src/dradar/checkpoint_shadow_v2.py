@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
+import secrets
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,7 @@ from .checkpoint_activation_v2 import (
     CheckpointV2ProtocolError,
     negotiate_checkpoint_activation_v2,
 )
+from .checkpoint_observation_v2 import checkpoint_mainline_assignment_digest_v2
 from .checkpoint_runtime_v2 import (
     CheckpointCaptureRequestV2,
     CheckpointDataPlaneError,
@@ -174,6 +176,8 @@ class CheckpointShadowCoordinatorV2:
         self._identity: ExecutionIdentityV2 | None = None
         self._identity_lock = asyncio.Lock()
         self._cohort_persisted: bool | None = None
+        self._impact_sample_id: str | None = None
+        self._impact_attempt_id = f"attempt-{secrets.token_hex(16)}"
         self._release_candidates: list[
             tuple[PublishedCheckpointV2, str, str]
         ] = []
@@ -241,7 +245,34 @@ class CheckpointShadowCoordinatorV2:
                         # evidence.
                         pass
                 self._cohort_persisted = registered
+                begin_impact = getattr(
+                    self.observation_sink,
+                    "begin_checkpoint_mainline_impact",
+                    None,
+                )
+                if registered and callable(begin_impact):
+                    try:
+                        sample_id = begin_impact({
+                            "assignment_id": receipt.identity.assignment_id,
+                            "identity_fingerprint": receipt.identity.fingerprint,
+                            "attempt_id": self._impact_attempt_id,
+                            "assignment_state_sha256": (
+                                checkpoint_mainline_assignment_digest_v2(
+                                    self.assignment,
+                                )
+                            ),
+                        })
+                        if isinstance(sample_id, str):
+                            self._impact_sample_id = sample_id
+                    except Exception:
+                        # Impact measurement is optional evidence. The capture
+                        # lane may continue, but promotion will lack a pair.
+                        pass
         return self._identity
+
+    @property
+    def impact_sample_id(self) -> str | None:
+        return self._impact_sample_id
 
     def _record(self, payload: dict[str, object]) -> bool:
         """Durably hand off evidence before its raw archive may be released.
@@ -581,6 +612,14 @@ class CheckpointShadowCoordinatorV2:
         interval_sec: float = 300.0,
         maximum_captures: int = 24,
     ) -> object:
+        try:
+            # Finalize and register the exact cohort immediately rather than
+            # waiting for the first periodic capture. Short ordinary trials
+            # must still contribute an impact denominator, and a failure here
+            # remains isolated inside the shadow lane.
+            await self._finalized_identity()
+        except Exception:
+            return await mainline
         return await run_mainline_with_periodic_shadow_captures_v2(
             mainline,
             self.capture,

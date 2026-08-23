@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
 from pathlib import Path
 
@@ -212,6 +213,7 @@ class Sink:
     def __init__(self):
         self.payloads = []
         self.cohorts = []
+        self.impact_starts = []
 
     def record_checkpoint_observation(self, payload):
         self.payloads.append(payload)
@@ -224,6 +226,10 @@ class Sink:
     def register_checkpoint_cohort(self, payload):
         self.cohorts.append(payload)
         return True
+
+    def begin_checkpoint_mainline_impact(self, payload):
+        self.impact_starts.append(payload)
+        return "impact-" + "1" * 48
 
 
 def _runtime() -> CheckpointShadowRuntimeFactsV2:
@@ -298,6 +304,19 @@ def test_observe_coordinator_keeps_mainline_authoritative_and_reports_capture(
         "checkpoint_core_abi": CHECKPOINT_CORE_ABI_V2,
         "checkpoint_abi": "dradar-checkpoint-v2/codex/1",
     }
+    assert coordinator.impact_sample_id == "impact-" + "1" * 48
+    assert sink.impact_starts == [{
+        "assignment_id": "assignment-0001",
+        "identity_fingerprint": coordinator._identity.fingerprint,
+        "attempt_id": sink.impact_starts[0]["attempt_id"],
+        "assignment_state_sha256": sink.impact_starts[0][
+            "assignment_state_sha256"
+        ],
+    }]
+    assert re.fullmatch(
+        r"attempt-[0-9a-f]{32}", sink.impact_starts[0]["attempt_id"],
+    )
+    assert len(sink.impact_starts[0]["assignment_state_sha256"]) == 64
 
 
 def test_missing_durable_cohort_registration_stops_optional_capture(
@@ -316,6 +335,25 @@ def test_missing_durable_cohort_registration_stops_optional_capture(
     )) == "paid-result"
     assert plane.captures == 0
     assert sink.payloads == []
+    assert sink.impact_starts == []
+
+
+def test_short_mainline_opens_impact_sample_before_first_periodic_capture(
+    tmp_path: Path,
+) -> None:
+    coordinator, plane, sink = _coordinator(tmp_path, "observe")
+
+    async def mainline():
+        await asyncio.sleep(0.01)
+        return "short-result"
+
+    assert asyncio.run(coordinator.run(
+        mainline(), initial_delay_sec=1, interval_sec=1,
+        maximum_captures=1,
+    )) == "short-result"
+    assert plane.captures == 0
+    assert len(sink.cohorts) == 1
+    assert len(sink.impact_starts) == 1
 
 
 def test_restore_test_reports_capture_before_nonpaid_restore(tmp_path: Path) -> None:

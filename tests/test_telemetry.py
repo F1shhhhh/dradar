@@ -154,6 +154,43 @@ def test_checkpoint_observation_reporting_is_opt_in_and_account_scoped(tmp_path)
     assert telemetry.persist_checkpoint_observation(durable_payload) is True
     assert reporter.spool.pending()[0][1] == durable_payload
 
+    assert telemetry.register_checkpoint_cohort({
+        "assignment_id": "assignment-0001",
+        "identity_fingerprint": "a" * 64,
+        "cohort": {
+            "platform": "macos",
+            "container_backend": "orbstack",
+            "harness": "codex",
+            "provider": "openai",
+            "client_version": "0.5.97",
+            "agent_version": "1.2.3",
+            "runtime_profile": "codex-runtime-v1",
+            "model_config_version": "codex-config-v1",
+            "runtime_compatibility_digest": "d" * 64,
+            "checkpoint_core_abi": "dradar-checkpoint-core-v2/1",
+            "checkpoint_abi": "codex-openai/v1",
+        },
+    }) is True
+    sample_id = telemetry.begin_checkpoint_mainline_impact({
+        "assignment_id": "assignment-0001",
+        "identity_fingerprint": "a" * 64,
+        "attempt_id": "attempt-0001",
+        "assignment_state_sha256": "b" * 64,
+        "started_at": "2026-08-24T00:00:00+00:00",
+    })
+    assert sample_id is not None
+    assert telemetry.complete_checkpoint_mainline_impact(sample_id, {
+        "completed_at": "2026-08-24T00:01:00+00:00",
+        "mainline_elapsed_ms": 60_000,
+        "checkpoint_sync_elapsed_ms": 10,
+        "outcome": "completed",
+        "result_preserved": True,
+        "assignment_state_sha256_after": "b" * 64,
+        "submission_preserved": True,
+        "comparable": True,
+        "exclusion_reason": None,
+    }) is True
+
     telemetry.configure_checkpoint_observation_reporting(tmp_path)
     try:
         telemetry.configure_checkpoint_observation_reporting(tmp_path / "other")

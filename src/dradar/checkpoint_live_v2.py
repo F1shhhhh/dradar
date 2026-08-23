@@ -13,6 +13,7 @@ import hashlib
 import json
 import tempfile
 import threading
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Mapping
@@ -135,6 +136,10 @@ class LiveCheckpointShadowControllerV2:
         self.maximum_captures = maximum_captures
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._sync_elapsed_ms = 0
+        self._closed_cleanly = False
+        self._mainline_started_ns: int | None = None
+        self._mainline_closed_ns: int | None = None
 
     async def _mainline_lifetime(self) -> None:
         while not self._stop.is_set():
@@ -167,13 +172,48 @@ class LiveCheckpointShadowControllerV2:
             name="dradar-checkpoint-v2-shadow",
             daemon=True,
         )
-        self._thread.start()
+        started = time.monotonic_ns()
+        self._mainline_started_ns = started
+        try:
+            self._thread.start()
+        finally:
+            self._sync_elapsed_ms += max(
+                0, (time.monotonic_ns() - started) // 1_000_000,
+            )
 
     def close(self, timeout: float = 0.75) -> None:
+        started = time.monotonic_ns()
         self._stop.set()
         thread = self._thread
         if thread is not None:
             thread.join(timeout=max(0.0, min(float(timeout), 2.0)))
+            self._closed_cleanly = not thread.is_alive()
+        self._sync_elapsed_ms += max(
+            0, (time.monotonic_ns() - started) // 1_000_000,
+        )
+        self._mainline_closed_ns = time.monotonic_ns()
+
+    @property
+    def impact_sample_id(self) -> str | None:
+        if not self._closed_cleanly:
+            return None
+        value = getattr(self.coordinator, "impact_sample_id", None)
+        return value if isinstance(value, str) else None
+
+    @property
+    def checkpoint_sync_elapsed_ms(self) -> int:
+        return self._sync_elapsed_ms
+
+    @property
+    def mainline_elapsed_ms(self) -> int:
+        started = self._mainline_started_ns
+        closed = self._mainline_closed_ns
+        if started is None or closed is None or closed < started:
+            return 0
+        return max(1, min(
+            7 * 24 * 60 * 60 * 1000,
+            (closed - started) // 1_000_000,
+        ))
 
 
 def build_live_checkpoint_shadow_v2(
