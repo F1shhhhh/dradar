@@ -115,7 +115,12 @@ def _auth_file(tmp_path: Path) -> Path:
     return auth
 
 
-def _agent(tmp_path: Path, recording_checkpoint) -> DeepSeekCodex:
+def _agent(
+    tmp_path: Path,
+    recording_checkpoint,
+    *,
+    checkpoint_enabled: bool = True,
+) -> DeepSeekCodex:
     del recording_checkpoint
     logs_dir = tmp_path / "trial" / "agent"
     logs_dir.mkdir(parents=True, mode=0o700)
@@ -124,7 +129,7 @@ def _agent(tmp_path: Path, recording_checkpoint) -> DeepSeekCodex:
         model_name="deepseek-v4-flash",
         version="0.149.0",
         model_catalog_json_file=str(deepseek_catalog_path()),
-        checkpoint_enabled=True,
+        checkpoint_enabled=checkpoint_enabled,
         checkpoint_assignment_id="assignment-deepseek-checkpoint-1",
         checkpoint_task_id="pompeii-task-1",
         checkpoint_effort="max",
@@ -202,6 +207,53 @@ def test_catalog_is_verified_before_unchanged_benchmark_instruction(
         assert agent_commands[0] == "mkdir -p /tmp/codex-home"
         assert "sha256sum /tmp/codex-home/models.json" in agent_commands[1]
         assert environment.root_commands == [
+            "chown benchmark-agent /tmp/codex-home/models.json"
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_disabled_checkpoint_uses_upstream_root_for_catalog_handoff(
+    tmp_path: Path,
+    recording_checkpoint,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Environment:
+        default_user = "benchmark-agent"
+
+        async def upload_file(self, _source: Path, _target: str) -> None:
+            return None
+
+    async def scenario() -> None:
+        agent = _agent(
+            tmp_path, recording_checkpoint, checkpoint_enabled=False,
+        )
+        checkpoint = recording_checkpoint.instances[-1]
+        root_commands: list[str] = []
+
+        async def forbidden_checkpoint_root(*_args, **_kwargs):
+            raise AssertionError("disabled rollout used checkpoint root helper")
+
+        async def exec_as_root(_environment, command, **_kwargs):
+            root_commands.append(command)
+
+        async def exec_as_agent(_environment, command, **_kwargs):
+            del command
+            return None
+
+        async def durable_run(self, _instruction, _environment, _context):
+            del self
+
+        monkeypatch.setattr(
+            checkpoint, "exec_root_maintenance", forbidden_checkpoint_root,
+        )
+        monkeypatch.setattr(agent, "exec_as_root", exec_as_root)
+        monkeypatch.setattr(agent, "exec_as_agent", exec_as_agent)
+        monkeypatch.setattr(DurableCodex, "run", durable_run)
+
+        await agent.run("unchanged", Environment(), object())
+
+        assert root_commands == [
             "chown benchmark-agent /tmp/codex-home/models.json"
         ]
 

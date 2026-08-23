@@ -638,6 +638,17 @@ class DshMinimal(BaseInstalledAgent):
         )
         if checkpoint.enabled:
             await checkpoint.prepare_agent_environment(self, environment, env)
+
+        async def root_maintenance(command: str) -> None:
+            if checkpoint.enabled:
+                await checkpoint.exec_root_maintenance(
+                    environment, command=command,
+                )
+            else:
+                await self.exec_as_root(
+                    environment, command=command, env=env,
+                )
+
         runtime_dirs = (remote_home, remote_config_dir, remote_secret_dir)
         setup_command = "mkdir -p " + " ".join(
             shlex.quote(path) for path in runtime_dirs
@@ -655,9 +666,7 @@ class DshMinimal(BaseInstalledAgent):
         )
         # Pier bind-mounts /logs at runtime, so Dockerfile ownership does not
         # survive. Create and hand off all runtime directories after mounts.
-        await checkpoint.exec_root_maintenance(
-            environment, command=setup_command,
-        )
+        await root_maintenance(setup_command)
         resume_session_id = await checkpoint.start(self, environment, env)
         failure: BaseException | None = None
         try:
@@ -667,12 +676,9 @@ class DshMinimal(BaseInstalledAgent):
             # Restored archives may be uploaded as root by an environment
             # backend. Re-assert ownership before DSH opens the session store.
             if environment.default_user is not None:
-                await checkpoint.exec_root_maintenance(
-                    environment,
-                    command=(
-                        f"chown -R {owner} {shlex.quote(remote_home)} "
-                        f"&& chmod 700 {shlex.quote(remote_home)}"
-                    ),
+                await root_maintenance(
+                    f"chown -R {owner} {shlex.quote(remote_home)} "
+                    f"&& chmod 700 {shlex.quote(remote_home)}"
                 )
             local_patch = self.logs_dir / "dsh-minimal.patch.yml"
             local_runner = self.logs_dir / "dsh-minimal-headless-runner.mjs"
@@ -689,13 +695,10 @@ class DshMinimal(BaseInstalledAgent):
                 f"{shlex.quote(remote_runner)}"
             )
             if environment.default_user is not None:
-                await checkpoint.exec_root_maintenance(
-                    environment,
-                    command=(
-                        f"chown {owner} {shlex.quote(remote_api_key)} "
-                        f"{shlex.quote(remote_patch)} {shlex.quote(remote_runner)} "
-                        f"&& {chmod_command}"
-                    ),
+                await root_maintenance(
+                    f"chown {owner} {shlex.quote(remote_api_key)} "
+                    f"{shlex.quote(remote_patch)} {shlex.quote(remote_runner)} "
+                    f"&& {chmod_command}"
                 )
             else:
                 await self.exec_as_agent(

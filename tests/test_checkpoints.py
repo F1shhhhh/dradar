@@ -13,6 +13,15 @@ from dradar import artifact_staging, checkpoints, pending, refill, runloop
 from dradar.api_client import ApiClient
 
 
+@pytest.fixture(autouse=True)
+def _enable_checkpoint_runtime_for_recovery_unit_tests(monkeypatch):
+    """Exercise recovery mechanics explicitly despite the public rollout gate."""
+
+    monkeypatch.setattr(
+        runloop, "durable_checkpoint_rollout_enabled", lambda: True,
+    )
+
+
 def _privatize_checkpoint_tree(trial: Path, checkpoint: Path) -> None:
     if os.name == "nt":
         return
@@ -856,6 +865,30 @@ def test_resume_one_passes_checkpoint_and_new_generation_to_runner(
     assert seen["checkpoint"].checkpoint_id == item.checkpoint_id
 
 
+def test_disabled_rollout_keeps_valid_checkpoint_paused_without_resume(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    aid = "d" * 32
+    item = _make_checkpoint(tmp_path, aid, generation=2)
+    assignment = _assignment(aid, generation=2)
+    client = _RecoveryClient(assignment)
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    monkeypatch.setattr(
+        runloop, "durable_checkpoint_rollout_enabled", lambda: False,
+    )
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **k: "base")
+
+    outcome = runloop._resume_one_checkpoint(
+        client, item, assignment, _args(), tmp_path / "tasks", None,
+    )
+
+    assert outcome == "paused"
+    assert client.resumes == []
+    assert client.discards == []
+    assert client.pauses == [(aid, item.checkpoint_id, 2)]
+    assert checkpoints.find_latest(tmp_path, aid) is not None
+
+
 def test_legacy_materialization_is_refused_without_publishing_sibling(
     tmp_path: Path,
 ) -> None:
@@ -1557,6 +1590,9 @@ def test_completed_checkpoint_resume_recovers_missing_staged_patch_without_rerun
 
     client = CompletedClient(assignment)
     monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **k: "base")
+    monkeypatch.setattr(
+        runloop, "durable_checkpoint_rollout_enabled", lambda: False,
+    )
 
     outcome = runloop._resume_one_checkpoint(
         client, item, assignment, _args(yes=True), tmp_path / "tasks", None,

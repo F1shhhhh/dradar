@@ -178,6 +178,16 @@ ZCODE_AGENT_MODULE_FILENAME = "_dradar_pier_zcode.py"
 DSH_AGENT_IMPORT_PATH = "_dradar_pier_dsh:DshMinimal"
 DSH_AGENT_MODULE_FILENAME = "_dradar_pier_dsh.py"
 CHECKPOINT_MODULE_FILENAME = "_dradar_pier_checkpoint.py"
+# Emergency public rollout gate. The shared durable runtime remains in the
+# package for diagnosis and controlled tests, but ordinary trials must use the
+# adapters' checkpoint-disabled path until the cross-platform preflight has a
+# complete release matrix. Do not make this an environment override: a stale
+# shell setting must not silently re-enable quota-burning startup failures.
+DURABLE_CHECKPOINT_ROLLOUT_ENABLED = False
+
+
+def durable_checkpoint_rollout_enabled() -> bool:
+    return DURABLE_CHECKPOINT_ROLLOUT_ENABLED
 BETA_SUBSCRIPTION_TRIAL_TIMEOUT_FLOOR_SEC = 120 * 60
 BETA_SUBSCRIPTION_AGENTS = frozenset({GROK_AGENT, KIMI_AGENT, ZCODE_AGENT})
 
@@ -896,8 +906,18 @@ def _agent_timeout_multiplier(assignment: dict, task_path: Path) -> float:
 
 
 def _checkpoint_agent_kwargs(
-    assignment: dict, resume_checkpoint: Path | None,
+    assignment: dict,
+    resume_checkpoint: Path | None,
+    *,
+    enabled: bool = True,
 ) -> list[str]:
+    if not enabled:
+        if resume_checkpoint is not None:
+            raise RunnerError(
+                "durable checkpoint resume is temporarily unavailable in "
+                "this release; the saved checkpoint was not started or discarded"
+            )
+        return []
     values = [
         "--ak", "checkpoint_enabled=true",
         "--ak", f"checkpoint_assignment_id={assignment['assignment_id']}",
@@ -1056,7 +1076,10 @@ def build_pier_command(
             "--ak", f"reasoning_effort={assignment['effort']}",
             "--ak", f"config_toml_file={allowlist}",
             "--ak", f"prompt_template_path={submission_prompt}",
-            *_checkpoint_agent_kwargs(assignment, resume_checkpoint),
+            *_checkpoint_agent_kwargs(
+                assignment, resume_checkpoint,
+                enabled=bool(assignment.get("_durable_checkpoint_enabled", True)),
+            ),
             "--ae", f"CODEX_AUTH_JSON_PATH={auth}",
         ]
         # The caller must resolve npm's stable tag to an exact version before
@@ -1092,7 +1115,10 @@ def build_pier_command(
             "--ak", f"config_toml_file={config_path}",
             "--ak", f"model_catalog_json_file={deepseek_catalog}",
             "--ak", f"prompt_template_path={submission_prompt}",
-            *_checkpoint_agent_kwargs(assignment, resume_checkpoint),
+            *_checkpoint_agent_kwargs(
+                assignment, resume_checkpoint,
+                enabled=bool(assignment.get("_durable_checkpoint_enabled", True)),
+            ),
             "--ae", f"CODEX_AUTH_JSON_PATH={provider_auth_path}",
             "--ak", f"version={_deepseek_codex_version(assignment)}",
         ]
@@ -1136,7 +1162,10 @@ def build_pier_command(
             "--ak", f"artifact_assignment_id={assignment['assignment_id']}",
             "--ak", f"artifact_run_id={assignment.get('_artifact_run_id') or uuid.uuid4().hex}",
             "--ak", f"artifact_task_id={assignment['task_id']}",
-            *_checkpoint_agent_kwargs(assignment, resume_checkpoint),
+            *_checkpoint_agent_kwargs(
+                assignment, resume_checkpoint,
+                enabled=bool(assignment.get("_durable_checkpoint_enabled", True)),
+            ),
         ]
     elif agent == GROK_AGENT:
         if provider_auth_path is None or not provider_auth_path.is_file():
@@ -1183,7 +1212,10 @@ def build_pier_command(
             "--ak", f"kimi_cli_file={provider_cli_path}",
             "--ak", f"prompt_template_path={submission_prompt}",
             "--ak", f"version={KIMI_CLI_VERSION}",
-            *_checkpoint_agent_kwargs(assignment, resume_checkpoint),
+            *_checkpoint_agent_kwargs(
+                assignment, resume_checkpoint,
+                enabled=bool(assignment.get("_durable_checkpoint_enabled", True)),
+            ),
         ]
     elif agent == ZCODE_AGENT:
         if provider_auth_path is None or not provider_auth_path.is_file():
@@ -1207,7 +1239,10 @@ def build_pier_command(
             "--ak", f"session_timeout_sec={_zcode_session_timeout_sec(assignment)}",
             "--ak", f"prompt_template_path={submission_prompt}",
             "--ak", f"version={ZCODE_CLI_VERSION}",
-            *_checkpoint_agent_kwargs(assignment, resume_checkpoint),
+            *_checkpoint_agent_kwargs(
+                assignment, resume_checkpoint,
+                enabled=bool(assignment.get("_durable_checkpoint_enabled", True)),
+            ),
         ]
     return cmd
 
@@ -2999,6 +3034,12 @@ def run_trial(
     dsh_version = None
     codex_provider = None
     effective_agent = dev_agent or assignment["agent"]
+    checkpoint_enabled = durable_checkpoint_rollout_enabled()
+    if not checkpoint_enabled and resume_checkpoint is not None:
+        raise RunnerError(
+            "durable checkpoint resume is temporarily unavailable in this release; "
+            "the saved checkpoint was not started or discarded"
+        )
     if effective_agent == "codex":
         codex_provider = (
             assignment_codex_provider(assignment) or DEFAULT_CODEX_PROVIDER
@@ -3066,6 +3107,11 @@ def run_trial(
             "_artifact_run_id": uuid.uuid4().hex,
         }
         print(f"verified pinned DSH Minimal: {dsh_version}")
+
+    effective_assignment = {
+        **effective_assignment,
+        "_durable_checkpoint_enabled": checkpoint_enabled,
+    }
 
     work_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -3195,6 +3241,13 @@ def run_trial(
                 on_started()
             except Exception:
                 pass
+        if not checkpoint_enabled and effective_agent in (
+            "codex", DSH_AGENT, KIMI_AGENT, ZCODE_AGENT,
+        ):
+            print(
+                "checkpoint safety fallback active: this trial will run without "
+                "durable checkpoint recovery while the shared runtime is repaired"
+            )
         started = time.time()
         with log_path.open("w") as log:
             log.write("cmd=" + " ".join(cmd) + "\n")

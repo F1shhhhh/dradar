@@ -9,6 +9,15 @@ import pytest
 from dradar import cli, runloop
 
 
+@pytest.fixture(autouse=True)
+def _enable_checkpoint_runtime_for_worker_mechanics(monkeypatch):
+    """Keep legacy recovery mechanics covered behind the disabled rollout."""
+
+    monkeypatch.setattr(
+        runloop, "durable_checkpoint_rollout_enabled", lambda: True,
+    )
+
+
 def _args(**overrides):
     values = dict(
         workers=3, yes=True, keep=False, allow_task_drift=False,
@@ -824,6 +833,33 @@ def test_backfill_counts_fresh_and_safely_recoverable_work(monkeypatch):
             ]}
 
     assert runloop._pool_ready_work_count(Client()) == 2
+
+
+def test_disabled_rollout_never_backfills_paused_checkpoint(monkeypatch):
+    checkpoint = SimpleNamespace(
+        valid=True, checkpoint_id="cp-1", resume_generation=2,
+    )
+    assignment = {
+        "assignment_id": "a-1", "started_at": "earlier",
+        "execution_state": "paused", "runner_state": "resumable",
+        "checkpoint_id": "cp-1", "resume_generation": 2,
+    }
+    monkeypatch.setattr(
+        runloop, "durable_checkpoint_rollout_enabled", lambda: False,
+    )
+    monkeypatch.setattr(
+        runloop.checkpoints, "latest_by_assignment",
+        lambda _home: {"a-1": checkpoint},
+    )
+
+    class Client:
+        def get_assignment(self):
+            return {"active": [assignment]}
+
+    assert not runloop._assignment_is_recoverable_checkpoint(
+        assignment, {"a-1": checkpoint},
+    )
+    assert runloop._pool_ready_work_count(Client()) == 0
 
 
 def test_backfill_retries_compensated_checkpoint_when_server_is_one_generation_ahead(
