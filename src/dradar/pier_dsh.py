@@ -615,24 +615,6 @@ class DshMinimal(BaseInstalledAgent):
                 "NODE_USE_ENV_PROXY": "1",
             }
         )
-        runtime_dirs = (remote_home, remote_config_dir, remote_secret_dir)
-        setup_command = "mkdir -p " + " ".join(
-            shlex.quote(path) for path in runtime_dirs
-        )
-        if environment.default_user is not None:
-            owner = shlex.quote(str(environment.default_user))
-            setup_command += (
-                " && chown "
-                + owner
-                + " "
-                + " ".join(shlex.quote(path) for path in runtime_dirs)
-            )
-        setup_command += " && chmod 700 " + " ".join(
-            shlex.quote(path) for path in runtime_dirs
-        )
-        # Pier bind-mounts /logs at runtime, so Dockerfile ownership does not
-        # survive. Create and hand off all runtime directories after mounts.
-        await self.exec_as_root(environment, command=setup_command, env=env)
         checkpoint = DurableCheckpoint(
             logs_dir=self.logs_dir,
             enabled=self._checkpoint_enabled,
@@ -654,6 +636,28 @@ class DshMinimal(BaseInstalledAgent):
             session_probe=f"cat {shlex.quote(session_id_file)}",
             sensitive_values=self._checkpoint_sensitive_values,
         )
+        if checkpoint.enabled:
+            await checkpoint.prepare_agent_environment(self, environment, env)
+        runtime_dirs = (remote_home, remote_config_dir, remote_secret_dir)
+        setup_command = "mkdir -p " + " ".join(
+            shlex.quote(path) for path in runtime_dirs
+        )
+        if environment.default_user is not None:
+            owner = shlex.quote(str(environment.default_user))
+            setup_command += (
+                " && chown "
+                + owner
+                + " "
+                + " ".join(shlex.quote(path) for path in runtime_dirs)
+            )
+        setup_command += " && chmod 700 " + " ".join(
+            shlex.quote(path) for path in runtime_dirs
+        )
+        # Pier bind-mounts /logs at runtime, so Dockerfile ownership does not
+        # survive. Create and hand off all runtime directories after mounts.
+        await checkpoint.exec_root_maintenance(
+            environment, command=setup_command,
+        )
         resume_session_id = await checkpoint.start(self, environment, env)
         failure: BaseException | None = None
         try:
@@ -663,13 +667,12 @@ class DshMinimal(BaseInstalledAgent):
             # Restored archives may be uploaded as root by an environment
             # backend. Re-assert ownership before DSH opens the session store.
             if environment.default_user is not None:
-                await self.exec_as_root(
+                await checkpoint.exec_root_maintenance(
                     environment,
                     command=(
                         f"chown -R {owner} {shlex.quote(remote_home)} "
                         f"&& chmod 700 {shlex.quote(remote_home)}"
                     ),
-                    env=env,
                 )
             local_patch = self.logs_dir / "dsh-minimal.patch.yml"
             local_runner = self.logs_dir / "dsh-minimal-headless-runner.mjs"
@@ -686,14 +689,13 @@ class DshMinimal(BaseInstalledAgent):
                 f"{shlex.quote(remote_runner)}"
             )
             if environment.default_user is not None:
-                await self.exec_as_root(
+                await checkpoint.exec_root_maintenance(
                     environment,
                     command=(
                         f"chown {owner} {shlex.quote(remote_api_key)} "
                         f"{shlex.quote(remote_patch)} {shlex.quote(remote_runner)} "
                         f"&& {chmod_command}"
                     ),
-                    env=env,
                 )
             else:
                 await self.exec_as_agent(
@@ -737,7 +739,7 @@ class DshMinimal(BaseInstalledAgent):
             raise
         finally:
             try:
-                await checkpoint.finish(
+                await checkpoint.finish_durably(
                     self,
                     environment,
                     env,
@@ -745,17 +747,14 @@ class DshMinimal(BaseInstalledAgent):
                     failure=failure,
                 )
             finally:
-                # DSH can run as root in images without a declared default
-                # user.  Pier later traverses all agent logs on the host, so
-                # return DSH_HOME to the host logs owner before post-run.
-                host_stat = self.logs_dir.stat()
-                await self.exec_as_root(
+                # Preserve the post-run ownership guarantee introduced after
+                # root-run DSH sessions made Pier's host traversal fail.  The
+                # handoff uses the host identity captured before the sticky
+                # logs directory is installed, rather than stat'ing that now
+                # root-owned bind mount.
+                await checkpoint.return_runtime_tree_to_host_owner(
                     environment,
-                    command=(
-                        f"chown -R {host_stat.st_uid}:{host_stat.st_gid} "
-                        f"{shlex.quote(remote_home)}"
-                    ),
-                    env=env,
+                    remote_home,
                 )
 
     def populate_context_post_run(self, context: AgentContext) -> None:

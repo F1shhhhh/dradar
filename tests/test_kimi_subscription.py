@@ -6,6 +6,7 @@ import json
 import os
 import ast
 import shlex
+import stat
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,6 +16,7 @@ import pytest
 
 import dradar.providers as providers
 import dradar.runner as runner
+from dradar.pier_checkpoint import AgentLogStore, UnsafeAgentLog
 from dradar.providers import (
     KIMI_AGENT,
     KIMI_API_KEY_ENVS,
@@ -384,13 +386,16 @@ def test_kimi_checkpoint_keeps_sessions_stream_and_original_prompt_only() -> Non
             isinstance(child, ast.Await)
             and isinstance(child.value, ast.Call)
             and isinstance(child.value.func, ast.Attribute)
-            and child.value.func.attr == "finish"
+                and child.value.func.attr == "finish_durably"
             for statement in node.finalbody for child in ast.walk(statement)
         )
         for node in ast.walk(run)
     )
     assert "append=self._checkpoint.previous is not None" in ast.unparse(run)
     run_source = ast.unparse(run)
+    assert "asyncio.wait_for" in run_source
+    assert "_FINAL_SESSION_PROBE_TIMEOUT_SEC" in run_source
+    assert "self._checkpoint.finish_durably" in run_source
     assert "restoring_checkpoint = self._checkpoint.previous is not None" in run_source
     assert run_source.count("raise CheckpointIncompatibleError") >= 2
     assert run_source.index("raise CheckpointIncompatibleError") < run_source.index(
@@ -424,6 +429,105 @@ def test_kimi_adapter_source_has_fixed_security_contract() -> None:
     assert "oauth_guard_pid" in source
     assert "sleep 0.02" in source
     assert "aloha" not in source
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX no-follow file semantics")
+@pytest.mark.parametrize("adapter_name", ["pier_kimi.py", "pier_zcode.py"])
+def test_agent_log_store_replaces_symlink_fifo_and_hardlink_without_following(
+    tmp_path: Path, adapter_name: str,
+) -> None:
+    logs = tmp_path / adapter_name / "agent"
+    logs.mkdir(parents=True, mode=0o777)
+    logs.chmod(0o777)
+    store = AgentLogStore(logs)
+    credential = "credential-sentinel-value"
+
+    regular = logs / "outcome.json"
+    regular.write_text(f'{{"message":"{credential}"}}\n', encoding="utf-8")
+    regular_inode = regular.stat().st_ino
+    with pytest.raises(ValueError, match="sanitized"):
+        store.redact_texts([regular], (credential,), "[REDACTED]")
+    assert regular.stat().st_ino != regular_inode
+    assert regular.read_text(encoding="utf-8") == (
+        '{"message":"[REDACTED]"}\n'
+    )
+
+    clean = logs / "clean.jsonl"
+    clean.write_text('{"message":"safe"}\n', encoding="utf-8")
+    clean_inode = clean.stat().st_ino
+    safe = store.redact_texts([clean], (credential,), "[REDACTED]")
+    assert safe == {clean: '{"message":"safe"}\n'}
+    assert clean.stat().st_ino != clean_inode
+    assert stat.S_IMODE(clean.stat().st_mode) == 0o600
+
+    host_jsonl = tmp_path / f"{adapter_name}-host.jsonl"
+    host_payload = '{"token":"credential-sentinel-value"}\n'
+    host_jsonl.write_text(host_payload, encoding="utf-8")
+
+    symlink = logs / "stream.jsonl"
+    symlink.symlink_to(host_jsonl)
+    with pytest.raises(ValueError, match="sanitized"):
+        store.redact_texts([symlink], (credential,), "[REDACTED]")
+    assert host_jsonl.read_text(encoding="utf-8") == host_payload
+    assert symlink.is_file() and not symlink.is_symlink()
+    assert credential not in symlink.read_text(encoding="utf-8")
+
+    fifo = logs / "stderr.log"
+    os.mkfifo(fifo)
+    with pytest.raises(ValueError, match="sanitized"):
+        store.redact_texts([fifo], (credential,), "[REDACTED]")
+    assert fifo.is_file() and not fifo.is_symlink()
+
+    hardlink = logs / "events.jsonl"
+    os.link(host_jsonl, hardlink)
+    with pytest.raises(ValueError, match="sanitized"):
+        store.redact_texts([hardlink], (credential,), "[REDACTED]")
+    assert host_jsonl.read_text(encoding="utf-8") == host_payload
+    assert hardlink.is_file()
+    assert hardlink.stat().st_nlink == 1
+    # Pier deliberately keeps this bind target broad for arbitrary image UIDs.
+    assert stat.S_IMODE(logs.stat().st_mode) == 0o777
+    for path in (regular, symlink, fifo, hardlink):
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX no-follow file semantics")
+@pytest.mark.parametrize("adapter_name", ["pier_kimi.py", "pier_zcode.py"])
+def test_agent_log_store_cas_race_never_rewrites_host_target(
+    tmp_path: Path, adapter_name: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logs = tmp_path / adapter_name / "agent"
+    logs.mkdir(parents=True)
+    store = AgentLogStore(logs)
+    output = logs / "stream.jsonl"
+    output.write_text("safe snapshot\n", encoding="utf-8")
+    snapshot = store.read_text(output)
+    assert snapshot is not None
+
+    host_jsonl = tmp_path / f"{adapter_name}-raced-host.jsonl"
+    host_jsonl.write_text("host payload must remain unchanged\n", encoding="utf-8")
+    original_fsync = os.fsync
+    raced = False
+
+    def race_after_initial_cas(descriptor: int) -> None:
+        nonlocal raced
+        original_fsync(descriptor)
+        if not raced:
+            raced = True
+            output.unlink()
+            output.symlink_to(host_jsonl)
+
+    monkeypatch.setattr(os, "fsync", race_after_initial_cas)
+    matched = store.replace_text(output, "safe replacement\n", expected=snapshot[1])
+
+    assert matched is False
+    assert host_jsonl.read_text(encoding="utf-8") == (
+        "host payload must remain unchanged\n"
+    )
+    assert output.read_text(encoding="utf-8") == "safe replacement\n"
+    assert not output.is_symlink()
+    with pytest.raises(UnsafeAgentLog, match="outside"):
+        store.replace_text(logs.parent / "outside.jsonl", "must not write\n")
 
 
 def test_kimi_shared_oauth_guard_is_dynamic_and_preserves_exit_status() -> None:

@@ -10,6 +10,7 @@ import json
 import math
 import os
 import re
+import signal
 import shutil
 import stat
 import subprocess
@@ -26,7 +27,7 @@ from pathlib import Path
 
 import httpx
 
-from . import egress
+from . import checkpoints, egress
 from .manifest import task_content_hash
 from .providers import (
     DEFAULT_CODEX_PROVIDER,
@@ -160,6 +161,8 @@ DEEPSEEK_TOML = (
 )
 DEEPSEEK_AGENT_IMPORT_PATH = "_dradar_pier_deepseek:DeepSeekCodex"
 DEEPSEEK_AGENT_MODULE_FILENAME = "_dradar_pier_deepseek.py"
+CODEX_AGENT_IMPORT_PATH = "_dradar_pier_codex:DurableCodex"
+CODEX_AGENT_MODULE_FILENAME = "_dradar_pier_codex.py"
 GROK_AGENT_IMPORT_PATH = "_dradar_pier_grok:GrokBuild"
 GROK_AGENT_MODULE_FILENAME = "_dradar_pier_grok.py"
 GROK_RECOVERY_MODULE_FILENAME = "_dradar_grok_recovery.py"
@@ -476,7 +479,7 @@ def _validated_deepseek_catalog() -> Path:
 
 
 def _ensure_deepseek_agent_module(home: Path) -> Path:
-    """Expose only the narrow public adapter to Pier's isolated Python env."""
+    """Expose DeepSeek and its host-private Codex dependencies to Pier."""
 
     source = Path(__file__).with_name("pier_deepseek.py")
     if not source.is_file():
@@ -484,6 +487,7 @@ def _ensure_deepseek_agent_module(home: Path) -> Path:
             "DeepSeek Pier adapter is missing; reinstall or upgrade dradar "
             "before running a paid task"
         )
+    _ensure_codex_agent_module(home)
     target = home / DEEPSEEK_AGENT_MODULE_FILENAME
     return _materialize_shared_file(target, source.read_bytes())
 
@@ -498,6 +502,21 @@ def _ensure_checkpoint_module(home: Path) -> Path:
         )
     return _materialize_shared_file(
         home / CHECKPOINT_MODULE_FILENAME, source.read_bytes()
+    )
+
+
+def _ensure_codex_agent_module(home: Path) -> Path:
+    """Expose the stock-compatible host-private Codex adapter to Pier."""
+
+    source = Path(__file__).with_name("pier_codex.py")
+    if not source.is_file():
+        raise RunnerError(
+            "Codex Pier checkpoint adapter is missing; reinstall or upgrade "
+            "dradar before running a paid task"
+        )
+    _ensure_checkpoint_module(home)
+    return _materialize_shared_file(
+        home / CODEX_AGENT_MODULE_FILENAME, source.read_bytes()
     )
 
 
@@ -779,6 +798,7 @@ def _pier_process_env(
     *,
     pier_bootstrap_dir: Path | None = None,
     egress_environment: dict[str, str] | None = None,
+    codex_module_dir: Path | None = None,
     deepseek_module_dir: Path | None = None,
     grok_module_dir: Path | None = None,
     kimi_module_dir: Path | None = None,
@@ -795,7 +815,8 @@ def _pier_process_env(
     env.pop("PYTHONHOME", None)
     python_dirs = [
         path for path in (
-            pier_bootstrap_dir, deepseek_module_dir, grok_module_dir,
+            pier_bootstrap_dir, codex_module_dir, deepseek_module_dir,
+            grok_module_dir,
             kimi_module_dir, zcode_module_dir, dsh_module_dir,
         ) if path is not None
     ]
@@ -963,6 +984,9 @@ def build_pier_command(
         deepseek_catalog = _validated_deepseek_catalog()
         _ensure_deepseek_agent_module(home)
         agent_args = ["--agent-import-path", DEEPSEEK_AGENT_IMPORT_PATH]
+    elif agent == "codex" and provider == DEFAULT_CODEX_PROVIDER:
+        _ensure_codex_agent_module(home)
+        agent_args = ["--agent-import-path", CODEX_AGENT_IMPORT_PATH]
     elif agent == GROK_AGENT:
         _validate_grok_assignment(assignment)
         _ensure_grok_agent_module(home)
@@ -1429,16 +1453,48 @@ def _recover_completed_checkpoint_patch(
     Recover only from an identity-matched, completed checkpoint and never
     follow symlinks or accept arbitrary bytes as a submission patch.
     """
-    checkpoint_dir = trial_dir / "agent" / "checkpoint"
-    metadata_path = checkpoint_dir / "checkpoint.json"
-    if not _plain_file(metadata_path):
+    new_checkpoint_dir = trial_dir / "checkpoint"
+    legacy_checkpoint_dir = trial_dir / "agent" / "checkpoint"
+    if checkpoints._lexists(new_checkpoint_dir):
+        checkpoint_dir = new_checkpoint_dir
+    elif checkpoints._lexists(legacy_checkpoint_dir):
+        return False, "legacy completed checkpoint is not host-private"
+    else:
         return False, None
+    if checkpoint_dir.is_symlink() or not checkpoint_dir.is_dir():
+        return False, "completed checkpoint root is unsafe"
+    layout_error = checkpoints._host_private_layout_error(
+        trial_dir, checkpoint_dir,
+    )
+    if layout_error:
+        return False, layout_error
+    snapshot_lock = checkpoint_dir / "snapshot.lock"
+    if checkpoints._lexists(snapshot_lock):
+        return False, "completed checkpoint snapshot is incomplete"
+
+    metadata_path = checkpoint_dir / "checkpoint.json"
     try:
-        metadata = json.loads(metadata_path.read_text())
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        metadata_bytes, metadata_identity = checkpoints._read_regular_file_snapshot(
+            metadata_path, max_bytes=checkpoints.MAX_MANIFEST_BYTES,
+        )
+        metadata = json.loads(metadata_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return False, "completed checkpoint metadata is unreadable"
     if not isinstance(metadata, dict) or metadata.get("phase") != "agent_completed":
         return False, None
+
+    payload_dir, pointer_error, pointer_before = checkpoints._snapshot_payload_dir(
+        checkpoint_dir,
+    )
+    if pointer_error:
+        return False, pointer_error
+    if checkpoints._lexists(checkpoint_dir / "invalid-snapshot"):
+        return False, "checkpoint snapshot did not finish safely"
+    if (
+        checkpoints._lexists(checkpoint_dir / "invalid-secret")
+        or checkpoints._lexists(payload_dir / "invalid-secret")
+    ):
+        return False, "checkpoint contains rejected credential data"
 
     expected = {
         "assignment_id": assignment.get("assignment_id"),
@@ -1458,13 +1514,39 @@ def _recover_completed_checkpoint_patch(
     workspace_name = metadata.get("workspace_patch")
     if workspace_name != "workspace.patch":
         return False, "completed checkpoint has an unsafe workspace_patch path"
-    workspace_patch = checkpoint_dir / workspace_name
+    workspace_patch = payload_dir / workspace_name
     if not _plain_file(workspace_patch):
         return False, "completed checkpoint is missing its workspace patch"
+    tree_error = checkpoints._host_private_layout_error(
+        trial_dir, checkpoint_dir,
+    )
+    if tree_error:
+        return False, tree_error
     try:
-        data = workspace_patch.read_bytes()
-    except OSError:
+        data = checkpoints._read_regular_file(
+            workspace_patch, max_bytes=64 * 1024 * 1024,
+        )
+    except ValueError:
         return False, "completed checkpoint workspace patch is unreadable"
+    try:
+        metadata_after = checkpoints._read_regular_file_snapshot(
+            metadata_path, max_bytes=checkpoints.MAX_MANIFEST_BYTES,
+        )
+    except ValueError:
+        return False, "completed checkpoint metadata changed while it was read"
+    _payload_after, pointer_error_after, pointer_after = (
+        checkpoints._snapshot_payload_dir(checkpoint_dir)
+    )
+    if (
+        checkpoints._lexists(snapshot_lock)
+        or checkpoints._lexists(checkpoint_dir / "invalid-secret")
+        or checkpoints._lexists(payload_dir / "invalid-secret")
+        or checkpoints._lexists(checkpoint_dir / "invalid-snapshot")
+        or metadata_after != (metadata_bytes, metadata_identity)
+        or pointer_error_after is not None
+        or pointer_after != pointer_before
+    ):
+        return False, "completed checkpoint changed while it was read"
     if b"\x00" in data or (data and not data.startswith(b"diff --git ")):
         return False, "completed checkpoint workspace patch is not a Git diff"
 
@@ -2737,6 +2819,171 @@ def _dsh_tasks_overlay(
         yield overlay_root
 
 
+_PIER_RUNTIME_PROJECT_RE = re.compile(
+    r"[a-z0-9][a-z0-9-]*__[a-z0-9]{6,8}$", re.IGNORECASE,
+)
+
+
+def _terminate_pier_process_tree(proc: subprocess.Popen) -> bool:
+    """TERM then KILL the isolated Pier process group; return if KILL was used."""
+
+    pid = getattr(proc, "pid", None)
+    group_signalled = False
+    if os.name != "nt" and isinstance(pid, int) and pid > 0:
+        try:
+            os.killpg(pid, signal.SIGTERM)
+            group_signalled = True
+        except ProcessLookupError:
+            pass
+        except OSError:
+            group_signalled = False
+    if not group_signalled:
+        proc.terminate()
+    try:
+        proc.wait(timeout=15)
+        leader_exited = True
+    except subprocess.TimeoutExpired:
+        leader_exited = False
+
+    if leader_exited:
+        if os.name == "nt" or not isinstance(pid, int) or pid <= 0:
+            return False
+        try:
+            # The leader may exit before its compose/helper children. Since
+            # Pier is started in a new session, PGID == leader PID; signal 0
+            # tells us whether anything in that group still survives.
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            return False
+        except OSError as exc:
+            raise RunnerError(
+                "Pier leader exited but its process group could not be audited",
+            ) from exc
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return False
+        except OSError as exc:
+            raise RunnerError(
+                "Pier leader exited but its surviving process group could not be killed",
+            ) from exc
+        return True
+
+    if os.name != "nt" and isinstance(pid, int) and pid > 0:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError as exc:
+            raise RunnerError("Pier process group could not be killed") from exc
+    else:
+        proc.kill()
+    proc.wait()
+    return True
+
+
+def _path_is_below(path: str, root: Path) -> bool:
+    try:
+        return Path(path).resolve().is_relative_to(root.resolve())
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _cleanup_terminated_pier_containers(job_root: Path) -> None:
+    """Remove only surviving containers bound to the exact terminated job."""
+
+    try:
+        listed = subprocess.run(
+            [
+                "docker", "ps", "-aq", "--filter",
+                "label=com.docker.compose.project",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RunnerError(
+            "Docker could not be queried for terminated Pier containers",
+        ) from exc
+    if listed.returncode != 0:
+        raise RunnerError(
+            "Docker rejected the terminated Pier container check",
+        )
+    container_ids = [
+        value for value in listed.stdout.split()
+        if re.fullmatch(r"[0-9a-f]{12,64}", value)
+    ]
+    if not container_ids:
+        return
+    try:
+        inspected = subprocess.run(
+            ["docker", "inspect", *container_ids],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RunnerError(
+            "terminated Pier container ownership is unknown",
+        ) from exc
+    if inspected.returncode != 0:
+        raise RunnerError(
+            "terminated Pier container inspection failed",
+        )
+    try:
+        containers = json.loads(inspected.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        raise RunnerError("Docker returned invalid orphan inspection data") from exc
+
+    owned: list[str] = []
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        container_id = container.get("Id")
+        labels = (container.get("Config", {}).get("Labels", {}) or {})
+        project = labels.get("com.docker.compose.project")
+        if (
+            not isinstance(container_id, str)
+            or not any(container_id.startswith(value) for value in container_ids)
+            or not isinstance(project, str)
+            or _PIER_RUNTIME_PROJECT_RE.fullmatch(project) is None
+        ):
+            continue
+        mounts_owned = any(
+            isinstance(mount, dict)
+            and mount.get("Type") == "bind"
+            and _path_is_below(str(mount.get("Source", "")), job_root)
+            for mount in container.get("Mounts", [])
+        )
+        config_owned = any(
+            _path_is_below(value.strip(), job_root)
+            for value in str(
+                labels.get("com.docker.compose.project.config_files", ""),
+            ).split(",")
+            if value.strip()
+        )
+        if mounts_owned or config_owned:
+            owned.append(container_id)
+    if not owned:
+        return
+    try:
+        removed = subprocess.run(
+            ["docker", "rm", "-f", *owned],
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RunnerError(
+            "terminated Pier task container could not be queried safely",
+        ) from exc
+    if removed.returncode != 0:
+        raise RunnerError(
+            "terminated Pier task container could not be removed",
+        )
+
+
 def run_trial(
     assignment: dict,
     tasks_root: Path,
@@ -2925,6 +3172,12 @@ def run_trial(
             effective_assignment,
             pier_bootstrap_dir=(work_dir if egress_environment else None),
             egress_environment=egress_environment,
+            codex_module_dir=(
+                work_dir
+                if effective_agent == "codex"
+                and codex_provider == DEFAULT_CODEX_PROVIDER
+                else None
+            ),
             deepseek_module_dir=(
                 work_dir if codex_provider == DEEPSEEK_PROVIDER else None
             ),
@@ -2951,8 +3204,14 @@ def run_trial(
             # tell "working" from "wedged" without docker-exec'ing into the
             # container (volunteer report, 2026-07-13). Once a minute, print
             # elapsed time plus the newest pier log line.
-            proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
-                                    cwd=work_dir, env=env)
+            proc = subprocess.Popen(
+                cmd,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                cwd=work_dir,
+                env=env,
+                start_new_session=(os.name != "nt"),
+            )
             try:
                 next_beat = started + HEARTBEAT_SEC
                 while True:
@@ -2995,12 +3254,23 @@ def run_trial(
                 # with a grace window: a SIGKILLed pier can never `docker compose
                 # down`, and its orphaned task container keeps the agent alive —
                 # burning quota with nobody left to harvest the result.
-                proc.terminate()
+                cleanup_errors: list[str] = []
                 try:
-                    proc.wait(timeout=15)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
+                    _terminate_pier_process_tree(proc)
+                except RunnerError as cleanup_error:
+                    cleanup_errors.append(str(cleanup_error))
+                try:
+                    # A Pier parent can exit cleanly on TERM before compose
+                    # teardown completes. Always inspect and remove only a
+                    # container positively bound to this exact failed job.
+                    _cleanup_terminated_pier_containers(jobs_dir / job_name)
+                except RunnerError as cleanup_error:
+                    cleanup_errors.append(str(cleanup_error))
+                if cleanup_errors:
+                    raise RunnerError(
+                        f"{exc}\nPier cleanup safety check failed: "
+                        + "; ".join(cleanup_errors),
+                    ) from exc
                 if isinstance(exc, RunnerError):
                     # A watchdog timeout is terminal for this process, but Pier
                     # may already have harvested a patch, trajectory and token

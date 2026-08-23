@@ -807,7 +807,10 @@ def test_backfill_counts_fresh_and_safely_recoverable_work(monkeypatch):
     )
     monkeypatch.setattr(runloop.checkpoints, "is_expired", lambda _item: False)
     monkeypatch.setattr(runloop.checkpoints, "is_terminal", lambda _home, _item: False)
-    monkeypatch.setattr(runloop, "_checkpoint_backoff_seconds", lambda _item: 0)
+    monkeypatch.setattr(
+        runloop, "_checkpoint_backoff_seconds",
+        lambda _item, *, generation=None: 0,
+    )
 
     class Client:
         def get_assignment(self):
@@ -823,13 +826,40 @@ def test_backfill_counts_fresh_and_safely_recoverable_work(monkeypatch):
     assert runloop._pool_ready_work_count(Client()) == 2
 
 
+def test_backfill_retries_compensated_checkpoint_when_server_is_one_generation_ahead(
+    monkeypatch,
+):
+    checkpoint = SimpleNamespace(
+        valid=True, checkpoint_id="cp-1", resume_generation=2,
+    )
+    assignment = {
+        "assignment_id": "a-1", "started_at": "earlier",
+        "execution_state": "paused", "runner_state": "paused",
+        "checkpoint_id": "cp-1", "resume_generation": 3,
+    }
+    monkeypatch.setattr(runloop.checkpoints, "is_expired", lambda _item: False)
+    monkeypatch.setattr(runloop.checkpoints, "is_terminal", lambda _home, _item: False)
+    seen = []
+    monkeypatch.setattr(
+        runloop,
+        "_checkpoint_backoff_seconds",
+        lambda _item, *, generation=None: seen.append(generation) or 0,
+    )
+
+    assert runloop._assignment_is_recoverable_checkpoint(
+        assignment, {"a-1": checkpoint},
+    )
+    assert seen == [3]
+
+
 @pytest.mark.parametrize(
     ("override", "local_override"),
     [
         ({"execution_state": "running"}, {}),
         ({"runner_state": "running"}, {}),
         ({"checkpoint_id": "different"}, {}),
-        ({"resume_generation": 3}, {}),
+        ({"resume_generation": 1}, {}),
+        ({"resume_generation": runloop.MAX_CHECKPOINT_RESUMES}, {}),
         ({"resume_generation": "2"}, {}),
         ({}, {"valid": False}),
     ],

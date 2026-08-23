@@ -385,6 +385,30 @@ def test_checkpoint_protocol_sends_id_generation_and_runner_session():
     assert b"reason=invalid" in seen[2][1]
 
 
+@pytest.mark.parametrize(
+    "reason", ["user_discard", "invalid", "expired", "incompatible"],
+)
+def test_checkpoint_discard_accepts_exact_server_reason_contract(reason):
+    seen = {}
+
+    def handler(request):
+        seen.update(urllib.parse.parse_qs(request.read().decode()))
+        return httpx.Response(200, json={"ok": True})
+
+    _client(handler).checkpoint_discard("a1", "checkpoint-123", 3, reason=reason)
+    assert seen["reason"] == [reason]
+
+
+def test_checkpoint_discard_rejects_reason_outside_server_contract():
+    client = _client(
+        lambda _request: pytest.fail("invalid reason must fail before HTTP"),
+    )
+    with pytest.raises(ValueError, match="unsupported checkpoint discard reason"):
+        client.checkpoint_discard(
+            "a1", "checkpoint-123", 3, reason="resume_fence_failed",
+        )
+
+
 def _do_submit(handler, tmp_path, with_optional):
     patch = tmp_path / "model.patch"
     patch.write_bytes(b"diff --git a/f b/f\n")
