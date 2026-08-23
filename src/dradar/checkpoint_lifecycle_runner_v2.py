@@ -20,6 +20,7 @@ import sys
 import tarfile
 import time
 import uuid
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -145,6 +146,45 @@ LIFECYCLE_PROBES_V2: dict[str, tuple[tuple[str, str], ...]] = {
 
 if set(LIFECYCLE_PROBES_V2) != LIFECYCLE_CASE_IDS_V2:  # pragma: no cover
     raise RuntimeError("checkpoint lifecycle probe plan is incomplete")
+
+_HARNESS_PROBE_IDS_V2 = {
+    ("codex", "openai"): "codex-openai",
+    ("codex", "deepseek"): "codex-deepseek",
+    ("dsh", "deepseek"): "dsh-deepseek",
+    ("kimi-code", "kimi-subscription"): "kimi-code-kimi-subscription",
+    ("zcode", "bigmodel-coding-plan"): "zcode-bigmodel-coding-plan",
+}
+
+
+def lifecycle_probe_plan_v2(
+    cohort: Mapping[str, Any],
+) -> dict[str, tuple[tuple[str, str], ...]]:
+    """Return the compiled common + exact-Harness plan for one cohort."""
+
+    key = (cohort.get("harness"), cohort.get("provider"))
+    harness_id = _HARNESS_PROBE_IDS_V2.get(key)
+    if harness_id is None:
+        raise ValueError("lifecycle cohort has no reviewed Harness probe plan")
+    plan = dict(LIFECYCLE_PROBES_V2)
+    plan["capture_interrupted"] = (
+        *plan["capture_interrupted"],
+        (
+            "client",
+            "tests/test_checkpoint_adapter_runtime_v2.py::"
+            "test_every_reviewed_harness_contract_builds_material_native_state"
+            f"[{harness_id}]",
+        ),
+    )
+    plan["restore_interrupted"] = (
+        *plan["restore_interrupted"],
+        (
+            "client",
+            "tests/test_checkpoint_docker_lifecycle_v2.py::"
+            "test_real_container_native_capture_seal_download_restore"
+            f"[{harness_id}]",
+        ),
+    )
+    return plan
 
 _PROVIDER_ENV_NAMES = frozenset({
     "ANTHROPIC_API_KEY",
@@ -332,14 +372,17 @@ def _materialize_git_revision(root: Path, revision: str, target: Path) -> None:
                 os.chmod(destination, 0o700)
 
 
-def _test_suite_digest(roots: Mapping[str, Path]) -> str:
+def _test_suite_digest(
+    roots: Mapping[str, Path],
+    plan: Mapping[str, Sequence[tuple[str, str]]],
+) -> str:
     digest = hashlib.sha256()
     digest.update(_canonical_bytes({
         "plan_version": LIFECYCLE_PROBE_PLAN_VERSION_V2,
-        "probes": LIFECYCLE_PROBES_V2,
+        "probes": plan,
     }))
     files: set[tuple[str, str]] = set()
-    for probes in LIFECYCLE_PROBES_V2.values():
+    for probes in plan.values():
         for component, node_id in probes:
             files.add((component, node_id.split("::", 1)[0]))
     files.add(("client", "src/dradar/checkpoint_lifecycle_runner_v2.py"))
@@ -361,7 +404,10 @@ def _test_suite_digest(roots: Mapping[str, Path]) -> str:
 def _probe_environment(sandbox_home: Path, source_root: Path) -> dict[str, str]:
     allowed = {
         name: os.environ[name]
-        for name in ("LANG", "LC_ALL", "PATH", "SYSTEMROOT", "TMPDIR")
+        for name in (
+            "DOCKER_HOST", "DRADAR_CHECKPOINT_V2_DOCKER_IMAGE", "LANG",
+            "LC_ALL", "PATH", "SYSTEMROOT", "TMPDIR",
+        )
         if os.environ.get(name)
     }
     allowed.update({
@@ -383,9 +429,13 @@ def _run_probe(
 ) -> dict[str, Any]:
     started = time.monotonic()
     timed_out = False
+    junit = sandbox_home / f"junit-{uuid.uuid4().hex}.xml"
     try:
         completed = subprocess.run(
-            [os.fspath(python), "-m", "pytest", "-q", node_id],
+            [
+                os.fspath(python), "-m", "pytest", "-q", node_id,
+                f"--junitxml={junit}",
+            ],
             cwd=source_root,
             env=_probe_environment(sandbox_home, source_root),
             stdout=subprocess.PIPE,
@@ -406,6 +456,37 @@ def _run_probe(
         len(stdout) > MAX_LIFECYCLE_LOG_BYTES_V2
         or len(stderr) > MAX_LIFECYCLE_LOG_BYTES_V2
     )
+    junit_valid = False
+    tests_collected = tests_skipped = tests_failed = tests_errored = -1
+    try:
+        metadata = junit.lstat()
+        if (
+            not junit.is_symlink()
+            and stat.S_ISREG(metadata.st_mode)
+            and metadata.st_nlink == 1
+            and 0 < metadata.st_size <= MAX_LIFECYCLE_LOG_BYTES_V2
+        ):
+            root = ET.fromstring(junit.read_bytes())
+            suites = [root] if root.tag == "testsuite" else list(
+                root.findall("testsuite")
+            )
+            if suites:
+                tests_collected = sum(int(item.attrib.get("tests", "0")) for item in suites)
+                tests_skipped = sum(int(item.attrib.get("skipped", "0")) for item in suites)
+                tests_failed = sum(int(item.attrib.get("failures", "0")) for item in suites)
+                tests_errored = sum(int(item.attrib.get("errors", "0")) for item in suites)
+                junit_valid = all(
+                    value >= 0 for value in (
+                        tests_collected, tests_skipped, tests_failed, tests_errored,
+                    )
+                )
+    except (OSError, ET.ParseError, TypeError, ValueError):
+        pass
+    finally:
+        try:
+            junit.unlink()
+        except FileNotFoundError:
+            pass
     return {
         "component": component,
         "node_id": node_id,
@@ -417,6 +498,11 @@ def _run_probe(
         "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
         "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
         "output_truncated": truncated,
+        "junit_valid": junit_valid,
+        "tests_collected": tests_collected,
+        "tests_skipped": tests_skipped,
+        "tests_failed": tests_failed,
+        "tests_errored": tests_errored,
     }
 
 
@@ -434,6 +520,11 @@ def _case_evidence(case_id: str, probes: Sequence[Mapping[str, Any]]) -> bytes:
                 "stdout_sha256": probe["stdout_sha256"],
                 "stderr_sha256": probe["stderr_sha256"],
                 "output_truncated": probe["output_truncated"],
+                "junit_valid": probe["junit_valid"],
+                "tests_collected": probe["tests_collected"],
+                "tests_skipped": probe["tests_skipped"],
+                "tests_failed": probe["tests_failed"],
+                "tests_errored": probe["tests_errored"],
             }
             for probe in probes
         ],
@@ -476,7 +567,8 @@ def run_lifecycle_matrix_v2(
         component: _git_revision(root)
         for component, root in roots.items()
     }
-    suite_digest = _test_suite_digest(roots)
+    plan = lifecycle_probe_plan_v2(cohort)
+    suite_digest = _test_suite_digest(roots, plan)
     output = Path(output_path).absolute()
     if output.exists() or output.is_symlink():
         raise ValueError("lifecycle result output already exists")
@@ -501,14 +593,14 @@ def run_lifecycle_matrix_v2(
         _materialize_git_revision(
             roots[component], revisions[component], exact_roots[component],
         )
-    if _test_suite_digest(exact_roots) != suite_digest:
+    if _test_suite_digest(exact_roots, plan) != suite_digest:
         raise ValueError("lifecycle source archive does not match reviewed tests")
     observed_from = datetime.now(timezone.utc).replace(microsecond=0)
     cases: list[dict[str, Any]] = []
     for case_id in sorted(LIFECYCLE_CASE_IDS_V2):
         probe_results = []
         for index, (component, node_id) in enumerate(
-            LIFECYCLE_PROBES_V2[case_id], start=1,
+            plan[case_id], start=1,
         ):
             probe = _run_probe(
                 component=component,
@@ -542,6 +634,11 @@ def run_lifecycle_matrix_v2(
             probe["returncode"] == 0
             and not probe["timed_out"]
             and not probe["output_truncated"]
+            and probe["junit_valid"]
+            and probe["tests_collected"] == 1
+            and probe["tests_skipped"] == 0
+            and probe["tests_failed"] == 0
+            and probe["tests_errored"] == 0
             for probe in probe_results
         )
         cases.append({
@@ -617,5 +714,6 @@ __all__ = [
     "LIFECYCLE_PROBE_PLAN_VERSION_V2",
     "LIFECYCLE_PROBES_V2",
     "cmd_checkpoint_lifecycle_run",
+    "lifecycle_probe_plan_v2",
     "run_lifecycle_matrix_v2",
 ]

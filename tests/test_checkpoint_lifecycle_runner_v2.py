@@ -34,9 +34,10 @@ def _cohort() -> dict[str, str]:
 
 
 def _commit_fake_source(root: Path, component: str) -> str:
+    plan = runner.lifecycle_probe_plan_v2(_cohort())
     paths = {
         node_id.split("::", 1)[0]
-        for probes in runner.LIFECYCLE_PROBES_V2.values()
+        for probes in plan.values()
         for probe_component, node_id in probes
         if probe_component == component
     }
@@ -98,6 +99,11 @@ def _successful_probe(**kwargs):
         "stdout_sha256": "b" * 64,
         "stderr_sha256": "c" * 64,
         "output_truncated": False,
+        "junit_valid": True,
+        "tests_collected": 1,
+        "tests_skipped": 0,
+        "tests_failed": 0,
+        "tests_errored": 0,
     }
 
 
@@ -132,7 +138,8 @@ def test_runner_executes_fixed_complete_plan_and_writes_private_results(
     assert not (logs[0] / "exact-sources").exists()
     log_files = list(logs[0].glob("*.json"))
     assert len(log_files) == sum(
-        len(probes) for probes in runner.LIFECYCLE_PROBES_V2.values()
+        len(probes)
+        for probes in runner.lifecycle_probe_plan_v2(_cohort()).values()
     )
     assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in log_files)
     bundle = load_lifecycle_matrix_results_v2(output)
@@ -170,6 +177,45 @@ def test_runner_records_failure_without_omitting_later_cases(
     failed = [case for case in result["cases"] if case["status"] == "failed"]
     assert [case["case_id"] for case in failed] == ["capture_interrupted"]
     assert "private failure detail" not in output.read_text(encoding="ascii")
+
+
+def test_probe_requires_one_collected_non_skipped_test(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    tests = source / "tests"
+    tests.mkdir(parents=True)
+    (tests / "test_probe.py").write_text(
+        "import pytest\n"
+        "def test_pass(): pass\n"
+        "def test_skip(): pytest.skip('not evidence')\n",
+        encoding="utf-8",
+    )
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir(mode=0o700)
+    passed = runner._run_probe(
+        component="client",
+        node_id="tests/test_probe.py::test_pass",
+        source_root=source,
+        python=Path(sys.executable),
+        sandbox_home=sandbox,
+        timeout_sec=30,
+    )
+    assert passed["returncode"] == 0
+    assert passed["junit_valid"] is True
+    assert passed["tests_collected"] == 1
+    assert passed["tests_skipped"] == 0
+
+    skipped = runner._run_probe(
+        component="client",
+        node_id="tests/test_probe.py::test_skip",
+        source_root=source,
+        python=Path(sys.executable),
+        sandbox_home=sandbox,
+        timeout_sec=30,
+    )
+    assert skipped["returncode"] == 0
+    assert skipped["junit_valid"] is True
+    assert skipped["tests_collected"] == 1
+    assert skipped["tests_skipped"] == 1
 
 
 @pytest.mark.parametrize(
@@ -242,8 +288,24 @@ def test_runner_refuses_dirty_source_and_existing_output(
 def test_probe_plan_has_no_operator_selectors_or_missing_cases() -> None:
     assert set(runner.LIFECYCLE_PROBES_V2) == LIFECYCLE_CASE_IDS_V2
     assert all(runner.LIFECYCLE_PROBES_V2.values())
-    assert {
-        component
-        for probes in runner.LIFECYCLE_PROBES_V2.values()
-        for component, _node_id in probes
-    } == {"client", "server"}
+    for harness, provider in (
+        ("codex", "openai"),
+        ("codex", "deepseek"),
+        ("dsh", "deepseek"),
+        ("kimi-code", "kimi-subscription"),
+        ("zcode", "bigmodel-coding-plan"),
+    ):
+        cohort = _cohort() | {"harness": harness, "provider": provider}
+        cohort["checkpoint_abi"] = f"dradar-checkpoint-v2/{harness}/1"
+        plan = runner.lifecycle_probe_plan_v2(cohort)
+        assert set(plan) == LIFECYCLE_CASE_IDS_V2
+        assert all(plan.values())
+        assert {
+            component
+            for probes in plan.values()
+            for component, _node_id in probes
+        } == {"client", "server"}
+        selected = "\n".join(
+            node_id for probes in plan.values() for _component, node_id in probes
+        )
+        assert f"[{harness}-{provider}]" in selected
