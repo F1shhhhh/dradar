@@ -40,6 +40,30 @@ def test_public_durable_checkpoint_rollout_is_hard_disabled(monkeypatch) -> None
     assert runner.durable_checkpoint_rollout_enabled() is False
 
 
+def test_disabled_rollout_uses_stock_codex_without_private_adapter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        runner, "_resolve_user_tool", lambda *_args, **_kwargs: "/usr/bin/pier",
+    )
+    tasks = tmp_path / "tasks"
+    (tasks / "task-1").mkdir(parents=True)
+    home = tmp_path / "home"
+    home.mkdir()
+    auth = _private_file(tmp_path / "codex-auth.json", "{}")
+    monkeypatch.setattr(runner, "codex_auth_path", lambda: auth)
+
+    command = runner.build_pier_command(
+        _assignment("codex"), tasks, tmp_path / "jobs", "job", home,
+    )
+
+    assert command[command.index("--agent") + 1] == "codex"
+    assert "--agent-import-path" not in command
+    assert not (home / runner.CODEX_AGENT_MODULE_FILENAME).exists()
+    assert not (home / runner.CHECKPOINT_MODULE_FILENAME).exists()
+
+
 @pytest.mark.parametrize(
     ("assignment", "credential_kind"),
     [
@@ -176,3 +200,33 @@ def test_run_trial_wires_public_rollout_gate_into_fresh_assignment(
         )
 
     assert captured["_durable_checkpoint_enabled"] is False
+
+
+def test_disabled_rollout_does_not_inject_codex_adapter_pythonpath(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict = {}
+
+    class EnvironmentObserved(RuntimeError):
+        pass
+
+    def observe_environment(_assignment, **kwargs):
+        captured.update(kwargs)
+        raise EnvironmentObserved
+
+    monkeypatch.setattr(
+        runner, "resolve_latest_codex_cli_version", lambda *_a, **_k: "0.145.0",
+    )
+    monkeypatch.setattr(
+        runner.egress, "prepare_egress_proxy_runtime", lambda **_kwargs: {},
+    )
+    monkeypatch.setattr(runner, "build_pier_command", lambda *_a, **_k: ["pier"])
+    monkeypatch.setattr(runner, "_pier_process_env", observe_environment)
+
+    with pytest.raises(EnvironmentObserved):
+        runner.run_trial(
+            _assignment("codex"), tmp_path / "tasks", tmp_path / "work",
+        )
+
+    assert captured["codex_module_dir"] is None

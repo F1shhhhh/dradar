@@ -678,6 +678,55 @@ def test_disabled_checkpoint_host_layout_preflight_is_strict_noop(
     assert not manager.host_dir.exists()
 
 
+def test_disabled_checkpoint_constructs_without_posix_host_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logs = tmp_path / "trial" / "agent"
+    logs.mkdir(parents=True)
+    monkeypatch.delattr(os, "getuid")
+    monkeypatch.delattr(os, "getgid")
+
+    manager = DurableCheckpoint(
+        logs_dir=logs,
+        enabled=False,
+        assignment_id=None,
+        task_id=None,
+        model=None,
+        effort=None,
+        harness="test-harness",
+        provider="test-provider",
+        agent_version="1.2.3",
+    )
+
+    assert manager.enabled is False
+    assert manager.host_uid == 0
+    assert manager.host_gid == 0
+
+
+def test_enabled_checkpoint_fails_closed_without_posix_host_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logs = tmp_path / "trial" / "agent"
+    logs.mkdir(parents=True)
+    monkeypatch.delattr(os, "getuid")
+    monkeypatch.delattr(os, "getgid")
+
+    with pytest.raises(CheckpointError, match="POSIX host ownership"):
+        DurableCheckpoint(
+            logs_dir=logs,
+            enabled=True,
+            assignment_id="assignment-1",
+            task_id="task-1",
+            model="gpt-5.6-sol",
+            effort="high",
+            harness="codex",
+            provider="openai",
+            agent_version="0.149.0",
+        )
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX no-follow directory semantics")
 def test_checkpoint_host_layout_preflight_rejects_symlinked_agent_dir(
     tmp_path: Path,
