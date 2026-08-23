@@ -251,6 +251,9 @@ def build_live_checkpoint_shadow_v2(
             / "shadow"
             / str(assignment["assignment_id"])
         ),
+        shadow_budget_root=(
+            Path(home).absolute() / "checkpoint-v2" / "shadow"
+        ),
     )
     coordinator = CheckpointShadowCoordinatorV2(
         assignment=assignment,

@@ -45,6 +45,8 @@ MAX_PENDING_OBSERVATIONS_V2 = 512
 MAX_PENDING_OBSERVATION_BYTES_V2 = 8 * 1024 * 1024
 MAX_REJECTED_OBSERVATIONS_V2 = 512
 MAX_REJECTED_OBSERVATION_BYTES_V2 = 8 * 1024 * 1024
+MAX_OBSERVATION_SPOOL_FILES_V2 = 16_384
+MAX_OBSERVATION_SPOOL_BYTES_V2 = 64 * 1024 * 1024
 
 _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9._-]{8,64}")
 _CAPTURE_WIRE_FIELDS = frozenset({
@@ -657,6 +659,8 @@ class CheckpointObservationSpoolV2:
         max_pending_bytes: int = MAX_PENDING_OBSERVATION_BYTES_V2,
         max_rejected: int = MAX_REJECTED_OBSERVATIONS_V2,
         max_rejected_bytes: int = MAX_REJECTED_OBSERVATION_BYTES_V2,
+        max_total_files: int = MAX_OBSERVATION_SPOOL_FILES_V2,
+        max_total_bytes: int = MAX_OBSERVATION_SPOOL_BYTES_V2,
     ) -> None:
         if not 1 <= max_pending <= 10_000:
             raise ValueError("checkpoint observation pending limit is invalid")
@@ -668,6 +672,10 @@ class CheckpointObservationSpoolV2:
             raise ValueError(
                 "checkpoint observation rejected byte limit is invalid"
             )
+        if not 2 <= max_total_files <= 100_000:
+            raise ValueError("checkpoint observation total file limit is invalid")
+        if not 2 * MAX_OBSERVATION_RECORD_BYTES_V2 <= max_total_bytes <= 1024 * 1024 * 1024:
+            raise ValueError("checkpoint observation total byte limit is invalid")
         self.root = Path(root).absolute()
         self.pending_root = self.root / "pending"
         self.rejected_root = self.root / "rejected"
@@ -677,6 +685,8 @@ class CheckpointObservationSpoolV2:
         self.max_pending_bytes = max_pending_bytes
         self.max_rejected = max_rejected
         self.max_rejected_bytes = max_rejected_bytes
+        self.max_total_files = max_total_files
+        self.max_total_bytes = max_total_bytes
         self._thread_lock = threading.Lock()
 
     def _prepare(self) -> None:
@@ -710,12 +720,18 @@ class CheckpointObservationSpoolV2:
                 value["registered_at"] = existing.get("registered_at")
                 encoded = _canonical_cohort_registration(value)
                 if _canonical_cohort_registration(existing) == encoded == raw:
+                    self._assert_total_capacity_unlocked(
+                        additional_files=0, additional_bytes=0,
+                    )
                     return False
                 raise CheckpointObservationSpoolError(
                     "checkpoint cohort registration conflicts",
                 )
             value.setdefault("registered_at", _now_iso())
             encoded = _canonical_cohort_registration(value)
+            self._assert_total_capacity_unlocked(
+                additional_files=1, additional_bytes=len(encoded),
+            )
             _atomic_private_record(target, encoded)
             return True
 
@@ -758,7 +774,8 @@ class CheckpointObservationSpoolV2:
             self._prepare()
             now = _now_iso()
             target = self.delivery_health_root / f"{assignment_id}.json"
-            if target.exists():
+            target_exists = target.exists() or target.is_symlink()
+            if target_exists:
                 current, raw = _read_private_json(target)
                 if _canonical_delivery_health(current) != raw:
                     raise CheckpointObservationSpoolError(
@@ -779,10 +796,12 @@ class CheckpointObservationSpoolV2:
                         "checkpoint delivery health counter overflowed",
                     )
                 updated[field] = total
-            _atomic_private_record(
-                target,
-                _canonical_delivery_health(updated),
+            encoded = _canonical_delivery_health(updated)
+            self._assert_total_capacity_unlocked(
+                additional_files=1,
+                additional_bytes=len(encoded),
             )
+            _atomic_private_record(target, encoded)
 
     def record_delivery_drops(
         self, assignment_id: str, count: int,
@@ -826,6 +845,78 @@ class CheckpointObservationSpoolV2:
         paths.sort()
         return [path for _, _, path in paths]
 
+    def _assert_total_capacity_unlocked(
+        self, *, additional_files: int, additional_bytes: int,
+    ) -> None:
+        """Bound every evidence file, including crash-left hidden temporaries."""
+
+        if additional_files < 0 or additional_bytes < 0:
+            raise CheckpointObservationSpoolError(
+                "checkpoint observation capacity delta is invalid",
+            )
+        self._prepare()
+        files = 0
+        total_bytes = 0
+        try:
+            for current, directory_names, file_names in os.walk(
+                self.root, topdown=True, followlinks=False,
+            ):
+                current_path = Path(current)
+                for name in directory_names:
+                    path = current_path / name
+                    metadata = path.lstat()
+                    if path.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+                        raise CheckpointObservationSpoolError(
+                            "checkpoint observation spool tree is unsafe",
+                        )
+                    if hasattr(os, "getuid") and (
+                        metadata.st_uid != os.getuid()
+                        or stat.S_IMODE(metadata.st_mode) & 0o077
+                    ):
+                        raise CheckpointObservationSpoolError(
+                            "checkpoint observation spool tree is not private",
+                        )
+                for name in file_names:
+                    path = current_path / name
+                    metadata = path.lstat()
+                    if (
+                        path.is_symlink()
+                        or not stat.S_ISREG(metadata.st_mode)
+                        or metadata.st_nlink != 1
+                    ):
+                        raise CheckpointObservationSpoolError(
+                            "checkpoint observation spool tree is unsafe",
+                        )
+                    if hasattr(os, "getuid") and (
+                        metadata.st_uid != os.getuid()
+                        or stat.S_IMODE(metadata.st_mode) != 0o600
+                    ):
+                        raise CheckpointObservationSpoolError(
+                            "checkpoint observation spool tree is not private",
+                        )
+                    files += 1
+                    total_bytes += metadata.st_size
+                    if (
+                        files + additional_files > self.max_total_files
+                        or total_bytes + additional_bytes > self.max_total_bytes
+                    ):
+                        raise CheckpointObservationSpoolError(
+                            "checkpoint observation total spool is full",
+                        )
+        except CheckpointObservationSpoolError:
+            raise
+        except OSError as exc:
+            raise CheckpointObservationSpoolError(
+                "checkpoint observation spool tree is unreadable",
+            ) from exc
+        if (
+            files + additional_files > self.max_total_files
+            or total_bytes + additional_bytes > self.max_total_bytes
+        ):
+            raise CheckpointObservationSpoolError(
+                "checkpoint observation total spool is full",
+            )
+
     def persist(self, payload: dict[str, Any]) -> bool:
         """Persist once; return False for an exact already-persisted replay."""
 
@@ -837,6 +928,9 @@ class CheckpointObservationSpoolV2:
             if target.exists() or target.is_symlink():
                 _, existing = _read_private_record(target)
                 if existing == encoded:
+                    self._assert_total_capacity_unlocked(
+                        additional_files=0, additional_bytes=0,
+                    )
                     return False
                 raise CheckpointObservationSpoolError(
                     "checkpoint observation operation id conflicts",
@@ -853,6 +947,9 @@ class CheckpointObservationSpoolV2:
                 raise CheckpointObservationSpoolError(
                     "checkpoint observation spool is full",
                 )
+            self._assert_total_capacity_unlocked(
+                additional_files=1, additional_bytes=len(encoded),
+            )
             temporary = self.pending_root / f".{operation_id}.{uuid.uuid4().hex}.tmp"
             descriptor: int | None = None
             try:
@@ -1043,7 +1140,8 @@ class CheckpointObservationReporterV2:
         """Persist exact finalized cohort facts; failure remains shadow-only."""
 
         try:
-            return self.spool.register_cohort(payload)
+            self.spool.register_cohort(payload)
+            return True
         except Exception:
             self._record_drop(payload)
             self._wake.set()
@@ -1565,6 +1663,8 @@ __all__ = [
     "CheckpointObservationSpoolError",
     "CheckpointObservationSpoolV2",
     "MAX_OBSERVATION_RECORD_BYTES_V2",
+    "MAX_OBSERVATION_SPOOL_BYTES_V2",
+    "MAX_OBSERVATION_SPOOL_FILES_V2",
     "MAX_PENDING_OBSERVATIONS_V2",
     "MAX_PENDING_OBSERVATION_BYTES_V2",
     "MAX_REJECTED_OBSERVATIONS_V2",

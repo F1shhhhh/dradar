@@ -34,6 +34,7 @@ from dradar.checkpoint_runtime_v2 import (
     CheckpointRetentionPolicyV2,
     CheckpointRestoreEvidenceV2,
     CheckpointRestoreRequestV2,
+    CheckpointShadowStorageBudgetV2,
     ContainerSealedExportV2,
     PublishedCheckpointV2,
     apply_checkpoint_generation_retention_v2,
@@ -562,6 +563,90 @@ def test_shadow_capture_disk_pressure_is_fail_open_before_export(
     assert observed.code == "disk_full"
     assert observed.mainline_may_continue is True
     assert exporter.capture_calls == 0
+
+
+def test_global_shadow_budget_stops_optional_capture_before_export(
+    tmp_path: Path,
+) -> None:
+    global_root = tmp_path / "shadow"
+    retained = global_root / "retained-assignment"
+    retained.mkdir(parents=True, mode=0o700)
+    global_root.chmod(0o700)
+    retained.chmod(0o700)
+    evidence = retained / "failed-snapshot.bin"
+    evidence.touch(mode=0o600)
+    evidence.chmod(0o600)
+    os.truncate(evidence, 61 * 1024 * 1024)
+    exporter = FakeExporter(tmp_path / "container")
+    plane = CheckpointDataPlaneV2(
+        activation=_activation("observe", "observe"),
+        storage_root=global_root / "current-assignment",
+        limits=replace(
+            runtime.DEFAULT_PACKAGE_LIMITS_V2,
+            max_archive_bytes=4 * 1024 * 1024,
+        ),
+        retention=CheckpointRetentionPolicyV2(
+            shadow_generations=2, minimum_free_bytes=0,
+        ),
+        shadow_budget_root=global_root,
+        shadow_budget=CheckpointShadowStorageBudgetV2(
+            max_bytes=64 * 1024 * 1024, max_entries=100,
+        ),
+    )
+
+    observed = asyncio.run(plane.observe_capture(_request(), exporter))
+
+    assert observed.status == "failed"
+    assert observed.code == "shadow_storage_budget_exhausted"
+    assert exporter.capture_calls == 0
+    assert evidence.stat().st_size == 61 * 1024 * 1024
+    assert not plane.storage_root.exists()
+
+
+def test_global_shadow_budget_preserves_unsafe_unknown_material(
+    tmp_path: Path,
+) -> None:
+    global_root = tmp_path / "shadow"
+    global_root.mkdir(mode=0o700)
+    unknown = global_root / "unknown-assignment"
+    unknown.symlink_to(tmp_path / "outside", target_is_directory=True)
+    exporter = FakeExporter(tmp_path / "container")
+    plane = CheckpointDataPlaneV2(
+        activation=_activation("observe", "observe"),
+        storage_root=global_root / "current-assignment",
+        retention=CheckpointRetentionPolicyV2(
+            shadow_generations=2, minimum_free_bytes=0,
+        ),
+        shadow_budget_root=global_root,
+    )
+
+    observed = asyncio.run(plane.observe_capture(_request(), exporter))
+
+    assert observed.status == "failed"
+    assert observed.code == "shadow_storage_unsafe"
+    assert exporter.capture_calls == 0
+    assert unknown.is_symlink()
+    assert not plane.storage_root.exists()
+
+
+def test_global_shadow_budget_guard_is_nonblocking_across_writers(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "shadow"
+    budget = CheckpointShadowStorageBudgetV2(
+        max_bytes=64 * 1024 * 1024, max_entries=100,
+    )
+
+    with runtime.shadow_storage_budget_guard_v2(
+        root, required_bytes=1024, budget=budget,
+    ):
+        with pytest.raises(CheckpointDataPlaneError) as failure:
+            with runtime.shadow_storage_budget_guard_v2(
+                root, required_bytes=1024, budget=budget,
+            ):
+                raise AssertionError("contended shadow writer entered")
+
+    assert failure.value.code == "shadow_storage_busy"
 
 
 def test_shadow_generation_restarts_after_published_directory_without_current(

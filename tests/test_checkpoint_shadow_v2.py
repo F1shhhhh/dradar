@@ -300,6 +300,24 @@ def test_observe_coordinator_keeps_mainline_authoritative_and_reports_capture(
     }
 
 
+def test_missing_durable_cohort_registration_stops_optional_capture(
+    tmp_path: Path,
+) -> None:
+    coordinator, plane, sink = _coordinator(tmp_path, "observe")
+    sink.register_checkpoint_cohort = lambda _payload: False
+
+    async def mainline():
+        await asyncio.sleep(0.02)
+        return "paid-result"
+
+    assert asyncio.run(coordinator.run(
+        mainline(), initial_delay_sec=0, interval_sec=0.01,
+        maximum_captures=1,
+    )) == "paid-result"
+    assert plane.captures == 0
+    assert sink.payloads == []
+
+
 def test_restore_test_reports_capture_before_nonpaid_restore(tmp_path: Path) -> None:
     coordinator, plane, sink = _coordinator(tmp_path, "restore-test")
 

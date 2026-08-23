@@ -25,7 +25,7 @@ import shutil
 import stat
 import tarfile
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -146,6 +146,31 @@ class CheckpointRetentionPolicyV2:
 
 
 DEFAULT_RETENTION_POLICY_V2 = CheckpointRetentionPolicyV2()
+
+
+@dataclass(frozen=True)
+class CheckpointShadowStorageBudgetV2:
+    """Global fail-open budget for long-running non-authoritative evidence."""
+
+    max_bytes: int = 4 * 1024 * 1024 * 1024
+    max_entries: int = 50_000
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.max_bytes, int)
+            or isinstance(self.max_bytes, bool)
+            or not 64 * 1024 * 1024 <= self.max_bytes <= 1024**4
+        ):
+            raise ValueError("checkpoint shadow byte budget is invalid")
+        if (
+            not isinstance(self.max_entries, int)
+            or isinstance(self.max_entries, bool)
+            or not 100 <= self.max_entries <= 1_000_000
+        ):
+            raise ValueError("checkpoint shadow entry budget is invalid")
+
+
+DEFAULT_SHADOW_STORAGE_BUDGET_V2 = CheckpointShadowStorageBudgetV2()
 
 
 class CheckpointDataPlaneError(RuntimeError):
@@ -1166,6 +1191,190 @@ def _ensure_private_directory(path: Path, *, stage: str) -> None:
     except OSError as exc:
         raise CheckpointDataPlaneError(stage, "storage_create_failed") from exc
     _assert_private_directory(path, stage=stage)
+
+
+def assert_shadow_storage_budget_v2(
+    root: Path,
+    *,
+    required_bytes: int,
+    budget: CheckpointShadowStorageBudgetV2 = (
+        DEFAULT_SHADOW_STORAGE_BUDGET_V2
+    ),
+) -> None:
+    """Refuse optional capture before a global evidence tree can grow.
+
+    The scan follows no links and counts logical bytes, regular files and
+    directories, including hidden crash remnants.  Unknown or unsafe material
+    is preserved and disables optional work; it is never repaired or deleted
+    from the paid execution path.
+    """
+
+    if (
+        not isinstance(required_bytes, int)
+        or isinstance(required_bytes, bool)
+        or required_bytes < 0
+        or required_bytes > budget.max_bytes
+    ):
+        raise CheckpointDataPlaneError(
+            "capture", "shadow_storage_budget_invalid",
+        )
+    root = Path(os.path.abspath(root))
+    _ensure_private_directory(root, stage="capture")
+    entries = 0
+    total_bytes = 0
+    try:
+        for current, directory_names, file_names in os.walk(
+            root, topdown=True, followlinks=False,
+        ):
+            current_path = Path(current)
+            for name in directory_names:
+                path = current_path / name
+                metadata = path.lstat()
+                if path.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+                    raise CheckpointDataPlaneError(
+                        "capture", "shadow_storage_unsafe",
+                    )
+                if os.name == "posix" and (
+                    metadata.st_uid != os.getuid()
+                    or stat.S_IMODE(metadata.st_mode) & 0o077
+                ):
+                    raise CheckpointDataPlaneError(
+                        "capture", "shadow_storage_unsafe",
+                    )
+                entries += 1
+                if entries > budget.max_entries:
+                    raise CheckpointDataPlaneError(
+                        "capture", "shadow_storage_budget_exhausted",
+                    )
+            for name in file_names:
+                path = current_path / name
+                metadata = path.lstat()
+                if (
+                    path.is_symlink()
+                    or not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_nlink != 1
+                ):
+                    raise CheckpointDataPlaneError(
+                        "capture", "shadow_storage_unsafe",
+                    )
+                if os.name == "posix" and (
+                    metadata.st_uid != os.getuid()
+                    or stat.S_IMODE(metadata.st_mode) != 0o600
+                ):
+                    raise CheckpointDataPlaneError(
+                        "capture", "shadow_storage_unsafe",
+                    )
+                entries += 1
+                total_bytes += metadata.st_size
+                if (
+                    entries > budget.max_entries
+                    or total_bytes + required_bytes > budget.max_bytes
+                ):
+                    raise CheckpointDataPlaneError(
+                        "capture", "shadow_storage_budget_exhausted",
+                    )
+    except CheckpointDataPlaneError:
+        raise
+    except OSError as exc:
+        raise CheckpointDataPlaneError(
+            "capture", "shadow_storage_unreadable",
+        ) from exc
+    if total_bytes + required_bytes > budget.max_bytes:
+        raise CheckpointDataPlaneError(
+            "capture", "shadow_storage_budget_exhausted",
+        )
+
+
+@contextmanager
+def shadow_storage_budget_guard_v2(
+    root: Path,
+    *,
+    required_bytes: int,
+    budget: CheckpointShadowStorageBudgetV2 = (
+        DEFAULT_SHADOW_STORAGE_BUDGET_V2
+    ),
+):
+    """Atomically reserve the global shadow writer lane across processes.
+
+    The lock is deliberately non-blocking.  Optional observation loses a
+    sample rather than queueing behind a stuck filesystem operation or adding
+    latency to shutdown.  Holding the lock through publication makes the
+    preceding budget scan a real reservation instead of a racy estimate.
+    """
+
+    root = Path(os.path.abspath(root))
+    _ensure_private_directory(root, stage="capture")
+    lock_path = root / ".budget.lock"
+    descriptor: int | None = None
+    locked = False
+    windows_lock = False
+    try:
+        flags = os.O_RDWR | os.O_CREAT
+        flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(lock_path, flags, 0o600)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or (
+                os.name == "posix"
+                and (
+                    metadata.st_uid != os.getuid()
+                    or stat.S_IMODE(metadata.st_mode) != 0o600
+                )
+            )
+        ):
+            raise CheckpointDataPlaneError(
+                "capture", "shadow_storage_lock_unsafe",
+            )
+        if metadata.st_size == 0:
+            os.write(descriptor, b"\0")
+            os.fsync(descriptor)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        try:
+            if os.name == "nt":  # pragma: no cover - Windows CI
+                import msvcrt
+
+                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                windows_lock = True
+            else:
+                import fcntl
+
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise CheckpointDataPlaneError(
+                "capture", "shadow_storage_busy",
+            ) from exc
+        locked = True
+        assert_shadow_storage_budget_v2(
+            root, required_bytes=required_bytes, budget=budget,
+        )
+        yield
+    except CheckpointDataPlaneError:
+        raise
+    except OSError as exc:
+        raise CheckpointDataPlaneError(
+            "capture", "shadow_storage_lock_failed",
+        ) from exc
+    finally:
+        if descriptor is not None:
+            if locked:
+                try:
+                    if windows_lock:  # pragma: no cover - Windows CI
+                        import msvcrt
+
+                        os.lseek(descriptor, 0, os.SEEK_SET)
+                        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def _fsync_directory(path: Path) -> None:
@@ -2842,6 +3051,10 @@ def checkpoint_observation_failure_family_v2(code: str | None) -> str:
         return "observer_failed"
     if code in {"observer_failed", "observer_cancel_timeout", "disk_full"}:
         return code
+    if code == "shadow_storage_budget_exhausted":
+        return "resource_limit"
+    if code == "shadow_storage_busy":
+        return "resource_limit"
     if code in {"mainline_completed", "mainline_aborted"}:
         return code
     if "secret" in code:
@@ -3068,11 +3281,21 @@ class CheckpointDataPlaneV2:
         storage_root: Path,
         limits: CheckpointPackageLimitsV2 = DEFAULT_PACKAGE_LIMITS_V2,
         retention: CheckpointRetentionPolicyV2 = DEFAULT_RETENTION_POLICY_V2,
+        shadow_budget_root: Path | None = None,
+        shadow_budget: CheckpointShadowStorageBudgetV2 = (
+            DEFAULT_SHADOW_STORAGE_BUDGET_V2
+        ),
     ) -> None:
+        if not isinstance(shadow_budget, CheckpointShadowStorageBudgetV2):
+            raise ValueError("checkpoint shadow storage budget is invalid")
         self.activation = activation
         self.storage_root = Path(storage_root)
         self.limits = limits
         self.retention = retention
+        self.shadow_budget_root = (
+            None if shadow_budget_root is None else Path(shadow_budget_root)
+        )
+        self.shadow_budget = shadow_budget
 
     async def observe_capture(
         self,
@@ -3083,11 +3306,21 @@ class CheckpointDataPlaneV2:
             return CheckpointObservationV2(status="skipped", capture_id=None)
         export: ContainerSealedExportV2 | None = None
         download: Path | None = None
+        budget_stack = ExitStack()
         stage = "capture"
         try:
             request.validate()
             if exporter.checkpoint_abi != request.checkpoint_abi:
                 raise CheckpointDataPlaneError("capture", "adapter_abi_mismatch")
+            if (
+                not self.activation.authoritative
+                and self.shadow_budget_root is not None
+            ):
+                budget_stack.enter_context(shadow_storage_budget_guard_v2(
+                    self.shadow_budget_root,
+                    required_bytes=self.limits.max_archive_bytes,
+                    budget=self.shadow_budget,
+                ))
             # Validate the operator-selected host boundary before asking a
             # Harness to spend CPU or create container-side state.  Checking
             # only the nested download/publication directories would allow a
@@ -3154,12 +3387,21 @@ class CheckpointDataPlaneV2:
                 stage, code = exc.stage, exc.code
             else:
                 code = f"{stage}_failed"
-            _record_local_checkpoint_failure_v2(
-                self.storage_root,
-                exc=exc,
-                stage=stage,
-                code=code,
-            )
+            if code not in {
+                "shadow_storage_budget_exhausted",
+                "shadow_storage_budget_invalid",
+                "shadow_storage_busy",
+                "shadow_storage_lock_failed",
+                "shadow_storage_lock_unsafe",
+                "shadow_storage_unsafe",
+                "shadow_storage_unreadable",
+            }:
+                _record_local_checkpoint_failure_v2(
+                    self.storage_root,
+                    exc=exc,
+                    stage=stage,
+                    code=code,
+                )
             cleanup = (
                 await self._discard_export(exporter, export)
                 if export is not None else "not_needed"
@@ -3186,6 +3428,13 @@ class CheckpointDataPlaneV2:
                     # their name remains below the non-authoritative download
                     # staging directory.
                     pass
+            try:
+                budget_stack.close()
+            except BaseException:
+                # The cross-process shadow guard has no authority over the
+                # ordinary result even if the local kernel reports an unlock
+                # or descriptor-cleanup anomaly.
+                pass
 
     @staticmethod
     async def _discard_export(
@@ -3469,6 +3718,7 @@ __all__ = [
     "CONTAINER_EXPORT_ROOT",
     "DEFAULT_PACKAGE_LIMITS_V2",
     "DEFAULT_RETENTION_POLICY_V2",
+    "DEFAULT_SHADOW_STORAGE_BUDGET_V2",
     "EXPORT_SCHEMA_V2",
     "CheckpointCaptureRequestV2",
     "CheckpointDataPlaneError",
@@ -3480,6 +3730,7 @@ __all__ = [
     "CheckpointRestoreEvidenceV2",
     "CheckpointRestoreObservationV2",
     "CheckpointRestoreRequestV2",
+    "CheckpointShadowStorageBudgetV2",
     "CheckpointRetentionApplyResultV2",
     "ContainerSealedExportV2",
     "HarnessCheckpointExporterV2",
@@ -3488,6 +3739,8 @@ __all__ = [
     "new_capture_request_v2",
     "next_shadow_generation_v2",
     "apply_checkpoint_generation_retention_v2",
+    "assert_shadow_storage_budget_v2",
+    "shadow_storage_budget_guard_v2",
     "checkpoint_observation_failure_family_v2",
     "checkpoint_observation_payload_v2",
     "checkpoint_restore_observation_payload_v2",

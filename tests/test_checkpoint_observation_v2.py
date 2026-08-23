@@ -645,6 +645,73 @@ def test_cohort_registration_is_private_idempotent_and_conflict_safe(tmp_path):
         spool.register_cohort(changed)
 
 
+def test_total_spool_budget_bounds_cohorts_and_exact_replay_survives(tmp_path):
+    spool = CheckpointObservationSpoolV2(
+        tmp_path / "observations", max_total_files=2,
+    )
+    first = _cohort_registration()
+    second = json.loads(json.dumps(first))
+    second.update({
+        "assignment_id": "assignment-0002",
+        "runner_session_id": "session-0002",
+        "identity_fingerprint": "b" * 64,
+    })
+
+    assert spool.register_cohort(first) is True
+    assert spool.register_cohort(first) is False
+    with pytest.raises(
+        CheckpointObservationSpoolError, match="total spool is full",
+    ):
+        spool.register_cohort(second)
+
+    assert len(list(spool.cohort_root.glob("*.json"))) == 1
+
+
+def test_total_spool_budget_counts_hidden_crash_temporaries(tmp_path):
+    spool = CheckpointObservationSpoolV2(
+        tmp_path / "observations", max_total_files=2,
+    )
+    spool._prepare()
+    orphan = spool.pending_root / ".crash-left.tmp"
+    orphan.write_bytes(b"partial")
+    orphan.chmod(0o600)
+
+    with pytest.raises(
+        CheckpointObservationSpoolError, match="total spool is full",
+    ):
+        spool.persist(_payload())
+
+    assert orphan.read_bytes() == b"partial"
+    assert spool.pending() == []
+
+
+def test_exact_replay_cannot_bypass_total_spool_budget(tmp_path):
+    spool = CheckpointObservationSpoolV2(
+        tmp_path / "observations", max_total_files=2,
+    )
+    registration = _cohort_registration()
+    assert spool.register_cohort(registration) is True
+    orphan = spool.pending_root / ".crash-left.tmp"
+    orphan.write_bytes(b"partial")
+    orphan.chmod(0o600)
+
+    with pytest.raises(
+        CheckpointObservationSpoolError, match="total spool is full",
+    ):
+        spool.register_cohort(registration)
+
+    assert orphan.read_bytes() == b"partial"
+
+
+def test_reporter_treats_exact_cohort_replay_as_durably_registered(tmp_path):
+    reporter = CheckpointObservationReporterV2(FakeObservationApi(), tmp_path)
+    registration = _cohort_registration()
+
+    assert reporter.register_cohort(registration) is True
+    assert reporter.register_cohort(registration) is True
+    assert len(list(reporter.spool.cohort_root.glob("*.json"))) == 1
+
+
 def test_local_evidence_reports_assignment_scoped_backlog_and_drops(tmp_path):
     reporter = CheckpointObservationReporterV2(
         FakeObservationApi([ApiError("offline")]), tmp_path, queue_size=1,

@@ -173,6 +173,7 @@ class CheckpointShadowCoordinatorV2:
         self.restorer_factory = restorer_factory
         self._identity: ExecutionIdentityV2 | None = None
         self._identity_lock = asyncio.Lock()
+        self._cohort_persisted: bool | None = None
         self._release_candidates: list[
             tuple[PublishedCheckpointV2, str, str]
         ] = []
@@ -198,6 +199,7 @@ class CheckpointShadowCoordinatorV2:
                     ),
                 )
                 self._identity = receipt.identity
+                registered = False
                 register = getattr(
                     self.observation_sink,
                     "register_checkpoint_cohort",
@@ -205,7 +207,7 @@ class CheckpointShadowCoordinatorV2:
                 )
                 if callable(register):
                     try:
-                        register({
+                        registered = bool(register({
                             "assignment_id": receipt.identity.assignment_id,
                             "identity_fingerprint": receipt.identity.fingerprint,
                             "cohort": {
@@ -231,12 +233,14 @@ class CheckpointShadowCoordinatorV2:
                                 ),
                                 "checkpoint_abi": receipt.identity.checkpoint_abi,
                             },
-                        })
+                        }))
                     except Exception:
                         # Local evidence registration is itself shadow-only.
-                        # Capture remains useful to the mainline even when the
-                        # operator later has to mark this cohort incomplete.
+                        # The paid mainline remains useful, but optional
+                        # capture will stop before creating unattributable
+                        # evidence.
                         pass
+                self._cohort_persisted = registered
         return self._identity
 
     def _record(self, payload: dict[str, object]) -> bool:
@@ -446,6 +450,11 @@ class CheckpointShadowCoordinatorV2:
                 code="identity_finalization_failed",
                 failure_type=type(exc).__name__[:64] or "Exception",
             )
+        if self._cohort_persisted is not True:
+            # Without a durable exact-cohort registration, observations could
+            # not be attributed or audited after a restart.  Stop optional
+            # sampling before container inspection or snapshot creation.
+            return CheckpointObservationV2(status="skipped", capture_id=None)
         try:
             activation = await self._sample_activation(identity)
         except Exception as exc:
