@@ -284,6 +284,10 @@ def main(argv: list[str] | None = None) -> int:
         "audit",
         help="emit a read-only privacy-bounded Checkpoint V2 evidence packet",
     )
+    p_cp_audit.add_argument(
+        "--hours", type=int, default=24 * 30,
+        help="bounded evidence window ending now (default 720)",
+    )
     p_cp_audit.set_defaults(func=cmd_checkpoint_audit)
     p_cp_lifecycle = checkpoint_sub.add_parser(
         "lifecycle-bundle",

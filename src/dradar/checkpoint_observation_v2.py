@@ -27,7 +27,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Protocol
 
@@ -1861,6 +1861,7 @@ def _local_cleanup_residue(home: Path, assignment_id: str) -> int:
 def checkpoint_local_evidence_v2(
     home: Path,
     *,
+    since: datetime | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Build strict assignment-scoped outbox-health attestations locally.
@@ -1873,7 +1874,23 @@ def checkpoint_local_evidence_v2(
 
     home = Path(home).absolute()
     root = home / "checkpoint-v2" / "observations"
-    instant = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    raw_instant = now or datetime.now(timezone.utc)
+    if raw_instant.tzinfo is None or since is not None and since.tzinfo is None:
+        raise CheckpointObservationSpoolError(
+            "checkpoint local evidence window is invalid",
+        )
+    instant = raw_instant.astimezone(timezone.utc)
+    window_start = since.astimezone(timezone.utc) if since is not None else None
+    if (
+        window_start is not None
+        and (
+            window_start >= instant
+            or instant - window_start > timedelta(days=365)
+        )
+    ):
+        raise CheckpointObservationSpoolError(
+            "checkpoint local evidence window is invalid",
+        )
     if not root.exists():
         return {
             "schema": LOCAL_EVIDENCE_SCHEMA_V2,
@@ -2055,6 +2072,8 @@ def checkpoint_local_evidence_v2(
             raise CheckpointObservationSpoolError(
                 "checkpoint mainline impact sample time is invalid",
             )
+        if window_start is not None and sample_started < window_start:
+            continue
         impact_groups.setdefault(registration[0], []).append((
             sample, digest, registration[2],
         ))
@@ -2073,6 +2092,9 @@ def checkpoint_local_evidence_v2(
             datetime.fromisoformat(value["registered_at"]).astimezone(timezone.utc)
             for value, _ in cohort_registrations
         ]
+        evidence_from = min(registered_at)
+        if window_start is not None and evidence_from <= window_start:
+            evidence_from = window_start
         pending = [
             (payload, digest) for state, payload, digest in observation_records
             if state == "pending" and payload.get("assignment_id") in assignments
@@ -2133,7 +2155,7 @@ def checkpoint_local_evidence_v2(
             "attestation_id": f"local-outbox-{artifact[:40]}",
             "kind": "outbox_health",
             "cohort": cohort,
-            "observed_from": min(registered_at).replace(microsecond=0).isoformat(),
+            "observed_from": evidence_from.replace(microsecond=0).isoformat(),
             "observed_until": instant.replace(microsecond=0).isoformat(),
             "artifact_sha256": artifact,
             "metrics": {
@@ -2155,6 +2177,15 @@ def checkpoint_local_evidence_v2(
     for key in sorted(impact_groups):
         samples = impact_groups[key]
         cohort = dict(zip(CHECKPOINT_COHORT_FIELDS_V2, key, strict=True))
+        cohort_registered_at = min(
+            datetime.fromisoformat(value["registered_at"]).astimezone(
+                timezone.utc,
+            )
+            for value, _ in groups[key]
+        )
+        evidence_from = cohort_registered_at
+        if window_start is not None and evidence_from <= window_start:
+            evidence_from = window_start
         settled = [
             sample for sample, _, _ in samples if sample["state"] == "completed"
         ]
@@ -2183,10 +2214,7 @@ def checkpoint_local_evidence_v2(
             "attestation_id": f"local-impact-{artifact[:40]}",
             "kind": "mainline_impact",
             "cohort": cohort,
-            "observed_from": min(
-                datetime.fromisoformat(sample["started_at"])
-                for sample, _, _ in samples
-            ).astimezone(timezone.utc).replace(microsecond=0).isoformat(),
+            "observed_from": evidence_from.replace(microsecond=0).isoformat(),
             "observed_until": instant.replace(microsecond=0).isoformat(),
             "artifact_sha256": artifact,
             "metrics": {
@@ -2216,13 +2244,27 @@ def checkpoint_local_evidence_v2(
     }
 
 
-def cmd_checkpoint_audit(_args) -> int:
+def cmd_checkpoint_audit(args) -> int:
     """CLI wrapper for the privacy-bounded local evidence scan."""
 
     from .local_config import HOME
 
     try:
-        report = checkpoint_local_evidence_v2(HOME)
+        hours = getattr(args, "hours", 24 * 30)
+        if (
+            not isinstance(hours, int)
+            or isinstance(hours, bool)
+            or not 1 <= hours <= 8760
+        ):
+            raise CheckpointObservationSpoolError(
+                "checkpoint local evidence hours are invalid",
+            )
+        instant = datetime.now(timezone.utc).replace(microsecond=0)
+        report = checkpoint_local_evidence_v2(
+            HOME,
+            since=instant - timedelta(hours=hours),
+            now=instant,
+        )
     except (OSError, ValueError, CheckpointObservationSpoolError) as exc:
         print(f"checkpoint evidence audit refused: {exc}")
         return 1

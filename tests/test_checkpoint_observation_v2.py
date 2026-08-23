@@ -924,6 +924,61 @@ def test_local_evidence_rejects_future_or_predating_mainline_samples(tmp_path):
         )
 
 
+def test_local_evidence_mainline_metrics_are_scoped_to_requested_window(tmp_path):
+    instant = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+    since = instant - timedelta(hours=1)
+    reporter = CheckpointObservationReporterV2(FakeObservationApi(), tmp_path)
+    registration = {
+        **_cohort_registration(),
+        "registered_at": (instant - timedelta(hours=2)).isoformat(),
+    }
+    assert reporter.register_cohort(registration) is True
+
+    old = dict(
+        _mainline_start(),
+        attempt_id="attempt-old1",
+        started_at=(instant - timedelta(minutes=90)).isoformat(),
+    )
+    old_id = reporter.begin_mainline_impact(old)
+    assert old_id is not None
+    assert reporter.complete_mainline_impact(
+        old_id, _mainline_completion(old),
+    ) is True
+
+    recent = dict(
+        _mainline_start(),
+        attempt_id="attempt-new1",
+        started_at=(instant - timedelta(minutes=30)).isoformat(),
+    )
+    recent_id = reporter.begin_mainline_impact(recent)
+    assert recent_id is not None
+    assert reporter.complete_mainline_impact(
+        recent_id, _mainline_completion(recent),
+    ) is True
+
+    packet = checkpoint_local_evidence_v2(
+        tmp_path, since=since, now=instant,
+    )
+    impact = next(
+        item for item in packet["attestations"]
+        if item["kind"] == "mainline_impact"
+    )
+    assert impact["observed_from"] == since.isoformat()
+    assert impact["observed_until"] == instant.isoformat()
+    assert impact["metrics"]["paired_samples"] == 1
+
+    with pytest.raises(CheckpointObservationSpoolError, match="window is invalid"):
+        checkpoint_local_evidence_v2(
+            tmp_path, since=instant, now=instant,
+        )
+    with pytest.raises(CheckpointObservationSpoolError, match="window is invalid"):
+        checkpoint_local_evidence_v2(
+            tmp_path,
+            since=datetime(2026, 8, 24, 11, 0),
+            now=instant,
+        )
+
+
 def test_local_evidence_reports_assignment_scoped_backlog_and_drops(tmp_path):
     reporter = CheckpointObservationReporterV2(
         FakeObservationApi([ApiError("offline")]), tmp_path, queue_size=1,
