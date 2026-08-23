@@ -576,8 +576,10 @@ dradar resume -y --benchmark deep-swe --workers 3 \
 - 任一任务没有正常提交时立即停止继续领题，但不会释放已有租约或删除 checkpoint。
 - 本机计划通过文件锁共享；正常新一轮可以安全替换无主旧计划，正常完成或显式执行
   `refill stop` 后会清理活动计划文件。因安全条件自动停止的诊断状态可以暂留供
-  `refill status` 查看，但不会阻塞新计划。手工 `--parallel` 无法证明旧计划无人使用时
-  会保守拒绝覆盖。
+  `refill status` 查看。`checkpoint_invalid` / `checkpoint_incompatible` 会把计划置为
+  `faulted`：重启 CLI、换题、换档位或升级版本都不会自动复活；修复并验证后必须显式执行
+  `refill stop`，才能启动新计划。手工 `--parallel` 无法证明旧计划无人使用时会保守拒绝
+  覆盖。
 
 ```bash
 dradar refill status    # 查看队列目标、已预留题数、额度和停止原因
@@ -630,14 +632,16 @@ dradar checkpoint discard <CHECKPOINT_ID_OR_ASSIGNMENT_ID>
 
 1. 原工作区 + 与 harness/provider/版本严格匹配的原生 session；
 2. 支持安全降级的 harness 在原 session 不可用时保留工作区，并使用原始任务说明；
-3. checkpoint 损坏、超过 7 天、身份不兼容或租约失效时，安全标记无效并重新开放格子。
+3. checkpoint 损坏或身份不兼容时，保留本地 terminal 证据、停止同 Harness/provider 的
+   自动补领，并重新开放格子；超过 7 天或租约失效的普通旧状态按生命周期回收。
 
-同一 assignment 使用本地文件锁，健康运行中的任务不会被第二个 `resume` 重复启动。超级
-账号批量运行时，每个 worker 独立认领 checkpoint，一个损坏项不会阻塞整个批次。
+同一 assignment 使用本地文件锁，健康运行中的任务不会被第二个 `resume` 重复启动。批量
+运行遇到 checkpoint 基础设施故障会停止后续 checkout，避免同一故障扩散到更多付费任务。
 
 checkpoint 不保存账号 Token、assignment nonce、API key 或 OAuth 文件。provider state
-使用逐 harness 最小白名单；manifest 出现敏感字段、状态包含通用凭据形态或精确命中本次
-注入的真实凭据值时，会删除相关产物、标记 checkpoint 无效并拒绝恢复。
+使用逐 harness 最小白名单；provider state 出现通用凭据形态时会整段省略，并把恢复安全
+降级为“仅工作区 + 全新原生 session”。manifest、工作区或未跟踪文件出现敏感字段，或
+checkpoint 产物精确命中本次注入的真实凭据值时，仍会标记无效并拒绝恢复。
 
 `checkpoint discard` 会删除本地恢复数据；如果服务端租约仍有效，还会通过恢复协议重新
 开放格子。这是明确放弃进度的操作。
@@ -738,7 +742,7 @@ dradar config show
 | `~/.dradar/deep-swe/tasks/` | 当前 DeepSWE 接入的兼容默认任务仓库路径 |
 | `~/.dradar/work/jobs/` | Pier 任务目录、artifact 和 checkpoint |
 | `~/.dradar/pending_uploads.json` | 待补传结果账本，不保存订阅凭据 |
-| `~/.dradar/refill-plan.json` | 当前持续补题计划或最近一次安全停止诊断；不会阻塞明确的新计划 |
+| `~/.dradar/refill-plan.json` | 当前持续补题计划或最近一次安全停止/熔断诊断；faulted 计划必须显式 `refill stop` 后才能重启 |
 
 trial 完成后，CLI 会在对应任务目录内保存一份独立的 `model.patch` 权威副本和 SHA-256
 清单，并把源路径、待上传路径、字节数和摘要写入待补传账本。`go`、`resume` 与
@@ -746,7 +750,8 @@ trial 完成后，CLI 会在对应任务目录内保存一份独立的 `model.pa
 rename 自动重建；若两份文件摘要冲突，则保留两份现场并拒绝上传，不会猜测或覆盖。
 
 提交成功或服务端确认已经提交后，CLI 会清理不再需要的副本；恢复产生新副本时删除旧副本；
-无效、过期或无租约的 checkpoint 会回收。需要保留现场时使用 `--keep`，之后可用
+过期或无租约的普通 checkpoint 会回收；基础设施判定为 invalid/incompatible 的现场会自动
+保留为 terminal evidence，不参与恢复。确认无需排查后，可用 `checkpoint discard` 或
 `cleanup --include-kept` 清理。
 
 ## 心跳与隐私

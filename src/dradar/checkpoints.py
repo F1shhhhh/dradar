@@ -325,13 +325,6 @@ def _host_private_layout_error(
 def _load(path: Path, *, trial_dir: Path, job_dir: Path) -> Checkpoint:
     checkpoint_dir = path.parent
     snapshot_lock = checkpoint_dir / "snapshot.lock"
-    if _lexists(snapshot_lock):
-        return Checkpoint(
-            path, checkpoint_dir, trial_dir, job_dir,
-            _infer_assignment_id(job_dir), None, "invalid", 0,
-            None, None, None, datetime.now(timezone.utc), False,
-            "checkpoint snapshot is incomplete",
-        )
     try:
         fallback = path.lstat().st_mtime
     except OSError:
@@ -456,6 +449,20 @@ def _load(path: Path, *, trial_dir: Path, job_dir: Path) -> Checkpoint:
     if _lexists(snapshot_lock):
         errors.append("checkpoint snapshot is incomplete")
         phase = "invalid"
+    provider_state_omitted = (
+        _lexists(checkpoint_dir / "session-omitted-sensitive")
+        or _lexists(payload_dir / "session-omitted-sensitive")
+    )
+    if provider_state_omitted:
+        # Native session state was deliberately removed before publication;
+        # never offer its detached session id to the restore path.  The
+        # workspace patch and untracked archive remain resumable.
+        session_id = None
+        if _lexists(payload_dir / "provider-state"):
+            errors.append(
+                "provider state conflicts with its omission marker",
+            )
+            phase = "invalid"
     try:
         manifest_after, manifest_identity_after = _read_regular_file_snapshot(
             path, max_bytes=MAX_MANIFEST_BYTES,
@@ -636,6 +643,12 @@ def _canonical_resume_manifest(
     root_thread_id = value.pop("root_thread_id", None)
     if "session_id" not in value and isinstance(root_thread_id, str):
         value["session_id"] = root_thread_id
+    if item.session_id is None:
+        # The scanner is authoritative about workspace-only recovery.  In
+        # particular, an omission marker suppresses native provider resume;
+        # do not carry a stale legacy session id through the local generation
+        # fence after that decision has been made.
+        value.pop("session_id", None)
     unexpected = set(value) - _RESUME_MANIFEST_FIELDS
     if unexpected:
         raise ValueError("checkpoint manifest contains unsupported fields")

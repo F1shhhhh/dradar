@@ -11,7 +11,9 @@ from dradar.api_client import ApiError
 from dradar.providers import (
     GROK_AGENT,
     KIMI_AGENT,
+    KIMI_PROVIDER,
     ZCODE_AGENT,
+    ZCODE_PROVIDER,
     normalize_refill_harness,
     validate_refill_scope,
 )
@@ -285,6 +287,111 @@ def test_scoped_automatic_stop_preserves_count_across_restart(tmp_path: Path):
     assert resumed["plan_id"] == first["plan_id"]
     assert resumed["status"] == "active"
     assert len(resumed["assignments"]) == 1
+
+
+def test_checkpoint_fault_circuit_survives_restart_and_scope_variants(
+    tmp_path: Path,
+) -> None:
+    assignment = _assignment(
+        "bad", agent=ZCODE_AGENT, model="glm-5.3", effort="high",
+    )
+    assignment["provider"] = ZCODE_PROVIDER
+    first = _configure(
+        tmp_path, harness=ZCODE_AGENT, model="glm-5.3", effort="high",
+        active=[assignment], refill_to=1, max_tasks=20,
+    )
+
+    faulted = refill.open_circuit(
+        tmp_path, assignment, "checkpoint_invalid",
+    )
+
+    assert faulted is not None
+    assert faulted["plan_id"] == first["plan_id"]
+    assert faulted["status"] == refill.FAULTED_STATE
+    assert faulted["circuit"]["state"] == "open"
+    assert faulted["circuit"]["volunteer_id"] == "v1"
+    assert faulted["circuit"]["harness"] == ZCODE_AGENT
+    assert faulted["circuit"]["provider"] == ZCODE_PROVIDER
+    assert faulted["circuit"]["failure_family"] == "checkpoint_invalid"
+    assert faulted["circuit"]["observation_count"] == 1
+    assert faulted["circuit"]["assignment_id"] == "bad"
+
+    class NoNetworkClient:
+        def __getattr__(self, name):
+            raise AssertionError(f"faulted refill used network method {name}")
+
+    assert refill.refill_once(tmp_path, NoNetworkClient()) == {
+        "status": refill.FAULTED_STATE,
+        "claimed": 0,
+    }
+    with pytest.raises(refill.RefillError, match="circuit is open"):
+        _configure(
+            tmp_path, harness=ZCODE_AGENT, model="glm-5.3", effort="low",
+            active=[], refill_to=1, max_tasks=20,
+        )
+    assert refill.load(tmp_path)["plan_id"] == first["plan_id"]
+
+
+def test_checkpoint_fault_circuit_is_atomic_and_does_not_cross_harness(
+    tmp_path: Path,
+) -> None:
+    zcode = _assignment(
+        "zcode", agent=ZCODE_AGENT, model="glm-5.3", effort="low",
+    )
+    zcode["provider"] = ZCODE_PROVIDER
+    _configure(
+        tmp_path, harness=ZCODE_AGENT, model="glm-5.3", effort="low",
+        active=[zcode], refill_to=1,
+    )
+    kimi = _assignment("kimi")
+    kimi["provider"] = KIMI_PROVIDER
+    assert refill.open_circuit(
+        tmp_path, kimi, "checkpoint_invalid",
+    ) is None
+    assert refill.load(tmp_path)["status"] == "active"
+
+    wrong_provider = dict(zcode, provider=KIMI_PROVIDER)
+    assert refill.open_circuit(
+        tmp_path, wrong_provider, "checkpoint_invalid",
+    ) is None
+    assert refill.load(tmp_path)["status"] == "active"
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        latched = list(pool.map(
+            lambda _n: refill.open_circuit(
+                tmp_path, zcode, "checkpoint_invalid",
+            ),
+            range(4),
+        ))
+
+    assert all(plan and plan["status"] == refill.FAULTED_STATE for plan in latched)
+    circuit = refill.load(tmp_path)["circuit"]
+    assert circuit["observation_count"] == 4
+    assert circuit["harness"] == ZCODE_AGENT
+    assert circuit["provider"] == ZCODE_PROVIDER
+
+
+def test_explicit_refill_stop_rearms_checkpoint_faulted_campaign(
+    tmp_path: Path,
+) -> None:
+    assignment = _assignment(
+        "bad", agent=ZCODE_AGENT, model="glm-5.3", effort="low",
+    )
+    assignment["provider"] = ZCODE_PROVIDER
+    _configure(
+        tmp_path, harness=ZCODE_AGENT, model="glm-5.3", effort="low",
+        active=[assignment], refill_to=1,
+    )
+    refill.open_circuit(tmp_path, assignment, "checkpoint_invalid")
+
+    refill.stop(tmp_path, "stopped by user", discard=True)
+    assert refill.load(tmp_path) is None
+    rearmed = _configure(
+        tmp_path, harness=ZCODE_AGENT, model="glm-5.3", effort="low",
+        active=[], refill_to=1,
+    )
+    assert rearmed["status"] == "active"
+    assert "circuit" not in rearmed
 
 
 def test_scoped_plan_cannot_reset_count_by_changing_cap(tmp_path: Path):
