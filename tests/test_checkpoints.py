@@ -1,12 +1,32 @@
 import argparse
 import json
+import os
 import threading
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import httpx
 import pytest
 
 from dradar import artifact_staging, checkpoints, pending, runloop
+from dradar.api_client import ApiClient
+
+
+def _privatize_checkpoint_tree(trial: Path, checkpoint: Path) -> None:
+    if os.name == "nt":
+        return
+    trial.chmod(0o700)
+    for current, directories, files in os.walk(checkpoint, followlinks=False):
+        Path(current).chmod(0o700)
+        for name in directories:
+            candidate = Path(current) / name
+            if not candidate.is_symlink():
+                candidate.chmod(0o700)
+        for name in files:
+            candidate = Path(current) / name
+            if candidate.is_file() and not candidate.is_symlink():
+                candidate.chmod(0o600)
 
 
 def _make_checkpoint(
@@ -18,10 +38,16 @@ def _make_checkpoint(
     generation: int = 0,
     updated_at: str | None = None,
     suffix: str = "one",
+    layout: str = "new",
     manifest_overrides: dict | None = None,
 ) -> checkpoints.Checkpoint:
     job = home / "work" / "jobs" / f"a{assignment_id}-{suffix}"
-    checkpoint = job / "task__trial" / "agent" / "checkpoint"
+    trial = job / "task__trial"
+    checkpoint = (
+        trial / "checkpoint"
+        if layout == "new"
+        else trial / "agent" / "checkpoint"
+    )
     checkpoint.mkdir(parents=True)
     heartbeat = updated_at or datetime.now(timezone.utc).isoformat()
     manifest = checkpoint / "checkpoint.json"
@@ -36,12 +62,21 @@ def _make_checkpoint(
         "model": "gpt-test",
         "task_id": "task-1",
         "effort": "high",
-        "base_commit": "abc",
+        "harness": "codex",
+        "provider": "openai",
+        "agent_version": "1.2.3",
+        "base_commit": "a" * 40,
         "resume_generation": generation,
-        "root_thread_id": "thread-1",
+        "resume_count": generation,
+        "session_id": "thread-12345678",
+        "workspace_patch": "workspace.patch",
+        "untracked_archive": "untracked.tar.gz",
+        "state_dir": "provider-state",
+        "events_file": "events.jsonl",
     }
     payload.update(manifest_overrides or {})
     manifest.write_text(json.dumps(payload))
+    _privatize_checkpoint_tree(trial, checkpoint)
     return next(item for item in checkpoints.scan(home)
                 if item.manifest_path == manifest)
 
@@ -76,6 +111,73 @@ def test_scan_reads_metadata_but_never_requires_nonce_or_account_token(tmp_path:
     raw = item.manifest_path.read_text().lower()
     assert "nonce" not in raw
     assert "account_token" not in raw
+
+
+def test_scan_discovers_sibling_checkpoint_layout(tmp_path: Path):
+    item = _make_checkpoint(tmp_path, "2" * 32, layout="new")
+
+    assert item.valid
+    assert item.checkpoint_dir == item.trial_dir / "checkpoint"
+    assert item.trial_dir.name == "task__trial"
+    assert item.job_dir == item.trial_dir.parent
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ownership boundary")
+def test_scan_rejects_world_writable_sibling_checkpoint(tmp_path: Path):
+    item = _make_checkpoint(tmp_path, "0" * 32, layout="new")
+    item.checkpoint_dir.chmod(0o777)
+
+    loaded = next(
+        found for found in checkpoints.scan(tmp_path)
+        if found.manifest_path == item.manifest_path
+    )
+
+    assert not loaded.valid
+    assert loaded.phase == "invalid"
+    assert "host-private" in (loaded.invalid_reason or "")
+
+
+def test_scan_prefers_new_layout_and_deduplicates_legacy_copy(tmp_path: Path):
+    assignment_id = "3" * 32
+    legacy = _make_checkpoint(tmp_path, assignment_id, layout="legacy")
+    current = _make_checkpoint(tmp_path, assignment_id, layout="new")
+
+    loaded = checkpoints.scan(tmp_path)
+
+    assert len(loaded) == 1
+    assert loaded[0].manifest_path == current.manifest_path
+    assert loaded[0].manifest_path != legacy.manifest_path
+
+
+@pytest.mark.parametrize("sibling_kind", ["empty", "dangling"])
+def test_incomplete_sibling_does_not_hide_untrusted_legacy_checkpoint(
+    tmp_path: Path, sibling_kind: str,
+) -> None:
+    legacy = _make_checkpoint(tmp_path, "4" * 32, layout="legacy")
+    sibling = legacy.trial_dir / "checkpoint"
+    if sibling_kind == "empty":
+        sibling.mkdir(mode=0o700)
+    else:
+        sibling.symlink_to(legacy.trial_dir / "missing-checkpoint")
+
+    loaded = checkpoints.scan(tmp_path)
+
+    assert len(loaded) == 1
+    assert loaded[0].manifest_path == legacy.manifest_path
+    assert loaded[0].checkpoint_dir == legacy.trial_dir / "agent" / "checkpoint"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX special file semantics")
+def test_special_sibling_does_not_hide_untrusted_legacy_checkpoint(
+    tmp_path: Path,
+) -> None:
+    legacy = _make_checkpoint(tmp_path, "5" * 32, layout="legacy")
+    os.mkfifo(legacy.trial_dir / "checkpoint")
+
+    loaded = checkpoints.scan(tmp_path)
+
+    assert len(loaded) == 1
+    assert loaded[0].manifest_path == legacy.manifest_path
 
 
 def test_scan_reads_extended_harness_identity(tmp_path: Path):
@@ -159,6 +261,311 @@ def test_scan_reports_snapshot_failure_separately_from_secret(tmp_path: Path):
     assert not loaded.valid
     assert loaded.phase == "invalid"
     assert "snapshot did not finish safely" in (loaded.invalid_reason or "")
+
+
+@pytest.mark.parametrize("location", ["root", "payload"])
+def test_scan_rejects_invalid_secret_marker_added_during_read(
+    tmp_path: Path, monkeypatch, location: str,
+):
+    item = _make_checkpoint(tmp_path, "1" * 32, layout="new")
+    generation = "a" * 32
+    payload = item.checkpoint_dir / "snapshots" / generation
+    payload.mkdir(parents=True)
+    sidecar = payload / "session-id"
+    sidecar.write_text("session-race-1234\n", encoding="utf-8")
+    (item.checkpoint_dir / "current-generation").write_text(
+        generation + "\n", encoding="ascii",
+    )
+    _privatize_checkpoint_tree(item.trial_dir, item.checkpoint_dir)
+    _privatize_checkpoint_tree(item.trial_dir, item.checkpoint_dir)
+    real_read = checkpoints._read_regular_file
+
+    def add_marker_during_read(path, *, max_bytes):
+        data = real_read(path, max_bytes=max_bytes)
+        if Path(path) == sidecar:
+            marker_root = item.checkpoint_dir if location == "root" else payload
+            (marker_root / "invalid-secret").write_text(
+                "rejected\n", encoding="utf-8",
+            )
+        return data
+
+    monkeypatch.setattr(checkpoints, "_read_regular_file", add_marker_during_read)
+
+    loaded = checkpoints.scan(tmp_path)[0]
+
+    assert not loaded.valid
+    assert "credential-shaped content" in (loaded.invalid_reason or "")
+
+
+def test_scan_rejects_checkpoint_with_snapshot_lock(tmp_path: Path):
+    item = _make_checkpoint(tmp_path, "8" * 32, phase="running")
+    (item.checkpoint_dir / "snapshot.lock").mkdir()
+
+    loaded = next(
+        found for found in checkpoints.scan(tmp_path)
+        if found.manifest_path == item.manifest_path
+    )
+
+    assert not loaded.valid
+    assert loaded.phase == "invalid"
+    assert "snapshot is incomplete" in (loaded.invalid_reason or "")
+
+
+def test_scan_rejects_dangling_snapshot_lock(tmp_path: Path):
+    item = _make_checkpoint(tmp_path, "9" * 32, phase="running")
+    (item.checkpoint_dir / "snapshot.lock").symlink_to(
+        item.checkpoint_dir / "missing",
+    )
+
+    loaded = next(
+        found for found in checkpoints.scan(tmp_path)
+        if found.manifest_path == item.manifest_path
+    )
+
+    assert not loaded.valid
+    assert loaded.phase == "invalid"
+    assert "snapshot is incomplete" in (loaded.invalid_reason or "")
+
+
+def test_scan_reads_atomically_published_generation(tmp_path: Path):
+    item = _make_checkpoint(tmp_path, "a" * 32)
+    generation = "1" * 32
+    payload = item.checkpoint_dir / "snapshots" / generation
+    payload.mkdir(parents=True)
+    (payload / "last_heartbeat").write_text(
+        "2026-08-23T00:00:00Z\n", encoding="utf-8",
+    )
+    (payload / "session-id").write_text(
+        "session-12345678\n", encoding="utf-8",
+    )
+    (item.checkpoint_dir / "current-generation").write_text(
+        generation + "\n", encoding="ascii",
+    )
+    _privatize_checkpoint_tree(item.trial_dir, item.checkpoint_dir)
+
+    loaded = next(
+        found for found in checkpoints.scan(tmp_path)
+        if found.manifest_path == item.manifest_path
+    )
+
+    assert loaded.valid
+    assert loaded.session_id == "session-12345678"
+
+
+def test_scan_rejects_generation_that_changes_during_payload_read(
+    tmp_path: Path, monkeypatch,
+):
+    item = _make_checkpoint(tmp_path, "b" * 32)
+    old_generation = "1" * 32
+    new_generation = "2" * 32
+    old_payload = item.checkpoint_dir / "snapshots" / old_generation
+    new_payload = item.checkpoint_dir / "snapshots" / new_generation
+    old_payload.mkdir(parents=True)
+    new_payload.mkdir(parents=True)
+    old_sidecar = old_payload / "session-id"
+    old_sidecar.write_text("session-old-1234\n", encoding="utf-8")
+    (new_payload / "session-id").write_text(
+        "session-new-1234\n", encoding="utf-8",
+    )
+    pointer = item.checkpoint_dir / "current-generation"
+    pointer.write_text(old_generation + "\n", encoding="ascii")
+    real_read = checkpoints._read_regular_file
+
+    def publish_during_read(path, *, max_bytes):
+        payload = real_read(path, max_bytes=max_bytes)
+        if Path(path) == old_sidecar:
+            temporary = pointer.with_suffix(".tmp")
+            temporary.write_text(new_generation + "\n", encoding="ascii")
+            os.replace(temporary, pointer)
+            old_sidecar.unlink()
+            old_payload.rmdir()
+        return payload
+
+    monkeypatch.setattr(checkpoints, "_read_regular_file", publish_during_read)
+
+    loaded = checkpoints.scan(tmp_path)[0]
+
+    assert not loaded.valid
+    assert "generation changed" in (loaded.invalid_reason or "")
+
+
+def test_scan_rejects_manifest_atomically_replaced_during_scan(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    item = _make_checkpoint(tmp_path, "f" * 32)
+    manifest = item.manifest_path
+    real_snapshot = checkpoints._read_regular_file_snapshot
+    manifest_reads = 0
+
+    def replace_before_final_read(path, *, max_bytes):
+        nonlocal manifest_reads
+        if Path(path) == manifest:
+            manifest_reads += 1
+            if manifest_reads == 2:
+                replacement = json.loads(manifest.read_text(encoding="utf-8"))
+                replacement["phase"] = "running"
+                temporary = manifest.with_suffix(".replacement")
+                temporary.write_text(json.dumps(replacement), encoding="utf-8")
+                os.replace(temporary, manifest)
+        return real_snapshot(path, max_bytes=max_bytes)
+
+    monkeypatch.setattr(
+        checkpoints, "_read_regular_file_snapshot", replace_before_final_read,
+    )
+
+    loaded = checkpoints.scan(tmp_path)[0]
+
+    assert not loaded.valid
+    assert loaded.phase == "invalid"
+    assert "manifest changed" in (loaded.invalid_reason or "")
+
+
+def test_scan_fails_closed_on_deep_manifest_without_crashing_all_discovery(
+    tmp_path: Path,
+) -> None:
+    item = _make_checkpoint(tmp_path, "d" * 32)
+    item.manifest_path.write_text(
+        '{"nested":' * 2_000 + "0" + "}" * 2_000,
+        encoding="utf-8",
+    )
+
+    loaded = checkpoints.scan(tmp_path)
+
+    assert len(loaded) == 1
+    assert not loaded[0].valid
+    assert loaded[0].phase == "invalid"
+
+
+def test_scan_bounds_checkpoint_tree_entries(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    item = _make_checkpoint(tmp_path, "e" * 32)
+    monkeypatch.setattr(checkpoints, "MAX_CHECKPOINT_TREE_ENTRIES", 2)
+    for index in range(3):
+        (item.checkpoint_dir / f"extra-{index}").write_text("x")
+    _privatize_checkpoint_tree(item.trial_dir, item.checkpoint_dir)
+
+    loaded = checkpoints.scan(tmp_path)[0]
+
+    assert not loaded.valid
+    assert "entry-count limit" in (loaded.invalid_reason or "")
+
+
+def test_scan_rejects_special_file_in_generation(tmp_path: Path):
+    item = _make_checkpoint(tmp_path, "c" * 32)
+    generation = "2" * 32
+    payload = item.checkpoint_dir / "snapshots" / generation
+    payload.mkdir(parents=True)
+    (item.checkpoint_dir / "current-generation").write_text(
+        generation + "\n", encoding="ascii",
+    )
+    os.mkfifo(payload / "fifo")
+    _privatize_checkpoint_tree(item.trial_dir, item.checkpoint_dir)
+
+    loaded = next(
+        found for found in checkpoints.scan(tmp_path)
+        if found.manifest_path == item.manifest_path
+    )
+
+    assert not loaded.valid
+    assert "special file" in (loaded.invalid_reason or "")
+
+
+def test_scan_rejects_fifo_manifest_without_blocking(tmp_path: Path):
+    item = _make_checkpoint(tmp_path, "4" * 32)
+    item.manifest_path.unlink()
+    os.mkfifo(item.manifest_path)
+    result = []
+
+    worker = threading.Thread(
+        target=lambda: result.extend(checkpoints.scan(tmp_path)), daemon=True,
+    )
+    worker.start()
+    worker.join(timeout=1)
+
+    assert not worker.is_alive(), "scanning a FIFO manifest must not block"
+    assert len(result) == 1
+    assert not result[0].valid
+    assert "regular file" in (result[0].invalid_reason or "")
+
+
+def test_scan_rejects_dangling_symlink_manifest(tmp_path: Path):
+    item = _make_checkpoint(tmp_path, "5" * 32)
+    item.manifest_path.unlink()
+    item.manifest_path.symlink_to(item.checkpoint_dir / "missing.json")
+
+    loaded = checkpoints.scan(tmp_path)
+
+    assert len(loaded) == 1
+    assert not loaded[0].valid
+    assert "regular file" in (loaded[0].invalid_reason or "")
+
+
+def test_scan_rejects_multiply_linked_manifest(tmp_path: Path):
+    item = _make_checkpoint(tmp_path, "6" * 32)
+    os.link(item.manifest_path, item.checkpoint_dir / "manifest-copy.json")
+
+    loaded = checkpoints.scan(tmp_path)[0]
+
+    assert not loaded.valid
+    assert "multiply linked" in (loaded.invalid_reason or "")
+
+
+def test_scan_rejects_oversized_manifest(tmp_path: Path):
+    item = _make_checkpoint(tmp_path, "7" * 32)
+    item.manifest_path.write_bytes(b" " * (checkpoints.MAX_MANIFEST_BYTES + 1))
+
+    loaded = checkpoints.scan(tmp_path)[0]
+
+    assert not loaded.valid
+    assert "too large" in (loaded.invalid_reason or "")
+
+
+def test_scan_turns_manifest_open_error_into_invalid_checkpoint(
+    tmp_path: Path, monkeypatch,
+):
+    item = _make_checkpoint(tmp_path, "8" * 32)
+    real_open = checkpoints.os.open
+
+    def deny_manifest(path, flags, *args, **kwargs):
+        if Path(path) == item.manifest_path:
+            raise PermissionError("denied for test")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(checkpoints.os, "open", deny_manifest)
+
+    loaded = checkpoints.scan(tmp_path)[0]
+
+    assert not loaded.valid
+    assert "opened safely" in (loaded.invalid_reason or "")
+
+
+def test_scan_fails_closed_when_tree_walk_gets_permission_error(
+    tmp_path: Path, monkeypatch,
+):
+    item = _make_checkpoint(tmp_path, "9" * 32)
+
+    def denied_walk(*args, onerror=None, **kwargs):
+        assert onerror is not None
+        onerror(PermissionError("denied for test"))
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(checkpoints.os, "walk", denied_walk)
+
+    loaded = checkpoints.scan(tmp_path)[0]
+
+    assert not loaded.valid
+    assert "tree is unreadable" in (loaded.invalid_reason or "")
+
+
+def test_dangling_terminal_marker_prevents_resume(tmp_path: Path):
+    item = _make_checkpoint(tmp_path, "0" * 32)
+    (item.job_dir / checkpoints.TERMINAL_MARKER).symlink_to(
+        item.job_dir / "missing-terminal-evidence",
+    )
+
+    assert checkpoints.is_terminal(tmp_path, checkpoints.scan(tmp_path)[0])
+    assert checkpoints.latest_by_assignment(tmp_path) == {}
 
 
 def test_custom_checkpoint_runtime_identity_is_fail_closed(tmp_path: Path):
@@ -302,6 +709,100 @@ def test_resume_one_passes_checkpoint_and_new_generation_to_runner(
     assert seen["checkpoint"].checkpoint_id == item.checkpoint_id
 
 
+def test_legacy_materialization_is_refused_without_publishing_sibling(
+    tmp_path: Path,
+) -> None:
+    item = _make_checkpoint(tmp_path, "a" * 32, layout="legacy")
+    item.trial_dir.chmod(0o700)
+    workspace = item.checkpoint_dir / "workspace.patch"
+    workspace.write_bytes(b"before\n")
+
+    with pytest.raises(ValueError, match="untrusted"):
+        checkpoints.materialize_host_checkpoint(tmp_path, item)
+
+    assert workspace.read_bytes() == b"before\n"
+    assert not (item.trial_dir / "checkpoint").exists()
+
+
+def test_legacy_materialization_never_launders_opaque_event_history(
+    tmp_path: Path,
+) -> None:
+    secret = "opaque-provider-value-not-covered-by-generic-pattern"
+    item = _make_checkpoint(tmp_path, "e" * 32, layout="legacy")
+    item.trial_dir.chmod(0o700)
+    (item.checkpoint_dir / "events.jsonl").write_text(
+        json.dumps({"event": "legacy", "detail": {"note": secret}}) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="untrusted"):
+        checkpoints.materialize_host_checkpoint(tmp_path, item)
+
+    assert secret in (item.checkpoint_dir / "events.jsonl").read_text()
+    assert not (item.trial_dir / "checkpoint").exists()
+
+
+def test_invalid_checkpoint_cannot_be_materialized(
+    tmp_path: Path,
+) -> None:
+    item = _make_checkpoint(tmp_path, "c" * 32, layout="legacy")
+    (item.checkpoint_dir / "invalid-snapshot").write_text("rejected\n")
+    item = next(
+        found for found in checkpoints.scan(tmp_path)
+        if found.assignment_id == item.assignment_id
+    )
+
+    with pytest.raises(ValueError, match="invalid checkpoint"):
+        checkpoints.materialize_host_checkpoint(tmp_path, item)
+
+
+def test_persist_generation_does_not_unlink_colliding_private_temp(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    item = _make_checkpoint(tmp_path, "b" * 32, layout="new", generation=1)
+    fixed = "f" * 32
+
+    class FixedUuid:
+        hex = fixed
+
+    monkeypatch.setattr(checkpoints.uuid, "uuid4", lambda: FixedUuid())
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_text("keep\n", encoding="utf-8")
+    collision = item.checkpoint_dir / f".checkpoint.json.tmp-{fixed}"
+    collision.symlink_to(sentinel)
+    original = item.manifest_path.read_bytes()
+
+    with pytest.raises(ValueError, match="checkpoint changed"):
+        checkpoints.persist_resume_generation(tmp_path, item, 2)
+
+    assert collision.is_symlink()
+    assert sentinel.read_text(encoding="utf-8") == "keep\n"
+    assert item.manifest_path.read_bytes() == original
+
+
+def test_persist_generation_rejects_manifest_replacement_without_washing_phase(
+    tmp_path: Path,
+) -> None:
+    item = _make_checkpoint(tmp_path, "1" * 32, generation=1)
+    changed = json.loads(item.manifest_path.read_text(encoding="utf-8"))
+    changed.update({
+        "phase": "invalid",
+        "model": "attacker-model",
+        "resume_generation": 99,
+    })
+    replacement = item.manifest_path.with_suffix(".replacement")
+    replacement.write_text(json.dumps(changed), encoding="utf-8")
+    os.replace(replacement, item.manifest_path)
+
+    with pytest.raises(ValueError, match="changed after discovery"):
+        checkpoints.persist_resume_generation(tmp_path, item, 2)
+
+    persisted = json.loads(item.manifest_path.read_text(encoding="utf-8"))
+    assert persisted["phase"] == "invalid"
+    assert persisted["model"] == "attacker-model"
+    assert persisted["resume_generation"] == 99
+
+
 def test_resume_uses_server_generation_and_persists_fence_before_runner(
     tmp_path: Path, monkeypatch,
 ):
@@ -315,9 +816,11 @@ def test_resume_uses_server_generation_and_persists_fence_before_runner(
     monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
 
     def fake_run(*args, **kwargs):
+        migrated = kwargs["resume_checkpoint"]
         seen["persisted_generation"] = json.loads(
-            item.manifest_path.read_text()
+            migrated.manifest_path.read_text()
         )["resume_generation"]
+        seen["checkpoint_dir"] = migrated.checkpoint_dir
         return "submitted"
 
     monkeypatch.setattr(runloop, "_run_and_submit", fake_run)
@@ -327,6 +830,209 @@ def test_resume_uses_server_generation_and_persists_fence_before_runner(
     ) == "submitted"
     assert client.resumes[0][2] == 2
     assert seen["persisted_generation"] == 3
+    assert seen["checkpoint_dir"] == item.trial_dir / "checkpoint"
+
+
+def test_invalid_server_resume_response_is_compensated_with_pause(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    aid = "2" * 32
+    item = _make_checkpoint(tmp_path, aid, generation=1)
+    assignment = _assignment(aid, generation=1)
+
+    class InvalidGenerationClient(_RecoveryClient):
+        def checkpoint_resume(self, assignment_id, checkpoint_id, generation,
+                              session_id=None):
+            self.resumes.append((assignment_id, checkpoint_id, generation, session_id))
+            return {"assignment": dict(
+                self.assignment, resume_generation=generation + 2,
+            )}
+
+    client = InvalidGenerationClient(assignment)
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **k: "base")
+    monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
+
+    outcome = runloop._resume_one_checkpoint(
+        client, item, assignment, _args(), tmp_path / "tasks", None,
+    )
+
+    assert outcome == "paused"
+    assert client.pauses == [(aid, item.checkpoint_id, 2)]
+
+
+@pytest.mark.parametrize(
+    "response_override",
+    [
+        {"checkpoint_id": "another-checkpoint"},
+        {"nonce": ""},
+        {"nonce": "another-lease-nonce"},
+        {"agent": "kimi-code"},
+        {"provider": "another-provider"},
+        {"model": "another-model"},
+        {"effort": "low"},
+        {"agent_version": "9.9.9"},
+    ],
+)
+def test_resume_rejects_drifted_server_assignment_identity(
+    tmp_path: Path, monkeypatch, response_override: dict,
+) -> None:
+    aid = "7" * 32
+    item = _make_checkpoint(tmp_path, aid, generation=1)
+    assignment = {
+        **_assignment(aid, generation=1),
+        "agent": "codex",
+        "provider": "openai",
+        "agent_version": "1.2.3",
+    }
+
+    class DriftedResponseClient(_RecoveryClient):
+        def checkpoint_resume(
+            self, assignment_id, checkpoint_id, generation, session_id=None,
+        ):
+            self.resumes.append(
+                (assignment_id, checkpoint_id, generation, session_id),
+            )
+            return {"assignment": {
+                **self.assignment,
+                "resume_generation": generation + 1,
+                **response_override,
+            }}
+
+    client = DriftedResponseClient(assignment)
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **k: "base")
+    monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        runloop,
+        "_run_and_submit",
+        lambda *_args, **_kwargs: pytest.fail("drifted response must not run"),
+    )
+
+    outcome = runloop._resume_one_checkpoint(
+        client, item, assignment, _args(), tmp_path / "tasks", None,
+    )
+
+    assert outcome == "paused"
+    assert client.pauses == [(aid, item.checkpoint_id, 2)]
+
+
+def test_local_fence_failure_after_server_resume_is_compensated_with_pause(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    aid = "3" * 32
+    item = _make_checkpoint(tmp_path, aid, generation=1)
+    assignment = _assignment(aid, generation=1)
+    client = _RecoveryClient(assignment)
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **k: "base")
+    monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        checkpoints,
+        "persist_resume_generation",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ValueError("simulated local CAS failure")
+        ),
+    )
+
+    outcome = runloop._resume_one_checkpoint(
+        client, item, assignment, _args(), tmp_path / "tasks", None,
+    )
+
+    assert outcome == "paused"
+    assert client.pauses == [(aid, item.checkpoint_id, 2)]
+
+
+def test_failed_resume_pause_uses_server_supported_invalid_discard(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    aid = "8" * 32
+    item = _make_checkpoint(tmp_path, aid, generation=1)
+    assignment = _assignment(aid, generation=1)
+
+    class PauseRejectedClient(_RecoveryClient):
+        def checkpoint_pause(self, assignment_id, checkpoint_id, generation):
+            self.pauses.append((assignment_id, checkpoint_id, generation))
+            raise runloop.ApiError("generation cannot be paused", status_code=409)
+
+        def checkpoint_discard(
+            self, assignment_id, checkpoint_id, generation, reason,
+        ):
+            assert reason in {
+                "user_discard", "invalid", "expired", "incompatible",
+            }
+            return super().checkpoint_discard(
+                assignment_id, checkpoint_id, generation, reason,
+            )
+
+    client = PauseRejectedClient(assignment)
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **k: "base")
+    monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        checkpoints,
+        "persist_resume_generation",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ValueError("simulated local CAS failure")
+        ),
+    )
+
+    outcome = runloop._resume_one_checkpoint(
+        client, item, assignment, _args(), tmp_path / "tasks", None,
+    )
+
+    assert outcome == "paused"
+    assert client.pauses == [(aid, item.checkpoint_id, 2)]
+    assert client.discards == [(aid, item.checkpoint_id, 2, "invalid")]
+    assert checkpoints.is_terminal(tmp_path, item)
+    assert item.manifest_path.exists()
+
+
+def test_legacy_checkpoint_is_never_sent_to_paid_resume(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    aid = "4" * 32
+    item = _make_checkpoint(tmp_path, aid, layout="legacy")
+    assignment = _assignment(aid)
+    client = _RecoveryClient(assignment)
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+
+    outcome = runloop._resume_one_checkpoint(
+        client, item, assignment, _args(), tmp_path / "tasks", None,
+    )
+
+    assert outcome == "legacy-checkpoint-unsupported"
+    assert client.resumes == []
+    assert client.discards == [(
+        aid, item.checkpoint_id, item.resume_generation, "incompatible",
+    )]
+    assert checkpoints.is_terminal(tmp_path, item)
+
+
+def test_legacy_checkpoint_discard_transport_failure_remains_retryable(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    aid = "6" * 32
+    item = _make_checkpoint(tmp_path, aid, layout="legacy")
+    assignment = _assignment(aid)
+
+    class OfflineDiscardClient(_RecoveryClient):
+        def checkpoint_discard(
+            self, assignment_id, checkpoint_id, generation, reason,
+        ):
+            raise runloop.ApiError("network unavailable")
+
+    client = OfflineDiscardClient(assignment)
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+
+    outcome = runloop._resume_one_checkpoint(
+        client, item, assignment, _args(), tmp_path / "tasks", None,
+    )
+
+    assert outcome == "paused"
+    assert client.resumes == []
+    assert not checkpoints.is_terminal(tmp_path, item)
+    assert checkpoints.find_latest(tmp_path, aid) is not None
 
 
 def test_worker_child_skips_checkpoint_owned_by_healthy_runner(
@@ -355,6 +1061,7 @@ def test_worker_child_skips_checkpoint_owned_by_healthy_runner(
         tmp_path / "tasks",
         None,
     ) == "busy"
+    assert item.checkpoint_dir == item.trial_dir / "checkpoint"
 
 
 def test_worker_child_does_not_hide_other_checkpoint_conflicts(
@@ -427,6 +1134,180 @@ def test_resume_registers_queued_then_announces_fenced_owner_after_success(
         ("phase", "running", aid, 3),
         "flush",
     ]
+
+
+@pytest.mark.parametrize("ambiguous_status", [None, 502, 504])
+def test_resume_replays_same_fence_after_committed_response_is_lost(
+    tmp_path: Path, monkeypatch, ambiguous_status: int | None,
+) -> None:
+    aid = "9" * 32
+    item = _make_checkpoint(tmp_path, aid, generation=2)
+    assignment = dict(_assignment(aid, generation=2), batch_id="batch-1")
+
+    class CommitThenLoseResponseClient(_RecoveryClient):
+        def checkpoint_resume(
+            self, assignment_id, checkpoint_id, generation, session_id=None,
+        ):
+            call = (assignment_id, checkpoint_id, generation, session_id)
+            self.resumes.append(call)
+            resumed = dict(self.assignment, resume_generation=generation + 1)
+            if len(self.resumes) == 1:
+                # Model the server committing N+1 and the network losing only
+                # the response.  The next identical request is its supported
+                # idempotent replay, not a new N+1 -> N+2 recovery.
+                self.assignment = resumed
+                raise runloop.ApiError(
+                    "response lost after commit",
+                    status_code=ambiguous_status,
+                )
+            assert call == self.resumes[0]
+            return {"ok": True, "replayed": True, "assignment": resumed}
+
+    class Telemetry:
+        session_id = "session-response-loss"
+
+        def bind_batch(self, _batch_id):
+            pass
+
+        def set_phase(self, *_args):
+            pass
+
+        def flush(self):
+            pass
+
+    client = CommitThenLoseResponseClient(assignment)
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **k: "base")
+    monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(runloop, "_run_and_submit", lambda *a, **k: "submitted")
+
+    outcome = runloop._resume_one_checkpoint(
+        client, item, assignment, _args(), tmp_path / "tasks", Telemetry(),
+    )
+
+    assert outcome == "submitted"
+    assert client.resumes == [
+        (aid, item.checkpoint_id, 2, "session-response-loss"),
+        (aid, item.checkpoint_id, 2, "session-response-loss"),
+    ]
+    assert checkpoints.find_latest(tmp_path, aid).resume_generation == 3
+    assert client.pauses == []
+    assert client.discards == []
+
+
+def test_resume_replays_truncated_http_200_with_same_idempotency_key(
+    monkeypatch,
+) -> None:
+    calls: list[dict[str, list[str]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        form = urllib.parse.parse_qs(request.read().decode())
+        calls.append(form)
+        if len(calls) == 1:
+            return httpx.Response(
+                200,
+                content=b'{"assignment":',
+                headers={"content-type": "application/json"},
+            )
+        return httpx.Response(200, json={"assignment": {
+            "assignment_id": "assignment-1",
+            "checkpoint_id": "checkpoint-12345678",
+            "resume_generation": 3,
+        }})
+
+    client = ApiClient(
+        "https://dradar.invalid",
+        "test-token",
+        transport=httpx.MockTransport(handler),
+        capabilities=(),
+    )
+    monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
+
+    response = runloop._resume_checkpoint_with_ambiguous_replay(
+        client,
+        assignment_id="assignment-1",
+        checkpoint_id="checkpoint-12345678",
+        generation=2,
+        session_id="session-response-loss",
+    )
+
+    assert response["assignment"]["resume_generation"] == 3
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
+    assert calls[0]["resume_generation"] == ["2"]
+    assert calls[0]["session_id"] == ["session-response-loss"]
+
+
+def test_resume_replays_incomplete_json_success_before_compensation(
+    monkeypatch,
+) -> None:
+    responses = [
+        {"ok": True},
+        {"assignment": {"assignment_id": "assignment-1"}},
+        {"assignment": {
+            "assignment_id": "assignment-1",
+            "checkpoint_id": "checkpoint-12345678",
+            "resume_generation": 3,
+        }},
+    ]
+
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        def checkpoint_resume(
+            self, assignment_id, checkpoint_id, generation, session_id=None,
+        ):
+            self.calls.append(
+                (assignment_id, checkpoint_id, generation, session_id),
+            )
+            return responses[len(self.calls) - 1]
+
+    client = Client()
+    monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
+
+    response = runloop._resume_checkpoint_with_ambiguous_replay(
+        client,
+        assignment_id="assignment-1",
+        checkpoint_id="checkpoint-12345678",
+        generation=2,
+        session_id="session-response-loss",
+    )
+
+    assert response == responses[-1]
+    assert client.calls == [
+        (
+            "assignment-1", "checkpoint-12345678", 2,
+            "session-response-loss",
+        ),
+    ] * 3
+
+
+def test_resume_without_session_never_replays_ambiguous_post(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    aid = "a" * 32
+    item = _make_checkpoint(tmp_path, aid, generation=1)
+    assignment = _assignment(aid, generation=1)
+
+    class AmbiguousClient(_RecoveryClient):
+        def checkpoint_resume(
+            self, assignment_id, checkpoint_id, generation, session_id=None,
+        ):
+            self.resumes.append(
+                (assignment_id, checkpoint_id, generation, session_id),
+            )
+            raise runloop.ApiError("response state unknown")
+
+    client = AmbiguousClient(assignment)
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **k: "base")
+    monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
+
+    assert runloop._resume_one_checkpoint(
+        client, item, assignment, _args(), tmp_path / "tasks", None,
+    ) == "paused"
+    assert client.resumes == [(aid, item.checkpoint_id, 1, None)]
 
 
 def test_checkpoint_recovery_uses_exponential_backoff(tmp_path: Path):
@@ -523,6 +1404,9 @@ def test_completed_checkpoint_resume_recovers_workspace_patch_without_rerun(
     item.manifest_path.write_text(json.dumps(metadata))
     patch_bytes = b"diff --git a/model_answer.json b/model_answer.json\n-old\n+new\n"
     (item.checkpoint_dir / "workspace.patch").write_bytes(patch_bytes)
+    _privatize_checkpoint_tree(item.trial_dir, item.checkpoint_dir)
+    item = checkpoints.find_latest(tmp_path, aid)
+    assert item is not None
     client = _RecoveryClient(assignment)
     monkeypatch.setattr(runloop, "HOME", tmp_path)
     monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **k: "base")

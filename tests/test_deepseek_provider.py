@@ -163,6 +163,8 @@ def test_command_uses_official_catalog_adapter_and_auth_without_secret_env(
     assert DEEPSEEK_API_KEY_ENV not in joined
     assert "CODEX_AUTH_JSON_PATH=" in joined
     assert (home / runner.DEEPSEEK_AGENT_MODULE_FILENAME).is_file()
+    assert (home / runner.CODEX_AGENT_MODULE_FILENAME).is_file()
+    assert (home / runner.CHECKPOINT_MODULE_FILENAME).is_file()
 
     catalog_arg = next(
         item for item in command if item.startswith("model_catalog_json_file=")
@@ -228,6 +230,12 @@ def test_deepseek_shared_inputs_are_reused_and_owner_only(
     expected = {
         home / runner.DEEPSEEK_AGENT_MODULE_FILENAME: (
             Path(runner.__file__).with_name("pier_deepseek.py").read_bytes()
+        ),
+        home / runner.CODEX_AGENT_MODULE_FILENAME: (
+            Path(runner.__file__).with_name("pier_codex.py").read_bytes()
+        ),
+        home / runner.CHECKPOINT_MODULE_FILENAME: (
+            Path(runner.__file__).with_name("pier_checkpoint.py").read_bytes()
         ),
         home / "codex-deepseek-v4.toml": runner.DEEPSEEK_TOML.encode(),
         home / "codex-submission-prompt.j2": (
@@ -417,24 +425,25 @@ def test_deepseek_checkpoint_resume_passes_durable_metadata(
     assert "checkpoint_resume_generation=2" in command
 
 
-def test_deepseek_identity_mismatch_writes_only_the_new_attempt() -> None:
+def test_deepseek_checkpoint_identity_is_owned_by_durable_codex() -> None:
     source = Path(runner.__file__).with_name("pier_deepseek.py").read_text()
     module = ast.parse(source)
     adapter = next(
         node for node in module.body
         if isinstance(node, ast.ClassDef) and node.name == "DeepSeekCodex"
     )
-    start = next(
-        node for node in adapter.body
-        if isinstance(node, ast.AsyncFunctionDef)
-        and node.name == "_start_checkpoint"
-    )
-    rendered = ast.unparse(start)
+    rendered = ast.unparse(adapter)
 
-    assert "previous_dir.is_symlink()" in rendered
-    assert "self._checkpoint_manifest_path = checkpoint_dir / 'checkpoint.json'" in rendered
-    assert "write_manifest(self._checkpoint_manifest_path, incompatible)" in rendered
-    assert "update_manifest(previous_dir / 'checkpoint.json'" not in rendered
+    assert any(
+        isinstance(base, ast.Name) and base.id == "DurableCodex"
+        for base in adapter.bases
+    )
+    assert "_CHECKPOINT_PROVIDER = 'deepseek'" in rendered
+    assert "_CHECKPOINT_HARNESS = 'codex'" in rendered
+    assert not any(
+        isinstance(node, ast.AsyncFunctionDef) and node.name == "_start_checkpoint"
+        for node in adapter.body
+    )
 
 
 def test_pier_process_isolates_deepseek_secret_and_adapter_path(

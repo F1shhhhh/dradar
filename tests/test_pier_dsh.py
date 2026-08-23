@@ -60,9 +60,26 @@ class RecordingCheckpoint:
 
     def __init__(self, **kwargs: object) -> None:
         self.kwargs = kwargs
+        self.enabled = bool(kwargs["enabled"])
         self.started = False
         self.finished: tuple[bool, BaseException | None] | None = None
+        self.runtime_handoffs: list[str] = []
         type(self).instances.append(self)
+
+    async def prepare_agent_environment(self, agent, environment, env):
+        del agent, environment, env
+        return None
+
+    async def exec_root_maintenance(
+        self, environment, command, *, timeout_sec=120,
+    ):
+        return await environment.exec(
+            command=command,
+            user="root",
+            env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "BASH_ENV": "/dev/null"},
+            cwd="/",
+            timeout_sec=timeout_sec,
+        )
 
     async def start(self, agent, environment, env):
         del agent, environment, env
@@ -76,6 +93,22 @@ class RecordingCheckpoint:
     ):
         del agent, environment, env, session_id
         self.finished = (completed, failure)
+
+    async def finish_durably(
+        self, agent, environment, env, *, completed, failure, session_id=None,
+    ):
+        await self.finish(
+            agent,
+            environment,
+            env,
+            completed=completed,
+            failure=failure,
+            session_id=session_id,
+        )
+
+    async def return_runtime_tree_to_host_owner(self, environment, remote_path):
+        del environment
+        self.runtime_handoffs.append(remote_path)
 
 
 @pytest.fixture
@@ -94,6 +127,9 @@ def test_standalone_adapter_matches_main_flow_contract() -> None:
     assert DSH_VERSION == MAIN_FLOW_VERSION
     assert SUPPORTED_MODELS == frozenset(MAIN_FLOW_MODELS)
     assert SUPPORTED_REASONING_EFFORTS == MAIN_FLOW_EFFORTS
+    source = Path(pier_dsh.__file__).read_text(encoding="utf-8")
+    assert "await checkpoint.finish_durably(" in source
+    assert "await checkpoint.finish(" not in source
 
 
 def make_key(tmp_path: Path, value: str = "test-secret-never-log") -> Path:
@@ -422,13 +458,7 @@ def test_checkpoint_marks_failed_paid_run_paused(
     completed, failure = checkpoint.finished
     assert completed is False
     assert failure is not None
-    owner = agent.logs_dir.stat()
-    assert any(
-        str(call.get("command", "")) == (
-            f"chown -R {owner.st_uid}:{owner.st_gid} /logs/agent/dsh-home"
-        )
-        for call in environment.calls
-    )
+    assert checkpoint.runtime_handoffs == ["/logs/agent/dsh-home"]
 
 
 @pytest.mark.parametrize(

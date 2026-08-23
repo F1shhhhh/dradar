@@ -8,6 +8,7 @@ excluded.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shlex
@@ -25,9 +26,12 @@ from pier.models.trajectories import Agent, FinalMetrics, Step, Trajectory
 from pier.utils.trajectory_metrics import populate_context_from_final_metrics
 
 from _dradar_pier_checkpoint import (
+    AgentLogStore,
+    CheckpointError,
     CheckpointIncompatibleError,
     DurableCheckpoint,
     StatePath,
+    UnsafeAgentLog,
 )
 from _dradar_kimi_recovery import (
     KIMI_PROVIDER_CONNECTION_EXIT_CODE,
@@ -42,7 +46,7 @@ from _dradar_kimi_recovery import (
 
 _MAX_USAGE_WIRE_BYTES = 16 * 1024 * 1024
 _MAX_USAGE_WIRE_RECORDS = 50_000
-
+_FINAL_SESSION_PROBE_TIMEOUT_SEC = 15.0
 
 KIMI_CONFIG = """\
 default_model = "kimi-code/k3"
@@ -656,6 +660,42 @@ class KimiCode(BaseInstalledAgent):
             "KIMI_CODE_PASSWORD",
         ):
             env.pop(name, None)
+        if self._checkpoint.enabled:
+            await self._checkpoint.prepare_agent_environment(
+                self, environment, env,
+            )
+        if self._checkpoint.enabled and self._shared_oauth:
+            identity = self._checkpoint.agent_identity
+            if identity is None:
+                raise CheckpointError("Kimi checkpoint agent identity is unavailable")
+            numeric_user = f"{identity.uid}:{identity.gid}"
+            quoted_home = shlex.quote(remote_home)
+            quoted_user_home = shlex.quote(remote_user_home)
+            quoted_skills = shlex.quote(remote_skills)
+            quoted_credentials = shlex.quote(remote_home + "/credentials")
+            quoted_oauth = shlex.quote(remote_home + "/oauth")
+            await self._checkpoint.exec_root_maintenance(
+                environment,
+                command=(
+                    "set -eu; "
+                    f"test -d {quoted_home}; test ! -L {quoted_home}; "
+                    f"test -d {quoted_credentials}; "
+                    f"test ! -L {quoted_credentials}; "
+                    f"test -d {quoted_oauth}; test ! -L {quoted_oauth}; "
+                    f"mkdir -p {quoted_user_home} {quoted_skills}; "
+                    f"chown {numeric_user} {quoted_home} {quoted_user_home} "
+                    f"{quoted_skills}; "
+                    f"test \"$(stat -c %u {quoted_credentials})\" = "
+                    f"'{identity.uid}'; "
+                    f"test \"$(stat -c %g {quoted_credentials})\" = "
+                    f"'{identity.gid}'; "
+                    f"test \"$(stat -c %u {quoted_oauth})\" = "
+                    f"'{identity.uid}'; "
+                    f"test \"$(stat -c %g {quoted_oauth})\" = "
+                    f"'{identity.gid}'; "
+                    f"chmod 700 {quoted_home} {quoted_user_home} {quoted_skills}"
+                ),
+            )
         await self.exec_as_agent(
             environment,
             command=(
@@ -680,8 +720,9 @@ class KimiCode(BaseInstalledAgent):
         )
         local_config = self.logs_dir / "kimi-config.toml"
         local_policy = self.logs_dir / "kimi-policy.py"
-        local_config.write_text(KIMI_CONFIG, encoding="utf-8")
-        local_policy.write_text(KIMI_POLICY, encoding="utf-8")
+        log_store = AgentLogStore(self.logs_dir)
+        log_store.replace_text(local_config, KIMI_CONFIG)
+        log_store.replace_text(local_policy, KIMI_POLICY)
         if not self._shared_oauth:
             await environment.upload_file(self._auth_json_file, remote_auth)
         await environment.upload_file(local_config, remote_config)
@@ -696,7 +737,7 @@ class KimiCode(BaseInstalledAgent):
             )
         )
         if environment.default_user is not None and not self._shared_oauth:
-            await self.exec_as_root(
+            await self._checkpoint.exec_root_maintenance(
                 environment,
                 command=(
                     f"chown {shlex.quote(str(environment.default_user))} {targets} "
@@ -704,7 +745,6 @@ class KimiCode(BaseInstalledAgent):
                     f"{shlex.quote(remote_lock)} {shlex.quote(remote_config)} "
                     f"&& chmod 500 {shlex.quote(remote_policy)}"
                 ),
-                env=env,
             )
         elif not self._shared_oauth:
             await self.exec_as_agent(
@@ -887,20 +927,34 @@ class KimiCode(BaseInstalledAgent):
             failure = exc
             raise
         finally:
+            probe_cancellation: asyncio.CancelledError | None = None
             try:
-                recovered_session_id = await remote_session_id(copy_log=True)
+                recovered_session_id = await asyncio.wait_for(
+                    remote_session_id(copy_log=True),
+                    timeout=_FINAL_SESSION_PROBE_TIMEOUT_SEC,
+                )
                 if recovered_session_id is not None:
                     self._session_id = recovered_session_id
+            except asyncio.CancelledError as exc:
+                probe_cancellation = exc
+                self.logger.warning(
+                    "Kimi session recovery was cancelled; finalizing the "
+                    "checkpoint before propagating cancellation"
+                )
             except Exception as exc:
                 self.logger.warning("Could not recover Kimi session log: %s", exc)
-            await self._checkpoint.finish(
-                self,
-                environment,
-                env,
-                completed=completed,
-                failure=failure,
-                session_id=self._session_id,
-            )
+            try:
+                await self._checkpoint.finish_durably(
+                    self,
+                    environment,
+                    env,
+                    completed=completed,
+                    failure=failure,
+                    session_id=self._session_id,
+                )
+            except asyncio.CancelledError as exc:
+                if probe_cancellation is None:
+                    probe_cancellation = exc
             if not self._shared_oauth:
                 try:
                     await environment.download_file(remote_auth, self._auth_json_file)
@@ -910,26 +964,21 @@ class KimiCode(BaseInstalledAgent):
                     self.logger.warning(
                         "Could not recover refreshed Kimi OAuth state: %s", exc
                     )
+            if probe_cancellation is not None:
+                raise probe_cancellation
 
-    def _redact_or_reject_credential_output(self, paths: list[Path]) -> None:
-        leaked = False
-        for path in paths:
-            try:
-                text = path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            redacted = text
-            for value in self._credential_values:
-                if value in redacted:
-                    leaked = True
-                    redacted = redacted.replace(value, "[REDACTED_KIMI_CREDENTIAL]")
-            if redacted != text:
-                path.write_text(redacted, encoding="utf-8")
-        if leaked:
-            raise ValueError(
-                "Kimi credential material reached agent output; logs were redacted "
-                "and the run was rejected"
-            )
+    def _redact_or_reject_credential_output(
+        self, paths: list[Path],
+    ) -> dict[Path, str]:
+        return AgentLogStore(self.logs_dir).redact_texts(
+            paths,
+            self._credential_values,
+            "[REDACTED_KIMI_CREDENTIAL]",
+            retain_paths={
+                path for path in paths
+                if path.name in {self._STREAM_FILE, self._SESSION_LOG_FILE}
+            },
+        )
 
     @staticmethod
     def _content_text(content: Any) -> str:
@@ -950,15 +999,19 @@ class KimiCode(BaseInstalledAgent):
         stream_path = self.logs_dir / self._STREAM_FILE
         stderr_path = self.logs_dir / self._STDERR_FILE
         session_log_path = self.logs_dir / self._SESSION_LOG_FILE
-        self._redact_or_reject_credential_output(
-            [stream_path, stderr_path, session_log_path]
+        safe_logs = self._redact_or_reject_credential_output(
+            [
+                stream_path,
+                stderr_path,
+                session_log_path,
+                self.logs_dir / "kimi-config.toml",
+                self.logs_dir / "kimi-policy.py",
+            ]
         )
-        try:
-            lines = stream_path.read_text(
-                encoding="utf-8", errors="replace"
-            ).splitlines()
-        except OSError:
+        stream_text = safe_logs.get(stream_path)
+        if stream_text is None:
             return
+        lines = stream_text.splitlines()
         steps: list[Step] = []
         retry_records: list[dict] = []
         if self._instruction:
@@ -999,17 +1052,16 @@ class KimiCode(BaseInstalledAgent):
             )
         if assistant_calls == 0:
             return
-        try:
-            if session_log_path.stat().st_size > _MAX_USAGE_WIRE_BYTES:
-                wire_lines = []
-            else:
-                wire_lines = session_log_path.read_text(
-                    encoding="utf-8", errors="replace"
-                ).splitlines()
-                if len(wire_lines) > _MAX_USAGE_WIRE_RECORDS:
-                    wire_lines = []
-        except OSError:
+        session_log_text = safe_logs.get(session_log_path)
+        if (
+            session_log_text is None
+            or len(session_log_text.encode("utf-8")) > _MAX_USAGE_WIRE_BYTES
+        ):
             wire_lines = []
+        else:
+            wire_lines = session_log_text.splitlines()
+            if len(wire_lines) > _MAX_USAGE_WIRE_RECORDS:
+                wire_lines = []
         wire_records = []
         for line in wire_lines:
             try:
@@ -1026,11 +1078,11 @@ class KimiCode(BaseInstalledAgent):
             usage_facts["cache_creation_tokens"] if usage_facts["complete"] else 0
         )
         try:
-            (self.logs_dir / self._USAGE_FILE).write_text(
+            AgentLogStore(self.logs_dir).replace_text(
+                self.logs_dir / self._USAGE_FILE,
                 json.dumps(usage_facts, ensure_ascii=False, separators=(",", ":")),
-                encoding="utf-8",
             )
-        except OSError:
+        except UnsafeAgentLog:
             pass
         metrics = FinalMetrics(
             total_prompt_tokens=prompt_tokens or None,
@@ -1058,11 +1110,11 @@ class KimiCode(BaseInstalledAgent):
             final_metrics=metrics,
         )
         try:
-            (self.logs_dir / "trajectory.json").write_text(
+            AgentLogStore(self.logs_dir).replace_text(
+                self.logs_dir / "trajectory.json",
                 json.dumps(trajectory.to_json_dict(), indent=2, ensure_ascii=False),
-                encoding="utf-8",
             )
-        except OSError:
+        except UnsafeAgentLog:
             return
         populate_context_from_final_metrics(context, metrics)
 

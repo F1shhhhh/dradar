@@ -101,6 +101,8 @@ _POOL_TARGET_CACHE: dict[Path, int] = {}
 MAX_CHECKPOINT_RESUMES = 5
 _CHECKPOINT_BACKOFF_BASE_SECONDS = 30.0
 _CHECKPOINT_BACKOFF_MAX_SECONDS = 600.0
+_CHECKPOINT_RESUME_REPLAY_ATTEMPTS = 3
+_CHECKPOINT_RESUME_REPLAY_DELAY_SECONDS = 0.25
 
 # Cloudflare's common request-body ceiling is 100 MB. Keep enough headroom
 # for multipart boundaries and form fields so an optional trajectory bundle
@@ -449,6 +451,29 @@ def _checkpoint_identity_mismatches(
             # before the run. The adapter compares that version again inside
             # the container before restoring provider state.
             mismatched.append("agent_version")
+    return list(dict.fromkeys(mismatched))
+
+
+def _checkpoint_resume_response_mismatches(
+    item: checkpoints.Checkpoint,
+    assignment: dict,
+    resumed: dict,
+) -> list[str]:
+    """Reject a resume grant that drifts from the authenticated lease."""
+
+    mismatched: list[str] = []
+    if resumed.get("checkpoint_id") != item.checkpoint_id:
+        mismatched.append("checkpoint_id")
+    nonce = resumed.get("nonce")
+    if not isinstance(nonce, str) or not nonce:
+        mismatched.append("nonce")
+    original_nonce = assignment.get("nonce")
+    if isinstance(original_nonce, str) and original_nonce and nonce != original_nonce:
+        mismatched.append("nonce")
+    for name in ("agent", "provider", "model", "effort", "agent_version"):
+        if resumed.get(name) != assignment.get(name):
+            mismatched.append(name)
+    mismatched.extend(_checkpoint_identity_mismatches(item, resumed))
     return list(dict.fromkeys(mismatched))
 
 
@@ -1838,6 +1863,118 @@ def _pause_checkpoint_quietly(
     return item
 
 
+def _compensate_failed_checkpoint_resume(
+    client: ApiClient,
+    item: checkpoints.Checkpoint,
+    assignment: dict,
+    generation: int,
+) -> None:
+    """Return a server-granted recovery fence to a non-running state."""
+
+    try:
+        client.checkpoint_pause(
+            assignment["assignment_id"], item.checkpoint_id, generation,
+        )
+        return
+    except ApiError as exc:
+        print(
+            "  checkpoint resume compensation could not pause the new "
+            f"generation ({exc}); attempting to release its fence"
+        )
+    fenced = dict(assignment)
+    fenced["resume_generation"] = generation
+    fenced["checkpoint_id"] = item.checkpoint_id
+    discarded = _discard_checkpoint_quietly(
+        client,
+        item,
+        fenced,
+        # The public server deliberately accepts only its stable discard
+        # reason vocabulary.  A locally unpersistable or identity-drifted
+        # granted fence is invalid recovery state, so invalidate that fence
+        # and reopen the cell while retaining the local evidence.
+        reason="invalid",
+        preserve_local=True,
+    )
+    if discarded:
+        checkpoints.mark_terminal(HOME, item)
+
+
+def _resume_checkpoint_with_ambiguous_replay(
+    client: ApiClient,
+    *,
+    assignment_id: str,
+    checkpoint_id: str,
+    generation: int,
+    session_id: str | None,
+) -> dict:
+    """Replay only an ambiguous resume POST under the server's idempotency key.
+
+    The server commits a checkpoint fence before its HTTP response reaches the
+    client.  If that response is lost, advancing from a freshly observed
+    server generation would consume another fence.  A live runner session may
+    instead replay the *same* checkpoint, old generation and session id; the
+    server returns the already-issued generation without incrementing it.
+    Explicit 4xx responses are never retried here; 5xx and unreadable 2xx
+    responses remain ambiguous because a reverse proxy can fail after commit.
+    A caller without a session id has no safe idempotency key, so it gets one
+    attempt only.
+    """
+
+    attempts = _CHECKPOINT_RESUME_REPLAY_ATTEMPTS if session_id else 1
+    def minimally_valid_response(data: object) -> bool:
+        if not isinstance(data, dict):
+            return False
+        resumed = data.get("assignment")
+        if not isinstance(resumed, dict):
+            return False
+        resumed_generation = resumed.get("resume_generation")
+        return (
+            resumed.get("assignment_id") == assignment_id
+            and resumed.get("checkpoint_id") == checkpoint_id
+            and isinstance(resumed_generation, int)
+            and not isinstance(resumed_generation, bool)
+            and resumed_generation == generation + 1
+        )
+
+    for attempt in range(attempts):
+        try:
+            data = client.checkpoint_resume(
+                assignment_id,
+                checkpoint_id,
+                generation,
+                session_id=session_id,
+            )
+        except ApiError as exc:
+            ambiguous_http = (
+                exc.status_code is None or exc.status_code >= 500
+            )
+            if not ambiguous_http or attempt + 1 >= attempts:
+                raise
+        except json.JSONDecodeError as exc:
+            # A 2xx response can be truncated after the server committed.
+            # Normalize it only inside this idempotent checkpoint endpoint;
+            # generic API calls keep their existing JSON error behaviour.
+            if attempt + 1 >= attempts:
+                raise ApiError(
+                    "checkpoint resume returned an unreadable success response",
+                ) from exc
+        else:
+            if minimally_valid_response(data) or attempt + 1 >= attempts:
+                return data
+            print(
+                f"  {assignment_id}: checkpoint resume success response was "
+                "incomplete; replaying the same fenced request"
+            )
+            time.sleep(_CHECKPOINT_RESUME_REPLAY_DELAY_SECONDS * (2 ** attempt))
+            continue
+        print(
+            f"  {assignment_id}: checkpoint resume response was ambiguous; "
+            "replaying the same fenced request"
+        )
+        time.sleep(_CHECKPOINT_RESUME_REPLAY_DELAY_SECONDS * (2 ** attempt))
+    raise AssertionError("unreachable")
+
+
 def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                     args, local_commit: str | None,
                     telemetry: RunnerTelemetry | None = None,
@@ -2318,6 +2455,25 @@ def _resume_one_checkpoint(
                 ):
                     return "discarded"
                 return "paused"
+            if item.checkpoint_dir != item.trial_dir / "checkpoint":
+                print(
+                    f"  {assignment_id}: legacy agent-mounted checkpoint is "
+                    "untrusted; preserving its diagnostics without resuming paid work"
+                )
+                discarded = _discard_checkpoint_quietly(
+                    client,
+                    item,
+                    assignment,
+                    # Legacy agent-mounted state cannot satisfy the new
+                    # host-private publication contract.  The public server's
+                    # stable vocabulary calls that state incompatible.
+                    reason="incompatible",
+                    preserve_local=True,
+                )
+                if discarded:
+                    checkpoints.mark_terminal(HOME, item)
+                    return "legacy-checkpoint-unsupported"
+                return "paused"
             if assignment.get("agent") == GROK_AGENT:
                 print(
                     f"  {assignment_id}: Grok Build checkpoints are not "
@@ -2347,6 +2503,14 @@ def _resume_one_checkpoint(
                 args.allow_task_drift,
             )
             if item.phase == "agent_completed":
+                try:
+                    item = checkpoints.revalidate_host_checkpoint(HOME, item)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    print(
+                        f"  {assignment_id}: completed checkpoint failed its "
+                        f"host-private revalidation ({exc}); kept locally"
+                    )
+                    return "paused"
                 print(f"found completed checkpoint {item.checkpoint_id}; uploading without rerunning")
                 checkpoints.prune_superseded(HOME, assignment_id, item)
                 return _upload_trial(
@@ -2396,9 +2560,11 @@ def _resume_one_checkpoint(
                 telemetry.set_phase("queued")
                 telemetry.flush()
             try:
-                data = client.checkpoint_resume(
-                    assignment_id, item.checkpoint_id,
-                    generation,
+                data = _resume_checkpoint_with_ambiguous_replay(
+                    client,
+                    assignment_id=assignment_id,
+                    checkpoint_id=item.checkpoint_id,
+                    generation=generation,
                     session_id=telemetry.session_id if telemetry else None,
                 )
             except ApiError as exc:
@@ -2430,26 +2596,52 @@ def _resume_one_checkpoint(
                     return "discarded"
                 print(f"  {assignment_id}: couldn't resume checkpoint ({exc}); kept locally")
                 return "paused"
-            resumed = data["assignment"]
-            resumed_generation = resumed.get("resume_generation")
+            resumed = data.get("assignment") if isinstance(data, dict) else None
+            resumed_generation = (
+                resumed.get("resume_generation")
+                if isinstance(resumed, dict) else None
+            )
+            expected_generation = generation + 1
+            response_identity_mismatches = (
+                _checkpoint_resume_response_mismatches(
+                    item, assignment, resumed,
+                )
+                if isinstance(resumed, dict)
+                else ["assignment"]
+            )
             if (
-                not isinstance(resumed_generation, int)
+                not isinstance(resumed, dict)
+                or not isinstance(resumed_generation, int)
                 or isinstance(resumed_generation, bool)
-                or resumed_generation != generation + 1
+                or resumed_generation != expected_generation
+                or resumed.get("assignment_id") != assignment_id
+                or resumed.get("task_id") != assignment.get("task_id")
+                or response_identity_mismatches
             ):
                 print(
                     f"  {assignment_id}: server returned an invalid checkpoint "
-                    "generation; kept locally"
+                    "resume response; pausing the granted fence and keeping it locally"
+                )
+                _compensate_failed_checkpoint_resume(
+                    client, item, assignment, expected_generation,
                 )
                 return "paused"
             try:
-                checkpoints.persist_resume_generation(
+                # Publish a legacy agent-mounted snapshot only after the
+                # server has atomically granted this runner ownership. A peer
+                # can otherwise receive checkpoint_runner_healthy while its
+                # stale sibling copy hides the still-live legacy checkpoint.
+                item = checkpoints.materialize_host_checkpoint(HOME, item)
+                item = checkpoints.persist_resume_generation(
                     HOME, item, resumed_generation,
                 )
             except (OSError, ValueError) as exc:
                 print(
-                    f"  {assignment_id}: couldn't persist the fenced checkpoint "
-                    f"generation ({exc}); kept locally"
+                    f"  {assignment_id}: couldn't materialize and persist the "
+                    f"fenced checkpoint generation ({exc}); kept locally"
+                )
+                _compensate_failed_checkpoint_resume(
+                    client, item, assignment, resumed_generation,
                 )
                 return "paused"
             if telemetry:
@@ -3074,7 +3266,15 @@ def _assignment_is_ready_for_checkout(
 def _assignment_is_recoverable_checkpoint(
     assignment: dict, local: dict[str, checkpoints.Checkpoint],
 ) -> bool:
-    """Whether a paused server lease has matching, safe local recovery state."""
+    """Whether a paused server lease has matching, safe local recovery state.
+
+    The server may be one generation ahead after it grants a resume fence and
+    the runner fails to persist that generation locally.  The compensating
+    pause deliberately keeps the original local snapshot intact, so a later
+    worker can resume from the authoritative server generation.  Reject only
+    local state *ahead* of the server; that direction cannot be explained by
+    the fail-closed compensation path.
+    """
     assignment_id = assignment.get("assignment_id")
     item = local.get(assignment_id) if assignment_id else None
     server_generation = assignment.get("resume_generation", 0)
@@ -3087,12 +3287,15 @@ def _assignment_is_recoverable_checkpoint(
         or not isinstance(server_generation, int)
         or isinstance(server_generation, bool)
         or server_generation < 0
+        or server_generation >= MAX_CHECKPOINT_RESUMES
     ):
         return False
     return (
         item.checkpoint_id == assignment.get("checkpoint_id")
-        and item.resume_generation == server_generation
-        and _checkpoint_backoff_seconds(item) <= 0
+        and item.resume_generation <= server_generation
+        and _checkpoint_backoff_seconds(
+            item, generation=server_generation,
+        ) <= 0
     )
 
 

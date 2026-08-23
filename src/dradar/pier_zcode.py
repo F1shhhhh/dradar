@@ -28,9 +28,19 @@ from pier.models.trajectories import Agent, FinalMetrics, Step, Trajectory
 from pier.utils.trajectory_metrics import populate_context_from_final_metrics
 
 try:
-    from _dradar_pier_checkpoint import DurableCheckpoint, StatePath
+    from _dradar_pier_checkpoint import (
+        AgentLogStore,
+        DurableCheckpoint,
+        StatePath,
+        UnsafeAgentLog,
+    )
 except ModuleNotFoundError:  # Local source-tree tests import the packaged module.
-    from dradar.pier_checkpoint import DurableCheckpoint, StatePath
+    from dradar.pier_checkpoint import (
+        AgentLogStore,
+        DurableCheckpoint,
+        StatePath,
+        UnsafeAgentLog,
+    )
 
 
 ZCODE_CLI_VERSION = "0.16.3"
@@ -44,6 +54,34 @@ NODE_SHA256 = {
 }
 SUPPORTED_EFFORTS = frozenset({"low", "high", "max"})
 _ARTIFACT_ID_RE = re.compile(r"[0-9a-f]{32}")
+_SESSION_ID_RE = re.compile(r"sess_[A-Za-z0-9._:-]{1,155}")
+
+
+def _read_local_session_id(path: Path) -> str | None:
+    """Read the model-writable session sidecar without links or blocking."""
+
+    try:
+        snapshot = AgentLogStore(path.parent).read_text(path, max_bytes=512)
+    except UnsafeAgentLog:
+        try:
+            AgentLogStore(path.parent).replace_text(
+                path, AgentLogStore.REJECTED,
+            )
+        except UnsafeAgentLog:
+            pass
+        return None
+    if snapshot is None:
+        return None
+    text, identity = snapshot
+    try:
+        if not AgentLogStore(path.parent).replace_text(
+            path, text, expected=identity,
+        ):
+            return None
+    except UnsafeAgentLog:
+        return None
+    candidate = text.strip()
+    return candidate if _SESSION_ID_RE.fullmatch(candidate) else None
 
 
 def _install_command() -> str:
@@ -1280,6 +1318,10 @@ class ZCodeBigModel(BaseInstalledAgent):
             "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
         ):
             env.pop(name, None)
+        if self._checkpoint.enabled:
+            await self._checkpoint.prepare_agent_environment(
+                self, environment, env,
+            )
         directories = (remote_home, remote_user_home, remote_bin, remote_secret)
         setup = "mkdir -p " + " ".join(shlex.quote(item) for item in directories)
         setup += " && chmod 700 " + " ".join(shlex.quote(item) for item in directories)
@@ -1288,14 +1330,19 @@ class ZCodeBigModel(BaseInstalledAgent):
         failure: BaseException | None = None
         completed = False
         resume_session_id: str | None = None
+        local_runner = self.logs_dir / "zcode-protocol-runner.py"
+        local_instruction = self.logs_dir / "zcode-instruction.txt"
         try:
+            # DurableCheckpoint.start() seals /logs/agent as a root-owned
+            # sticky directory before the untrusted model process begins.
+            # Publish host-authored inputs first while AgentLogStore can still
+            # require the ordinary Pier host-owned layout without weakening
+            # its directory-ownership invariant.
+            log_store = AgentLogStore(self.logs_dir)
+            log_store.replace_text(local_runner, _PROTOCOL_RUNNER)
+            log_store.replace_text(local_instruction, instruction)
             resume_session_id = await self._checkpoint.start(self, environment, env)
 
-            local_runner = self.logs_dir / "zcode-protocol-runner.py"
-            local_instruction = self.logs_dir / "zcode-instruction.txt"
-            local_runner.parent.mkdir(parents=True, exist_ok=True)
-            local_runner.write_text(_PROTOCOL_RUNNER, encoding="utf-8")
-            local_instruction.write_text(instruction, encoding="utf-8")
             await environment.upload_file(self._zcode_cli_file, remote_cli)
             await environment.upload_file(local_runner, remote_runner)
             await environment.upload_file(local_instruction, instruction_path)
@@ -1305,13 +1352,12 @@ class ZCodeBigModel(BaseInstalledAgent):
                 for item in (remote_cli, remote_runner, instruction_path, remote_key)
             )
             if environment.default_user is not None:
-                await self.exec_as_root(
+                await self._checkpoint.exec_root_maintenance(
                     environment,
                     command=(
                         f"chown {shlex.quote(str(environment.default_user))} {targets} "
                         f"&& chmod 600 {targets}"
                     ),
-                    env=env,
                 )
             else:
                 await self.exec_as_agent(
@@ -1349,17 +1395,9 @@ class ZCodeBigModel(BaseInstalledAgent):
             failure = exc
             raise
         finally:
-            checkpoint_session_id = None
             local_session_id = self.logs_dir / self._SESSION_ID_FILE
-            try:
-                candidate = local_session_id.read_text(
-                    encoding="utf-8", errors="replace",
-                ).strip()
-                if candidate.startswith("sess_") and len(candidate) <= 160:
-                    checkpoint_session_id = candidate
-            except OSError:
-                pass
-            await self._checkpoint.finish(
+            checkpoint_session_id = _read_local_session_id(local_session_id)
+            await self._checkpoint.finish_durably(
                 self,
                 environment,
                 env,
@@ -1368,27 +1406,17 @@ class ZCodeBigModel(BaseInstalledAgent):
                 session_id=checkpoint_session_id,
             )
 
-    def _redact_or_reject_credential_output(self, paths: list[Path]) -> None:
-        leaked = False
-        for path in paths:
-            try:
-                text = path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            if self._credential_value not in text:
-                continue
-            leaked = True
-            path.write_text(
-                text.replace(
-                    self._credential_value, "[REDACTED_ZCODE_CREDENTIAL]"
-                ),
-                encoding="utf-8",
-            )
-        if leaked:
-            raise ValueError(
-                "ZCode credential material reached agent output; logs were redacted "
-                "and the run was rejected"
-            )
+    def _redact_or_reject_credential_output(
+        self, paths: list[Path],
+    ) -> dict[Path, str]:
+        return AgentLogStore(self.logs_dir).redact_texts(
+            paths,
+            (self._credential_value,),
+            "[REDACTED_ZCODE_CREDENTIAL]",
+            retain_paths={
+                path for path in paths if path.name == self._OUTCOME_FILE
+            },
+        )
 
     @staticmethod
     def _text(value: Any) -> str:
@@ -1412,11 +1440,19 @@ class ZCodeBigModel(BaseInstalledAgent):
             self.logs_dir / self._EVENTS_FILE,
             self.logs_dir / self._STDERR_FILE,
             self.logs_dir / self._STREAM_FILE,
+            self.logs_dir / self._DIAGNOSTIC_FILE,
+            self.logs_dir / self._COMPACT_USAGE_FILE,
+            self.logs_dir / self._SESSION_ID_FILE,
+            self.logs_dir / "zcode-protocol-runner.py",
+            self.logs_dir / "zcode-instruction.txt",
         ]
-        self._redact_or_reject_credential_output(paths)
+        safe_logs = self._redact_or_reject_credential_output(paths)
+        outcome_text = safe_logs.get(paths[0])
+        if outcome_text is None:
+            return
         try:
-            payload = json.loads(paths[0].read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            payload = json.loads(outcome_text)
+        except json.JSONDecodeError:
             return
         steps = [Step(step_id=1, source="user", message=self._instruction)]
         raw_messages = payload.get("messages")
@@ -1496,11 +1532,11 @@ class ZCodeBigModel(BaseInstalledAgent):
         output_tokens = usage_facts["n_output_tokens"] if usage_facts["complete"] else 0
         created_tokens = usage_facts["cache_creation_tokens"] if usage_facts["complete"] else 0
         try:
-            (self.logs_dir / self._USAGE_FILE).write_text(
+            AgentLogStore(self.logs_dir).replace_text(
+                self.logs_dir / self._USAGE_FILE,
                 json.dumps(usage_facts, ensure_ascii=False, separators=(",", ":")),
-                encoding="utf-8",
             )
-        except OSError:
+        except UnsafeAgentLog:
             pass
         metrics = FinalMetrics(
             total_prompt_tokens=prompt_tokens or None,
@@ -1534,11 +1570,11 @@ class ZCodeBigModel(BaseInstalledAgent):
             final_metrics=metrics,
         )
         try:
-            (self.logs_dir / "trajectory.json").write_text(
+            AgentLogStore(self.logs_dir).replace_text(
+                self.logs_dir / "trajectory.json",
                 json.dumps(trajectory.to_json_dict(), indent=2, ensure_ascii=False),
-                encoding="utf-8",
             )
-        except OSError:
+        except UnsafeAgentLog:
             return
         populate_context_from_final_metrics(context, metrics)
 

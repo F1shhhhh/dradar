@@ -5,6 +5,8 @@ from __future__ import annotations
 import ast
 import json
 import os
+import re
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +16,7 @@ import pytest
 import dradar.providers as providers
 import dradar.provider_config as provider_config
 import dradar.runner as runner
+from dradar.pier_checkpoint import AgentLogStore, UnsafeAgentLog
 from dradar.providers import (
     ZCODE_AGENT,
     ZCODE_API_KEY_ENV,
@@ -309,13 +312,66 @@ def test_zcode_adapter_source_has_fixed_security_contract() -> None:
     assert "deadline = time.monotonic() + session_timeout_sec" in source
     assert "90 * 60" not in source
     assert "dradar-zcode-runtime-v1" in source
-    assert "from _dradar_pier_checkpoint import DurableCheckpoint, StatePath" in source
+    assert "from _dradar_pier_checkpoint import (" in source
+    assert "AgentLogStore" in source
+    assert "DurableCheckpoint" in source
+    assert "StatePath" in source
+    assert "UnsafeAgentLog" in source
     assert 'StatePath("xdg-data", (self._REMOTE_HOME / "data").as_posix())' in source
     assert 'self._REMOTE_USER_HOME / ".zcode" / "cli" / "rollout"' in source
     assert 'self._REMOTE_HOME / "config"' not in source
     assert "sensitive_values=(key_value,)" in source
     assert "await self._checkpoint.start(self, environment, env)" in source
-    assert "await self._checkpoint.finish(" in source
+    assert "await self._checkpoint.finish_durably(" in source
+    # start() deliberately seals /logs/agent as root-owned; every host-side
+    # AgentLogStore write needed to launch ZCode must precede that transition.
+    runner_write = source.index("log_store.replace_text(local_runner")
+    instruction_write = source.index("log_store.replace_text(local_instruction")
+    checkpoint_start = source.index(
+        "resume_session_id = await self._checkpoint.start(self, environment, env)"
+    )
+    assert runner_write < checkpoint_start
+    assert instruction_write < checkpoint_start
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX no-follow file semantics")
+def test_zcode_session_sidecar_reader_rejects_symlink_fifo_and_oversize(
+    tmp_path: Path,
+) -> None:
+    source = Path(providers.__file__).with_name("pier_zcode.py").read_text()
+    module = ast.parse(source)
+    helper = next(
+        node for node in module.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_read_local_session_id"
+    )
+    namespace = {
+        "AgentLogStore": AgentLogStore,
+        "Path": Path,
+        "_SESSION_ID_RE": re.compile(r"sess_[A-Za-z0-9._:-]{1,155}"),
+        "UnsafeAgentLog": UnsafeAgentLog,
+    }
+    exec(
+        compile(ast.Module(body=[helper], type_ignores=[]), "pier_zcode.py", "exec"),
+        namespace,
+    )
+    read_session = namespace["_read_local_session_id"]
+
+    regular = tmp_path / "session-id"
+    regular.write_text("sess_0123456789\n", encoding="utf-8")
+    assert read_session(regular) == "sess_0123456789"
+
+    link = tmp_path / "session-link"
+    link.symlink_to(regular)
+    assert read_session(link) is None
+
+    fifo = tmp_path / "session-fifo"
+    os.mkfifo(fifo)
+    assert read_session(fifo) is None
+
+    oversized = tmp_path / "session-large"
+    oversized.write_bytes(b"s" * 513)
+    assert read_session(oversized) is None
 
 
 def test_zcode_protocol_uses_native_resume_without_changing_instruction() -> None:

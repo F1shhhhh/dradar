@@ -365,6 +365,8 @@ class ApiClient:
         self, assignment_id: str, checkpoint_id: str, resume_generation: int,
         reason: str = "user_discard",
     ) -> dict[str, Any]:
+        if reason not in {"user_discard", "invalid", "expired", "incompatible"}:
+            raise ValueError("unsupported checkpoint discard reason")
         return self._post(
             "/api/v1/assignment/checkpoint/discard",
             data={"assignment_id": assignment_id, "checkpoint_id": checkpoint_id,
