@@ -217,6 +217,10 @@ class Sink:
         self.payloads.append(payload)
         return True
 
+    def persist_checkpoint_observation(self, payload):
+        self.payloads.append(payload)
+        return True
+
     def register_checkpoint_cohort(self, payload):
         self.cohorts.append(payload)
         return True
@@ -399,7 +403,7 @@ def test_unrecorded_capture_is_preserved_for_local_diagnosis(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     coordinator, plane, sink = _coordinator(tmp_path, "observe")
-    sink.record_checkpoint_observation = lambda _payload: False
+    sink.persist_checkpoint_observation = lambda _payload: False
     released = []
     monkeypatch.setattr(
         shadow_runtime,

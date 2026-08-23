@@ -1077,6 +1077,30 @@ class CheckpointObservationReporterV2:
         self._wake.set()
         return True
 
+    def persist(self, payload: dict[str, Any]) -> bool:
+        """Durably enqueue one shadow record outside the paid mainline.
+
+        This path is used only by the isolated shadow coordinator when local
+        snapshot retention depends on a crash-safe evidence handoff.  Exact
+        replay is success: the operation is already durable.  Delivery remains
+        asynchronous and never grants assignment or paid-execution authority.
+        """
+
+        try:
+            encoded = _canonical_record(payload)
+            canonical = json.loads(encoded)["payload"]
+            created = self.spool.persist(canonical)
+        except (CheckpointObservationSpoolError, ValueError, TypeError):
+            self._record_drop(payload)
+            self._wake.set()
+            return False
+        if created:
+            delta = ObservationDeliveryResultV2(persisted=1)
+            self._add_stats(delta)
+            self._queue_health(canonical, delta)
+        self._wake.set()
+        return True
+
     def _persist_queued(self) -> ObservationDeliveryResultV2:
         result = ObservationDeliveryResultV2()
         for _ in range(self._queue.qsize()):

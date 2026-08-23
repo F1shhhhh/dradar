@@ -507,6 +507,21 @@ def test_exact_rejected_replay_converges_without_duplicate_evidence(tmp_path):
     assert json.loads(rejected[0].read_text())["payload"] == payload
 
 
+def test_durable_reporter_handoff_survives_before_delivery(tmp_path):
+    reporter = CheckpointObservationReporterV2(
+        FakeObservationApi(), tmp_path, idle_retry_sec=3600,
+    )
+    payload = _payload()
+
+    assert reporter.persist(payload) is True
+    assert reporter.persist(payload) is True
+
+    pending = reporter.spool.pending()
+    assert len(pending) == 1
+    assert pending[0][1] == payload
+    assert reporter.stats.persisted == 1
+
+
 @pytest.mark.parametrize("code", [
     "checkpoint_v2_kill_switch_active",
     "checkpoint_observation_not_authorized",

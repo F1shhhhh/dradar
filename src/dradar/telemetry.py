@@ -143,6 +143,18 @@ class RunnerTelemetry:
         except Exception:
             return False
 
+    def persist_checkpoint_observation(self, payload: dict) -> bool:
+        """Crash-safely hand off shadow evidence outside the paid mainline."""
+
+        with self._lock:
+            reporter = self._checkpoint_observation_reporter
+        if reporter is None:
+            return False
+        try:
+            return reporter.persist(payload)
+        except Exception:
+            return False
+
     def register_checkpoint_cohort(self, payload: dict) -> bool:
         """Bind local evidence to this exact runner session and cohort."""
 

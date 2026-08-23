@@ -134,6 +134,7 @@ def test_checkpoint_observation_reporting_is_opt_in_and_account_scoped(tmp_path)
     payload = _checkpoint_observation()
 
     assert telemetry.record_checkpoint_observation(payload) is False
+    assert telemetry.persist_checkpoint_observation(payload) is False
     assert not (tmp_path / "checkpoint-v2").exists()
 
     telemetry.configure_checkpoint_observation_reporting(tmp_path)
@@ -144,6 +145,14 @@ def test_checkpoint_observation_reporting_is_opt_in_and_account_scoped(tmp_path)
     assert result.persisted == 1
     assert result.acknowledged == 1
     assert client.checkpoint_observations == [payload]
+
+    durable_payload = dict(payload)
+    durable_payload.update({
+        "operation_id": "operation-0002",
+        "capture_id": "capture-0002",
+    })
+    assert telemetry.persist_checkpoint_observation(durable_payload) is True
+    assert reporter.spool.pending()[0][1] == durable_payload
 
     telemetry.configure_checkpoint_observation_reporting(tmp_path)
     try:

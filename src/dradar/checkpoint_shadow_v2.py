@@ -60,6 +60,8 @@ _TOKEN_RE = re.compile(r"[A-Za-z0-9._/+:-]{1,160}")
 class CheckpointShadowObservationSinkV2(Protocol):
     def record_checkpoint_observation(self, payload: dict) -> bool: ...
 
+    def persist_checkpoint_observation(self, payload: dict) -> bool: ...
+
 
 @dataclass(frozen=True)
 class CheckpointShadowRuntimeFactsV2:
@@ -238,10 +240,21 @@ class CheckpointShadowCoordinatorV2:
         return self._identity
 
     def _record(self, payload: dict[str, object]) -> bool:
+        """Durably hand off evidence before its raw archive may be released.
+
+        Queue admission is sufficient for best-effort telemetry, but not for
+        retention: a process crash could otherwise lose both the queued record
+        and the already-released generation.  Unknown/older sinks therefore
+        preserve the raw generation rather than claiming durable delivery.
+        """
+
+        persist = getattr(
+            self.observation_sink, "persist_checkpoint_observation", None,
+        )
+        if not callable(persist):
+            return False
         try:
-            return bool(
-                self.observation_sink.record_checkpoint_observation(dict(payload))
-            )
+            return bool(persist(dict(payload)))
         except Exception:
             return False
 
@@ -501,7 +514,7 @@ class CheckpointShadowCoordinatorV2:
         started = time.monotonic()
         observation = await self.data_plane.observe_capture(request, self.exporter)
         elapsed_ms = min(86_400_000, int((time.monotonic() - started) * 1000))
-        capture_recorded = False
+        capture_persisted = False
         try:
             payload = checkpoint_observation_payload_v2(
                 request,
@@ -520,7 +533,7 @@ class CheckpointShadowCoordinatorV2:
         except Exception:
             pass
         else:
-            capture_recorded = self._record(payload)
+            capture_persisted = self._record(payload)
         restore_observation: CheckpointRestoreObservationV2 | None = None
         if observation.status == "sealed" and activation.offline_restore_enabled:
             try:
@@ -535,7 +548,7 @@ class CheckpointShadowCoordinatorV2:
         if (
             observation.status == "sealed"
             and observation.published is not None
-            and capture_recorded
+            and capture_persisted
             and (
                 not activation.offline_restore_enabled
                 or (
