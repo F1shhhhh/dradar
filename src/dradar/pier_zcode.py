@@ -1338,6 +1338,7 @@ class ZCodeBigModel(BaseInstalledAgent):
             # Publish host-authored inputs first while AgentLogStore can still
             # require the ordinary Pier host-owned layout without weakening
             # its directory-ownership invariant.
+            self._checkpoint.prepare_host_layout()
             log_store = AgentLogStore(self.logs_dir)
             log_store.replace_text(local_runner, _PROTOCOL_RUNNER)
             log_store.replace_text(local_instruction, instruction)

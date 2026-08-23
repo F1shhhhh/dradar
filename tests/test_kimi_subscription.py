@@ -391,8 +391,16 @@ def test_kimi_checkpoint_keeps_sessions_stream_and_original_prompt_only() -> Non
         )
         for node in ast.walk(run)
     )
-    assert "append=self._checkpoint.previous is not None" in ast.unparse(run)
     run_source = ast.unparse(run)
+    prepare_host_layout = run_source.index(
+        "self._checkpoint.prepare_host_layout()"
+    )
+    config_write = run_source.index("log_store.replace_text(local_config")
+    policy_write = run_source.index("log_store.replace_text(local_policy")
+    checkpoint_start = run_source.index("await self._checkpoint.start")
+    assert prepare_host_layout < config_write < checkpoint_start
+    assert prepare_host_layout < policy_write < checkpoint_start
+    assert "append=self._checkpoint.previous is not None" in ast.unparse(run)
     assert "asyncio.wait_for" in run_source
     assert "_FINAL_SESSION_PROBE_TIMEOUT_SEC" in run_source
     assert "self._checkpoint.finish_durably" in run_source
