@@ -103,7 +103,7 @@ _RESTORE_WIRE_FIELDS = frozenset({
     "authoritative",
 })
 _STABLE_REJECTION_STATUS = frozenset({400, 409, 410, 422})
-_COHORT_FIELDS = (
+CHECKPOINT_COHORT_FIELDS_V2 = (
     "platform",
     "container_backend",
     "harness",
@@ -264,7 +264,10 @@ def _canonical_cohort_registration(value: dict[str, Any]) -> bytes:
             "checkpoint cohort timestamp is invalid",
         )
     cohort = value["cohort"]
-    if not isinstance(cohort, dict) or set(cohort) != set(_COHORT_FIELDS):
+    if (
+        not isinstance(cohort, dict)
+        or set(cohort) != set(CHECKPOINT_COHORT_FIELDS_V2)
+    ):
         raise CheckpointObservationSpoolError(
             "checkpoint cohort tuple is invalid",
         )
@@ -1258,7 +1261,9 @@ def checkpoint_local_evidence_v2(
     assignment_fingerprints: dict[str, str] = {}
     for registration in registrations:
         value = registration[0]
-        key = tuple(value["cohort"][field] for field in _COHORT_FIELDS)
+        key = tuple(
+            value["cohort"][field] for field in CHECKPOINT_COHORT_FIELDS_V2
+        )
         assignment_id = value["assignment_id"]
         fingerprint = value["identity_fingerprint"]
         if (
@@ -1287,7 +1292,7 @@ def checkpoint_local_evidence_v2(
     attestations: list[dict[str, Any]] = []
     for key in sorted(groups):
         cohort_registrations = groups[key]
-        cohort = dict(zip(_COHORT_FIELDS, key, strict=True))
+        cohort = dict(zip(CHECKPOINT_COHORT_FIELDS_V2, key, strict=True))
         assignments = {
             value["assignment_id"] for value, _ in cohort_registrations
         }
@@ -1394,6 +1399,7 @@ def cmd_checkpoint_audit(_args) -> int:
 
 
 __all__ = [
+    "CHECKPOINT_COHORT_FIELDS_V2",
     "COHORT_REGISTRY_SCHEMA_V2",
     "CheckpointObservationReporterV2",
     "CheckpointObservationSpoolError",

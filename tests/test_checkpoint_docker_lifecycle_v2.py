@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from dradar import __version__
 from dradar.checkpoint_adapters_v2 import checkpoint_adapter_contract_v2
 from dradar.checkpoint_docker_runtime_v2 import (
     DockerCliLazyCheckpointExporterV2,
@@ -210,7 +211,7 @@ chmod 0700 /app
                 elapsed_ms=100,
                 platform=platform,
                 container_backend=container_backend,
-                client_version="0.5.97",
+                client_version=__version__,
                 adapter_version=exporter.adapter_version,
             ),
         )
@@ -278,7 +279,7 @@ chmod 0700 /app
                 elapsed_ms=200,
                 platform=platform,
                 container_backend=container_backend,
-                client_version="0.5.97",
+                client_version=__version__,
                 adapter_version=restorer.adapter_version,
             ),
         )

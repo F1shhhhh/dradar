@@ -21,6 +21,7 @@ import sys
 from . import __version__
 from .capacity import cmd_capacity
 from .cells import cmd_cells
+from .checkpoint_lifecycle_evidence_v2 import cmd_checkpoint_lifecycle_bundle
 from .checkpoint_observation_v2 import cmd_checkpoint_audit
 from .doctor import cmd_doctor
 from .identity import cmd_link_github, cmd_login, cmd_rename, cmd_status
@@ -283,6 +284,18 @@ def main(argv: list[str] | None = None) -> int:
         help="emit a read-only privacy-bounded Checkpoint V2 evidence packet",
     )
     p_cp_audit.set_defaults(func=cmd_checkpoint_audit)
+    p_cp_lifecycle = checkpoint_sub.add_parser(
+        "lifecycle-bundle",
+        help=(
+            "verify strict offline lifecycle results and emit a digest-bound "
+            "human-review bundle"
+        ),
+    )
+    p_cp_lifecycle.add_argument(
+        "--results", required=True,
+        help="private JSON result file produced by the lifecycle runner",
+    )
+    p_cp_lifecycle.set_defaults(func=cmd_checkpoint_lifecycle_bundle)
 
     p_sessions = sub.add_parser(
         "sessions", help="manage opt-in local Codex session archives")
