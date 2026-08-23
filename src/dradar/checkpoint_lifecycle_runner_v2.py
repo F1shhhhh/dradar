@@ -39,7 +39,7 @@ from .telemetry import platform_family
 
 
 MAX_LIFECYCLE_LOG_BYTES_V2 = 1024 * 1024
-LIFECYCLE_PROBE_PLAN_VERSION_V2 = "checkpoint-v2-crash-cut-plan-v1"
+LIFECYCLE_PROBE_PLAN_VERSION_V2 = "checkpoint-v2-crash-cut-plan-v2"
 _MACOS_SANDBOX_MARKER_ENV = (
     "DRADAR_CHECKPOINT_V2_MACOS_SANDBOX_SHA256"
 )
@@ -142,11 +142,18 @@ LIFECYCLE_PROBES_V2: dict[str, tuple[tuple[str, str], ...]] = {
             "test_v2_resume_segments_are_deduplicated_into_submission_usage",
         ),
     ),
-    "completed_result_finalize_failure": ((
-        "server",
-        "tests/test_checkpoint_v2_foundation.py::"
-        "test_v2_completed_result_is_durable_before_finalize_failure",
-    ),),
+    "completed_result_finalize_failure": (
+        (
+            "server",
+            "tests/test_checkpoint_v2_foundation.py::"
+            "test_v2_completed_result_is_durable_before_finalize_failure",
+        ),
+        (
+            "client",
+            "tests/test_checkpoint_observation_v2.py::"
+            "test_mainline_impact_pair_is_private_idempotent_and_conflict_safe",
+        ),
+    ),
     "submission_response_lost": ((
         "client",
         "tests/test_checkpoint_owner_runtime_v2.py::"
@@ -167,6 +174,11 @@ LIFECYCLE_PROBES_V2: dict[str, tuple[tuple[str, str], ...]] = {
             "client",
             "tests/test_checkpoint_owner_runtime_v2.py::"
             "test_cross_process_orphan_preserves_completed_result_and_never_restarts",
+        ),
+        (
+            "client",
+            "tests/test_checkpoint_observation_v2.py::"
+            "test_incomplete_or_unregistered_mainline_sample_cannot_look_healthy",
         ),
     ),
 }
