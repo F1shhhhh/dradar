@@ -422,6 +422,13 @@ def test_checkpoint_marks_failed_paid_run_paused(
     completed, failure = checkpoint.finished
     assert completed is False
     assert failure is not None
+    owner = agent.logs_dir.stat()
+    assert any(
+        str(call.get("command", "")) == (
+            f"chown -R {owner.st_uid}:{owner.st_gid} /logs/agent/dsh-home"
+        )
+        for call in environment.calls
+    )
 
 
 @pytest.mark.parametrize(

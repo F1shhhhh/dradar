@@ -32,6 +32,11 @@ class FakeAgent:
         stdout = BASE_COMMIT + "\n" if "rev-parse HEAD" in command else ""
         return SimpleNamespace(return_code=0, stdout=stdout, stderr="")
 
+    async def exec_as_root(self, _environment, *, command, env):
+        del env
+        self.commands.append(command)
+        return SimpleNamespace(return_code=0, stdout="", stderr="")
+
 
 class FakeEnvironment:
     def __init__(self) -> None:
@@ -244,6 +249,29 @@ def test_checkpoint_finish_deletes_exact_credential_and_marks_invalid(
     assert not (tmp_path / "agent/checkpoint/provider-state").exists()
 
 
+def test_checkpoint_finish_hands_snapshot_back_to_host_owner(
+    tmp_path: Path,
+) -> None:
+    logs_dir = tmp_path / "agent"
+    manager = _manager(logs_dir)
+    agent = FakeAgent()
+    environment = FakeEnvironment()
+    asyncio.run(manager.start(agent, environment, {}))
+
+    asyncio.run(
+        manager.finish(agent, environment, {}, completed=True, failure=None)
+    )
+
+    owner = logs_dir.stat()
+    assert any(
+        command == (
+            f"chown -R {owner.st_uid}:{owner.st_gid} "
+            "/logs/agent/checkpoint"
+        )
+        for command in agent.commands
+    )
+
+
 def test_snapshot_stop_failure_discards_all_payload_artifacts(
     tmp_path: Path,
 ) -> None:
@@ -359,7 +387,10 @@ def test_checkpoint_finish_uses_snapshot_session_sidecar(tmp_path: Path) -> None
     manifest = json.loads((manager.host_dir / "checkpoint.json").read_text())
     assert manifest["phase"] == "paused"
     assert manifest["session_id"] == "session-12345678"
-    final_snapshot = agent.commands[-1]
+    final_snapshot = next(
+        command for command in agent.commands
+        if "touch /logs/agent/checkpoint/stop" in command
+    )
     assert "touch /logs/agent/checkpoint/stop" in final_snapshot
     assert 'snapshot_state=$(awk \'{print $3}\'' in final_snapshot
     assert '[ "$snapshot_state" != Z ]' in final_snapshot
