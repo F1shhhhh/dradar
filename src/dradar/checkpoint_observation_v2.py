@@ -103,6 +103,16 @@ _RESTORE_WIRE_FIELDS = frozenset({
     "authoritative",
 })
 _STABLE_REJECTION_STATUS = frozenset({400, 409, 410, 422})
+_RETRYABLE_APPLICATION_CODES = frozenset({
+    # A fleet or cohort downgrade is reversible.  The sealed local record must
+    # remain in the private outbox so it can be published if the experiment is
+    # re-enabled; treating these 409s as semantic corruption would discard the
+    # most useful incident-boundary evidence.
+    "checkpoint_v2_kill_switch_active",
+    "checkpoint_observation_not_authorized",
+    "checkpoint_restore_observation_not_authorized",
+    "checkpoint_restore_source_pending",
+})
 CHECKPOINT_COHORT_FIELDS_V2 = (
     "platform",
     "container_backend",
@@ -697,23 +707,41 @@ class CheckpointObservationSpoolV2:
             _atomic_private_record(target, encoded)
             return True
 
-    def record_delivery_drops(
-        self, assignment_id: str, count: int,
+    def record_delivery_health(
+        self,
+        assignment_id: str,
+        delta: ObservationDeliveryResultV2,
     ) -> None:
-        """Persist assignment-scoped queue/validation drops for audit."""
+        """Atomically persist assignment-scoped delivery counters.
+
+        These counters are evidence, not control state.  Keeping every field
+        crash-persistent prevents a client restart from making a lossy outbox
+        look healthy merely because its in-memory statistics were reset.
+        """
 
         if _IDENTIFIER_RE.fullmatch(assignment_id) is None:
             raise CheckpointObservationSpoolError(
                 "checkpoint delivery assignment is invalid",
             )
-        if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+        if not isinstance(delta, ObservationDeliveryResultV2):
             raise CheckpointObservationSpoolError(
-                "checkpoint delivery drop count is invalid",
+                "checkpoint delivery health delta is invalid",
             )
-        if count > 1_000_000:
+        raw_values = {field: getattr(delta, field) for field in _DELIVERY_FIELDS}
+        if (
+            any(
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+                for value in raw_values.values()
+            )
+            or not any(raw_values.values())
+            or any(value > 1_000_000 for value in raw_values.values())
+        ):
             raise CheckpointObservationSpoolError(
-                "checkpoint delivery drop count is too large",
+                "checkpoint delivery health delta is invalid",
             )
+        values = {field: int(value) for field, value in raw_values.items()}
         with self._thread_lock, _process_lock(self.root):
             self._prepare()
             now = _now_iso()
@@ -731,15 +759,32 @@ class CheckpointObservationSpoolV2:
                     "last_observed_at": now,
                     **{field: 0 for field in _DELIVERY_FIELDS},
                 }
-            updated = {
-                **current,
-                "last_observed_at": now,
-                "dropped": int(current["dropped"]) + count,
-            }
+            updated = {**current, "last_observed_at": now}
+            for field, value in values.items():
+                total = int(current[field]) + value
+                if total > 2**63 - 1:
+                    raise CheckpointObservationSpoolError(
+                        "checkpoint delivery health counter overflowed",
+                    )
+                updated[field] = total
             _atomic_private_record(
                 target,
                 _canonical_delivery_health(updated),
             )
+
+    def record_delivery_drops(
+        self, assignment_id: str, count: int,
+    ) -> None:
+        """Compatibility wrapper for assignment-scoped validation drops."""
+
+        if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+            raise CheckpointObservationSpoolError(
+                "checkpoint delivery drop count is invalid",
+            )
+        self.record_delivery_health(
+            assignment_id,
+            ObservationDeliveryResultV2(dropped=count),
+        )
 
     def _pending_paths_unlocked(self) -> list[Path]:
         self._prepare()
@@ -894,14 +939,17 @@ class CheckpointObservationReporterV2:
         self._thread: threading.Thread | None = None
         self._stats_lock = threading.Lock()
         self._stats = ObservationDeliveryResultV2()
-        self._unpersisted_drops: dict[str, int] = {}
+        self._unpersisted_health: dict[str, ObservationDeliveryResultV2] = {}
 
     def _add_stats(self, value: ObservationDeliveryResultV2) -> None:
         with self._stats_lock:
             self._stats = self._stats.plus(value)
 
-    def _record_drop(self, payload: object) -> None:
-        self._add_stats(ObservationDeliveryResultV2(dropped=1))
+    def _queue_health(
+        self,
+        payload: object,
+        delta: ObservationDeliveryResultV2,
+    ) -> None:
         assignment_id = (
             payload.get("assignment_id") if isinstance(payload, dict) else None
         )
@@ -910,27 +958,36 @@ class CheckpointObservationReporterV2:
             and _IDENTIFIER_RE.fullmatch(assignment_id) is not None
         ):
             with self._stats_lock:
-                self._unpersisted_drops[assignment_id] = (
-                    self._unpersisted_drops.get(assignment_id, 0) + 1
+                self._unpersisted_health[assignment_id] = (
+                    self._unpersisted_health.get(
+                        assignment_id, ObservationDeliveryResultV2(),
+                    ).plus(delta)
                 )
+
+    def _record_drop(self, payload: object) -> None:
+        delta = ObservationDeliveryResultV2(dropped=1)
+        self._add_stats(delta)
+        self._queue_health(payload, delta)
 
     def _flush_health(self) -> None:
         with self._stats_lock:
-            pending = self._unpersisted_drops
-            self._unpersisted_drops = {}
+            pending = self._unpersisted_health
+            self._unpersisted_health = {}
         if not pending:
             return
-        failed: dict[str, int] = {}
-        for assignment_id, count in pending.items():
+        failed: dict[str, ObservationDeliveryResultV2] = {}
+        for assignment_id, delta in pending.items():
             try:
-                self.spool.record_delivery_drops(assignment_id, count)
+                self.spool.record_delivery_health(assignment_id, delta)
             except Exception:
-                failed[assignment_id] = count
+                failed[assignment_id] = delta
         if failed:
             with self._stats_lock:
-                for assignment_id, count in failed.items():
-                    self._unpersisted_drops[assignment_id] = (
-                        self._unpersisted_drops.get(assignment_id, 0) + count
+                for assignment_id, delta in failed.items():
+                    self._unpersisted_health[assignment_id] = (
+                        self._unpersisted_health.get(
+                            assignment_id, ObservationDeliveryResultV2(),
+                        ).plus(delta)
                     )
 
     def register_cohort(self, payload: dict[str, Any]) -> bool:
@@ -981,10 +1038,14 @@ class CheckpointObservationReporterV2:
             try:
                 created = self.spool.persist(payload)
             except Exception:
-                result = result.plus(ObservationDeliveryResultV2(dropped=1))
+                delta = ObservationDeliveryResultV2(dropped=1)
+                result = result.plus(delta)
+                self._queue_health(payload, delta)
             else:
                 if created:
-                    result = result.plus(ObservationDeliveryResultV2(persisted=1))
+                    delta = ObservationDeliveryResultV2(persisted=1)
+                    result = result.plus(delta)
+                    self._queue_health(payload, delta)
             finally:
                 self._queue.task_done()
         return result
@@ -1018,6 +1079,13 @@ class CheckpointObservationReporterV2:
             "checkpoint observation kind is invalid",
         )
 
+    @staticmethod
+    def _is_stable_rejection(exc: ApiError) -> bool:
+        return (
+            exc.status_code in _STABLE_REJECTION_STATUS
+            and exc.code not in _RETRYABLE_APPLICATION_CODES
+        )
+
     def flush_once(self) -> ObservationDeliveryResultV2:
         """Persist queued data and attempt a bounded replay batch."""
 
@@ -1033,28 +1101,36 @@ class CheckpointObservationReporterV2:
             try:
                 response = self._send(payload)
             except ApiError as exc:
-                if exc.status_code in _STABLE_REJECTION_STATUS:
+                if self._is_stable_rejection(exc):
                     try:
                         self.spool.reject(path, str(payload["operation_id"]))
                     except Exception:
-                        result = result.plus(ObservationDeliveryResultV2(retryable=1))
+                        delta = ObservationDeliveryResultV2(retryable=1)
                     else:
-                        result = result.plus(ObservationDeliveryResultV2(rejected=1))
+                        delta = ObservationDeliveryResultV2(rejected=1)
                 else:
-                    result = result.plus(ObservationDeliveryResultV2(retryable=1))
+                    delta = ObservationDeliveryResultV2(retryable=1)
+                result = result.plus(delta)
+                self._queue_health(payload, delta)
                 continue
             except Exception:
-                result = result.plus(ObservationDeliveryResultV2(retryable=1))
+                delta = ObservationDeliveryResultV2(retryable=1)
+                result = result.plus(delta)
+                self._queue_health(payload, delta)
                 continue
             if not self._acknowledges_without_authority(response, payload):
-                result = result.plus(ObservationDeliveryResultV2(retryable=1))
+                delta = ObservationDeliveryResultV2(retryable=1)
+                result = result.plus(delta)
+                self._queue_health(payload, delta)
                 continue
             try:
                 self.spool.acknowledge(path, str(payload["operation_id"]))
             except Exception:
-                result = result.plus(ObservationDeliveryResultV2(retryable=1))
+                delta = ObservationDeliveryResultV2(retryable=1)
             else:
-                result = result.plus(ObservationDeliveryResultV2(acknowledged=1))
+                delta = ObservationDeliveryResultV2(acknowledged=1)
+            result = result.plus(delta)
+            self._queue_health(payload, delta)
         self._add_stats(result)
         self._flush_health()
         return result
@@ -1311,10 +1387,13 @@ def checkpoint_local_evidence_v2(
             (payload, digest) for state, payload, digest in observation_records
             if state == "rejected" and payload.get("assignment_id") in assignments
         ]
-        drops = sum(
-            int(health[assignment_id][0]["dropped"])
-            for assignment_id in assignments if assignment_id in health
-        )
+        delivery_totals = {
+            field: sum(
+                int(health[assignment_id][0][field])
+                for assignment_id in assignments if assignment_id in health
+            )
+            for field in _DELIVERY_FIELDS
+        }
         diagnostics = 0
         unstructured_diagnostics = 0
         cleanup_residue = 0
@@ -1369,7 +1448,11 @@ def checkpoint_local_evidence_v2(
                 "pending_records": len(pending),
                 "oldest_pending_seconds": max(pending_ages, default=0),
                 "rejected_records": len(rejected),
-                "dropped_records": drops,
+                "persisted_records": delivery_totals["persisted"],
+                "acknowledged_records": delivery_totals["acknowledged"],
+                "retryable_deliveries": delivery_totals["retryable"],
+                "rejected_deliveries": delivery_totals["rejected"],
+                "dropped_records": delivery_totals["dropped"],
                 "diagnostic_records": diagnostics,
                 "unstructured_diagnostics": unstructured_diagnostics,
                 "cleanup_residue": cleanup_residue,

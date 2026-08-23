@@ -13,6 +13,7 @@ from dradar.checkpoint_observation_v2 import (
     CheckpointObservationReporterV2,
     CheckpointObservationSpoolError,
     CheckpointObservationSpoolV2,
+    ObservationDeliveryResultV2,
     checkpoint_local_evidence_v2,
 )
 
@@ -303,6 +304,48 @@ def test_spool_drop_accounting_is_atomic_across_processes(tmp_path):
     assert health["dropped"] == sum(counts)
 
 
+def test_spool_persists_every_delivery_health_counter(tmp_path):
+    root = tmp_path / "observations"
+    spool = CheckpointObservationSpoolV2(root)
+
+    spool.record_delivery_health(
+        "assignment-0001",
+        ObservationDeliveryResultV2(
+            persisted=2,
+            acknowledged=1,
+            retryable=3,
+            rejected=4,
+            dropped=5,
+        ),
+    )
+    spool.record_delivery_health(
+        "assignment-0001",
+        ObservationDeliveryResultV2(
+            persisted=7,
+            acknowledged=6,
+            retryable=5,
+            rejected=4,
+            dropped=3,
+        ),
+    )
+
+    health = json.loads(
+        (root / "delivery-health" / "assignment-0001.json").read_text(),
+    )
+    assert {
+        field: health[field]
+        for field in (
+            "persisted", "acknowledged", "retryable", "rejected", "dropped",
+        )
+    } == {
+        "persisted": 9,
+        "acknowledged": 7,
+        "retryable": 8,
+        "rejected": 8,
+        "dropped": 8,
+    }
+
+
 def test_spool_process_lock_is_released_after_hard_crash(tmp_path):
     root = tmp_path / "observations"
     ctx = multiprocessing.get_context("spawn")
@@ -421,6 +464,60 @@ def test_stable_semantic_rejection_is_quarantined_not_retried(tmp_path):
     assert json.loads(rejected[0].read_text())["payload"] == payload
 
 
+@pytest.mark.parametrize("code", [
+    "checkpoint_v2_kill_switch_active",
+    "checkpoint_observation_not_authorized",
+    "checkpoint_restore_observation_not_authorized",
+])
+def test_reversible_rollout_rejection_stays_pending_for_later_replay(
+    tmp_path, code,
+):
+    payload = _payload()
+    api = FakeObservationApi([
+        ApiError("temporarily disabled", status_code=409, code=code),
+        _ack(payload),
+    ])
+    reporter = CheckpointObservationReporterV2(api, tmp_path)
+    assert reporter.record(payload)
+
+    disabled = reporter.flush_once()
+    assert disabled.retryable == 1
+    assert len(reporter.spool.pending()) == 1
+    assert list(reporter.spool.rejected_root.glob("*.json")) == []
+
+    replay = CheckpointObservationReporterV2(api, tmp_path).flush_once()
+    assert replay.acknowledged == 1
+    assert reporter.spool.pending() == []
+
+
+def test_reporter_delivery_health_survives_restart(tmp_path):
+    payload = _payload()
+    first_api = FakeObservationApi([
+        ApiError("offline"),
+    ])
+    first = CheckpointObservationReporterV2(first_api, tmp_path)
+    assert first.record(payload)
+    first_result = first.flush_once()
+    assert first_result == ObservationDeliveryResultV2(
+        persisted=1, retryable=1,
+    )
+
+    second = CheckpointObservationReporterV2(FakeObservationApi(), tmp_path)
+    assert second.flush_once() == ObservationDeliveryResultV2(acknowledged=1)
+
+    health = json.loads(
+        (
+            tmp_path / "checkpoint-v2" / "observations" / "delivery-health"
+            / "assignment-0001.json"
+        ).read_text(),
+    )
+    assert health["persisted"] == 1
+    assert health["retryable"] == 1
+    assert health["acknowledged"] == 1
+    assert health["rejected"] == 0
+    assert health["dropped"] == 0
+
+
 def test_old_server_404_is_retryable_for_future_upgrade(tmp_path):
     payload = _payload()
     api = FakeObservationApi([ApiError("not found", status_code=404)])
@@ -512,6 +609,10 @@ def test_local_evidence_reports_assignment_scoped_backlog_and_drops(tmp_path):
     assert attestation["cohort"]["platform"] == "macos"
     assert attestation["metrics"]["observation_processes"] == 1
     assert attestation["metrics"]["pending_records"] == 1
+    assert attestation["metrics"]["persisted_records"] == 1
+    assert attestation["metrics"]["acknowledged_records"] == 0
+    assert attestation["metrics"]["retryable_deliveries"] == 1
+    assert attestation["metrics"]["rejected_deliveries"] == 0
     assert attestation["metrics"]["dropped_records"] == 1
     serialized = json.dumps(packet)
     assert str(tmp_path) not in serialized
