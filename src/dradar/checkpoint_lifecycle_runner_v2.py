@@ -32,6 +32,8 @@ from .checkpoint_lifecycle_evidence_v2 import (
     LIFECYCLE_ZERO_METRICS_V2,
     _cohort,
 )
+from .checkpoint_docker_runtime_v2 import docker_container_backend_v2
+from .telemetry import platform_family
 
 
 MAX_LIFECYCLE_LOG_BYTES_V2 = 1024 * 1024
@@ -303,6 +305,13 @@ def _provider_credentials_present() -> bool:
     return any(os.environ.get(name) for name in _PROVIDER_ENV_NAMES)
 
 
+def _observed_platform_backend() -> tuple[str, str]:
+    try:
+        return platform_family(), docker_container_backend_v2()
+    except Exception as exc:
+        raise ValueError("lifecycle runner cannot verify its Docker backend") from exc
+
+
 def _git_revision(root: Path) -> str:
     root = root.resolve(strict=True)
     status = subprocess.run(
@@ -550,6 +559,10 @@ def run_lifecycle_matrix_v2(
     cohort = _cohort(_read_private_json(Path(cohort_path)))
     if cohort["client_version"] != __version__:
         raise ValueError("lifecycle cohort client version does not match runner")
+    if _observed_platform_backend() != (
+        cohort["platform"], cohort["container_backend"],
+    ):
+        raise ValueError("lifecycle cohort platform/backend does not match runner")
     roots = {
         "client": Path(client_source).resolve(strict=True),
         "server": Path(server_source).resolve(strict=True),
@@ -655,6 +668,10 @@ def run_lifecycle_matrix_v2(
         raise ValueError("lifecycle source changed while probes were running")
     if not _network_isolated() or _provider_credentials_present():
         raise ValueError("lifecycle runner isolation changed while probes were running")
+    if _observed_platform_backend() != (
+        cohort["platform"], cohort["container_backend"],
+    ):
+        raise ValueError("lifecycle runner platform/backend changed while probes were running")
     shutil.rmtree(materialized_root)
     if materialized_root.exists() or materialized_root.is_symlink():
         raise ValueError("lifecycle exact-source cleanup failed")

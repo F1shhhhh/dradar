@@ -17,6 +17,13 @@ from dradar.checkpoint_lifecycle_evidence_v2 import (
 from dradar import checkpoint_lifecycle_runner_v2 as runner
 
 
+@pytest.fixture(autouse=True)
+def _verified_runner_platform(monkeypatch):
+    monkeypatch.setattr(
+        runner, "_observed_platform_backend", lambda: ("linux", "docker"),
+    )
+
+
 def _cohort() -> dict[str, str]:
     return {
         "platform": "linux",
