@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 import stat
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -38,6 +40,64 @@ from dradar.checkpoint_v2 import (
     finalize_execution_identity_v2,
     negotiate_checkpoint_activation_v2,
 )
+
+
+def _journal_begin_process(
+    home: str,
+    command: str,
+    payload: dict,
+    start,
+    results,
+) -> None:
+    """Exercise a real independent process without sharing Python locks."""
+
+    start.wait()
+    journal = CheckpointV2Journal(Path(home))
+    for _ in range(200):
+        try:
+            entry = journal.begin(command, payload)
+        except checkpoints.CheckpointBusy:
+            time.sleep(0.005)
+            continue
+        except CheckpointV2OperationConflict:
+            results.put(("conflict", None))
+            return
+        except Exception as exc:  # pragma: no cover - asserted by parent
+            results.put(("error", f"{type(exc).__name__}:{exc}"))
+            return
+        results.put(("ok", entry.state))
+        return
+    results.put(("error", "checkpoint journal remained busy"))
+
+
+def _journal_transition_process(
+    home: str,
+    response: dict,
+    start,
+    results,
+) -> None:
+    start.wait()
+    journal = CheckpointV2Journal(Path(home))
+    for _ in range(200):
+        try:
+            current = journal.load("assignment-0001", "operation-0001")
+            entry = journal._transition(
+                current,
+                state="ACKNOWLEDGED",
+                response=response,
+            )
+        except checkpoints.CheckpointBusy:
+            time.sleep(0.005)
+            continue
+        except CheckpointV2OperationConflict:
+            results.put(("conflict", None))
+            return
+        except Exception as exc:  # pragma: no cover - asserted by parent
+            results.put(("error", f"{type(exc).__name__}:{exc}"))
+            return
+        results.put(("ok", entry.response))
+        return
+    results.put(("error", "checkpoint journal remained busy"))
 
 
 class FakeApi:
@@ -404,6 +464,142 @@ def test_operation_id_cannot_be_reused_for_a_different_request(
         journal.begin("checkout", _payload(expected_owner_epoch=7))
     with pytest.raises(CheckpointV2OperationConflict):
         journal.begin("start", _payload())
+
+
+def test_journal_creation_is_safe_across_independent_processes(
+    tmp_path: Path,
+) -> None:
+    ctx = multiprocessing.get_context("spawn")
+    start = ctx.Event()
+    results = ctx.Queue()
+    processes = []
+    for index in range(8):
+        payload = _payload(operation_id=f"operation-process-{index:04d}")
+        process = ctx.Process(
+            target=_journal_begin_process,
+            args=(str(tmp_path), "checkout", payload, start, results),
+        )
+        process.start()
+        processes.append(process)
+    start.set()
+    observed = [results.get(timeout=15) for _ in processes]
+    for process in processes:
+        process.join(timeout=15)
+        assert process.exitcode == 0
+    assert observed == [("ok", "PENDING")] * len(processes)
+    journal = CheckpointV2Journal(tmp_path)
+    for index in range(8):
+        assert journal.load(
+            "assignment-0001", f"operation-process-{index:04d}",
+        ).state == "PENDING"
+
+
+def test_journal_replay_and_conflict_are_stable_across_processes(
+    tmp_path: Path,
+) -> None:
+    journal = CheckpointV2Journal(tmp_path)
+    journal.begin("checkout", _payload())
+    ctx = multiprocessing.get_context("spawn")
+    start = ctx.Event()
+    results = ctx.Queue()
+    processes = []
+    requests = [
+        ("checkout", _payload()),
+        ("checkout", _payload()),
+        ("checkout", _payload(expected_owner_epoch=7)),
+        ("start", _payload()),
+    ]
+    for command, payload in requests:
+        process = ctx.Process(
+            target=_journal_begin_process,
+            args=(str(tmp_path), command, payload, start, results),
+        )
+        process.start()
+        processes.append(process)
+    start.set()
+    observed = [results.get(timeout=15) for _ in processes]
+    for process in processes:
+        process.join(timeout=15)
+        assert process.exitcode == 0
+    assert sorted(observed) == [
+        ("conflict", None),
+        ("conflict", None),
+        ("ok", "PENDING"),
+        ("ok", "PENDING"),
+    ]
+    assert journal.load("assignment-0001", "operation-0001").payload == _payload()
+
+
+def test_journal_terminal_result_is_idempotent_and_never_overwritten(
+    tmp_path: Path,
+) -> None:
+    journal = CheckpointV2Journal(tmp_path)
+    journal.begin("checkout", _payload())
+    response = _checkout_ack()
+    ctx = multiprocessing.get_context("spawn")
+    start = ctx.Event()
+    results = ctx.Queue()
+    processes = [
+        ctx.Process(
+            target=_journal_transition_process,
+            args=(str(tmp_path), response, start, results),
+        )
+        for _ in range(6)
+    ]
+    for process in processes:
+        process.start()
+    start.set()
+    observed = [results.get(timeout=15) for _ in processes]
+    for process in processes:
+        process.join(timeout=15)
+        assert process.exitcode == 0
+    assert observed == [("ok", response)] * len(processes)
+
+    terminal = journal.load("assignment-0001", "operation-0001")
+    assert terminal.state == "ACKNOWLEDGED"
+    assert terminal.response == response
+    with pytest.raises(
+        CheckpointV2OperationConflict,
+        match="different terminal result",
+    ):
+        journal._transition(
+            terminal,
+            state="REJECTED",
+            error_status=409,
+            error_code="checkpoint_owner_fenced",
+        )
+    assert journal.load("assignment-0001", "operation-0001") == terminal
+
+
+def test_journal_never_last_writer_wins_conflicting_process_results(
+    tmp_path: Path,
+) -> None:
+    journal = CheckpointV2Journal(tmp_path)
+    journal.begin("checkout", _payload())
+    first = _checkout_ack()
+    second = dict(first, owner_epoch=2)
+    ctx = multiprocessing.get_context("spawn")
+    start = ctx.Event()
+    results = ctx.Queue()
+    processes = [
+        ctx.Process(
+            target=_journal_transition_process,
+            args=(str(tmp_path), response, start, results),
+        )
+        for response in (first, second)
+    ]
+    for process in processes:
+        process.start()
+    start.set()
+    observed = [results.get(timeout=15) for _ in processes]
+    for process in processes:
+        process.join(timeout=15)
+        assert process.exitcode == 0
+    assert sum(item[0] == "ok" for item in observed) == 1
+    assert sum(item[0] == "conflict" for item in observed) == 1
+    terminal = journal.load("assignment-0001", "operation-0001")
+    assert terminal.state == "ACKNOWLEDGED"
+    assert terminal.response in (first, second)
 
 
 def test_sensitive_fields_are_rejected_before_disk_or_network(tmp_path: Path) -> None:

@@ -1339,6 +1339,18 @@ class CheckpointV2Journal:
                 _canonical_bytes(
                     materialized_response, label="checkpoint command response",
                 )
+            if latest.state != "PENDING":
+                exact_replay = (
+                    latest.state == state
+                    and latest.response == materialized_response
+                    and latest.error_status == error_status
+                    and latest.error_code == error_code
+                )
+                if exact_replay:
+                    return latest
+                raise CheckpointV2OperationConflict(
+                    "checkpoint command already has a different terminal result"
+                )
             updated = JournalEntry(
                 assignment_id=latest.assignment_id,
                 operation_id=latest.operation_id,
@@ -1415,7 +1427,8 @@ class CheckpointV2Journal:
 
     def load(self, assignment_id: str, operation_id: str) -> JournalEntry:
         path = self._entry_path(assignment_id, operation_id)
-        return self._decode(_read_entry(path))
+        with self._command_lock(assignment_id):
+            return self._decode(_read_entry(path))
 
 
 def finalize_execution_identity_v2(

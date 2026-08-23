@@ -1,8 +1,10 @@
 import json
+import multiprocessing
 import os
 import stat
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +15,55 @@ from dradar.checkpoint_observation_v2 import (
     CheckpointObservationSpoolV2,
     checkpoint_local_evidence_v2,
 )
+
+
+def _observation_persist_process(
+    root: str,
+    payload: dict,
+    start,
+    results,
+) -> None:
+    start.wait()
+    spool = CheckpointObservationSpoolV2(Path(root))
+    try:
+        created = spool.persist(payload)
+    except CheckpointObservationSpoolError as exc:
+        results.put(("conflict", str(exc)))
+    except Exception as exc:  # pragma: no cover - asserted by parent
+        results.put(("error", f"{type(exc).__name__}:{exc}"))
+    else:
+        results.put(("created" if created else "replay", None))
+
+
+def _observation_drop_process(
+    root: str,
+    assignment_id: str,
+    count: int,
+    start,
+    results,
+) -> None:
+    start.wait()
+    try:
+        CheckpointObservationSpoolV2(Path(root)).record_delivery_drops(
+            assignment_id, count,
+        )
+    except Exception as exc:  # pragma: no cover - asserted by parent
+        results.put(("error", f"{type(exc).__name__}:{exc}"))
+    else:
+        results.put(("ok", count))
+
+
+def _observation_lock_crash_process(
+    root: str,
+    ready,
+    crash,
+) -> None:
+    from dradar.checkpoint_observation_v2 import _process_lock
+
+    with _process_lock(Path(root)):
+        ready.set()
+        crash.wait(10)
+        os._exit(94)
 
 
 def _payload(operation_id="operation-0001", capture_id="capture-0001"):
@@ -156,6 +207,120 @@ def test_spool_is_private_canonical_idempotent_and_conflict_safe(tmp_path):
     with pytest.raises(CheckpointObservationSpoolError, match="conflicts"):
         spool.persist(conflict)
     assert spool.pending()[0][1] == payload
+
+
+def test_spool_preserves_all_distinct_records_from_independent_processes(
+    tmp_path,
+):
+    root = tmp_path / "observations"
+    ctx = multiprocessing.get_context("spawn")
+    start = ctx.Event()
+    results = ctx.Queue()
+    processes = []
+    expected = {}
+    for index in range(12):
+        payload = _payload(
+            f"operation-process-{index:04d}",
+            f"capture-process-{index:04d}",
+        )
+        expected[payload["operation_id"]] = payload
+        process = ctx.Process(
+            target=_observation_persist_process,
+            args=(str(root), payload, start, results),
+        )
+        process.start()
+        processes.append(process)
+    start.set()
+    observed = [results.get(timeout=15) for _ in processes]
+    for process in processes:
+        process.join(timeout=15)
+        assert process.exitcode == 0
+    assert observed == [("created", None)] * len(processes)
+    pending = {
+        payload["operation_id"]: payload
+        for _, payload in CheckpointObservationSpoolV2(root).pending(limit=32)
+    }
+    assert pending == expected
+    assert list((root / "pending").glob(".*.tmp")) == []
+
+
+def test_spool_replay_and_conflict_are_stable_across_processes(tmp_path):
+    root = tmp_path / "observations"
+    payload = _payload()
+    spool = CheckpointObservationSpoolV2(root)
+    assert spool.persist(payload) is True
+    ctx = multiprocessing.get_context("spawn")
+    start = ctx.Event()
+    results = ctx.Queue()
+    variants = [dict(payload) for _ in range(5)] + [
+        dict(payload, status="failed") for _ in range(3)
+    ]
+    processes = [
+        ctx.Process(
+            target=_observation_persist_process,
+            args=(str(root), variant, start, results),
+        )
+        for variant in variants
+    ]
+    for process in processes:
+        process.start()
+    start.set()
+    observed = [results.get(timeout=15) for _ in processes]
+    for process in processes:
+        process.join(timeout=15)
+        assert process.exitcode == 0
+    assert sum(item[0] == "replay" for item in observed) == 5
+    conflicts = [item for item in observed if item[0] == "conflict"]
+    assert len(conflicts) == 3
+    assert all("operation id conflicts" in item[1] for item in conflicts)
+    assert spool.pending()[0][1] == payload
+
+
+def test_spool_drop_accounting_is_atomic_across_processes(tmp_path):
+    root = tmp_path / "observations"
+    ctx = multiprocessing.get_context("spawn")
+    start = ctx.Event()
+    results = ctx.Queue()
+    counts = list(range(1, 9))
+    processes = [
+        ctx.Process(
+            target=_observation_drop_process,
+            args=(str(root), "assignment-0001", count, start, results),
+        )
+        for count in counts
+    ]
+    for process in processes:
+        process.start()
+    start.set()
+    observed = [results.get(timeout=15) for _ in processes]
+    for process in processes:
+        process.join(timeout=15)
+        assert process.exitcode == 0
+    assert sorted(observed) == [("ok", count) for count in counts]
+    health = json.loads(
+        (root / "delivery-health" / "assignment-0001.json").read_text(),
+    )
+    assert health["dropped"] == sum(counts)
+
+
+def test_spool_process_lock_is_released_after_hard_crash(tmp_path):
+    root = tmp_path / "observations"
+    ctx = multiprocessing.get_context("spawn")
+    ready = ctx.Event()
+    crash = ctx.Event()
+    process = ctx.Process(
+        target=_observation_lock_crash_process,
+        args=(str(root), ready, crash),
+    )
+    process.start()
+    assert ready.wait(10)
+    crash.set()
+    process.join(timeout=15)
+    assert process.exitcode == 94
+
+    spool = CheckpointObservationSpoolV2(root)
+    assert spool.persist(_payload()) is True
+    assert spool.pending()[0][1] == _payload()
 
 
 def test_spool_rejects_unknown_fields_multiline_text_and_symlink_root(tmp_path):
