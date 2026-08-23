@@ -44,6 +44,7 @@ _MACOS_SANDBOX_MARKER_ENV = (
     "DRADAR_CHECKPOINT_V2_MACOS_SANDBOX_SHA256"
 )
 _MACOS_SANDBOX_EXEC = Path("/usr/bin/sandbox-exec")
+_MACOS_PS_EXEC = Path("/bin/ps")
 _INET_DENIED_ERRNOS = frozenset({1, 13})
 LIFECYCLE_PROBES_V2: dict[str, tuple[tuple[str, str], ...]] = {
     "owner_checkout_precommit": ((
@@ -389,22 +390,31 @@ def _docker_unix_socket() -> Path:
     return path
 
 
-def _macos_sandbox_profile() -> tuple[str, str]:
-    executable = _MACOS_SANDBOX_EXEC.resolve(strict=True)
+def _trusted_root_executable(path: Path, *, label: str) -> Path:
+    executable = path.resolve(strict=True)
     metadata = executable.stat()
     if (
-        executable != _MACOS_SANDBOX_EXEC
+        executable != path
         or not stat.S_ISREG(metadata.st_mode)
         or metadata.st_uid != 0
         or stat.S_IMODE(metadata.st_mode) & 0o022
         or not os.access(executable, os.X_OK)
     ):
-        raise ValueError("macOS lifecycle sandbox executable is unsafe")
+        raise ValueError(f"macOS lifecycle {label} executable is unsafe")
+    return executable
+
+
+def _macos_sandbox_profile() -> tuple[str, str]:
+    _trusted_root_executable(_MACOS_SANDBOX_EXEC, label="sandbox")
+    ps_executable = _trusted_root_executable(_MACOS_PS_EXEC, label="ps")
     docker_socket = os.fspath(_docker_unix_socket())
     quoted_socket = json.dumps(docker_socket, ensure_ascii=True)
+    quoted_ps = json.dumps(os.fspath(ps_executable), ensure_ascii=True)
     profile = " ".join((
         "(version 1)",
         "(allow default)",
+        "(allow process-exec* (with no-sandbox)",
+        f"(literal {quoted_ps}))",
         "(deny network*)",
         "(allow network-outbound",
         f"(remote unix-socket (path {quoted_socket})))",
