@@ -518,6 +518,32 @@ def test_worker_above_live_target_retires_before_next_checkout(
     assert runloop._worker_slot_is_enabled() is True
 
 
+def test_worker_target_zero_retires_every_slot_before_next_checkout(
+        tmp_path, monkeypatch):
+    target = tmp_path / "workers"
+    target.write_text("0")
+    monkeypatch.setenv("DRADAR_POOL_TARGET_FILE", str(target))
+    monkeypatch.setenv("DRADAR_WORKER_INDEX", "1")
+    monkeypatch.setenv("DRADAR_POOL_MAX_SIZE", "4")
+    monkeypatch.setenv("DRADAR_POOL_SIZE", "4")
+    runloop._POOL_TARGET_CACHE.clear()
+    assert runloop._worker_slot_is_enabled() is False
+
+
+def test_pool_can_start_at_zero_without_spawning_workers(
+        tmp_path, monkeypatch):
+    _patch_pool_setup(monkeypatch, active_count=4)
+    target = tmp_path / "workers"
+    target.write_text("0")
+    monkeypatch.setattr(
+        runloop.subprocess, "Popen",
+        lambda *_args, **_kwargs: pytest.fail("zero target must not spawn workers"),
+    )
+    assert runloop._run_worker_pool(
+        _args(workers=4, worker_target_file=str(target)),
+    ) == 0
+
+
 def test_worker_keeps_last_valid_target_during_atomic_file_replacement(
         tmp_path, monkeypatch):
     target = tmp_path / "workers"

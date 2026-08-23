@@ -324,9 +324,9 @@ def _read_pool_target(path: Path | None, *, default: int, maximum: int) -> int:
             f"keeping {default} worker(s)", file=sys.stderr,
         )
         return default
-    if not 1 <= value <= maximum:
+    if not 0 <= value <= maximum:
         print(
-            f"worker target {value} is outside 1..{maximum}; "
+            f"worker target {value} is outside 0..{maximum}; "
             f"keeping {default} worker(s)", file=sys.stderr,
         )
         return default
@@ -3680,7 +3680,7 @@ def _run_worker_pool(args) -> int:
         print(f"only {len(active)} task(s) are currently held; starting {count} worker(s)")
     print(f"starting {count} worker(s); server-side checkout assigns each task exactly once")
     if target_file is not None:
-        print(f"live worker target: {target_file} (range 1..{maximum})")
+        print(f"live worker target: {target_file} (range 0..{maximum})")
     command = _worker_command(args)
     pool_abort_file = configured_abort_file or (
         Path(tempfile.gettempdir())
