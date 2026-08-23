@@ -28,6 +28,7 @@ from .api_client import ApiClient, ApiError
 from .checkpoint_activation_v2 import (
     CheckpointActivationV2,
     CheckpointV2ProtocolError,
+    negotiate_checkpoint_activation_v2,
 )
 from .checkpoint_adapters_v2 import checkpoint_adapter_contract_v2
 from .checkpoint_docker_runtime_v2 import (
@@ -62,6 +63,7 @@ from .checkpoint_v2 import (
     CheckpointV2Journal,
     CheckpointV2StateMachine,
     CompletedResultPermit,
+    ExecutionIdentityV2,
     FinalizedUsageSegmentReceiptV2,
     FreePreparationPermit,
     OfflineRestorePermit,
@@ -109,6 +111,277 @@ def _stable_owner_ids(
         ).encode("ascii")
     ).hexdigest()
     return f"checkpoint-{digest[:48]}", f"lineage-{digest[16:64]}"
+
+
+_COMPLETED_RESULT_RECOVERY_SCHEMA_V2 = (
+    "dradar-checkpoint-completed-result-recovery-v2"
+)
+
+
+def checkpoint_usage_evidence_v2(
+    *,
+    permit: PaidExecutionPermit,
+    harness: str,
+    provider: str,
+    n_input_tokens: object,
+    n_cache_tokens: object,
+    n_output_tokens: object,
+    token_usage_events: object = None,
+    request_usage_complete: object = None,
+    request_usage_observed: object = None,
+    complete: bool = True,
+) -> UsageSegmentEvidenceV2:
+    """Build deterministic usage evidence for live and crash recovery paths."""
+
+    contract = checkpoint_adapter_contract_v2(harness, provider)
+    counters = (n_input_tokens, n_cache_tokens, n_output_tokens)
+    counters_valid = all(
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value >= 0
+        for value in counters
+    ) and int(n_cache_tokens) <= int(n_input_tokens)
+    raw_events = token_usage_events if isinstance(token_usage_events, list) else []
+    events_valid = isinstance(token_usage_events, list) and 0 < len(raw_events) <= 512
+    materialized: list[UsageEventV2] = []
+    event_totals = [0, 0, 0]
+    if events_valid:
+        for source_sequence, raw in enumerate(raw_events):
+            if not isinstance(raw, Mapping):
+                events_valid = False
+                break
+            raw_counters = tuple(
+                raw.get(name) for name in (
+                    "n_input_tokens", "n_cache_tokens", "n_output_tokens",
+                )
+            )
+            observed_at = raw.get("occurred_at")
+            try:
+                instant = datetime.fromisoformat(
+                    observed_at.replace("Z", "+00:00")
+                )
+            except (AttributeError, TypeError, ValueError):
+                events_valid = False
+                break
+            if (
+                instant.tzinfo is None
+                or any(
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or value < 0
+                    for value in raw_counters
+                )
+                or int(raw_counters[1]) > int(raw_counters[0])
+            ):
+                events_valid = False
+                break
+            identity = {
+                "schema": "dradar-checkpoint-usage-event-identity-v2",
+                "assignment_id": permit.assignment_id,
+                "harness": harness,
+                "provider": provider,
+                "ledger_scope": contract.usage_ledger_scope,
+                "source_sequence": source_sequence,
+                "occurred_at": observed_at,
+                "n_input_tokens": int(raw_counters[0]),
+                "n_cache_tokens": int(raw_counters[1]),
+                "n_output_tokens": int(raw_counters[2]),
+            }
+            if contract.usage_ledger_scope == "segment_delta":
+                identity["usage_segment_id"] = permit.usage_segment_id
+            event_id = hashlib.sha256(json.dumps(
+                identity, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()
+            materialized.append(UsageEventV2(
+                event_id=event_id,
+                occurred_at=str(observed_at),
+                n_input_tokens=int(raw_counters[0]),
+                n_cache_tokens=int(raw_counters[1]),
+                n_output_tokens=int(raw_counters[2]),
+            ))
+            for index, value in enumerate(raw_counters):
+                event_totals[index] += int(value)
+    events_valid = (
+        events_valid
+        and counters_valid
+        and tuple(event_totals) == tuple(int(value) for value in counters)
+    )
+    if not events_valid or request_usage_observed is not True:
+        return UsageSegmentEvidenceV2(
+            completeness="unavailable",
+            evidence_kind="unavailable",
+            events=(),
+        )
+    return UsageSegmentEvidenceV2(
+        completeness=(
+            "complete"
+            if complete and request_usage_complete is True
+            else "partial"
+        ),
+        evidence_kind=(
+            "trajectory_bundle"
+            if harness == "codex"
+            else "provider_request_ledger"
+        ),
+        events=tuple(materialized),
+        ledger_scope=contract.usage_ledger_scope,
+    )
+
+
+def _completed_result_recovery_context_v2(
+    descriptor: Mapping[str, Any],
+    *,
+    api: ApiClient,
+    home: Path,
+) -> tuple[CheckpointV2StateMachine, PaidExecutionPermit, str, str]:
+    expected_fields = {
+        "schema", "assignment_id", "execution_identity", "rollout_mode",
+        "session_id", "owner_epoch", "owner_lease_expires_at", "source",
+        "usage_segment_id", "usage_operation_id", "result_operation_id",
+    }
+    if not isinstance(descriptor, Mapping) or set(descriptor) != expected_fields:
+        raise CheckpointV2ProtocolError(
+            "checkpoint completed-result recovery descriptor is invalid"
+        )
+    assignment_id = descriptor.get("assignment_id")
+    session_id = descriptor.get("session_id")
+    owner_epoch = descriptor.get("owner_epoch")
+    owner_lease_expires_at = descriptor.get("owner_lease_expires_at")
+    source = descriptor.get("source")
+    usage_segment_id = descriptor.get("usage_segment_id")
+    usage_operation_id = descriptor.get("usage_operation_id")
+    result_operation_id = descriptor.get("result_operation_id")
+    rollout_mode = descriptor.get("rollout_mode")
+    stored_identity = descriptor.get("execution_identity")
+    identity_fields = set(ExecutionIdentityV2.__dataclass_fields__)
+    try:
+        lease_expiry = datetime.fromisoformat(
+            str(owner_lease_expires_at).replace("Z", "+00:00")
+        )
+    except (TypeError, ValueError):
+        lease_expiry = None
+    if (
+        descriptor.get("schema") != _COMPLETED_RESULT_RECOVERY_SCHEMA_V2
+        or re.fullmatch(r"[A-Za-z0-9._-]{8,64}", str(assignment_id)) is None
+        or re.fullmatch(r"[A-Za-z0-9._:-]{8,64}", str(session_id)) is None
+        or not isinstance(owner_epoch, int)
+        or isinstance(owner_epoch, bool)
+        or owner_epoch < 0
+        or lease_expiry is None
+        or lease_expiry.tzinfo is None
+        or source not in {"fresh", "resume"}
+        or re.fullmatch(r"[A-Za-z0-9._-]{8,64}", str(usage_segment_id)) is None
+        or re.fullmatch(r"[A-Za-z0-9._-]{8,64}", str(usage_operation_id)) is None
+        or re.fullmatch(r"[A-Za-z0-9._-]{8,64}", str(result_operation_id)) is None
+        or rollout_mode not in {"canary", "on"}
+        or not isinstance(stored_identity, Mapping)
+        or set(stored_identity) != identity_fields
+        or stored_identity.get("assignment_id") != assignment_id
+    ):
+        raise CheckpointV2ProtocolError(
+            "checkpoint completed-result recovery descriptor is inconsistent"
+        )
+    raw_identity = {
+        key: value for key, value in stored_identity.items()
+        if key not in {"assignment_id", "fingerprint"}
+    }
+    raw_identity["identity_state"] = "FINAL"
+    assignment = {
+        "assignment_id": assignment_id,
+        "checkpoint_protocol_version": 2,
+        "checkpoint_v2_identity_protocol_version": 2,
+        "checkpoint_v2_rollout_mode": rollout_mode,
+        "owner_epoch": owner_epoch,
+        "execution_identity": raw_identity,
+    }
+    identity = ExecutionIdentityV2.from_assignment(assignment)
+    if asdict(identity) != dict(stored_identity):
+        raise CheckpointV2ProtocolError(
+            "checkpoint completed-result execution identity drifted"
+        )
+    activation = negotiate_checkpoint_activation_v2(
+        local_mode=rollout_mode,
+        server_mode=rollout_mode,
+        controlled_account=True,
+    )
+    machine = CheckpointV2StateMachine(
+        assignment,
+        api=api,
+        journal=CheckpointV2Journal(home),
+        activation=activation,
+    )
+    permit = PaidExecutionPermit(
+        assignment_id=str(assignment_id),
+        identity_fingerprint=identity.fingerprint,
+        session_id=str(session_id),
+        owner_epoch=int(owner_epoch),
+        owner_lease_expires_at=owner_lease_expires_at,
+        source=str(source),
+        usage_segment_id=str(usage_segment_id),
+    )
+    return machine, permit, str(usage_operation_id), str(result_operation_id)
+
+
+def recover_completed_result_usage_v2(
+    descriptor: Mapping[str, Any],
+    *,
+    api: ApiClient,
+    home: Path,
+    n_input_tokens: object,
+    n_cache_tokens: object,
+    n_output_tokens: object,
+    token_usage_events: object = None,
+    request_usage_complete: object = None,
+    request_usage_observed: object = None,
+    complete: bool = True,
+) -> FinalizedUsageSegmentReceiptV2:
+    """Replay/free-finalize one exact completed paid segment after a crash."""
+
+    machine, permit, usage_operation_id, _ = (
+        _completed_result_recovery_context_v2(
+            descriptor, api=api, home=home,
+        )
+    )
+    evidence = checkpoint_usage_evidence_v2(
+        permit=permit,
+        harness=machine.identity.harness,
+        provider=machine.identity.provider,
+        n_input_tokens=n_input_tokens,
+        n_cache_tokens=n_cache_tokens,
+        n_output_tokens=n_output_tokens,
+        token_usage_events=token_usage_events,
+        request_usage_complete=request_usage_complete,
+        request_usage_observed=request_usage_observed,
+        complete=complete,
+    )
+    return machine.finalize_usage_segment(
+        permit,
+        evidence=evidence,
+        operation_id=usage_operation_id,
+    )
+
+
+def recover_completed_result_ready_v2(
+    descriptor: Mapping[str, Any],
+    *,
+    usage_receipt: FinalizedUsageSegmentReceiptV2,
+    upload_intent_id: str,
+    api: ApiClient,
+    home: Path,
+) -> CompletedResultPermit:
+    """Replay/free-bind the exact completed payload; never starts a Provider."""
+
+    machine, permit, _, result_operation_id = (
+        _completed_result_recovery_context_v2(
+            descriptor, api=api, home=home,
+        )
+    )
+    return machine.declare_result_ready(
+        permit,
+        usage_receipt=usage_receipt,
+        upload_intent_id=upload_intent_id,
+        operation_id=result_operation_id,
+    )
 
 
 def _utc_now() -> str:
@@ -1511,6 +1784,53 @@ class AuthoritativeCheckpointRunV2:
             if thread is not None:
                 thread.join(timeout=max(0.0, min(float(timeout), 5.0)))
 
+    def completed_result_recovery_descriptor(
+        self,
+        *,
+        usage_operation_id: str,
+        result_operation_id: str,
+    ) -> dict[str, Any]:
+        """Persist enough non-secret authority to finish a completed upload.
+
+        The descriptor grants no paid execution.  Its two operation IDs can
+        only replay the free usage-finalize and result-ready commands, both of
+        which remain server-fenced by the exact owner epoch and session.
+        """
+
+        with self._lock:
+            machine = self.state_machine
+            permit = self._permit
+        if machine is None or not isinstance(permit, PaidExecutionPermit):
+            raise CheckpointV2ProtocolError(
+                "checkpoint completed result has no paid owner evidence"
+            )
+        for value, label in (
+            (usage_operation_id, "usage operation"),
+            (result_operation_id, "result operation"),
+        ):
+            if re.fullmatch(r"[A-Za-z0-9._-]{8,64}", value) is None:
+                raise CheckpointV2ProtocolError(
+                    f"checkpoint completed-result {label} id is invalid"
+                )
+        rollout_mode = self.activation.effective_mode.wire_value
+        if rollout_mode not in {"canary", "on"}:
+            raise CheckpointV2ProtocolError(
+                "checkpoint completed result is not authoritative"
+            )
+        return {
+            "schema": _COMPLETED_RESULT_RECOVERY_SCHEMA_V2,
+            "assignment_id": permit.assignment_id,
+            "execution_identity": asdict(machine.identity),
+            "rollout_mode": rollout_mode,
+            "session_id": permit.session_id,
+            "owner_epoch": permit.owner_epoch,
+            "owner_lease_expires_at": permit.owner_lease_expires_at,
+            "source": permit.source,
+            "usage_segment_id": permit.usage_segment_id,
+            "usage_operation_id": usage_operation_id,
+            "result_operation_id": result_operation_id,
+        }
+
     def finalize_usage(
         self,
         *,
@@ -1522,6 +1842,7 @@ class AuthoritativeCheckpointRunV2:
         request_usage_observed: object = None,
         occurred_at: str | None = None,
         complete: bool = True,
+        operation_id: str | None = None,
     ) -> FinalizedUsageSegmentReceiptV2:
         with self._lock:
             machine = self.state_machine
@@ -1533,112 +1854,21 @@ class AuthoritativeCheckpointRunV2:
             raise CheckpointV2ProtocolError(
                 "checkpoint usage has no paid owner"
             )
-        counters = (n_input_tokens, n_cache_tokens, n_output_tokens)
-        counters_valid = all(
-            isinstance(value, int)
-            and not isinstance(value, bool)
-            and value >= 0
-            for value in counters
-        ) and int(n_cache_tokens) <= int(n_input_tokens)
-        raw_events = (
-            token_usage_events if isinstance(token_usage_events, list) else []
+        evidence = checkpoint_usage_evidence_v2(
+            permit=permit,
+            harness=self.harness,
+            provider=self.provider,
+            n_input_tokens=n_input_tokens,
+            n_cache_tokens=n_cache_tokens,
+            n_output_tokens=n_output_tokens,
+            token_usage_events=token_usage_events,
+            request_usage_complete=request_usage_complete,
+            request_usage_observed=request_usage_observed,
+            complete=complete,
         )
-        events_valid = (
-            isinstance(token_usage_events, list)
-            and 0 < len(raw_events) <= 512
+        receipt = machine.finalize_usage_segment(
+            permit, evidence=evidence, operation_id=operation_id,
         )
-        materialized: list[UsageEventV2] = []
-        event_totals = [0, 0, 0]
-        if events_valid:
-            for source_sequence, raw in enumerate(raw_events):
-                if not isinstance(raw, Mapping):
-                    events_valid = False
-                    break
-                raw_counters = tuple(
-                    raw.get(name) for name in (
-                        "n_input_tokens", "n_cache_tokens",
-                        "n_output_tokens",
-                    )
-                )
-                observed_at = raw.get("occurred_at")
-                try:
-                    instant = datetime.fromisoformat(
-                        observed_at.replace("Z", "+00:00")
-                    )
-                except (AttributeError, TypeError, ValueError):
-                    events_valid = False
-                    break
-                if (
-                    instant.tzinfo is None
-                    or any(
-                        not isinstance(value, int)
-                        or isinstance(value, bool)
-                        or value < 0
-                        for value in raw_counters
-                    )
-                    or int(raw_counters[1]) > int(raw_counters[0])
-                ):
-                    events_valid = False
-                    break
-                identity = {
-                    "schema": "dradar-checkpoint-usage-event-identity-v2",
-                    "assignment_id": machine.identity.assignment_id,
-                    "harness": self.harness,
-                    "provider": self.provider,
-                    "ledger_scope": self.contract.usage_ledger_scope,
-                    "source_sequence": source_sequence,
-                    "occurred_at": observed_at,
-                    "n_input_tokens": int(raw_counters[0]),
-                    "n_cache_tokens": int(raw_counters[1]),
-                    "n_output_tokens": int(raw_counters[2]),
-                }
-                if self.contract.usage_ledger_scope == "segment_delta":
-                    # Segment-local ledgers (Kimi/ZCode) can restart their
-                    # source sequence at zero. Bind those event identities to
-                    # the paid epoch so two distinct requests with identical
-                    # counters and timestamps cannot collapse into one.
-                    identity["usage_segment_id"] = permit.usage_segment_id
-                event_id = hashlib.sha256(json.dumps(
-                    identity, sort_keys=True, separators=(",", ":"),
-                ).encode("utf-8")).hexdigest()
-                event = UsageEventV2(
-                    event_id=event_id,
-                    occurred_at=str(observed_at),
-                    n_input_tokens=int(raw_counters[0]),
-                    n_cache_tokens=int(raw_counters[1]),
-                    n_output_tokens=int(raw_counters[2]),
-                )
-                materialized.append(event)
-                for index, value in enumerate(raw_counters):
-                    event_totals[index] += int(value)
-        events_valid = (
-            events_valid
-            and counters_valid
-            and tuple(event_totals) == tuple(int(value) for value in counters)
-        )
-        if not events_valid or request_usage_observed is not True:
-            evidence = UsageSegmentEvidenceV2(
-                completeness="unavailable",
-                evidence_kind="unavailable",
-                events=(),
-            )
-        else:
-            evidence_kind = (
-                "trajectory_bundle"
-                if self.harness == "codex"
-                else "provider_request_ledger"
-            )
-            evidence = UsageSegmentEvidenceV2(
-                completeness=(
-                    "complete"
-                    if complete and request_usage_complete is True
-                    else "partial"
-                ),
-                evidence_kind=evidence_kind,
-                events=tuple(materialized),
-                ledger_scope=self.contract.usage_ledger_scope,
-            )
-        receipt = machine.finalize_usage_segment(permit, evidence=evidence)
         with self._lock:
             self._usage_receipt = receipt
         return receipt
@@ -1647,6 +1877,7 @@ class AuthoritativeCheckpointRunV2:
         self,
         *,
         upload_intent_id: str,
+        operation_id: str | None = None,
     ) -> CompletedResultPermit:
         with self._lock:
             machine = self.state_machine
@@ -1664,6 +1895,7 @@ class AuthoritativeCheckpointRunV2:
             permit,
             usage_receipt=usage_receipt,
             upload_intent_id=upload_intent_id,
+            operation_id=operation_id,
         )
         with self._lock:
             self._permit = completed
@@ -1742,5 +1974,8 @@ class AuthoritativeCheckpointRunV2:
 __all__ = [
     "AuthoritativeCheckpointRunV2",
     "CheckpointV2OwnerLost",
+    "checkpoint_usage_evidence_v2",
+    "recover_completed_result_ready_v2",
+    "recover_completed_result_usage_v2",
     "reconcile_orphaned_paid_gate_v2",
 ]

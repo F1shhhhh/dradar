@@ -1431,15 +1431,56 @@ def _upload_trial(
     scrubbing writes to a fresh tempdir, so a later retry re-scrubs from the
     same byte-verified original."""
     entry = dict(entry)
+    checkpoint_protocol_was_explicit = (
+        "checkpoint_protocol_version" in entry
+    )
+    checkpoint_protocol = entry.get("checkpoint_protocol_version", 1)
+    if checkpoint_v2_owner is not None:
+        checkpoint_protocol = 2
+        entry["checkpoint_protocol_version"] = 2
+    elif (
+        not checkpoint_protocol_was_explicit
+        and (
+            entry.get("checkpoint_v2") is not None
+            or entry.get("checkpoint_v2_recovery") is not None
+        )
+    ):
+        # Migrate pending V2 ledgers written by an older V2 client before the
+        # protocol marker was copied into every upload entry. The V2 evidence
+        # itself remains strictly validated below; an explicitly declared V1
+        # entry is never upgraded by inference.
+        checkpoint_protocol = 2
+        entry["checkpoint_protocol_version"] = 2
+    if (
+        not isinstance(checkpoint_protocol, int)
+        or isinstance(checkpoint_protocol, bool)
+        or checkpoint_protocol not in {1, 2}
+    ):
+        print("pending result checkpoint protocol is malformed; kept unchanged")
+        return "upload-failed"
     checkpoint_v2_facts = entry.get("checkpoint_v2")
     if checkpoint_v2_facts is not None and not isinstance(
         checkpoint_v2_facts, dict,
     ):
         print("checkpoint V2 pending result metadata is malformed; kept unchanged")
         return "upload-failed"
-    checkpoint_v2_upload = (
-        checkpoint_v2_owner is not None or checkpoint_v2_facts is not None
-    )
+    checkpoint_v2_recovery = entry.get("checkpoint_v2_recovery")
+    if checkpoint_v2_recovery is not None and not isinstance(
+        checkpoint_v2_recovery, dict,
+    ):
+        print("checkpoint V2 recovery descriptor is malformed; kept unchanged")
+        return "upload-failed"
+    checkpoint_v2_upload = checkpoint_protocol == 2
+    if (
+        checkpoint_protocol_was_explicit
+        and checkpoint_protocol == 1
+        and (checkpoint_v2_facts is not None or checkpoint_v2_recovery is not None)
+    ):
+        print(
+            "pending result mixes legacy and checkpoint V2 ownership; "
+            "kept unchanged"
+        )
+        return "upload-failed"
     assignment_id = entry["assignment_id"]
     task_id = entry.get("task_id", "?")
     outcome = entry.get("outcome", "completed")
@@ -1751,6 +1792,23 @@ def _upload_trial(
                     "budget; kept for retry without allocating the body"
                 )
                 return "upload-failed"
+        checkpoint_usage_kwargs = {}
+        if checkpoint_v2_upload:
+            checkpoint_usage_kwargs = {
+                "n_input_tokens": upload_meta.get("n_input_tokens"),
+                "n_cache_tokens": upload_meta.get("n_cache_tokens"),
+                "n_output_tokens": upload_meta.get("n_output_tokens"),
+                "token_usage_events": upload_meta.get("token_usage_events"),
+                "request_usage_complete": upload_meta.get(
+                    "request_usage_complete"
+                ),
+                "request_usage_observed": upload_meta.get(
+                    "request_usage_observed"
+                ),
+                "complete": (
+                    upload_meta.get("usage_aggregation_complete") is not False
+                ),
+            }
         while True:
             submit_kwargs = {
                 "outcome": outcome,
@@ -1766,40 +1824,63 @@ def _upload_trial(
                         "interrupted result; sealed recovery evidence was kept"
                     )
                     return "checkpoint-v2-paused"
+                usage_receipt = None
                 if checkpoint_v2_facts is None:
-                    if checkpoint_v2_owner is None:
-                        print(
-                            f"  {task_id}: checkpoint V2 result owner is "
-                            "unavailable; completed evidence was kept"
+                    if checkpoint_v2_recovery is None:
+                        if checkpoint_v2_owner is None:
+                            print(
+                                f"  {task_id}: checkpoint V2 result owner is "
+                                "unavailable and no free recovery descriptor "
+                                "exists; completed evidence was kept"
+                            )
+                            return "upload-failed"
+                        from .checkpoint_v2 import new_operation_id
+
+                        usage_operation_id = new_operation_id()
+                        result_operation_id = new_operation_id()
+                        try:
+                            checkpoint_v2_recovery = (
+                                checkpoint_v2_owner
+                                .completed_result_recovery_descriptor(
+                                    usage_operation_id=usage_operation_id,
+                                    result_operation_id=result_operation_id,
+                                )
+                            )
+                        except Exception as exc:
+                            print(
+                                f"  {task_id}: checkpoint V2 could not seal "
+                                "its free completed-result recovery authority "
+                                f"({type(exc).__name__}); evidence was kept"
+                            )
+                            return "upload-failed"
+                        entry["checkpoint_v2_recovery"] = (
+                            checkpoint_v2_recovery
                         )
-                        return "upload-failed"
-                    occurred_at = entry.get("checkpoint_v2_usage_occurred_at")
-                    if not isinstance(occurred_at, str) or not occurred_at:
-                        occurred_at = datetime.now(timezone.utc).replace(
-                            microsecond=0,
-                        ).isoformat()
-                        entry["checkpoint_v2_usage_occurred_at"] = occurred_at
+                        # This write must precede usage-finalize. A crash after
+                        # either free server command can now replay that exact
+                        # operation, but never grants start/resume authority.
                         pending.record(HOME, entry)
                     try:
-                        usage_receipt = checkpoint_v2_owner.finalize_usage(
-                            n_input_tokens=upload_meta.get("n_input_tokens"),
-                            n_cache_tokens=upload_meta.get("n_cache_tokens"),
-                            n_output_tokens=upload_meta.get("n_output_tokens"),
-                            token_usage_events=upload_meta.get(
-                                "token_usage_events"
-                            ),
-                            request_usage_complete=upload_meta.get(
-                                "request_usage_complete"
-                            ),
-                            request_usage_observed=upload_meta.get(
-                                "request_usage_observed"
-                            ),
-                            occurred_at=occurred_at,
-                            complete=(
-                                upload_meta.get("usage_aggregation_complete")
-                                is not False
-                            ),
-                        )
+                        if checkpoint_v2_owner is not None:
+                            usage_receipt = (
+                                checkpoint_v2_owner.finalize_usage(
+                                    **checkpoint_usage_kwargs,
+                                    operation_id=checkpoint_v2_recovery[
+                                        "usage_operation_id"
+                                    ],
+                                )
+                            )
+                        else:
+                            from .checkpoint_owner_runtime_v2 import (
+                                recover_completed_result_usage_v2,
+                            )
+
+                            usage_receipt = recover_completed_result_usage_v2(
+                                checkpoint_v2_recovery,
+                                api=client,
+                                home=HOME,
+                                **checkpoint_usage_kwargs,
+                            )
                     except Exception as exc:
                         print(
                             f"  {task_id}: checkpoint V2 usage finalization "
@@ -1835,84 +1916,8 @@ def _upload_trial(
                             "was kept before result-ready"
                         )
                         return "upload-failed"
-                    permit = checkpoint_v2_owner.permit
-                    if permit is None:
-                        print(
-                            f"  {task_id}: checkpoint V2 owner disappeared "
-                            "before result binding; evidence was kept"
-                        )
-                        return "upload-failed"
-                    manifest = checkpoint_v2_submission_payload_manifest(
-                        assignment_id=assignment_id,
-                        session_id=permit.session_id,
-                        owner_epoch=permit.owner_epoch,
-                        outcome=outcome,
-                        meta=upload_meta,
-                        patch=upload_patch,
-                        trajectory=traj_scrubbed,
-                        result=result_scrubbed,
-                        trajectory_bundle=submit_bundle,
-                    )
-                    calculated_intent_id = upload_intent_id(manifest)
-                    try:
-                        completed = checkpoint_v2_owner.declare_result_ready(
-                            upload_intent_id=calculated_intent_id,
-                        )
-                    except Exception as exc:
-                        print(
-                            f"  {task_id}: checkpoint V2 result-ready "
-                            f"transition failed ({type(exc).__name__}); "
-                            "completed evidence was kept"
-                        )
-                        return "upload-failed"
-                    checkpoint_v2_facts = {
-                        "protocol_version": 2,
-                        "owner_epoch": completed.owner_epoch,
-                        "session_id": completed.session_id,
-                        "upload_intent_id": completed.upload_intent_id,
-                        "usage_ledger_sha256": completed.usage_ledger_sha256,
-                        "usage_ledger_complete": (
-                            usage_receipt.usage_ledger_complete
-                        ),
-                        "manifest": manifest,
-                    }
-                    entry["checkpoint_v2"] = checkpoint_v2_facts
-                    pending.record(HOME, entry)
-                else:
-                    owner_epoch = checkpoint_v2_facts.get("owner_epoch")
-                    session_id = checkpoint_v2_facts.get("session_id")
-                    calculated_intent_id = checkpoint_v2_facts.get(
-                        "upload_intent_id"
-                    )
-                    usage_ledger_sha256 = checkpoint_v2_facts.get(
-                        "usage_ledger_sha256"
-                    )
-                    usage_ledger_complete = checkpoint_v2_facts.get(
-                        "usage_ledger_complete"
-                    )
-                    if (
-                        not isinstance(owner_epoch, int)
-                        or isinstance(owner_epoch, bool)
-                        or owner_epoch < 0
-                        or not isinstance(session_id, str)
-                        or not session_id
-                        or not isinstance(calculated_intent_id, str)
-                        or len(calculated_intent_id) != 64
-                        or not isinstance(usage_ledger_sha256, str)
-                        or len(usage_ledger_sha256) != 64
-                        or not isinstance(usage_ledger_complete, bool)
-                    ):
-                        print(
-                            f"  {task_id}: checkpoint V2 pending result "
-                            "identity is incomplete; evidence was kept"
-                        )
-                        return "upload-failed"
-                    upload_meta["checkpoint_usage_ledger_sha256"] = (
-                        usage_ledger_sha256
-                    )
-                    upload_meta["checkpoint_usage_ledger_complete"] = (
-                        usage_ledger_complete
-                    )
+                    owner_epoch = checkpoint_v2_recovery.get("owner_epoch")
+                    session_id = checkpoint_v2_recovery.get("session_id")
                     manifest = checkpoint_v2_submission_payload_manifest(
                         assignment_id=assignment_id,
                         session_id=session_id,
@@ -1924,15 +1929,163 @@ def _upload_trial(
                         result=result_scrubbed,
                         trajectory_bundle=submit_bundle,
                     )
-                    if (
-                        checkpoint_v2_facts.get("manifest") != manifest
-                        or upload_intent_id(manifest) != calculated_intent_id
-                    ):
+                    calculated_intent_id = upload_intent_id(manifest)
+                    checkpoint_v2_facts = {
+                        "protocol_version": 2,
+                        "owner_epoch": owner_epoch,
+                        "session_id": session_id,
+                        "upload_intent_id": calculated_intent_id,
+                        "usage_ledger_sha256": (
+                            usage_receipt.usage_ledger_sha256
+                        ),
+                        "usage_ledger_complete": (
+                            usage_receipt.usage_ledger_complete
+                        ),
+                        "manifest": manifest,
+                        "result_ready_state": "pending",
+                    }
+                    entry["checkpoint_v2"] = checkpoint_v2_facts
+                    # Persist the exact content-bound intent before the free
+                    # result-ready command. A lost response cannot downgrade
+                    # this completed run into a legacy submission.
+                    pending.record(HOME, entry)
+                owner_epoch = checkpoint_v2_facts.get("owner_epoch")
+                session_id = checkpoint_v2_facts.get("session_id")
+                calculated_intent_id = checkpoint_v2_facts.get(
+                    "upload_intent_id"
+                )
+                usage_ledger_sha256 = checkpoint_v2_facts.get(
+                    "usage_ledger_sha256"
+                )
+                usage_ledger_complete = checkpoint_v2_facts.get(
+                    "usage_ledger_complete"
+                )
+                result_ready_state = checkpoint_v2_facts.get(
+                    "result_ready_state", "acknowledged",
+                )
+                if (
+                    checkpoint_v2_facts.get("protocol_version") != 2
+                    or not isinstance(owner_epoch, int)
+                    or isinstance(owner_epoch, bool)
+                    or owner_epoch < 0
+                    or not isinstance(session_id, str)
+                    or not session_id
+                    or not isinstance(calculated_intent_id, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", calculated_intent_id)
+                    is None
+                    or not isinstance(usage_ledger_sha256, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", usage_ledger_sha256)
+                    is None
+                    or not isinstance(usage_ledger_complete, bool)
+                    or result_ready_state not in {"pending", "acknowledged"}
+                ):
+                    print(
+                        f"  {task_id}: checkpoint V2 pending result identity "
+                        "is incomplete; evidence was kept"
+                    )
+                    return "upload-failed"
+                upload_meta["checkpoint_usage_ledger_sha256"] = (
+                    usage_ledger_sha256
+                )
+                upload_meta["checkpoint_usage_ledger_complete"] = (
+                    usage_ledger_complete
+                )
+                manifest = checkpoint_v2_submission_payload_manifest(
+                    assignment_id=assignment_id,
+                    session_id=session_id,
+                    owner_epoch=owner_epoch,
+                    outcome=outcome,
+                    meta=upload_meta,
+                    patch=upload_patch,
+                    trajectory=traj_scrubbed,
+                    result=result_scrubbed,
+                    trajectory_bundle=submit_bundle,
+                )
+                if (
+                    checkpoint_v2_facts.get("manifest") != manifest
+                    or upload_intent_id(manifest) != calculated_intent_id
+                ):
+                    print(
+                        f"  {task_id}: checkpoint V2 completed payload "
+                        "changed after result-ready; evidence was kept"
+                    )
+                    return "upload-failed"
+                if result_ready_state == "pending":
+                    if not isinstance(checkpoint_v2_recovery, dict):
                         print(
-                            f"  {task_id}: checkpoint V2 completed payload "
-                            "changed after result-ready; evidence was kept"
+                            f"  {task_id}: checkpoint V2 result-ready is "
+                            "unconfirmed and has no replay descriptor; "
+                            "evidence was kept"
                         )
                         return "upload-failed"
+                    try:
+                        if checkpoint_v2_owner is not None:
+                            if usage_receipt is None:
+                                usage_receipt = (
+                                    checkpoint_v2_owner.finalize_usage(
+                                        **checkpoint_usage_kwargs,
+                                        operation_id=checkpoint_v2_recovery[
+                                            "usage_operation_id"
+                                        ],
+                                    )
+                                )
+                            completed = (
+                                checkpoint_v2_owner.declare_result_ready(
+                                    upload_intent_id=calculated_intent_id,
+                                    operation_id=checkpoint_v2_recovery[
+                                        "result_operation_id"
+                                    ],
+                                )
+                            )
+                        else:
+                            from .checkpoint_owner_runtime_v2 import (
+                                recover_completed_result_ready_v2,
+                                recover_completed_result_usage_v2,
+                            )
+
+                            if usage_receipt is None:
+                                usage_receipt = (
+                                    recover_completed_result_usage_v2(
+                                        checkpoint_v2_recovery,
+                                        api=client,
+                                        home=HOME,
+                                        **checkpoint_usage_kwargs,
+                                    )
+                                )
+                            completed = recover_completed_result_ready_v2(
+                                checkpoint_v2_recovery,
+                                usage_receipt=usage_receipt,
+                                upload_intent_id=calculated_intent_id,
+                                api=client,
+                                home=HOME,
+                            )
+                    except Exception as exc:
+                        print(
+                            f"  {task_id}: checkpoint V2 result-ready "
+                            f"reconciliation failed ({type(exc).__name__}); "
+                            "completed evidence was kept"
+                        )
+                        return "upload-failed"
+                    if (
+                        completed.owner_epoch != owner_epoch
+                        or completed.session_id != session_id
+                        or completed.upload_intent_id != calculated_intent_id
+                        or completed.usage_ledger_sha256
+                        != usage_ledger_sha256
+                        or usage_receipt.usage_ledger_sha256
+                        != usage_ledger_sha256
+                        or usage_receipt.usage_ledger_complete
+                        is not usage_ledger_complete
+                    ):
+                        print(
+                            f"  {task_id}: checkpoint V2 result-ready replay "
+                            "returned different ownership evidence; kept"
+                        )
+                        return "upload-failed"
+                    checkpoint_v2_facts[
+                        "result_ready_state"
+                    ] = "acknowledged"
+                    pending.record(HOME, entry)
                 submit_kwargs = {
                     "owner_epoch": checkpoint_v2_facts["owner_epoch"],
                     "session_id": checkpoint_v2_facts["session_id"],
@@ -3109,6 +3262,7 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
     upload_outcome = _upload_trial(client, {
         "assignment_id": assignment["assignment_id"], "nonce": assignment["nonce"],
         "task_id": assignment["task_id"], "trial_dir": str(art.trial_dir),
+        "checkpoint_protocol_version": checkpoint_protocol,
         "meta": meta, "outcome": outcome,
         "job_dir": str(art.job_dir) if art.job_dir else None, "keep": args.keep,
         "archive_session": getattr(args, "archive_session", False),

@@ -19,8 +19,11 @@ from dradar import pending
 from dradar.checkpoint_owner_runtime_v2 import (
     AuthoritativeCheckpointRunV2,
     CheckpointV2OwnerLost,
+    recover_completed_result_ready_v2,
+    recover_completed_result_usage_v2,
     reconcile_orphaned_paid_gate_v2,
 )
+from dradar.checkpoint_activation_v2 import CheckpointV2ProtocolError
 from dradar.checkpoint_v2 import ExecutionIdentityV2
 from dradar.checkpoint_v2 import (
     CheckpointV2OrdinaryFallback,
@@ -1134,6 +1137,23 @@ class _UploadOwner:
         )
         self.calls = []
 
+    def completed_result_recovery_descriptor(
+        self, *, usage_operation_id: str, result_operation_id: str,
+    ) -> dict:
+        return {
+            "schema": "dradar-checkpoint-completed-result-recovery-v2",
+            "assignment_id": self.permit.assignment_id,
+            "execution_identity": {},
+            "rollout_mode": "canary",
+            "session_id": self.permit.session_id,
+            "owner_epoch": self.permit.owner_epoch,
+            "owner_lease_expires_at": self.permit.owner_lease_expires_at,
+            "source": self.permit.source,
+            "usage_segment_id": self.permit.usage_segment_id,
+            "usage_operation_id": usage_operation_id,
+            "result_operation_id": result_operation_id,
+        }
+
     def finalize_usage(self, **facts):
         self.calls.append(("usage", facts))
         return FinalizedUsageSegmentReceiptV2(
@@ -1148,7 +1168,9 @@ class _UploadOwner:
             usage_ledger_complete=True,
         )
 
-    def declare_result_ready(self, *, upload_intent_id: str):
+    def declare_result_ready(
+        self, *, upload_intent_id: str, operation_id: str | None = None,
+    ):
         self.calls.append(("result-ready", upload_intent_id))
         self.permit = CompletedResultPermit(
             assignment_id=self.permit.assignment_id,
@@ -1184,6 +1206,15 @@ class _UploadClient:
         }
 
 
+class _OwnerApiUploadClient(_Api):
+    def submit_checkpoint_v2(self, *args, **kwargs):
+        self.calls.append(("submit", {"args": args, "kwargs": kwargs}))
+        return {
+            "submission_id": "submission-owner-0001",
+            "grade_status": "pending",
+        }
+
+
 class _RetryUploadClient(_UploadClient):
     def submit_checkpoint_v2(self, *args, **kwargs):
         self.calls.append((args, kwargs))
@@ -1205,6 +1236,12 @@ class _RetryUploadClient(_UploadClient):
             "assignment_unchanged": True,
             "paid_execution_authorized": False,
         }
+
+
+class _SubmitResponseLostClient(_UploadClient):
+    def submit_checkpoint_v2(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        raise ApiError("simulated submit response loss", status_code=503)
 
 
 def test_upload_uses_v2_result_ready_endpoint_and_retention_before_cleanup(
@@ -1268,6 +1305,196 @@ def test_upload_uses_v2_result_ready_endpoint_and_retention_before_cleanup(
     assert not job_dir.exists()
 
 
+def test_completed_result_free_commands_replay_from_exact_descriptor(
+    owner: AuthoritativeCheckpointRunV2,
+    tmp_path: Path,
+) -> None:
+    owner.prepare()
+    _authorize_fresh_at_gate(owner)
+    descriptor = owner.completed_result_recovery_descriptor(
+        usage_operation_id="usage-recovery-operation-0001",
+        result_operation_id="result-recovery-operation-0001",
+    )
+    recovery_api = _Api(_assignment())
+    receipt = recover_completed_result_usage_v2(
+        descriptor,
+        api=recovery_api,
+        home=tmp_path / "recovery-home",
+        n_input_tokens=10,
+        n_cache_tokens=2,
+        n_output_tokens=3,
+        token_usage_events=[{
+            "occurred_at": "2026-08-23T12:00:00+00:00",
+            "n_input_tokens": 10,
+            "n_cache_tokens": 2,
+            "n_output_tokens": 3,
+        }],
+        request_usage_complete=True,
+        request_usage_observed=True,
+    )
+    completed = recover_completed_result_ready_v2(
+        descriptor,
+        usage_receipt=receipt,
+        upload_intent_id="e" * 64,
+        api=recovery_api,
+        home=tmp_path / "recovery-home",
+    )
+
+    assert completed.upload_intent_id == "e" * 64
+    assert [command for command, _payload in recovery_api.calls] == [
+        "usage-finalize", "result-ready",
+    ]
+    assert recovery_api.calls[0][1]["operation_id"] == (
+        "usage-recovery-operation-0001"
+    )
+    assert recovery_api.calls[1][1]["operation_id"] == (
+        "result-recovery-operation-0001"
+    )
+    assert all(
+        command not in {"start", "resume-commit"}
+        for command, _payload in recovery_api.calls
+    )
+
+    tampered = json.loads(json.dumps(descriptor))
+    tampered["execution_identity"]["provider"] = "different-provider"
+    call_count = len(recovery_api.calls)
+    with pytest.raises(
+        CheckpointV2ProtocolError,
+    ):
+        recover_completed_result_usage_v2(
+            tampered,
+            api=recovery_api,
+            home=tmp_path / "tampered-home",
+            n_input_tokens=10,
+            n_cache_tokens=2,
+            n_output_tokens=3,
+        )
+    assert len(recovery_api.calls) == call_count
+    owner.mainline_exited()
+
+
+@pytest.mark.parametrize("crash_stage", ["usage-finalize", "result-ready"])
+def test_completed_result_upload_recovers_after_free_command_response_loss(
+    owner: AuthoritativeCheckpointRunV2,
+    monkeypatch,
+    tmp_path: Path,
+    crash_stage: str,
+) -> None:
+    owner.prepare()
+    _authorize_fresh_at_gate(owner)
+    owner.mainline_exited()
+    job_dir = tmp_path / "work" / "jobs" / "aassignment-owner-0001"
+    trial_dir = job_dir / "trial"
+    artifacts = trial_dir / "artifacts"
+    artifacts.mkdir(parents=True)
+    (artifacts / "model.patch").write_text(
+        "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -0,0 +1 @@\n+x\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    entry = {
+        "assignment_id": "assignment-owner-0001",
+        "nonce": "nonce-owner-0001",
+        "task_id": "t1",
+        "trial_dir": str(trial_dir),
+        "job_dir": str(job_dir),
+        "checkpoint_protocol_version": 2,
+        "meta": {
+            "n_input_tokens": 10,
+            "n_cache_tokens": 2,
+            "n_output_tokens": 3,
+            "token_usage_events": [{
+                "occurred_at": "2026-08-23T12:00:00+00:00",
+                "n_input_tokens": 10,
+                "n_cache_tokens": 2,
+                "n_output_tokens": 3,
+            }],
+            "request_usage_complete": True,
+            "request_usage_observed": True,
+        },
+        "outcome": "completed",
+        "keep": False,
+    }
+    original_command = owner.api.checkpoint_v2_command
+    response_lost = False
+
+    def lose_exact_response(command: str, payload: dict):
+        nonlocal response_lost
+        response = original_command(command, payload)
+        if command == crash_stage and not response_lost:
+            response_lost = True
+            raise ApiError(
+                f"simulated {crash_stage} response loss",
+                status_code=503,
+            )
+        return response
+
+    owner.api.checkpoint_v2_command = lose_exact_response
+
+    first = runloop._upload_trial(
+        _UploadClient(), entry, checkpoint_v2_owner=owner,
+    )
+    assert first == "upload-failed"
+    saved = pending.load(tmp_path)
+    assert len(saved) == 1
+    assert saved[0]["checkpoint_protocol_version"] == 2
+    assert saved[0]["checkpoint_v2_recovery"]["usage_operation_id"]
+    if crash_stage == "usage-finalize":
+        assert "checkpoint_v2" not in saved[0]
+    else:
+        assert saved[0]["checkpoint_v2"]["result_ready_state"] == "pending"
+
+    recovery_client = _OwnerApiUploadClient(_assignment())
+    second = runloop._upload_trial(recovery_client, saved[0])
+    assert second == "submitted"
+    assert pending.load(tmp_path) == []
+    assert not job_dir.exists()
+    commands = [command for command, _payload in recovery_client.calls]
+    expected = ["result-ready", "submit", "retention"]
+    if crash_stage == "usage-finalize":
+        expected.insert(0, "usage-finalize")
+    assert commands == expected
+    assert "start" not in commands
+    assert "resume-commit" not in commands
+
+
+def test_protocol_v2_pending_result_never_downgrades_to_legacy_submit(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    job_dir = tmp_path / "work" / "jobs" / "aassignment-upload-0001"
+    trial_dir = job_dir / "trial"
+    artifacts = trial_dir / "artifacts"
+    artifacts.mkdir(parents=True)
+    (artifacts / "model.patch").write_text(
+        "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -0,0 +1 @@\n+x\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+
+    class NoSubmitClient:
+        def submit(self, *_args, **_kwargs):
+            raise AssertionError("legacy submit must not be called")
+
+        def submit_checkpoint_v2(self, *_args, **_kwargs):
+            raise AssertionError("V2 submit must not precede result-ready")
+
+    outcome = runloop._upload_trial(NoSubmitClient(), {
+        "assignment_id": "assignment-upload-0001",
+        "nonce": "nonce-upload-0001",
+        "task_id": "t1",
+        "trial_dir": str(trial_dir),
+        "job_dir": str(job_dir),
+        "checkpoint_protocol_version": 2,
+        "meta": {},
+        "outcome": "completed",
+        "keep": False,
+    })
+
+    assert outcome == "upload-failed"
+    assert pending.load(tmp_path)[0]["checkpoint_protocol_version"] == 2
+
+
 def test_completed_result_retention_recovers_after_live_owner_process_is_gone(
     monkeypatch,
     tmp_path: Path,
@@ -1307,9 +1534,67 @@ def test_completed_result_retention_recovers_after_live_owner_process_is_gone(
     saved = pending.load(home)
     assert len(saved) == 1
     assert saved[0]["checkpoint_v2"]["retention_pending"] is True
+    # Compatibility with V2 ledgers produced before the protocol marker was
+    # copied into every pending upload entry.
+    saved[0].pop("checkpoint_protocol_version")
+    pending.record(home, saved[0])
 
     second = runloop._upload_trial(_RetryUploadClient(), saved[0])
     assert second == "submitted"
+    assert pending.load(home) == []
+    assert not job_dir.exists()
+
+
+def test_v2_submit_response_loss_reuses_exact_intent_without_model_rerun(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    job_dir = home / "work" / "jobs" / "aassignment-upload-0001"
+    trial_dir = job_dir / "trial"
+    artifacts = trial_dir / "artifacts"
+    artifacts.mkdir(parents=True)
+    (artifacts / "model.patch").write_text(
+        "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -0,0 +1 @@\n+x\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(runloop, "HOME", home)
+    entry = {
+        "assignment_id": "assignment-upload-0001",
+        "nonce": "nonce-upload-0001",
+        "task_id": "t1",
+        "trial_dir": str(trial_dir),
+        "job_dir": str(job_dir),
+        "meta": {
+            "n_input_tokens": 10,
+            "n_cache_tokens": 2,
+            "n_output_tokens": 3,
+        },
+        "outcome": "completed",
+        "keep": False,
+    }
+
+    first_client = _SubmitResponseLostClient()
+    first = runloop._upload_trial(
+        first_client, entry, checkpoint_v2_owner=_UploadOwner(),
+    )
+
+    assert first == "upload-failed"
+    saved = pending.load(home)
+    assert len(saved) == 1
+    facts = saved[0]["checkpoint_v2"]
+    assert facts["result_ready_state"] == "acknowledged"
+    assert first_client.calls[0][1]["upload_intent_id"] == (
+        facts["upload_intent_id"]
+    )
+
+    retry_client = _RetryUploadClient()
+    second = runloop._upload_trial(retry_client, saved[0])
+
+    assert second == "submitted"
+    assert retry_client.calls[0][1]["upload_intent_id"] == (
+        facts["upload_intent_id"]
+    )
     assert pending.load(home) == []
     assert not job_dir.exists()
 
