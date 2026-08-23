@@ -24,8 +24,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import (
-    __version__, artifact_staging, checkpoints, egress, image_cache, pending,
-    refill as refill_plan,
+    __version__, artifact_staging, checkpoints, egress, failure_circuit,
+    image_cache, pending, refill as refill_plan,
 )
 from .api_client import ApiClient, ApiError
 from .identity import _client
@@ -90,9 +90,11 @@ _TERMINAL_LOCAL_OUTCOMES = {
 _ACCOUNT_TERMINAL_OUTCOMES = {
     "auth-failure", "insufficient-balance", "quota-exhausted",
     "recovery-exhausted", "runtime-incompatible", "provider-preflight-failed",
+    "repeat-agent-failure",
 }
 _POOL_ABORT_ENV = "DRADAR_POOL_ABORT_FILE"
 _POOL_TARGET_FILE_ENV = "DRADAR_POOL_TARGET_FILE"
+_REPEAT_FAILURE_STATE_ENV = "DRADAR_REPEAT_FAILURE_STATE_FILE"
 _POOL_DRAIN_PREFIX = "drain:"
 _POOL_SUPERVISOR_POLL_SECONDS = 0.2
 _POOL_BACKFILL_REFRESH_SECONDS = 2.0
@@ -357,6 +359,9 @@ def _announce_account_stop(outcome: str) -> None:
         "provider-preflight-failed": (
             "the selected subscription provider failed its live check"
         ),
+        "repeat-agent-failure": (
+            "the same zero-progress agent command failure repeated"
+        ),
     }
     reason = messages.get(outcome, "an account-wide stop condition was detected")
     print(
@@ -366,6 +371,108 @@ def _announce_account_stop(outcome: str) -> None:
         "Unstarted leases and checkpoints remain untouched; fix or wait for "
         "the condition, then explicitly start `dradar resume` again."
     )
+
+
+def _repeat_failure_state_path() -> Path | None:
+    raw = os.environ.get(_REPEAT_FAILURE_STATE_ENV)
+    return Path(raw) if raw else None
+
+
+def _agent_exit_code(diag: dict) -> int | None:
+    text = "\n".join(str(line) for line in diag.get("tail", ()))
+    match = re.search(
+        r"(?:command\s+failed\s*\(\s*exit|exit(?:ed)?(?:\s+with)?"
+        r"(?:\s+(?:status|code))?|return\s*code|returncode|\brc)"
+        r"\s*[:=()]?\s*(-?\d+)\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return int(match.group(1)) if match is not None else None
+
+
+def _repeat_failure_scope(assignment: dict, codex_cli_version=None) -> str:
+    return json.dumps({
+        "batch_id": assignment.get("batch_id"),
+        "agent": assignment.get("agent") or "codex",
+        "provider": assignment.get("provider"),
+        "model": assignment.get("model"),
+        "agent_version": assignment.get("agent_version"),
+        "codex_cli_version": codex_cli_version,
+    }, sort_keys=True, separators=(",", ":"))
+
+
+def _repeat_failure_signature(
+    assignment: dict, stats: dict, diag: dict, art,
+) -> tuple[str, str] | None:
+    """Identify only proven task-independent, zero-progress command exits."""
+    if assignment.get("agent") not in {None, "codex"}:
+        return None
+    if diag.get("type") != "NonZeroAgentExitCodeError":
+        return None
+    exit_code = _agent_exit_code(diag)
+    if exit_code is None:
+        return None
+    progress = (
+        stats.get("n_agent_steps"), stats.get("n_input_tokens"),
+        stats.get("n_cache_tokens"), stats.get("n_output_tokens"),
+        stats.get("cost_usd"),
+    )
+    if any(
+        isinstance(value, (int, float)) and not isinstance(value, bool)
+        and value > 0 for value in progress
+    ):
+        return None
+    # Pier's compact result can be empty even when a partially parsed Codex
+    # session proves a model request consumed tokens. Treat that evidence as
+    # progress too; the circuit is for truly empty command exits, not merely
+    # incomplete aggregate accounting.
+    bundle = build_codex_trajectory_bundle(art.trial_dir)
+    aggregate = bundle.get("aggregate_usage") if isinstance(bundle, dict) else None
+    if isinstance(aggregate, dict) and any(
+        isinstance(value, (int, float)) and not isinstance(value, bool)
+        and value > 0 for value in aggregate.values()
+    ):
+        return None
+    scope = _repeat_failure_scope(
+        assignment, getattr(art, "codex_cli_version", None),
+    )
+    signature = json.dumps({
+        "failure_kind": "agent-command-failed",
+        "exception_type": diag["type"],
+        "exit_code": exit_code,
+    }, sort_keys=True, separators=(",", ":"))
+    return scope, signature
+
+
+def _observe_repeat_failure(
+    assignment: dict, signature: tuple[str, str] | None, *, success: bool,
+    codex_cli_version=None, invocation_id: str | None = None,
+) -> bool:
+    if signature is None and not success:
+        return False
+    scope = (
+        signature[0] if signature is not None
+        else _repeat_failure_scope(assignment, codex_cli_version)
+    )
+    if _repeat_failure_state_path() is None and invocation_id is not None:
+        scope = f"{invocation_id}:{scope}"
+    count, opened = failure_circuit.observe(
+        scope=scope,
+        signature=signature[1] if signature is not None else None,
+        state_path=_repeat_failure_state_path(),
+    )
+    if not opened:
+        return False
+    reason = f"repeated zero-progress agent command failure ({count} consecutive)"
+    _signal_pool_abort(reason, interrupt_siblings=False)
+    print(
+        f"safety circuit opened after {count} consecutive identical "
+        "zero-progress agent command failures; no later waiting task or "
+        "automatic refill will start. Existing sibling runs are left alone. "
+        "Inspect the local agent login/runtime, then explicitly run "
+        "`dradar resume` after it is fixed."
+    )
+    return True
 
 
 def _grok_preflight_failure(result_path: Path | None) -> str | None:
@@ -2005,6 +2112,13 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                     _assignment_lock_held: bool = False) -> str:
     """Run one assignment and upload the artifacts. Returns an outcome tag —
     never exits, so the held-batch loop can carry on with the next item."""
+    if (
+        _repeat_failure_state_path() is None
+        and getattr(args, "_repeat_failure_invocation_id", None) is None
+    ):
+        args._repeat_failure_invocation_id = (
+            f"{os.getpid()}-{time.time_ns()}-{id(args)}"
+        )
     # The assignment lock must cover the whole quota-consuming lifetime, not
     # just checkpoint recovery.  Otherwise a second `dradar resume` can see
     # the checkpoint written by a healthy first run, ask the server for a new
@@ -2211,6 +2325,17 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
     )
     diag = diagnose_exception(art.result) if interrupted else {}
     failure_kind = diag.get("kind")
+    if (
+        failure_kind is None
+        and diag.get("type") == "NonZeroAgentExitCodeError"
+        and _agent_exit_code(diag) is not None
+    ):
+        failure_kind = "agent-command-failed"
+    repeat_failure = (
+        _repeat_failure_signature(assignment, stats, diag, art)
+        if interrupted and failure_kind == "agent-command-failed"
+        else None
+    )
     terminal_outcome = _terminal_failure_outcome(failure_kind)
     item = checkpoints.find_latest(HOME, assignment["assignment_id"])
     if interrupted and item is not None and item.phase != "agent_completed":
@@ -2377,6 +2502,21 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         and not getattr(args, "yes", False)
         and not getattr(args, "parallel", False)
     ))
+    circuit_opened = _observe_repeat_failure(
+        assignment,
+        repeat_failure,
+        # Any settled non-candidate result breaks consecutiveness. This
+        # includes a real success and a task-level failure with observed
+        # progress; neither may bridge two empty command exits into a streak.
+        success=(
+            repeat_failure is None
+            and upload_outcome in {"submitted", "interrupted"}
+        ),
+        codex_cli_version=art.codex_cli_version,
+        invocation_id=getattr(args, "_repeat_failure_invocation_id", None),
+    )
+    if circuit_opened:
+        return "repeat-agent-failure"
     return terminal_outcome or upload_outcome
 
 
@@ -2784,6 +2924,11 @@ def _resume_local_checkpoints(
         results.append(outcome)
         if outcome == "submitted" and getattr(args, "refill", False):
             refill_plan.mark_submitted(HOME, item.assignment_id)
+        if outcome in _ACCOUNT_TERMINAL_OUTCOMES:
+            if getattr(args, "refill", False):
+                refill_plan.stop(HOME, f"account stop: {outcome}")
+            _announce_account_stop(outcome)
+            break
         # Super-account batch workers use --parallel. Each process owns one
         # checkpoint for its whole lifetime, so one corrupt worker cannot
         # serialize or block the other 23.
@@ -3533,6 +3678,10 @@ def _run_worker_pool(args) -> int:
         Path(tempfile.gettempdir())
         / f"dradar-pool-abort-{os.getpid()}-{time.time_ns()}"
     )
+    repeat_failure_state_file = (
+        Path(tempfile.gettempdir())
+        / f"dradar-repeat-failure-{os.getpid()}-{time.time_ns()}.json"
+    )
     owns_abort_file = configured_abort_file is None
     popen_kwargs = {}
     if os.name == "nt":
@@ -3548,6 +3697,10 @@ def _run_worker_pool(args) -> int:
     def cleanup_abort_file() -> None:
         if owns_abort_file:
             pool_abort_file.unlink(missing_ok=True)
+        repeat_failure_state_file.unlink(missing_ok=True)
+        repeat_failure_state_file.with_name(
+            f"{repeat_failure_state_file.name}.lock"
+        ).unlink(missing_ok=True)
 
     def spawn_worker(slot: int) -> None:
         env = os.environ.copy()
@@ -3557,6 +3710,7 @@ def _run_worker_pool(args) -> int:
         if target_file is not None:
             env[_POOL_TARGET_FILE_ENV] = str(target_file)
         env[_POOL_ABORT_ENV] = str(pool_abort_file)
+        env[_REPEAT_FAILURE_STATE_ENV] = str(repeat_failure_state_file)
         process = subprocess.Popen(command, env=env, **popen_kwargs)
         processes.append(process)
         active_processes[slot] = process

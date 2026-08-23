@@ -148,6 +148,79 @@ class InvalidAckClient(SubmitClient):
         return {"submission_id": f"s-{assignment_id}", "grade_status": "invalid"}
 
 
+def test_real_run_path_opens_repeat_zero_progress_circuit_on_second_exit(
+        monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
+    result_data = {
+        "exception_info": {
+            "exception_type": "NonZeroAgentExitCodeError",
+            "exception_message": "Command failed (exit 1): codex exec",
+        },
+        "agent_result": {
+            "n_agent_steps": 0, "n_input_tokens": None,
+            "n_cache_tokens": None, "n_output_tokens": None,
+            "cost_usd": None,
+        },
+    }
+    artifacts = [
+        _fake_art(tmp_path / "first", result_data=result_data),
+        _fake_art(tmp_path / "second", result_data=result_data),
+    ]
+    monkeypatch.setattr(runloop, "run_trial", lambda *a, **kw: artifacts.pop(0))
+    client = InvalidAckClient({})
+    args = _args()
+    base = {
+        **ASSIGNMENT, "agent": "codex", "model": "gpt-5.6-sol",
+        "agent_version": "0.149.0", "batch_id": "batch-1",
+    }
+
+    first = runloop._run_and_submit(
+        client, {**base, "assignment_id": "a-first"}, tmp_path, args, "abc123",
+    )
+    second = runloop._run_and_submit(
+        client, {**base, "assignment_id": "a-second"}, tmp_path, args, "abc123",
+    )
+
+    assert first == "interrupted"
+    assert second == "repeat-agent-failure"
+    assert [item["meta"]["failure_kind"] for item in client.submissions] == [
+        "agent-command-failed", "agent-command-failed",
+    ]
+
+
+def test_real_success_resets_zero_progress_failure_streak(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
+    failed = {
+        "exception_info": {
+            "exception_type": "NonZeroAgentExitCodeError",
+            "exception_message": "Command failed (exit 1): codex exec",
+        },
+        "agent_result": {"n_agent_steps": 0},
+    }
+    artifacts = [
+        _fake_art(tmp_path / "first", result_data=failed),
+        _fake_art(tmp_path / "success", result_data={"agent_result": {}}),
+        _fake_art(tmp_path / "third", result_data=failed),
+    ]
+    monkeypatch.setattr(runloop, "run_trial", lambda *a, **kw: artifacts.pop(0))
+    args = _args()
+    client = InvalidAckClient({})
+    base = {
+        **ASSIGNMENT, "agent": "codex", "model": "gpt-5.6-sol",
+        "agent_version": "0.149.0", "batch_id": "batch-1",
+    }
+
+    outcomes = [
+        runloop._run_and_submit(
+            client, {**base, "assignment_id": f"a-{index}"},
+            tmp_path, args, "abc123",
+        )
+        for index in range(3)
+    ]
+
+    assert outcomes == ["interrupted", "submitted", "interrupted"]
+
+
 def test_interrupted_prints_cause_keeps_artifacts_no_quota_claim(
         monkeypatch, capsys, tmp_path: Path):
     monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
