@@ -2120,6 +2120,18 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                     _assignment_lock_held: bool = False) -> str:
     """Run one assignment and upload the artifacts. Returns an outcome tag —
     never exits, so the held-batch loop can carry on with the next item."""
+    checkpoint_protocol = assignment.get("checkpoint_protocol_version", 1)
+    if (
+        not isinstance(checkpoint_protocol, int)
+        or isinstance(checkpoint_protocol, bool)
+        or checkpoint_protocol != 1
+    ):
+        print(
+            "refusing to start this assignment: its checkpoint ownership "
+            "protocol requires a newer live execution path. Local evidence "
+            "and the server lease were left unchanged; no model quota was used."
+        )
+        return "checkpoint-reader-blocked"
     if (
         _repeat_failure_state_path() is None
         and getattr(args, "_repeat_failure_invocation_id", None) is None
@@ -2156,6 +2168,53 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         )
         _mark_stopped_quietly(client, assignment)
         return "task-content-mismatch"
+    checkpoint_shadow_factory = None
+    local_checkpoint_v2_mode = os.environ.get(
+        "DRADAR_CHECKPOINT_V2_MODE", "off",
+    ).strip()
+    if local_checkpoint_v2_mode.lower().replace("-", "_") != "off":
+        try:
+            from .checkpoint_live_v2 import (
+                build_live_checkpoint_shadow_v2,
+                checkpoint_live_activation_v2,
+            )
+
+            activation = checkpoint_live_activation_v2(
+                assignment,
+                local_mode=local_checkpoint_v2_mode,
+            )
+        except Exception as exc:
+            # An explicitly authoritative assignment must never fall through
+            # to the legacy paid runner. Other shadow configuration errors are
+            # optional-capability failures and leave the ordinary run intact.
+            local_mode_key = local_checkpoint_v2_mode.lower().replace("-", "_")
+            authoritative_requested = (
+                assignment.get("checkpoint_v2_controlled_account") is True
+                and assignment.get("checkpoint_v2_rollout_mode")
+                in {"canary", "on"}
+                and local_mode_key in {"canary", "on"}
+            )
+            if (
+                assignment.get("checkpoint_protocol_version") == 2
+                or authoritative_requested
+            ):
+                print(
+                    "refusing to start: checkpoint V2 ownership is not "
+                    f"available in this runner ({exc})"
+                )
+                return "checkpoint-reader-blocked"
+            activation = None
+        if activation is not None and activation.capture_enabled and telemetry:
+            def checkpoint_shadow_factory(effective_assignment, job_root):
+                return build_live_checkpoint_shadow_v2(
+                    assignment=assignment,
+                    effective_assignment=effective_assignment,
+                    local_mode=local_checkpoint_v2_mode,
+                    api=client,
+                    telemetry=telemetry,
+                    home=HOME,
+                    job_root=job_root,
+                )
     work_dir = HOME / "work"
     print("running trial (this can take a while)...")
     for attempt in (1, 2):
@@ -2169,7 +2228,9 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                 ),
                 resume_checkpoint=(
                     resume_checkpoint.checkpoint_dir if resume_checkpoint else None
-                ))
+                ),
+                checkpoint_shadow_factory=checkpoint_shadow_factory,
+            )
             break
         except BuildFlakeError as exc:
             # The image build died before the agent ran — a free failure
@@ -2901,6 +2962,25 @@ def _resume_local_checkpoints(
 ) -> tuple[list[str], bool]:
     """Recover local work before the server is allowed to dispense new work."""
     target = getattr(args, "assignment", None)
+    blocked = checkpoints.scan_reader_blocked(HOME)
+    if target:
+        blocked = [item for item in blocked if item.assignment_id == target]
+    if blocked:
+        action = (
+            "refused the explicitly targeted recovery"
+            if target else
+            "kept them outside the legacy recovery queue"
+        )
+        print(
+            f"found {len(blocked)} checkpoint(s) that require a newer reader; "
+            f"preserved them unchanged and {action}"
+        )
+        for item in blocked:
+            print(
+                f"  assignment={item.assignment_id or '?'}  {item.reason}"
+            )
+        if target:
+            return ["reader-blocked"], True
     candidates = list(checkpoints.latest_by_assignment(HOME).values())
     if target:
         candidates = [c for c in candidates if c.assignment_id == target]
@@ -2956,7 +3036,8 @@ def _format_size(size: int) -> str:
 
 def cmd_checkpoints(args) -> int:
     items = checkpoints.scan(HOME)
-    if not items:
+    blocked = checkpoints.scan_reader_blocked(HOME)
+    if not items and not blocked:
         print("no local checkpoints")
         return 0
     total = 0
@@ -2970,11 +3051,30 @@ def cmd_checkpoints(args) -> int:
         print(f"{item.checkpoint_id or '?'}  assignment={item.assignment_id or '?'}  "
               f"task={item.task_id or '?'}  state={state}  size={_format_size(size)}  "
               f"updated={item.updated_at.isoformat()}")
-    print(f"total: {len(items)} checkpoint(s), {_format_size(total)}")
+    for item in blocked:
+        print(
+            f"?  assignment={item.assignment_id or '?'}  "
+            f"state=reader-blocked ({item.reason})  size=preserved  "
+            f"updated={item.updated_at.isoformat()}"
+        )
+    print(
+        f"total: {len(items) + len(blocked)} checkpoint(s), "
+        f"{_format_size(total)} known-size; {len(blocked)} reader-blocked"
+    )
     return 0
 
 
 def cmd_checkpoint_discard(args) -> int:
+    blocked = [item for item in checkpoints.scan_reader_blocked(HOME) if (
+        item.assignment_id == args.checkpoint_id
+        or item.manifest_path.parent.name == args.checkpoint_id
+    )]
+    if blocked:
+        print(
+            "checkpoint requires a newer reader and was preserved unchanged; "
+            "this client will not discard it"
+        )
+        return 1
     items = checkpoints.scan(HOME)
     matches = [item for item in items if (
         item.checkpoint_id == args.checkpoint_id
@@ -3493,7 +3593,8 @@ def _assignment_is_ready_for_checkout(
     an incident. Fresh controller claims have no ``started_at`` value and are
     safe for the server's atomic checkout endpoint to assign.
     """
-    if (assignment.get("started_at")
+    if (assignment.get("checkpoint_protocol_version", 1) != 1
+            or assignment.get("started_at")
             or assignment.get("execution_state") == "paused"
             or assignment.get("checkpoint_id")):
         return False
@@ -3521,7 +3622,10 @@ def _assignment_is_recoverable_checkpoint(
     local state *ahead* of the server; that direction cannot be explained by
     the fail-closed compensation path.
     """
-    if not durable_checkpoint_rollout_enabled():
+    if (
+        not durable_checkpoint_rollout_enabled()
+        or assignment.get("checkpoint_protocol_version", 1) != 1
+    ):
         return False
     assignment_id = assignment.get("assignment_id")
     item = local.get(assignment_id) if assignment_id else None

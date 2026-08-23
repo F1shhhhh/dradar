@@ -8,6 +8,9 @@ from pathlib import Path
 
 
 UPLOAD_INTENT_VERSION = "dradar-submission-upload-v2"
+CHECKPOINT_V2_UPLOAD_INTENT_VERSION = (
+    "dradar-checkpoint-v2-submission-upload-v1"
+)
 _HASH_CHUNK_BYTES = 1024 * 1024
 
 
@@ -78,3 +81,38 @@ def upload_intent_id(manifest: dict) -> str:
 def submission_payload_sha256(**kwargs) -> str:
     """Compatibility wrapper returning the id for a freshly built manifest."""
     return upload_intent_id(submission_payload_manifest(**kwargs))
+
+
+def checkpoint_v2_submission_payload_manifest(
+    *,
+    assignment_id: str,
+    session_id: str,
+    owner_epoch: int,
+    outcome: str,
+    meta: dict,
+    patch: Path,
+    trajectory: Path | None,
+    result: Path | None,
+    trajectory_bundle: Path | None,
+) -> dict:
+    return {
+        "version": CHECKPOINT_V2_UPLOAD_INTENT_VERSION,
+        "checkpoint_protocol_version": 2,
+        "assignment_id": assignment_id,
+        "session_id": session_id,
+        "owner_epoch": owner_epoch,
+        "outcome": outcome,
+        "components": {
+            "client_meta": _bytes_fact(canonical_meta_bytes(meta)),
+            "model.patch": _path_fact(patch),
+            "trajectory.json": _path_fact(trajectory),
+            "result.json": _path_fact(result),
+            "trajectory_bundle.json": _path_fact(trajectory_bundle),
+        },
+    }
+
+
+def checkpoint_v2_submission_payload_sha256(**kwargs) -> str:
+    return upload_intent_id(
+        checkpoint_v2_submission_payload_manifest(**kwargs)
+    )

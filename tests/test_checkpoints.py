@@ -103,6 +103,22 @@ def _assignment(assignment_id: str, generation: int = 0) -> dict:
     }
 
 
+def _make_v2_checkpoint(home: Path, assignment_id: str) -> Path:
+    job = home / "work" / "jobs" / f"a{assignment_id}-v2"
+    trial = job / "task__trial"
+    manifest = checkpoints.v2_manifest_path(trial)
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(json.dumps({
+        "schema_version": 2,
+        "checkpoint_protocol_version": 2,
+        "checkpoint_abi": "dradar-checkpoint-v2/codex/1",
+        "assignment_id": assignment_id,
+        "updated_at": "2026-08-23T00:00:00Z",
+    }), encoding="utf-8")
+    _privatize_checkpoint_tree(trial, manifest.parent)
+    return manifest
+
+
 def _args(**overrides):
     values = dict(
         dev_agent=None, keep=False, allow_task_drift=False,
@@ -129,6 +145,136 @@ def test_scan_discovers_sibling_checkpoint_layout(tmp_path: Path):
     assert item.checkpoint_dir == item.trial_dir / "checkpoint"
     assert item.trial_dir.name == "task__trial"
     assert item.job_dir == item.trial_dir.parent
+
+
+def test_v2_namespace_is_reader_blocked_and_never_enters_v1_scan(
+    tmp_path: Path,
+) -> None:
+    assignment_id = "f" * 32
+    manifest = _make_v2_checkpoint(tmp_path, assignment_id)
+
+    assert checkpoints.scan(tmp_path) == []
+    assert checkpoints.latest_by_assignment(tmp_path) == {}
+    blocked = checkpoints.scan_reader_blocked(tmp_path)
+    assert len(blocked) == 1
+    assert blocked[0].manifest_path == manifest
+    assert blocked[0].assignment_id == assignment_id
+    assert blocked[0].required_protocol == 2
+    assert blocked[0].required_abi == "dradar-checkpoint-v2/codex/1"
+
+
+def test_future_schema_in_v1_path_is_preserved_as_reader_blocked(
+    tmp_path: Path,
+) -> None:
+    assignment_id = "e" * 32
+    item = _make_checkpoint(tmp_path, assignment_id)
+    payload = json.loads(item.manifest_path.read_text(encoding="utf-8"))
+    payload.update({
+        "schema_version": 3,
+        "checkpoint_protocol_version": 3,
+        "checkpoint_abi": "dradar-checkpoint-v3/codex/1",
+    })
+    item.manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert checkpoints.scan(tmp_path) == []
+    blocked = checkpoints.scan_reader_blocked(tmp_path)
+    assert len(blocked) == 1
+    assert blocked[0].assignment_id == assignment_id
+    assert blocked[0].required_protocol == 3
+    assert blocked[0].required_abi == "dradar-checkpoint-v3/codex/1"
+
+
+def test_reader_blocked_checkpoint_cannot_be_discarded_by_v1_command(
+    tmp_path: Path, monkeypatch, capsys,
+) -> None:
+    assignment_id = "d" * 32
+    manifest = _make_v2_checkpoint(tmp_path, assignment_id)
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    monkeypatch.setattr(
+        runloop, "_load_config",
+        lambda: pytest.fail("reader-blocked discard must stay entirely local"),
+    )
+
+    assert runloop.cmd_checkpoint_discard(
+        argparse.Namespace(checkpoint_id=assignment_id),
+    ) == 1
+    assert manifest.is_file()
+    assert "preserved unchanged" in capsys.readouterr().out
+
+
+def test_reader_blocked_checkpoint_stops_only_explicit_targeted_recovery(
+    tmp_path: Path, monkeypatch, capsys,
+) -> None:
+    assignment_id = "c" * 32
+    _make_v2_checkpoint(tmp_path, assignment_id)
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+
+    class NoNetworkClient:
+        def get_assignment(self):
+            pytest.fail("reader compatibility is decided before server mutation")
+
+    results, found = runloop._resume_local_checkpoints(
+        NoNetworkClient(), _args(assignment=assignment_id),
+        tmp_path / "tasks", None,
+    )
+
+    assert found
+    assert results == ["reader-blocked"]
+    assert "refused the explicitly targeted recovery" in capsys.readouterr().out
+
+
+def test_reader_blocked_shadow_evidence_does_not_block_unrelated_normal_work(
+    tmp_path: Path, monkeypatch, capsys,
+) -> None:
+    assignment_id = "b" * 32
+    manifest = _make_v2_checkpoint(tmp_path, assignment_id)
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+
+    class NoNetworkClient:
+        def get_assignment(self):
+            pytest.fail("no legacy recovery candidate requires server lookup")
+
+    results, found = runloop._resume_local_checkpoints(
+        NoNetworkClient(), _args(), tmp_path / "tasks", None,
+    )
+
+    assert results == []
+    assert found is False
+    assert manifest.is_file()
+    assert "outside the legacy recovery queue" in capsys.readouterr().out
+
+
+def test_protocol_v2_assignment_is_never_ready_for_v1_checkout() -> None:
+    assert not runloop._assignment_is_ready_for_checkout({
+        "assignment_id": "assignment-v2",
+        "checkpoint_protocol_version": 2,
+        "started_at": None,
+        "execution_state": "waiting",
+        "checkpoint_id": None,
+        "retry_after": None,
+    })
+
+
+def test_protocol_v2_assignment_never_enters_legacy_paid_run(
+    tmp_path: Path, monkeypatch, capsys,
+) -> None:
+    monkeypatch.setattr(
+        runloop,
+        "run_trial",
+        lambda *_args, **_kwargs: pytest.fail("model must not start"),
+    )
+    outcome = runloop._run_and_submit(
+        object(),
+        {
+            "assignment_id": "assignment-v2",
+            "checkpoint_protocol_version": 2,
+        },
+        tmp_path / "tasks",
+        _args(),
+        None,
+    )
+    assert outcome == "checkpoint-reader-blocked"
+    assert "no model quota was used" in capsys.readouterr().out
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX ownership boundary")

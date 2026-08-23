@@ -3044,6 +3044,7 @@ def run_trial(
     dev_agent: str | None = None,
     on_started: Callable[[], None] | None = None,
     resume_checkpoint: Path | None = None,
+    checkpoint_shadow_factory: Callable[[dict, Path], object | None] | None = None,
 ) -> TrialArtifacts:
     effective_assignment = assignment
     codex_cli_version = None
@@ -3284,6 +3285,20 @@ def run_trial(
                 env=env,
                 start_new_session=(os.name != "nt"),
             )
+            shadow_controller = None
+            if checkpoint_shadow_factory is not None:
+                try:
+                    shadow_controller = checkpoint_shadow_factory(
+                        effective_assignment,
+                        jobs_dir / job_name,
+                    )
+                    if shadow_controller is not None:
+                        shadow_controller.start()
+                except Exception:
+                    # Shadow setup is deliberately fail-open. The server-side
+                    # rollout remains observable through missing/failure
+                    # evidence, while the paid mainline proceeds unchanged.
+                    shadow_controller = None
             try:
                 next_beat = started + HEARTBEAT_SEC
                 while True:
@@ -3353,6 +3368,12 @@ def run_trial(
                     terminal_error = exc
                 else:
                     raise
+            finally:
+                if shadow_controller is not None:
+                    try:
+                        shadow_controller.close()
+                    except Exception:
+                        pass
     finally:
         if provider_auth_path is not None:
             if (

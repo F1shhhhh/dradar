@@ -12,7 +12,10 @@ from dradar import __version__
 from dradar.api_client import ApiClient, ApiError
 from dradar.providers import DEEPSEEK_CAPABILITY
 from dradar.submission_intent import (
+    CHECKPOINT_V2_UPLOAD_INTENT_VERSION,
     UPLOAD_INTENT_VERSION,
+    checkpoint_v2_submission_payload_manifest,
+    checkpoint_v2_submission_payload_sha256,
     submission_payload_sha256,
 )
 
@@ -66,6 +69,26 @@ def test_legacy_http_error_without_code_remains_compatible():
     assert ei.value.status_code == 409
     assert ei.value.code is None
     assert "legacy conflict" in str(ei.value)
+
+
+def test_nested_state_machine_error_preserves_code_and_bounded_detail():
+    structured = {
+        "code": "checkpoint_circuit_open",
+        "detail": "checkpoint infrastructure is circuit-broken",
+        "assignment_unchanged": True,
+        "circuit_id": "circuit-123",
+        "state": "OPEN",
+    }
+
+    def handler(request):
+        return httpx.Response(409, json={"detail": structured})
+
+    with pytest.raises(ApiError) as caught:
+        _client(handler).get_assignment()
+    assert caught.value.status_code == 409
+    assert caught.value.code == "checkpoint_circuit_open"
+    assert caught.value.detail == structured
+    assert "checkpoint_circuit_open" in str(caught.value)
 
 
 def test_transport_failure_has_no_status_code():
@@ -186,6 +209,81 @@ def test_submission_upload_intent_and_submit_share_exact_content_hash(tmp_path):
     assert requests[1][0] == "/api/v1/submissions"
     assert intent_id.encode() in requests[1][1]
     assert json.dumps(meta).encode() in requests[1][1]
+
+
+def test_checkpoint_v2_upload_binds_owner_epoch_and_uses_v2_route(tmp_path):
+    seen = {}
+
+    def handler(request):
+        seen["path"] = request.url.path
+        seen["body"] = request.read()
+        return httpx.Response(200, json={
+            "submission_id": "s-v2",
+            "grade_status": "pending",
+            "checkpoint_protocol_version": 2,
+        })
+
+    patch = tmp_path / "model.patch"
+    patch.write_bytes(b"diff --git a/a b/a\n")
+    meta = {"dradar_version": "test"}
+    manifest = checkpoint_v2_submission_payload_manifest(
+        assignment_id="assignment-v2",
+        session_id="session-v2",
+        owner_epoch=7,
+        outcome="completed",
+        meta=meta,
+        patch=patch,
+        trajectory=None,
+        result=None,
+        trajectory_bundle=None,
+    )
+    intent_id = checkpoint_v2_submission_payload_sha256(
+        assignment_id="assignment-v2",
+        session_id="session-v2",
+        owner_epoch=7,
+        outcome="completed",
+        meta=meta,
+        patch=patch,
+        trajectory=None,
+        result=None,
+        trajectory_bundle=None,
+    )
+    assert manifest["version"] == CHECKPOINT_V2_UPLOAD_INTENT_VERSION
+    assert manifest["owner_epoch"] == 7
+    assert intent_id != checkpoint_v2_submission_payload_sha256(
+        assignment_id="assignment-v2",
+        session_id="session-v2",
+        owner_epoch=8,
+        outcome="completed",
+        meta=meta,
+        patch=patch,
+        trajectory=None,
+        result=None,
+        trajectory_bundle=None,
+    )
+
+    response = _client(handler).submit_checkpoint_v2(
+        "assignment-v2",
+        "nonce-v2",
+        patch,
+        None,
+        None,
+        meta,
+        owner_epoch=7,
+        session_id="session-v2",
+        upload_intent_id=intent_id,
+    )
+    assert response["checkpoint_protocol_version"] == 2
+    assert seen["path"] == "/api/v2/submissions"
+    for expected in (
+        b'name="owner_epoch"',
+        b"\r\n\r\n7\r\n",
+        b'name="session_id"',
+        b"session-v2",
+        intent_id.encode(),
+        b'name="patch"',
+    ):
+        assert expected in seen["body"]
 
 
 def test_suggest_passes_n_and_returns_cells():
@@ -407,6 +505,96 @@ def test_checkpoint_discard_rejects_reason_outside_server_contract():
         client.checkpoint_discard(
             "a1", "checkpoint-123", 3, reason="resume_fence_failed",
         )
+
+
+def test_checkpoint_v2_command_uses_json_protocol_path_without_mutating_payload():
+    seen = {}
+    payload = {
+        "assignment_id": "assignment-123",
+        "operation_id": "operation-123",
+        "session_id": "session-123",
+        "expected_owner_epoch": 4,
+    }
+
+    def handler(request):
+        seen["path"] = request.url.path
+        seen["json"] = json.loads(request.read())
+        return httpx.Response(200, json={"ok": True, "owner_epoch": 4})
+
+    original = dict(payload)
+    response = _client(handler).checkpoint_v2_command("renew", payload)
+    assert response == {"ok": True, "owner_epoch": 4}
+    assert seen == {
+        "path": "/api/v2/assignment/checkpoint/renew",
+        "json": payload,
+    }
+    assert payload == original
+
+
+def test_checkpoint_v2_command_rejects_unknown_route_before_network():
+    client = _client(
+        lambda _request: pytest.fail("invalid v2 command must fail before HTTP"),
+    )
+    with pytest.raises(ValueError, match="unsupported checkpoint v2 command"):
+        client.checkpoint_v2_command("synthetic-discard", {})
+
+
+def test_checkpoint_v2_observation_uses_non_command_shadow_route():
+    seen = {}
+    payload = {
+        "assignment_id": "assignment-123",
+        "operation_id": "operation-observe-123",
+        "capture_id": "capture-observe-123",
+        "status": "failed",
+    }
+
+    def handler(request):
+        seen["path"] = request.url.path
+        seen["json"] = json.loads(request.read())
+        return httpx.Response(200, json={
+            "ok": True,
+            "assignment_unchanged": True,
+            "paid_execution_authorized": False,
+        })
+
+    original = dict(payload)
+    response = _client(handler).checkpoint_v2_observation(payload)
+    assert response["assignment_unchanged"] is True
+    assert response["paid_execution_authorized"] is False
+    assert seen == {
+        "path": "/api/v2/assignment/checkpoint/observation",
+        "json": payload,
+    }
+    assert payload == original
+
+
+def test_checkpoint_v2_restore_observation_uses_distinct_shadow_route():
+    seen = {}
+    payload = {
+        "assignment_id": "assignment-123",
+        "operation_id": "operation-restore-123",
+        "restore_id": "restore-123",
+        "status": "verified",
+    }
+
+    def handler(request):
+        seen["path"] = request.url.path
+        seen["json"] = json.loads(request.read())
+        return httpx.Response(200, json={
+            "ok": True,
+            "assignment_unchanged": True,
+            "paid_execution_authorized": False,
+        })
+
+    original = dict(payload)
+    response = _client(handler).checkpoint_v2_restore_observation(payload)
+    assert response["assignment_unchanged"] is True
+    assert response["paid_execution_authorized"] is False
+    assert seen == {
+        "path": "/api/v2/assignment/checkpoint/observation/restore",
+        "json": payload,
+    }
+    assert payload == original
 
 
 def _do_submit(handler, tmp_path, with_optional):
