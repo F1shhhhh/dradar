@@ -121,6 +121,28 @@ def test_kimi_low_scoped_refill_claims_only_kimi_low(tmp_path: Path):
     assert client.suggest_calls == []
 
 
+def test_scoped_refill_claims_cheapest_candidates_first(tmp_path: Path):
+    board = _table(
+        ("expensive", KIMI_AGENT, "k3", "low", "open"),
+        ("unpriced", KIMI_AGENT, "k3", "low", "open"),
+        ("cheap", KIMI_AGENT, "k3", "low", "open"),
+        ("middle", KIMI_AGENT, "k3", "low", "open"),
+    )
+    board["cells"]["expensive|k3|low"]["cost"] = 3.0
+    board["cells"]["unpriced|k3|low"].pop("cost")
+    board["cells"]["cheap|k3|low"]["cost"] = 0.1
+    board["cells"]["middle|k3|low"]["cost"] = 1.0
+    client = ScopedClient(board)
+    _configure(tmp_path, refill_to=4)
+
+    result = refill.refill_once(tmp_path, client)
+
+    assert result["claimed"] == 4
+    assert [task_id for task_id, _model, _effort in client.claimed] == [
+        "cheap", "middle", "expensive", "unpriced",
+    ]
+
+
 def test_no_kimi_inventory_never_falls_back_to_codex(tmp_path: Path):
     client = ScopedClient(_table(
         ("k-busy", KIMI_AGENT, "k3", "low", "leased"),
