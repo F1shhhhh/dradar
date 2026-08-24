@@ -19,24 +19,6 @@ _DEFAULT_RETRY_AFTER_SEC = 1.0
 _MAX_RETRY_AFTER_SEC = 60.0
 CLIENT_VERSION_HEADER = "X-DRadar-Client-Version"
 CLIENT_CAPABILITIES_HEADER = "X-DRadar-Capabilities"
-_CHECKPOINT_V2_COMMANDS = frozenset({
-    "identity/finalize",
-    "checkout",
-    "start",
-    "usage-finalize",
-    "renew",
-    "result-ready",
-    "pause",
-    "resume-reserve",
-    "resume-commit",
-    "resume-abort",
-    "fresh-fallback",
-    "paid-gate-reconcile",
-    "fallback-generation",
-    "discard",
-    "failure",
-    "retention",
-})
 
 
 def _env_proxies_set() -> bool:
@@ -50,8 +32,7 @@ def _env_proxies_set() -> bool:
 
 class ApiError(RuntimeError):
     def __init__(self, message: str, status_code: int | None = None,
-                 code: str | None = None, retry_after: float | None = None,
-                 detail: Any = None):
+                 code: str | None = None, retry_after: float | None = None):
         # None means "never got a real HTTP response" (DNS/connect/timeout) —
         # callers that need to branch on a specific status (e.g. 409 vs 410)
         # must check this instead of grepping the message, which can contain
@@ -64,10 +45,6 @@ class ApiError(RuntimeError):
         # retain a conservative compatibility fallback for those responses.
         self.code = code
         self.retry_after = retry_after
-        # Newer state-machine endpoints return a bounded object containing a
-        # stable code plus fences/circuit facts.  Preserve it for typed caller
-        # decisions instead of forcing every Harness to parse exception text.
-        self.detail = detail
 
 
 class ApiClient:
@@ -157,8 +134,6 @@ class ApiClient:
                 if isinstance(body, dict):
                     detail = body.get("detail", resp.text)
                     raw_code = body.get("code")
-                    if raw_code is None and isinstance(detail, dict):
-                        raw_code = detail.get("code")
                     if isinstance(raw_code, str):
                         code = raw_code
             except (json.JSONDecodeError, ValueError):
@@ -170,7 +145,6 @@ class ApiClient:
                 retry_after=(
                     self._retry_after(resp) if resp.status_code == 429 else None
                 ),
-                detail=detail,
             )
         return resp.json()
 
@@ -399,65 +373,6 @@ class ApiClient:
                   "resume_generation": str(resume_generation), "reason": reason},
         )
 
-    def checkpoint_v2_command(
-        self, command: str, payload: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Send one idempotent checkpoint-v2 command.
-
-        The state machine creates and persists ``operation_id`` before this
-        method is called.  This transport wrapper deliberately neither
-        invents IDs nor retries semantic failures, so response-loss replay is
-        driven by the caller's durable journal and the server command ledger.
-        """
-
-        if command not in _CHECKPOINT_V2_COMMANDS:
-            raise ValueError("unsupported checkpoint v2 command")
-        if not isinstance(payload, dict):
-            raise TypeError("checkpoint v2 payload must be a dictionary")
-        return self._post(
-            f"/api/v2/assignment/checkpoint/{command}",
-            json=dict(payload),
-        )
-
-    def checkpoint_v2_observation(
-        self, payload: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Send bounded shadow evidence with no assignment-state authority."""
-
-        if not isinstance(payload, dict):
-            raise TypeError("checkpoint v2 observation must be a dictionary")
-        return self._post(
-            "/api/v2/assignment/checkpoint/observation",
-            json=dict(payload),
-            timeout=3.0,
-        )
-
-    def checkpoint_v2_activation(
-        self, payload: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Recheck the current shadow ceiling before doing local work."""
-
-        if not isinstance(payload, dict):
-            raise TypeError("checkpoint v2 activation must be a dictionary")
-        return self._post(
-            "/api/v2/assignment/checkpoint/activation",
-            json=dict(payload),
-            timeout=3.0,
-        )
-
-    def checkpoint_v2_restore_observation(
-        self, payload: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Send bounded offline-restore evidence with no paid authority."""
-
-        if not isinstance(payload, dict):
-            raise TypeError("checkpoint v2 restore observation must be a dictionary")
-        return self._post(
-            "/api/v2/assignment/checkpoint/observation/restore",
-            json=dict(payload),
-            timeout=3.0,
-        )
-
     def submit(
         self,
         assignment_id: str,
@@ -494,60 +409,6 @@ class ApiClient:
         return self._post(
             "/api/v1/submissions",
             data=data,
-            files=files,
-        )
-
-    def submit_checkpoint_v2(
-        self,
-        assignment_id: str,
-        nonce: str,
-        patch: Path,
-        trajectory: Path | None,
-        result: Path | None,
-        client_meta: dict[str, Any],
-        *,
-        owner_epoch: int,
-        session_id: str,
-        upload_intent_id: str,
-        outcome: str = "completed",
-        trajectory_bundle: Path | None = None,
-    ) -> dict[str, Any]:
-        """Upload one content-bound result through the V2 reconciliation path."""
-
-        if (
-            not isinstance(owner_epoch, int)
-            or isinstance(owner_epoch, bool)
-            or owner_epoch < 0
-        ):
-            raise ValueError("owner_epoch must be a non-negative integer")
-        if not session_id:
-            raise ValueError("session_id is required for checkpoint v2 upload")
-        if len(upload_intent_id) != 64 or any(
-            char not in "0123456789abcdef" for char in upload_intent_id
-        ):
-            raise ValueError("upload_intent_id must be 64 lowercase hex characters")
-        files: list[tuple[str, tuple[str, bytes]]] = [
-            ("patch", ("model.patch", patch.read_bytes())),
-        ]
-        if trajectory and trajectory.exists():
-            files.append(("trajectory", ("trajectory.json", trajectory.read_bytes())))
-        if result and result.exists():
-            files.append(("result", ("result.json", result.read_bytes())))
-        if trajectory_bundle and trajectory_bundle.exists():
-            files.append(("trajectory_bundle", (
-                "trajectory_bundle.json", trajectory_bundle.read_bytes(),
-            )))
-        return self._post(
-            "/api/v2/submissions",
-            data={
-                "assignment_id": assignment_id,
-                "nonce": nonce,
-                "owner_epoch": str(owner_epoch),
-                "session_id": session_id,
-                "upload_intent_id": upload_intent_id,
-                "outcome": outcome,
-                "client_meta": json.dumps(client_meta),
-            },
             files=files,
         )
 

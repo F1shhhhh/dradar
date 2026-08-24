@@ -30,7 +30,6 @@ from pier.utils.trajectory_metrics import populate_context_from_final_metrics
 try:
     from _dradar_pier_checkpoint import (
         AgentLogStore,
-        CheckpointV2PreProviderBarrier,
         DurableCheckpoint,
         StatePath,
         UnsafeAgentLog,
@@ -38,7 +37,6 @@ try:
 except ModuleNotFoundError:  # Local source-tree tests import the packaged module.
     from dradar.pier_checkpoint import (
         AgentLogStore,
-        CheckpointV2PreProviderBarrier,
         DurableCheckpoint,
         StatePath,
         UnsafeAgentLog,
@@ -1169,7 +1167,6 @@ class ZCodeBigModel(BaseInstalledAgent):
         checkpoint_effort: str | None = None,
         checkpoint_resume_generation: str | int = 0,
         checkpoint_path: str | None = None,
-        checkpoint_v2_gate_dir: str | None = None,
         model_name: str | None = None,
         version: str | None = ZCODE_CLI_VERSION,
         **kwargs: Any,
@@ -1226,9 +1223,6 @@ class ZCodeBigModel(BaseInstalledAgent):
         self._session_timeout_sec = resolved_session_timeout
         self._credential_value = key_value
         self._instruction = ""
-        self._checkpoint_v2_barrier = CheckpointV2PreProviderBarrier(
-            checkpoint_v2_gate_dir,
-        )
         run_secret_dir = self._REMOTE_SECRET_ROOT / uuid.uuid4().hex
         self._remote_secret_dir = run_secret_dir
         self._remote_api_key = run_secret_dir / "coding-plan-key"
@@ -1349,23 +1343,6 @@ class ZCodeBigModel(BaseInstalledAgent):
             log_store.replace_text(local_runner, _PROTOCOL_RUNNER)
             log_store.replace_text(local_instruction, instruction)
             resume_session_id = await self._checkpoint.start(self, environment, env)
-            v2_session_id = await self._checkpoint_v2_barrier.restore_if_requested(
-                self,
-                environment,
-                env,
-                state_paths=(
-                    StatePath("xdg-data", (self._REMOTE_HOME / "data").as_posix()),
-                    StatePath(
-                        "zcode-rollout",
-                        (
-                            self._REMOTE_USER_HOME / ".zcode" / "cli" / "rollout"
-                        ).as_posix(),
-                    ),
-                ),
-                sensitive_values=(self._credential_value,),
-            )
-            if v2_session_id is not None:
-                resume_session_id = v2_session_id
 
             await environment.upload_file(self._zcode_cli_file, remote_cli)
             await environment.upload_file(local_runner, remote_runner)
@@ -1416,7 +1393,6 @@ class ZCodeBigModel(BaseInstalledAgent):
                 f"cd /app; python3 {shlex.quote(remote_runner)} {args} "
                 f"2>&1 | tee {shlex.quote(stream)}"
             )
-            await self._checkpoint_v2_barrier.authorize_provider_start()
             await self.exec_as_agent(
                 environment, command=command, env=env, cwd="/app",
             )
