@@ -23,9 +23,6 @@ from pathlib import Path
 from typing import Iterator
 
 SCHEMA_VERSION = 1
-CHECKPOINT_PROTOCOL_V2 = 2
-V2_STORAGE_DIR = "checkpoint-v2"
-V2_MANIFEST_NAME = "manifest.json"
 DEFAULT_TTL_DAYS = 7
 KEEP_MARKER = ".dradar-keep"
 TERMINAL_MARKER = ".dradar-terminal-evidence"
@@ -63,9 +60,6 @@ class Checkpoint:
     manifest_sha256: str | None = None
     manifest_identity: tuple[int, int, int, int] | None = None
     payload_pointer: tuple[bytes, tuple[int, int, int, int]] | None = None
-    reader_blocked: bool = False
-    required_protocol: int | None = None
-    required_abi: str | None = None
 
     @property
     def size_bytes(self) -> int:
@@ -85,20 +79,6 @@ class Checkpoint:
 
 class CheckpointBusy(RuntimeError):
     pass
-
-
-@dataclass(frozen=True)
-class ReaderBlockedCheckpoint:
-    """Future checkpoint evidence this client must preserve without mutation."""
-
-    manifest_path: Path
-    trial_dir: Path
-    job_dir: Path
-    assignment_id: str | None
-    required_protocol: int | None
-    required_abi: str | None
-    updated_at: datetime
-    reason: str
 
 
 def _contains_sensitive_key(value) -> bool:
@@ -373,58 +353,12 @@ def _load(path: Path, *, trial_dir: Path, job_dir: Path) -> Checkpoint:
         if isinstance(manifest_assignment_id, str) and manifest_assignment_id
         else inferred_assignment_id
     )
-    schema_version = raw.get("schema_version")
-    declared_protocol = raw.get("checkpoint_protocol_version")
-    if (
-        (
-            isinstance(schema_version, int)
-            and not isinstance(schema_version, bool)
-            and schema_version >= CHECKPOINT_PROTOCOL_V2
-        )
-        or (
-            isinstance(declared_protocol, int)
-            and not isinstance(declared_protocol, bool)
-            and declared_protocol >= CHECKPOINT_PROTOCOL_V2
-        )
-    ):
-        required_protocol = raw.get("checkpoint_protocol_version")
-        if (
-            not isinstance(required_protocol, int)
-            or isinstance(required_protocol, bool)
-            or required_protocol < CHECKPOINT_PROTOCOL_V2
-        ):
-            required_protocol = (
-                schema_version
-                if (
-                    isinstance(schema_version, int)
-                    and not isinstance(schema_version, bool)
-                    and schema_version >= CHECKPOINT_PROTOCOL_V2
-                )
-                else None
-            )
-        required_abi = raw.get("checkpoint_abi")
-        if not (
-            isinstance(required_abi, str)
-            and re.fullmatch(r"[A-Za-z0-9._/-]{1,160}", required_abi)
-        ):
-            required_abi = None
-        return Checkpoint(
-            path, checkpoint_dir, trial_dir, job_dir,
-            inferred_assignment_id or assignment_id, None, "reader_blocked", 0,
-            None, None, None,
-            _parse_time(raw.get("updated_at"), fallback), False, None,
-            manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
-            manifest_identity=manifest_identity,
-            reader_blocked=True,
-            required_protocol=required_protocol,
-            required_abi=required_abi,
-        )
     checkpoint_id = raw.get("checkpoint_id")
     phase = raw.get("phase") if isinstance(raw.get("phase"), str) else "invalid"
     generation = raw.get("resume_generation", 0)
     errors = []
-    if schema_version != SCHEMA_VERSION:
-        errors.append(f"unsupported schema {schema_version!r}")
+    if raw.get("schema_version") != SCHEMA_VERSION:
+        errors.append(f"unsupported schema {raw.get('schema_version')!r}")
     if _contains_sensitive_key(raw):
         errors.append("manifest contains a sensitive field")
     if not assignment_id:
@@ -565,119 +499,6 @@ def _load(path: Path, *, trial_dir: Path, job_dir: Path) -> Checkpoint:
     )
 
 
-def v2_manifest_path(trial_dir: Path) -> Path:
-    """Return the protocol-namespaced path reserved for checkpoint v2."""
-
-    return trial_dir / V2_STORAGE_DIR / V2_MANIFEST_NAME
-
-
-def _blocked_from_v2_manifest(
-    path: Path, *, trial_dir: Path, job_dir: Path,
-) -> ReaderBlockedCheckpoint:
-    try:
-        fallback = path.lstat().st_mtime
-    except OSError:
-        fallback = datetime.now(timezone.utc).timestamp()
-    assignment_id = _infer_assignment_id(job_dir)
-    required_protocol: int | None = CHECKPOINT_PROTOCOL_V2
-    required_abi: str | None = None
-    try:
-        payload = json.loads(
-            _read_regular_file(path, max_bytes=MAX_MANIFEST_BYTES).decode("utf-8")
-        )
-    except (
-        UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError,
-        _UnsafeCheckpointFile,
-    ):
-        payload = None
-    if isinstance(payload, dict):
-        candidate_protocol = payload.get("checkpoint_protocol_version")
-        if (
-            isinstance(candidate_protocol, int)
-            and not isinstance(candidate_protocol, bool)
-            and candidate_protocol >= CHECKPOINT_PROTOCOL_V2
-        ):
-            required_protocol = candidate_protocol
-        candidate_abi = payload.get("checkpoint_abi")
-        if (
-            isinstance(candidate_abi, str)
-            and re.fullmatch(r"[A-Za-z0-9._/-]{1,160}", candidate_abi)
-        ):
-            required_abi = candidate_abi
-    requirement = f"protocol {required_protocol or 'unknown'}"
-    if required_abi:
-        requirement += f" / ABI {required_abi}"
-    return ReaderBlockedCheckpoint(
-        manifest_path=path,
-        trial_dir=trial_dir,
-        job_dir=job_dir,
-        assignment_id=assignment_id,
-        required_protocol=required_protocol,
-        required_abi=required_abi,
-        updated_at=_parse_time(
-            payload.get("updated_at") if isinstance(payload, dict) else None,
-            fallback,
-        ),
-        reason=f"checkpoint requires a newer reader ({requirement})",
-    )
-
-
-def scan_reader_blocked(home: Path) -> list[ReaderBlockedCheckpoint]:
-    """Discover future-protocol evidence without offering it to v1 recovery.
-
-    The result is intentionally separate from :func:`scan`: every current v1
-    mutation path consumes ``scan()`` and therefore cannot mistake an unknown
-    schema for corruption or call checkpoint/discard against it.
-    """
-
-    root = home / "work" / "jobs"
-    if root.is_symlink() or not root.is_dir():
-        return []
-    blocked: list[ReaderBlockedCheckpoint] = []
-    for pattern, trial_parent, job_parent in (
-        ("*/*/checkpoint/checkpoint.json", 1, 2),
-        ("*/*/agent/checkpoint/checkpoint.json", 2, 3),
-    ):
-        for path in root.glob(pattern):
-            trial_dir = path.parents[trial_parent]
-            job_dir = path.parents[job_parent]
-            if _path_uses_symlink(root, path.parent):
-                continue
-            try:
-                item = _load(path, trial_dir=trial_dir, job_dir=job_dir)
-            except (OSError, IndexError, RecursionError):
-                continue
-            if item.reader_blocked:
-                requirement = f"protocol {item.required_protocol or 'unknown'}"
-                if item.required_abi:
-                    requirement += f" / ABI {item.required_abi}"
-                blocked.append(ReaderBlockedCheckpoint(
-                    manifest_path=item.manifest_path,
-                    trial_dir=item.trial_dir,
-                    job_dir=item.job_dir,
-                    assignment_id=item.assignment_id,
-                    required_protocol=item.required_protocol,
-                    required_abi=item.required_abi,
-                    updated_at=item.updated_at,
-                    reason=f"checkpoint requires a newer reader ({requirement})",
-                ))
-    for path in root.glob(f"*/*/{V2_STORAGE_DIR}/{V2_MANIFEST_NAME}"):
-        if _path_uses_symlink(root, path.parent):
-            continue
-        try:
-            blocked.append(_blocked_from_v2_manifest(
-                path,
-                trial_dir=path.parents[1],
-                job_dir=path.parents[2],
-            ))
-        except (OSError, IndexError, RecursionError):
-            continue
-    unique = {item.manifest_path.absolute(): item for item in blocked}
-    return sorted(
-        unique.values(), key=lambda item: item.updated_at, reverse=True,
-    )
-
-
 def scan(home: Path) -> list[Checkpoint]:
     root = home / "work" / "jobs"
     if root.is_symlink() or not root.is_dir():
@@ -699,9 +520,7 @@ def scan(home: Path) -> list[Checkpoint]:
             )
     for path, trial_dir, job_dir in candidates.values():
         try:
-            item = _load(path, trial_dir=trial_dir, job_dir=job_dir)
-            if not item.reader_blocked:
-                found.append(item)
+            found.append(_load(path, trial_dir=trial_dir, job_dir=job_dir))
         except (OSError, IndexError, RecursionError):
             continue
     seen_jobs = {item.job_dir.resolve() for item in found}

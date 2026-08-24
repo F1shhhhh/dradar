@@ -29,7 +29,6 @@ from _dradar_pier_checkpoint import (
     AgentLogStore,
     CheckpointError,
     CheckpointIncompatibleError,
-    CheckpointV2PreProviderBarrier,
     DurableCheckpoint,
     StatePath,
     UnsafeAgentLog,
@@ -544,7 +543,6 @@ class KimiCode(BaseInstalledAgent):
         checkpoint_effort: str | None = None,
         checkpoint_resume_generation: str | int = 0,
         checkpoint_path: str | None = None,
-        checkpoint_v2_gate_dir: str | None = None,
         **kwargs: Any,
     ):
         auth = Path(auth_json_file)
@@ -577,9 +575,6 @@ class KimiCode(BaseInstalledAgent):
         self._instruction = ""
         self._resume_attempts = 0
         self._session_id: str | None = None
-        self._checkpoint_v2_barrier = CheckpointV2PreProviderBarrier(
-            checkpoint_v2_gate_dir,
-        )
         super().__init__(*args, **kwargs)
         self._checkpoint = DurableCheckpoint(
             logs_dir=self.logs_dir,
@@ -899,24 +894,6 @@ class KimiCode(BaseInstalledAgent):
             checkpoint_session = await self._checkpoint.start(
                 self, environment, env,
             )
-            v2_session_id = await self._checkpoint_v2_barrier.restore_if_requested(
-                self,
-                environment,
-                env,
-                state_paths=(
-                    StatePath(
-                        "sessions", (self._REMOTE_HOME / "sessions").as_posix(),
-                    ),
-                    StatePath(
-                        "session-index",
-                        (self._REMOTE_HOME / "session_index.jsonl").as_posix(),
-                    ),
-                    StatePath("stream", f"/logs/agent/{self._STREAM_FILE}"),
-                ),
-                sensitive_values=self._credential_values,
-            )
-            if v2_session_id is not None:
-                checkpoint_session = v2_session_id
             restoring_checkpoint = self._checkpoint.previous is not None
             if checkpoint_session is not None:
                 checkpoint_session = validated_session_id(checkpoint_session)
@@ -940,7 +917,6 @@ class KimiCode(BaseInstalledAgent):
                         "Kimi checkpoint native session state is unavailable"
                     )
             self._session_id = checkpoint_session
-            await self._checkpoint_v2_barrier.authorize_provider_start()
             resume_attempts, runtime_session = await run_with_kimi_resume(
                 run_initial=run_initial,
                 find_session_id=remote_session_id,

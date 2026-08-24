@@ -27,7 +27,6 @@ class RecordingCheckpoint:
     def __init__(self, **kwargs: object) -> None:
         self.kwargs = kwargs
         self.enabled = bool(kwargs["enabled"])
-        self.sensitive_values = tuple(kwargs.get("sensitive_values", ()))
         logs_dir = Path(kwargs["logs_dir"])
         self.host_dir = logs_dir.parent / "checkpoint"
         checkpoint_path = kwargs.get("checkpoint_path")
