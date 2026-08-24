@@ -8,6 +8,7 @@ All workers under one DRADAR_HOME serialize plan updates through an OS lock.
 from __future__ import annotations
 
 import json
+import math
 import os
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -485,7 +486,35 @@ def _scoped_candidates(table: dict, plan: dict) -> list[dict]:
         ):
             candidate["est_quota_pct"] = float(cost) / float(plus_window) * 100
         candidates.append(candidate)
-    return candidates
+    def price_key(candidate: dict) -> tuple[int, float, str, str, str]:
+        """Cheapest authoritative estimate first, with deterministic ties.
+
+        A missing or malformed estimate must never jump ahead of priced work.
+        ``est_quota_pct`` is a useful secondary estimate when a provider cell
+        has no dollar-equivalent cost, but it is intentionally ranked after
+        every directly priced candidate because the units are not comparable.
+        """
+
+        cost = candidate.get("cost")
+        if (isinstance(cost, (int, float)) and not isinstance(cost, bool)
+                and math.isfinite(float(cost)) and float(cost) >= 0):
+            bucket, price = 0, float(cost)
+        else:
+            quota = candidate.get("est_quota_pct")
+            if (isinstance(quota, (int, float)) and not isinstance(quota, bool)
+                    and math.isfinite(float(quota)) and float(quota) >= 0):
+                bucket, price = 1, float(quota)
+            else:
+                bucket, price = 2, 0.0
+        return (
+            bucket,
+            price,
+            str(candidate.get("task_id", "")),
+            str(candidate.get("model", "")),
+            str(candidate.get("effort", "")),
+        )
+
+    return sorted(candidates, key=price_key)
 
 
 def mark_submitted(home: Path, assignment_id: str) -> int:
