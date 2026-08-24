@@ -87,6 +87,10 @@ _FIXED_ARTIFACTS = {
 }
 _TRACKED_SCAN_ARTIFACT = ".tracked-worktree.scan"
 _MAX_AGENT_LOG_BYTES = 64 * 1024 * 1024
+_CHECKPOINT_V2_GATE_SCHEMA = "dradar-checkpoint-paid-gate-contract-v2"
+_CHECKPOINT_V2_REQUEST_SCHEMA = "dradar-checkpoint-paid-gate-request-v2"
+_CHECKPOINT_V2_GRANT_SCHEMA = "dradar-checkpoint-paid-gate-grant-v2"
+_CHECKPOINT_V2_DENIAL_SCHEMA = "dradar-checkpoint-paid-gate-denial-v2"
 
 
 class CheckpointError(RuntimeError):
@@ -99,6 +103,675 @@ class CheckpointIncompatibleError(CheckpointError):
 
 class UnsafeAgentLog(ValueError):
     """A model-writable host log could not be handled without following it."""
+
+
+class CheckpointV2PaidExecutionGate:
+    """One-shot host-private barrier immediately before Provider execution.
+
+    Pier may build an image, create a task container, and perform free restore
+    work before this barrier. It cannot start the paid Provider command until
+    the outer DRadar owner has durably authorized the exact request. The gate
+    contains no credentials, prompt, command line, or Provider output.
+    """
+
+    def __init__(self, gate_dir: str | os.PathLike[str] | None) -> None:
+        self.gate_dir = Path(gate_dir) if gate_dir else None
+        self._used = False
+        self._authorized = False
+
+    @property
+    def enabled(self) -> bool:
+        return self.gate_dir is not None
+
+    @staticmethod
+    def _private_regular(path: Path, *, maximum: int) -> bytes:
+        try:
+            metadata = path.lstat()
+            data = path.read_bytes()
+        except OSError as exc:
+            raise CheckpointError("checkpoint v2 paid gate is unreadable") from exc
+        if (
+            path.is_symlink()
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or len(data) > maximum
+            or (
+                os.name == "posix"
+                and (
+                    metadata.st_uid != os.getuid()
+                    or stat.S_IMODE(metadata.st_mode) != 0o600
+                )
+            )
+        ):
+            raise CheckpointError("checkpoint v2 paid gate is unsafe")
+        return data
+
+    def _contract(self) -> dict[str, Any]:
+        if self.gate_dir is None:
+            raise CheckpointError("checkpoint v2 paid gate is disabled")
+        try:
+            canonical = self.gate_dir.resolve(strict=True)
+            metadata = canonical.lstat()
+        except OSError as exc:
+            raise CheckpointError("checkpoint v2 paid gate is unavailable") from exc
+        if (
+            canonical != self.gate_dir.absolute()
+            or canonical.is_symlink()
+            or not stat.S_ISDIR(metadata.st_mode)
+            or (
+                os.name == "posix"
+                and (
+                    metadata.st_uid != os.getuid()
+                    or stat.S_IMODE(metadata.st_mode) != 0o700
+                )
+            )
+        ):
+            raise CheckpointError("checkpoint v2 paid gate directory is unsafe")
+        try:
+            value = json.loads(self._private_regular(
+                canonical / "contract.json", maximum=4096,
+            ))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise CheckpointError("checkpoint v2 paid gate contract is invalid") from exc
+        common_fields = {
+            "schema", "assignment_id", "gate_nonce", "action",
+            "session_id", "owner_epoch", "reconcile_operation_id",
+            "job_root",
+        }
+        resume_fields = {
+            "restore_root", "manifest_sha256", "identity_fingerprint",
+            "checkpoint_abi", "recovery_capability", "native_state_schema",
+            "restore_adapter_version", "restore_receipt_sha256",
+        }
+        if (
+            not isinstance(value, dict)
+            or (
+                set(value) != common_fields
+                if value.get("action") == "fresh"
+                else set(value) != common_fields | resume_fields
+            )
+            or value.get("schema") != _CHECKPOINT_V2_GATE_SCHEMA
+            or _ID_RE.fullmatch(str(value.get("assignment_id"))) is None
+            or re.fullmatch(r"[0-9a-f]{32}", str(value.get("gate_nonce"))) is None
+            or value.get("action") not in {"fresh", "resume"}
+            or re.fullmatch(
+                r"[A-Za-z0-9._:-]{8,64}", str(value.get("session_id"))
+            ) is None
+            or _ID_RE.fullmatch(
+                str(value.get("reconcile_operation_id"))
+            ) is None
+            or not isinstance(value.get("job_root"), str)
+            or not Path(value["job_root"]).is_absolute()
+            or not isinstance(value.get("owner_epoch"), int)
+            or isinstance(value.get("owner_epoch"), bool)
+            or value["owner_epoch"] < 0
+        ):
+            raise CheckpointError("checkpoint v2 paid gate contract is invalid")
+        if value["action"] == "resume" and (
+            not isinstance(value.get("restore_root"), str)
+            or not Path(value["restore_root"]).is_absolute()
+            or re.fullmatch(
+                r"[0-9a-f]{64}", str(value.get("manifest_sha256")),
+            ) is None
+            or re.fullmatch(
+                r"[0-9a-f]{64}", str(value.get("identity_fingerprint")),
+            ) is None
+            or not isinstance(value.get("checkpoint_abi"), str)
+            or not 8 <= len(value["checkpoint_abi"]) <= 160
+            or value.get("recovery_capability")
+            not in {"NATIVE_VALID", "WORKSPACE_ONLY"}
+            or (
+                value.get("native_state_schema") is not None
+                and (
+                    not isinstance(value.get("native_state_schema"), str)
+                    or not value["native_state_schema"]
+                    or len(value["native_state_schema"]) > 160
+                )
+            )
+            or not isinstance(value.get("restore_adapter_version"), str)
+            or not 1 <= len(value["restore_adapter_version"]) <= 160
+            or re.fullmatch(
+                r"[0-9a-f]{64}", str(value.get("restore_receipt_sha256")),
+            ) is None
+        ):
+            raise CheckpointError("checkpoint v2 paid gate contract is invalid")
+        return value
+
+    @staticmethod
+    def _canonical_bytes(value: dict[str, Any]) -> bytes:
+        return json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        ).encode("utf-8") + b"\n"
+
+    @staticmethod
+    def _publish_once(path: Path, data: bytes) -> None:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        try:
+            descriptor = os.open(path, flags, 0o600)
+        except OSError as exc:
+            raise CheckpointError("checkpoint v2 paid gate request already exists") from exc
+        try:
+            view = memoryview(data)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise CheckpointError("checkpoint v2 paid gate request write failed")
+                view = view[written:]
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    async def authorize_provider_start(
+        self,
+        *,
+        action: str = "fresh",
+        restore_receipt_sha256: str | None = None,
+        timeout_sec: float = 900.0,
+    ) -> None:
+        if self.gate_dir is None:
+            return
+        if self._authorized:
+            return
+        if self._used:
+            raise CheckpointError("checkpoint v2 paid gate is one-shot")
+        self._used = True
+        contract = self._contract()
+        if action != contract["action"] or (
+            action == "fresh" and restore_receipt_sha256 is not None
+        ) or (
+            action == "resume"
+            and (
+                re.fullmatch(
+                    r"[0-9a-f]{64}", str(restore_receipt_sha256),
+                ) is None
+                or restore_receipt_sha256
+                != contract.get("restore_receipt_sha256")
+            )
+        ):
+            raise CheckpointError("checkpoint v2 paid gate action is inconsistent")
+        request = {
+            "schema": _CHECKPOINT_V2_REQUEST_SCHEMA,
+            "assignment_id": contract["assignment_id"],
+            "gate_nonce": contract["gate_nonce"],
+            "action": action,
+            "restore_receipt_sha256": restore_receipt_sha256,
+        }
+        request_bytes = self._canonical_bytes(request)
+        request_sha256 = hashlib.sha256(request_bytes).hexdigest()
+        self._publish_once(self.gate_dir / "request.json", request_bytes)
+        deadline = asyncio.get_running_loop().time() + max(
+            1.0, min(float(timeout_sec), 3600.0),
+        )
+        while True:
+            denial_path = self.gate_dir / "denial.json"
+            grant_path = self.gate_dir / "grant.json"
+            if denial_path.exists() or denial_path.is_symlink():
+                try:
+                    denial = json.loads(self._private_regular(
+                        denial_path, maximum=4096,
+                    ))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise CheckpointError(
+                        "checkpoint v2 paid gate denial is invalid",
+                    ) from exc
+                if (
+                    not isinstance(denial, dict)
+                    or denial.get("schema") != _CHECKPOINT_V2_DENIAL_SCHEMA
+                    or denial.get("assignment_id") != contract["assignment_id"]
+                    or denial.get("gate_nonce") != contract["gate_nonce"]
+                    or denial.get("request_sha256") != request_sha256
+                    or not isinstance(denial.get("code"), str)
+                ):
+                    raise CheckpointError(
+                        "checkpoint v2 paid gate denial is invalid",
+                    )
+                raise CheckpointError(
+                    "checkpoint v2 paid execution was denied: " + denial["code"],
+                )
+            if grant_path.exists() or grant_path.is_symlink():
+                try:
+                    grant = json.loads(self._private_regular(
+                        grant_path, maximum=4096,
+                    ))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise CheckpointError(
+                        "checkpoint v2 paid gate grant is invalid",
+                    ) from exc
+                if (
+                    not isinstance(grant, dict)
+                    or set(grant) != {
+                        "schema", "assignment_id", "gate_nonce",
+                        "request_sha256", "owner_epoch", "usage_segment_id",
+                        "paid_execution_authorized",
+                    }
+                    or grant.get("schema") != _CHECKPOINT_V2_GRANT_SCHEMA
+                    or grant.get("assignment_id") != contract["assignment_id"]
+                    or grant.get("gate_nonce") != contract["gate_nonce"]
+                    or grant.get("request_sha256") != request_sha256
+                    or not isinstance(grant.get("owner_epoch"), int)
+                    or isinstance(grant.get("owner_epoch"), bool)
+                    or grant.get("owner_epoch") < 0
+                    or _ID_RE.fullmatch(str(grant.get("usage_segment_id"))) is None
+                    or grant.get("paid_execution_authorized") is not True
+                ):
+                    raise CheckpointError(
+                        "checkpoint v2 paid gate grant is invalid",
+                    )
+                self._authorized = True
+                return
+            if asyncio.get_running_loop().time() >= deadline:
+                raise CheckpointError("checkpoint v2 paid gate timed out")
+            await asyncio.sleep(0.1)
+
+
+class CheckpointV2PreProviderBarrier:
+    """Revalidate/restore a V2 payload, then cross the paid gate exactly once."""
+
+    _MANIFEST_FIELDS = {
+        "schema", "protocol_version", "checkpoint_core_abi", "checkpoint_abi",
+        "checkpoint_id", "checkpoint_lineage_id", "snapshot_generation",
+        "capture_id", "identity_fingerprint", "recovery_capability",
+        "native_state_schema", "captured_at", "capture_storage", "directories",
+        "files", "file_count", "total_bytes",
+    }
+    _PROGRESS_FIELDS = {
+        "schema", "harness", "provider", "checkpoint_abi", "base_commit",
+        "captured_at", "session_id_present", "native_artifacts",
+        "recovery_capability", "workspace_patch_bytes", "untracked_files",
+        "untracked_bytes",
+    }
+
+    def __init__(self, gate_dir: str | os.PathLike[str] | None) -> None:
+        self.gate = CheckpointV2PaidExecutionGate(gate_dir)
+        self._restored = False
+        self._restore_attempted = False
+        self._restore_receipt_sha256: str | None = None
+        self._session_id: str | None = None
+        self._payload_root: Path | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return self.gate.enabled
+
+    @property
+    def payload_root(self) -> Path | None:
+        return self._payload_root
+
+    @staticmethod
+    def _private_tree(root: Path) -> None:
+        _validate_regular_tree(root, label="checkpoint v2 restore root")
+        try:
+            entries = [root]
+            for current, directories, files in os.walk(root, followlinks=False):
+                base = Path(current)
+                entries.extend(base / name for name in directories)
+                entries.extend(base / name for name in files)
+        except OSError as exc:
+            raise CheckpointError("checkpoint v2 restore tree is unreadable") from exc
+        if len(entries) > _MAX_CHECKPOINT_FILES + 16:
+            raise CheckpointError("checkpoint v2 restore tree is oversized")
+        for path in entries:
+            metadata = path.lstat()
+            if os.name == "posix" and metadata.st_uid != os.getuid():
+                raise CheckpointError("checkpoint v2 restore tree owner is unsafe")
+            mode = stat.S_IMODE(metadata.st_mode)
+            if stat.S_ISDIR(metadata.st_mode):
+                if mode != 0o700:
+                    raise CheckpointError("checkpoint v2 restore directory is not private")
+            elif stat.S_ISREG(metadata.st_mode):
+                if metadata.st_nlink != 1 or mode != 0o600:
+                    raise CheckpointError("checkpoint v2 restore file is not private")
+            else:
+                raise CheckpointError("checkpoint v2 restore tree contains special data")
+
+    @staticmethod
+    def _sha256(path: Path, *, maximum: int) -> tuple[str, int]:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(path, flags)
+        try:
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or before.st_size > maximum
+            ):
+                raise CheckpointError("checkpoint v2 restore file is unsafe")
+            digest = hashlib.sha256()
+            total = 0
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > maximum:
+                    raise CheckpointError("checkpoint v2 restore file is oversized")
+                digest.update(chunk)
+            after = os.fstat(descriptor)
+            if _metadata_fingerprint(before) != _metadata_fingerprint(after):
+                raise CheckpointError("checkpoint v2 restore file changed")
+            return digest.hexdigest(), total
+        finally:
+            os.close(descriptor)
+
+    def _validated_payload(self, contract: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
+        root = Path(contract["restore_root"])
+        try:
+            canonical = root.resolve(strict=True)
+        except OSError as exc:
+            raise CheckpointError("checkpoint v2 restore root is unavailable") from exc
+        if canonical != root.absolute() or canonical.is_symlink():
+            raise CheckpointError("checkpoint v2 restore root is unsafe")
+        self._private_tree(canonical)
+        manifest_path = canonical / "manifest.json"
+        manifest_digest, manifest_size = self._sha256(
+            manifest_path, maximum=_MAX_ARCHIVE_CONTROL_READ_BYTES,
+        )
+        if manifest_digest != contract["manifest_sha256"]:
+            raise CheckpointError("checkpoint v2 restore manifest changed")
+        try:
+            manifest = json.loads(manifest_path.read_bytes())
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise CheckpointError("checkpoint v2 restore manifest is invalid") from exc
+        if (
+            manifest_size <= 0
+            or not isinstance(manifest, dict)
+            or set(manifest) != self._MANIFEST_FIELDS
+            or manifest.get("schema") != "dradar-checkpoint-export-v2"
+            or manifest.get("protocol_version") != 2
+            or manifest.get("checkpoint_core_abi")
+            != "dradar-checkpoint-core-v2/1"
+            or manifest.get("checkpoint_abi") != contract["checkpoint_abi"]
+            or manifest.get("identity_fingerprint")
+            != contract["identity_fingerprint"]
+            or manifest.get("recovery_capability")
+            != contract["recovery_capability"]
+            or manifest.get("native_state_schema")
+            != contract["native_state_schema"]
+            or manifest.get("capture_storage") != "container_native"
+        ):
+            raise CheckpointError("checkpoint v2 restore manifest identity is invalid")
+        directories = manifest.get("directories")
+        files = manifest.get("files")
+        if (
+            not isinstance(directories, list)
+            or not isinstance(files, list)
+            or manifest.get("file_count") != len(files)
+            or len(files) + len(directories) > _MAX_CHECKPOINT_FILES
+        ):
+            raise CheckpointError("checkpoint v2 restore inventory is invalid")
+        expected_directories: set[str] = set()
+        expected_files: dict[str, dict[str, Any]] = {}
+        total_bytes = 0
+        for value in directories:
+            if (
+                not isinstance(value, str)
+                or not value
+                or value.startswith("/")
+                or ".." in PurePosixPath(value).parts
+                or PurePosixPath(value).as_posix() != value
+                or value in expected_directories
+            ):
+                raise CheckpointError("checkpoint v2 restore inventory is invalid")
+            expected_directories.add(value)
+        for value in files:
+            if not isinstance(value, dict) or set(value) != {
+                "path", "size", "sha256", "mode",
+            }:
+                raise CheckpointError("checkpoint v2 restore inventory is invalid")
+            relative = value.get("path")
+            size = value.get("size")
+            digest = value.get("sha256")
+            if (
+                not isinstance(relative, str)
+                or not relative
+                or relative.startswith("/")
+                or ".." in PurePosixPath(relative).parts
+                or PurePosixPath(relative).as_posix() != relative
+                or relative in expected_files
+                or relative in expected_directories
+                or not isinstance(size, int)
+                or isinstance(size, bool)
+                or not 0 <= size <= _MAX_CHECKPOINT_FILE_BYTES
+                or re.fullmatch(r"[0-9a-f]{64}", str(digest)) is None
+                or value.get("mode") != 0o600
+            ):
+                raise CheckpointError("checkpoint v2 restore inventory is invalid")
+            expected_files[relative] = value
+            total_bytes += size
+            if total_bytes > _MAX_CHECKPOINT_TOTAL_BYTES:
+                raise CheckpointError("checkpoint v2 restore inventory is oversized")
+        if manifest.get("total_bytes") != total_bytes:
+            raise CheckpointError("checkpoint v2 restore inventory total is invalid")
+        payload = canonical / "payload"
+        observed_directories: set[str] = set()
+        observed_files: set[str] = set()
+        for current, directory_names, file_names in os.walk(
+            payload, topdown=True, followlinks=False,
+        ):
+            base = Path(current)
+            for name in directory_names:
+                relative = (base / name).relative_to(payload).as_posix()
+                if relative not in expected_directories:
+                    raise CheckpointError("checkpoint v2 restore payload drifted")
+                observed_directories.add(relative)
+            for name in file_names:
+                path = base / name
+                relative = path.relative_to(payload).as_posix()
+                expected = expected_files.get(relative)
+                if expected is None:
+                    raise CheckpointError("checkpoint v2 restore payload drifted")
+                digest, size = self._sha256(
+                    path, maximum=_MAX_CHECKPOINT_FILE_BYTES,
+                )
+                if digest != expected["sha256"] or size != expected["size"]:
+                    raise CheckpointError("checkpoint v2 restore payload drifted")
+                observed_files.add(relative)
+        if (
+            observed_directories != expected_directories
+            or observed_files != set(expected_files)
+        ):
+            raise CheckpointError("checkpoint v2 restore payload is incomplete")
+        if _path_contains_any(payload, ()):
+            raise CheckpointError("checkpoint v2 restore payload contains a credential")
+        progress_path = payload / "progress.json"
+        try:
+            progress = json.loads(progress_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise CheckpointError("checkpoint v2 restore progress is invalid") from exc
+        if (
+            not isinstance(progress, dict)
+            or set(progress) != self._PROGRESS_FIELDS
+            or progress.get("schema") != "dradar-checkpoint-adapter-progress-v2"
+            or progress.get("checkpoint_abi") != contract["checkpoint_abi"]
+            or progress.get("recovery_capability")
+            != contract["recovery_capability"]
+            or re.fullmatch(r"[0-9a-f]{40,64}", str(progress.get("base_commit")))
+            is None
+            or not isinstance(progress.get("session_id_present"), bool)
+            or not isinstance(progress.get("native_artifacts"), list)
+        ):
+            raise CheckpointError("checkpoint v2 restore progress is invalid")
+        self._payload_root = payload
+        return payload, progress
+
+    @staticmethod
+    async def _make_uploaded_owned(
+        agent: Any, environment: Any, env: dict[str, str], path: str,
+        *, recursive: bool,
+    ) -> None:
+        default_user = getattr(environment, "default_user", None)
+        if default_user is None:
+            return
+        owner = str(default_user)
+        if re.fullmatch(r"[0-9]+(?::[0-9]+)?", owner) is None:
+            raise CheckpointError("checkpoint v2 restore agent identity is invalid")
+        command = (
+            f"chown {'-R ' if recursive else ''}{shlex.quote(owner)} "
+            f"{shlex.quote(path)} && "
+            + (
+                f"find -P {shlex.quote(path)} -type d -exec chmod 700 -- {{}} +; "
+                f"find -P {shlex.quote(path)} -type f -exec chmod 600 -- {{}} +"
+                if recursive
+                else f"chmod 600 {shlex.quote(path)}"
+            )
+        )
+        await agent.exec_as_root(environment, command=command, env=env)
+
+    async def restore_if_requested(
+        self,
+        agent: Any,
+        environment: Any,
+        env: dict[str, str],
+        *,
+        state_paths: Iterable["StatePath"],
+        sensitive_values: Iterable[str | bytes] = (),
+        workdir: str = "/app",
+    ) -> str | None:
+        if not self.enabled:
+            return None
+        if self._restored:
+            return self._session_id
+        if self._restore_attempted:
+            raise CheckpointError(
+                "checkpoint v2 partial restore cannot be retried in place"
+            )
+        contract = self.gate._contract()
+        if contract["action"] == "fresh":
+            self._restored = True
+            return None
+        # A resume mutates the disposable Harness worktree and native state.
+        # Any failure must terminate this Pier/container; retrying in place
+        # could apply the same patch twice or mix partial Provider state.
+        self._restore_attempted = True
+        payload, progress = self._validated_payload(contract)
+        needles = tuple(
+            value if isinstance(value, bytes) else value.encode("utf-8")
+            for value in sensitive_values
+            if isinstance(value, (str, bytes)) and len(value) >= 8
+        )
+        if _path_contains_any(payload, needles):
+            raise CheckpointError("checkpoint v2 restore payload contains a credential")
+        base = await agent.exec_as_agent(
+            environment,
+            command=f"git -C {shlex.quote(workdir)} rev-parse HEAD",
+            env=env,
+        )
+        if base.stdout.strip() != progress["base_commit"]:
+            raise CheckpointIncompatibleError(
+                "checkpoint v2 task base commit changed"
+            )
+        remote_root = f"/tmp/dradar-checkpoint-v2-restore-{contract['gate_nonce']}"
+        await agent.exec_as_agent(
+            environment,
+            command=f"rm -rf {shlex.quote(remote_root)} && mkdir -p {shlex.quote(remote_root)}",
+            env=env,
+        )
+        try:
+            patch = payload / "workspace.patch"
+            remote_patch = remote_root + "/workspace.patch"
+            if patch.stat().st_size:
+                await environment.upload_file(patch, remote_patch)
+                await self._make_uploaded_owned(
+                    agent, environment, env, remote_patch, recursive=False,
+                )
+                await agent.exec_as_agent(
+                    environment,
+                    command=(
+                        f"git -C {shlex.quote(workdir)} apply --check --binary "
+                        f"{shlex.quote(remote_patch)} && "
+                        f"git -C {shlex.quote(workdir)} apply --binary "
+                        f"{shlex.quote(remote_patch)}"
+                    ),
+                    env=env,
+                )
+            archive = payload / "untracked.tar.gz"
+            if archive.stat().st_size:
+                if _validate_archive(archive, needles):
+                    raise CheckpointError(
+                        "checkpoint v2 untracked archive contains a credential"
+                    )
+                remote_archive = remote_root + "/untracked.tar.gz"
+                await environment.upload_file(archive, remote_archive)
+                await self._make_uploaded_owned(
+                    agent, environment, env, remote_archive, recursive=False,
+                )
+                await agent.exec_as_agent(
+                    environment,
+                    command=(
+                        f"tar -xzf {shlex.quote(remote_archive)} "
+                        f"-C {shlex.quote(workdir)}"
+                    ),
+                    env=env,
+                )
+            state_root = payload / "provider-state"
+            for item in tuple(state_paths):
+                source = state_root / item.name
+                if not source.exists():
+                    continue
+                remote = item.remote_path
+                await agent.exec_as_agent(
+                    environment,
+                    command=f"rm -rf {shlex.quote(remote)} && mkdir -p "
+                    f"{shlex.quote(str(PurePosixPath(remote).parent))}",
+                    env=env,
+                )
+                if source.is_dir():
+                    await environment.upload_dir(source, remote)
+                    await self._make_uploaded_owned(
+                        agent, environment, env, remote, recursive=True,
+                    )
+                elif source.is_file():
+                    await environment.upload_file(source, remote)
+                    await self._make_uploaded_owned(
+                        agent, environment, env, remote, recursive=False,
+                    )
+                else:
+                    raise CheckpointError(
+                        "checkpoint v2 provider state is unsafe"
+                    )
+            session_path = payload / "session-id"
+            session_id = None
+            if session_path.exists():
+                session_id = session_path.read_text(
+                    encoding="utf-8", errors="strict",
+                ).strip()
+                if _SESSION_ID_RE.fullmatch(session_id) is None:
+                    raise CheckpointError(
+                        "checkpoint v2 native session id is invalid"
+                    )
+            if bool(session_id) is not progress["session_id_present"]:
+                raise CheckpointError(
+                    "checkpoint v2 native session evidence is inconsistent"
+                )
+            self._session_id = session_id
+            self._restore_receipt_sha256 = contract["restore_receipt_sha256"]
+            self._restored = True
+            return session_id
+        finally:
+            try:
+                await agent.exec_as_agent(
+                    environment,
+                    command=f"rm -rf {shlex.quote(remote_root)}",
+                    env=env,
+                )
+            except BaseException:
+                pass
+
+    async def authorize_provider_start(self) -> None:
+        if not self.enabled:
+            return
+        contract = self.gate._contract()
+        if not self._restored:
+            raise CheckpointError(
+                "checkpoint v2 paid gate was reached before restore preparation"
+            )
+        await self.gate.authorize_provider_start(
+            action=contract["action"],
+            restore_receipt_sha256=self._restore_receipt_sha256,
+        )
 
 
 class AgentLogStore:
@@ -3362,6 +4035,8 @@ __all__ = [
     "AgentLogStore",
     "CheckpointError",
     "CheckpointIncompatibleError",
+    "CheckpointV2PaidExecutionGate",
+    "CheckpointV2PreProviderBarrier",
     "DurableCheckpoint",
     "StatePath",
     "UnsafeAgentLog",

@@ -23,11 +23,19 @@ from pier.models.agent.install import AgentInstallSpec, InstallStep
 from pier.models.agent.network import NetworkAllowlist
 
 try:
-    from _dradar_pier_checkpoint import DurableCheckpoint, StatePath
+    from _dradar_pier_checkpoint import (
+        CheckpointV2PreProviderBarrier,
+        DurableCheckpoint,
+        StatePath,
+    )
 except ModuleNotFoundError as exc:  # Local source/test import before materialization.
     if exc.name != "_dradar_pier_checkpoint":
         raise
-    from dradar.pier_checkpoint import DurableCheckpoint, StatePath
+    from dradar.pier_checkpoint import (
+        CheckpointV2PreProviderBarrier,
+        DurableCheckpoint,
+        StatePath,
+    )
 
 DSH_VERSION = "0.1.1-rc.1"
 NODE_VERSION = "22.23.2"
@@ -446,6 +454,7 @@ class DshMinimal(BaseInstalledAgent):
         checkpoint_effort: str | None = None,
         checkpoint_resume_generation: str | int = 0,
         checkpoint_path: str | None = None,
+        checkpoint_v2_gate_dir: str | None = None,
         extra_env: dict[str, str] | None = None,
         **kwargs: Any,
     ):
@@ -535,6 +544,9 @@ class DshMinimal(BaseInstalledAgent):
         self._checkpoint_resume_generation = checkpoint_resume_generation
         self._checkpoint_path = checkpoint_path
         self._checkpoint_sensitive_values = (key_bytes.strip(),)
+        self._checkpoint_v2_barrier = CheckpointV2PreProviderBarrier(
+            checkpoint_v2_gate_dir,
+        )
         run_secret_dir = self._REMOTE_SECRET_ROOT / uuid.uuid4().hex
         self._remote_secret_dir = run_secret_dir
         self._remote_api_key = run_secret_dir / "deepseek-api-key"
@@ -668,6 +680,18 @@ class DshMinimal(BaseInstalledAgent):
         # survive. Create and hand off all runtime directories after mounts.
         await root_maintenance(setup_command)
         resume_session_id = await checkpoint.start(self, environment, env)
+        v2_session_id = await self._checkpoint_v2_barrier.restore_if_requested(
+            self,
+            environment,
+            env,
+            state_paths=(
+                StatePath("dsh-sessions", f"{remote_home}/sessions"),
+                StatePath("dsh-attachments", f"{remote_home}/attachments"),
+            ),
+            sensitive_values=self._checkpoint_sensitive_values,
+        )
+        if v2_session_id is not None:
+            resume_session_id = v2_session_id
         failure: BaseException | None = None
         try:
             if resume_session_id is not None:
@@ -731,6 +755,7 @@ class DshMinimal(BaseInstalledAgent):
                 f"{shlex.quote(instruction)} 2>&1 </dev/null | "
                 f"tee {shlex.quote(stream)}"
             )
+            await self._checkpoint_v2_barrier.authorize_provider_start()
             await self.exec_as_agent(
                 environment,
                 command=command,

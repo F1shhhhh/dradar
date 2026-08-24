@@ -28,6 +28,7 @@ from pathlib import Path
 import httpx
 
 from . import checkpoints, egress
+from .checkpoint_v2 import CheckpointV2OrdinaryFallback
 from .manifest import task_content_hash
 from .providers import (
     DEFAULT_CODEX_PROVIDER,
@@ -264,6 +265,9 @@ class TrialArtifacts:
     zcode_cli_version: str | None = None
     dsh_version: str | None = None
     dsh_artifact_binding: dict[str, object] | None = None
+    checkpoint_v2_owner: object | None = None
+    checkpoint_impact_sample_id: str | None = None
+    checkpoint_sync_elapsed_ms: int = 0
 
 
 class RunnerError(RuntimeError):
@@ -276,6 +280,18 @@ class RunnerError(RuntimeError):
 
 class LiveAccountTerminalError(RunnerError):
     """A running agent reported an account-wide terminal provider failure."""
+
+
+class CheckpointV2RestorePreflightError(RuntimeError):
+    """Pier failed a free restore before its paid Provider gate."""
+
+
+class CheckpointV2PaidGateAmbiguousError(RuntimeError):
+    """Server authorization and the local grant file may have diverged."""
+
+
+class CheckpointV2PaidGateFaultedError(RunnerError):
+    """Ambiguous gate was stopped; ordinary retry is intentionally forbidden."""
 
 
 def resolve_latest_codex_cli_version(
@@ -919,26 +935,35 @@ def _checkpoint_agent_kwargs(
     resume_checkpoint: Path | None,
     *,
     enabled: bool = True,
+    checkpoint_v2_agent_kwargs: dict[str, str] | None = None,
 ) -> list[str]:
+    values: list[str] = []
     if not enabled:
         if resume_checkpoint is not None:
             raise RunnerError(
                 "durable checkpoint resume is temporarily unavailable in "
                 "this release; the saved checkpoint was not started or discarded"
             )
-        return []
-    values = [
-        "--ak", "checkpoint_enabled=true",
-        "--ak", f"checkpoint_assignment_id={assignment['assignment_id']}",
-        "--ak", f"checkpoint_task_id={assignment['task_id']}",
-        "--ak", f"checkpoint_effort={assignment['effort']}",
-        "--ak", (
-            "checkpoint_resume_generation="
-            f"{assignment.get('resume_generation', 0)}"
-        ),
-    ]
-    if resume_checkpoint is not None:
-        values += ["--ak", f"checkpoint_path={resume_checkpoint}"]
+    else:
+        values = [
+            "--ak", "checkpoint_enabled=true",
+            "--ak", f"checkpoint_assignment_id={assignment['assignment_id']}",
+            "--ak", f"checkpoint_task_id={assignment['task_id']}",
+            "--ak", f"checkpoint_effort={assignment['effort']}",
+            "--ak", (
+                "checkpoint_resume_generation="
+                f"{assignment.get('resume_generation', 0)}"
+            ),
+        ]
+        if resume_checkpoint is not None:
+            values += ["--ak", f"checkpoint_path={resume_checkpoint}"]
+    if checkpoint_v2_agent_kwargs:
+        if set(checkpoint_v2_agent_kwargs) != {"checkpoint_v2_gate_dir"}:
+            raise RunnerError("checkpoint v2 Pier arguments are invalid")
+        gate_dir = Path(checkpoint_v2_agent_kwargs["checkpoint_v2_gate_dir"])
+        if not gate_dir.is_absolute():
+            raise RunnerError("checkpoint v2 paid gate path must be absolute")
+        values += ["--ak", f"checkpoint_v2_gate_dir={gate_dir}"]
     return values
 
 
@@ -952,6 +977,7 @@ def build_pier_command(
     resume_checkpoint: Path | None = None,
     provider_auth_path: Path | None = None,
     provider_cli_path: Path | None = None,
+    checkpoint_v2_agent_kwargs: dict[str, str] | None = None,
 ) -> list[str]:
     task_path = tasks_root / assignment["task_id"]
     if not task_path.is_dir():
@@ -1014,7 +1040,10 @@ def build_pier_command(
         _ensure_deepseek_agent_module(home)
         agent_args = ["--agent-import-path", DEEPSEEK_AGENT_IMPORT_PATH]
     elif agent == "codex" and provider == DEFAULT_CODEX_PROVIDER:
-        if bool(assignment.get("_durable_checkpoint_enabled", True)):
+        if (
+            bool(assignment.get("_durable_checkpoint_enabled", True))
+            or bool(checkpoint_v2_agent_kwargs)
+        ):
             _ensure_codex_agent_module(home)
             agent_args = ["--agent-import-path", CODEX_AGENT_IMPORT_PATH]
         else:
@@ -1096,6 +1125,7 @@ def build_pier_command(
             *_checkpoint_agent_kwargs(
                 assignment, resume_checkpoint,
                 enabled=bool(assignment.get("_durable_checkpoint_enabled", True)),
+                checkpoint_v2_agent_kwargs=checkpoint_v2_agent_kwargs,
             ),
             "--ae", f"CODEX_AUTH_JSON_PATH={auth}",
         ]
@@ -1135,6 +1165,7 @@ def build_pier_command(
             *_checkpoint_agent_kwargs(
                 assignment, resume_checkpoint,
                 enabled=bool(assignment.get("_durable_checkpoint_enabled", True)),
+                checkpoint_v2_agent_kwargs=checkpoint_v2_agent_kwargs,
             ),
             "--ae", f"CODEX_AUTH_JSON_PATH={provider_auth_path}",
             "--ak", f"version={_deepseek_codex_version(assignment)}",
@@ -1182,6 +1213,7 @@ def build_pier_command(
             *_checkpoint_agent_kwargs(
                 assignment, resume_checkpoint,
                 enabled=bool(assignment.get("_durable_checkpoint_enabled", True)),
+                checkpoint_v2_agent_kwargs=checkpoint_v2_agent_kwargs,
             ),
         ]
     elif agent == GROK_AGENT:
@@ -1232,6 +1264,7 @@ def build_pier_command(
             *_checkpoint_agent_kwargs(
                 assignment, resume_checkpoint,
                 enabled=bool(assignment.get("_durable_checkpoint_enabled", True)),
+                checkpoint_v2_agent_kwargs=checkpoint_v2_agent_kwargs,
             ),
         ]
     elif agent == ZCODE_AGENT:
@@ -1259,6 +1292,7 @@ def build_pier_command(
             *_checkpoint_agent_kwargs(
                 assignment, resume_checkpoint,
                 enabled=bool(assignment.get("_durable_checkpoint_enabled", True)),
+                checkpoint_v2_agent_kwargs=checkpoint_v2_agent_kwargs,
             ),
         ]
     return cmd
@@ -3044,6 +3078,8 @@ def run_trial(
     dev_agent: str | None = None,
     on_started: Callable[[], None] | None = None,
     resume_checkpoint: Path | None = None,
+    checkpoint_shadow_factory: Callable[[dict, Path], object | None] | None = None,
+    checkpoint_owner_factory: Callable[[dict, Path], object] | None = None,
 ) -> TrialArtifacts:
     effective_assignment = assignment
     codex_cli_version = None
@@ -3153,6 +3189,9 @@ def run_trial(
     # `interrupted` -> the server marks it invalid and the cell reopens.
     timeout_sec = _effective_trial_timeout_sec(effective_assignment)
     terminal_error: RunnerError | None = None
+    checkpoint_v2_owner = None
+    checkpoint_impact_sample_id: str | None = None
+    checkpoint_sync_elapsed_ms = 0
     live_error_offsets: dict[Path, int] = {}
     live_error_counts: dict[str, int] = {}
     watch_live_account_errors = (
@@ -3221,16 +3260,86 @@ def run_trial(
                     job_name,
                 )
             )
+        if (
+            checkpoint_shadow_factory is not None
+            and checkpoint_owner_factory is not None
+        ):
+            raise RunnerError(
+                "checkpoint shadow and authoritative owner are mutually exclusive"
+            )
+        checkpoint_v2_agent_kwargs = None
+        if checkpoint_owner_factory is not None:
+            try:
+                checkpoint_v2_owner = checkpoint_owner_factory(
+                    effective_assignment,
+                    jobs_dir / job_name,
+                )
+                checkpoint_v2_owner.prepare()
+                checkpoint_v2_agent_kwargs = (
+                    checkpoint_v2_owner.pier_agent_kwargs()
+                )
+            except Exception as exc:
+                if (
+                    isinstance(exc, CheckpointV2OrdinaryFallback)
+                    and checkpoint_v2_owner is not None
+                    and checkpoint_v2_owner.ordinary_fallback
+                    and checkpoint_v2_owner.permit is None
+                ):
+                    if exc.assignment_restarted_fresh:
+                        if (
+                            not isinstance(exc.owner_epoch, int)
+                            or not isinstance(exc.resume_generation, int)
+                        ):
+                            raise RunnerError(
+                                "checkpoint V2 fresh fallback omitted its fence"
+                            ) from exc
+                        fresh_facts = {
+                            "checkpoint_protocol_version": 1,
+                            "checkpoint_id": None,
+                            "execution_state": "waiting",
+                            "owner_epoch": exc.owner_epoch,
+                            "resume_generation": exc.resume_generation,
+                        }
+                        assignment.update(fresh_facts)
+                        effective_assignment.update(fresh_facts)
+                        resume_checkpoint = None
+                    fallback_owner = checkpoint_v2_owner
+                    checkpoint_v2_owner = None
+                    checkpoint_v2_agent_kwargs = None
+
+                    def checkpoint_shadow_factory(
+                        _effective_assignment, _job_root,
+                    ):
+                        return fallback_owner.build_ordinary_fallback_shadow()
+
+                    print(
+                        "checkpoint V2 recovery declined before Provider "
+                        "start; continuing the ordinary fresh task with "
+                        "fail-open shadow observation"
+                    )
+                else:
+                    raise RunnerError(
+                        "checkpoint v2 free preparation failed before model start"
+                    ) from exc
         if resume_checkpoint is None:
             cmd = build_pier_command(
                 effective_assignment, pier_tasks_root, jobs_dir, job_name, work_dir,
-                dev_agent, **provider_kwargs,
+                dev_agent,
+                **provider_kwargs,
+                **(
+                    {"checkpoint_v2_agent_kwargs": checkpoint_v2_agent_kwargs}
+                    if checkpoint_v2_agent_kwargs is not None else {}
+                ),
             )
         else:
             cmd = build_pier_command(
                 effective_assignment, pier_tasks_root, jobs_dir, job_name, work_dir,
                 dev_agent, resume_checkpoint=resume_checkpoint,
                 **provider_kwargs,
+                **(
+                    {"checkpoint_v2_agent_kwargs": checkpoint_v2_agent_kwargs}
+                    if checkpoint_v2_agent_kwargs is not None else {}
+                ),
             )
         env = _pier_process_env(
             effective_assignment,
@@ -3240,7 +3349,7 @@ def run_trial(
                 work_dir
                 if effective_agent == "codex"
                 and codex_provider == DEFAULT_CODEX_PROVIDER
-                and checkpoint_enabled
+                and (checkpoint_enabled or checkpoint_v2_agent_kwargs is not None)
                 else None
             ),
             deepseek_module_dir=(
@@ -3251,7 +3360,7 @@ def run_trial(
             zcode_module_dir=(work_dir if effective_agent == ZCODE_AGENT else None),
             dsh_module_dir=(work_dir if effective_agent == DSH_AGENT else None),
         )
-        if on_started is not None:
+        if on_started is not None and checkpoint_v2_owner is None:
             # Best-effort by design: this only confirms to the server that a
             # free-pick claim's short initial lease should be extended (see
             # app.py's assignment_started endpoint) -- a network hiccup here must
@@ -3260,8 +3369,12 @@ def run_trial(
                 on_started()
             except Exception:
                 pass
-        if not checkpoint_enabled and effective_agent in (
+        if (
+            not checkpoint_enabled
+            and checkpoint_v2_agent_kwargs is None
+            and effective_agent in (
             "codex", DSH_AGENT, KIMI_AGENT, ZCODE_AGENT,
+            )
         ):
             print(
                 "checkpoint safety fallback active: this trial will run without "
@@ -3276,15 +3389,65 @@ def run_trial(
             # tell "working" from "wedged" without docker-exec'ing into the
             # container (volunteer report, 2026-07-13). Once a minute, print
             # elapsed time plus the newest pier log line.
-            proc = subprocess.Popen(
-                cmd,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                cwd=work_dir,
-                env=env,
-                start_new_session=(os.name != "nt"),
-            )
+            if checkpoint_v2_owner is not None:
+                checkpoint_v2_owner.record_pier_launch_intent(cmd)
             try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    cwd=work_dir,
+                    env=env,
+                    start_new_session=(os.name != "nt"),
+                )
+            except Exception as exc:
+                if checkpoint_v2_owner is not None:
+                    try:
+                        checkpoint_v2_owner.record_pier_launch_failed(
+                            code="popen_failed",
+                        )
+                    except Exception:
+                        pass
+                raise RunnerError(
+                    "Pier process could not start before checkpoint v2 paid authorization"
+                ) from exc
+            shadow_controller = None
+            if checkpoint_shadow_factory is not None:
+                try:
+                    shadow_controller = checkpoint_shadow_factory(
+                        effective_assignment,
+                        jobs_dir / job_name,
+                    )
+                    if shadow_controller is not None:
+                        shadow_controller.start()
+                except Exception:
+                    # Shadow setup is deliberately fail-open. The server-side
+                    # rollout remains observable through missing/failure
+                    # evidence, while the paid mainline proceeds unchanged.
+                    shadow_controller = None
+            try:
+                if checkpoint_v2_owner is not None:
+                    checkpoint_v2_owner.register_pier_process(proc, cmd)
+                if checkpoint_v2_owner is not None:
+                    try:
+                        checkpoint_v2_owner.authorize_at_paid_gate(
+                            proc, timeout_sec=timeout_sec,
+                        )
+                    except Exception as exc:
+                        if isinstance(exc, CheckpointV2OrdinaryFallback):
+                            raise
+                        if checkpoint_v2_owner.paid_gate_reconcile_required:
+                            raise CheckpointV2PaidGateAmbiguousError(
+                                "checkpoint v2 paid gate outcome is ambiguous"
+                            ) from exc
+                        if checkpoint_v2_owner.offline_restore_pending:
+                            raise CheckpointV2RestorePreflightError(
+                                "checkpoint v2 restore failed before Provider start"
+                            ) from exc
+                        raise RunnerError(
+                            "checkpoint v2 paid start was not authorized at "
+                            "the pre-Provider gate"
+                        ) from exc
                 next_beat = started + HEARTBEAT_SEC
                 while True:
                     try:
@@ -3293,6 +3456,11 @@ def run_trial(
                     except subprocess.TimeoutExpired:
                         pass
                     now = time.time()
+                    if checkpoint_v2_owner is not None:
+                        try:
+                            checkpoint_v2_owner.raise_if_fatal()
+                        except Exception as exc:
+                            raise RunnerError(str(exc)) from exc
                     if watch_live_account_errors:
                         live_failure = _scan_live_account_errors(
                             jobs_dir, job_name,
@@ -3343,6 +3511,41 @@ def run_trial(
                         f"{exc}\nPier cleanup safety check failed: "
                         + "; ".join(cleanup_errors),
                     ) from exc
+                if isinstance(exc, CheckpointV2RestorePreflightError):
+                    try:
+                        fallback = (
+                            checkpoint_v2_owner.fallback_after_restore_preflight()
+                        )
+                    except Exception as fallback_error:
+                        raise RunnerError(
+                            "checkpoint v2 restore failed and the ordinary "
+                            "fresh fallback could not be fenced"
+                        ) from fallback_error
+                    raise fallback
+                if isinstance(exc, CheckpointV2PaidGateAmbiguousError):
+                    try:
+                        reconciliation = (
+                            checkpoint_v2_owner.reconcile_ambiguous_paid_gate()
+                        )
+                    except Exception as reconcile_error:
+                        raise CheckpointV2PaidGateFaultedError(
+                            "checkpoint v2 paid gate reconciliation is still "
+                            "pending; ordinary retry is blocked"
+                        ) from reconcile_error
+                    if reconciliation.get("outcome") == "fresh_fallback":
+                        raise CheckpointV2OrdinaryFallback(
+                            "observe",
+                            assignment_restarted_fresh=True,
+                            owner_epoch=reconciliation.get("owner_epoch"),
+                            resume_generation=reconciliation.get(
+                                "resume_generation"
+                            ),
+                            reason="paid_gate_not_committed",
+                        )
+                    raise CheckpointV2PaidGateFaultedError(
+                        "checkpoint v2 paid gate was reconciled as faulted; "
+                        "ordinary retry is blocked"
+                    )
                 if isinstance(exc, RunnerError):
                     # A watchdog timeout is terminal for this process, but Pier
                     # may already have harvested a patch, trajectory and token
@@ -3353,6 +3556,31 @@ def run_trial(
                     terminal_error = exc
                 else:
                     raise
+            finally:
+                if shadow_controller is not None:
+                    try:
+                        shadow_controller.close()
+                    except Exception:
+                        pass
+                    sample_id = getattr(
+                        shadow_controller, "impact_sample_id", None,
+                    )
+                    sync_elapsed = getattr(
+                        shadow_controller, "checkpoint_sync_elapsed_ms", 0,
+                    )
+                    if isinstance(sample_id, str):
+                        checkpoint_impact_sample_id = sample_id
+                    if (
+                        isinstance(sync_elapsed, int)
+                        and not isinstance(sync_elapsed, bool)
+                        and sync_elapsed >= 0
+                    ):
+                        checkpoint_sync_elapsed_ms = sync_elapsed
+                if checkpoint_v2_owner is not None:
+                    try:
+                        checkpoint_v2_owner.mainline_exited()
+                    except Exception:
+                        pass
     finally:
         if provider_auth_path is not None:
             if (
@@ -3516,6 +3744,9 @@ def run_trial(
         zcode_cli_version=zcode_cli_version,
         dsh_version=dsh_version,
         dsh_artifact_binding=dsh_artifact_binding,
+        checkpoint_v2_owner=checkpoint_v2_owner,
+        checkpoint_impact_sample_id=checkpoint_impact_sample_id,
+        checkpoint_sync_elapsed_ms=checkpoint_sync_elapsed_ms,
     )
 
 

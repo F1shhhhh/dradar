@@ -13,9 +13,11 @@ import sys
 import threading
 import time
 import uuid
+from pathlib import Path
 
 from . import __version__
 from .api_client import ApiClient, ApiError
+from .checkpoint_observation_v2 import CheckpointObservationReporterV2
 
 
 def platform_family() -> str:
@@ -67,6 +69,137 @@ class RunnerTelemetry:
         self._disabled = False
         self._jitter = jitter
         self._shown_notice_ids: set[str] = set()
+        self._checkpoint_container_backend: str | None = None
+        self._checkpoint_machine_fingerprint: str | None = None
+        self._checkpoint_observation_reporter: (
+            CheckpointObservationReporterV2 | None
+        ) = None
+
+    def configure_checkpoint_runtime(
+        self,
+        *,
+        container_backend: str,
+        machine_fingerprint: str,
+    ) -> None:
+        """Attach immutable, privacy-preserving V2 recovery cohort facts."""
+
+        if container_backend not in {
+            "docker", "orbstack", "podman", "native", "other",
+        }:
+            raise ValueError("unknown checkpoint container backend")
+        if (
+            not isinstance(machine_fingerprint, str)
+            or len(machine_fingerprint) != 64
+            or any(ch not in "0123456789abcdef" for ch in machine_fingerprint)
+        ):
+            raise ValueError("invalid checkpoint machine fingerprint")
+        with self._lock:
+            current = (
+                self._checkpoint_container_backend,
+                self._checkpoint_machine_fingerprint,
+            )
+            requested = (container_backend, machine_fingerprint)
+            if current != (None, None) and current != requested:
+                raise ValueError("checkpoint runtime identity is immutable")
+            self._checkpoint_container_backend = container_backend
+            self._checkpoint_machine_fingerprint = machine_fingerprint
+
+    def configure_checkpoint_observation_reporting(self, home: Path) -> None:
+        """Enable the optional shadow outbox for a non-OFF V2 activation.
+
+        Merely constructing ``RunnerTelemetry`` must remain a strict no-op for
+        Checkpoint V2.  The rollout coordinator calls this method only after
+        the assignment/server negotiation enables capture.  The reporter is
+        deliberately independent from the heartbeat: a slow observation POST
+        cannot consume this thread's send lock or delay an atomic checkout.
+        """
+
+        requested_root = (
+            Path(home).absolute() / "checkpoint-v2" / "observations"
+        )
+        with self._lock:
+            current = self._checkpoint_observation_reporter
+            if current is not None:
+                if current.spool.root != requested_root:
+                    raise ValueError(
+                        "checkpoint observation account boundary is immutable",
+                    )
+                return
+            reporter = CheckpointObservationReporterV2(self.client, Path(home))
+            self._checkpoint_observation_reporter = reporter
+            already_started = self._thread is not None
+        if already_started:
+            reporter.start()
+
+    def record_checkpoint_observation(self, payload: dict) -> bool:
+        """Queue shadow evidence without I/O, waiting, or raising."""
+
+        with self._lock:
+            reporter = self._checkpoint_observation_reporter
+        if reporter is None:
+            return False
+        try:
+            return reporter.record(payload)
+        except Exception:
+            return False
+
+    def persist_checkpoint_observation(self, payload: dict) -> bool:
+        """Crash-safely hand off shadow evidence outside the paid mainline."""
+
+        with self._lock:
+            reporter = self._checkpoint_observation_reporter
+        if reporter is None:
+            return False
+        try:
+            return reporter.persist(payload)
+        except Exception:
+            return False
+
+    def register_checkpoint_cohort(self, payload: dict) -> bool:
+        """Bind local evidence to this exact runner session and cohort."""
+
+        with self._lock:
+            reporter = self._checkpoint_observation_reporter
+            session_id = self.session_id
+        if reporter is None:
+            return False
+        materialized = dict(payload)
+        materialized["runner_session_id"] = session_id
+        try:
+            return reporter.register_cohort(materialized)
+        except Exception:
+            return False
+
+    def begin_checkpoint_mainline_impact(self, payload: dict) -> str | None:
+        """Open one crash-visible ordinary-run/shadow pair off the paid path."""
+
+        with self._lock:
+            reporter = self._checkpoint_observation_reporter
+            session_id = self.session_id
+        if reporter is None:
+            return None
+        materialized = dict(payload)
+        materialized["runner_session_id"] = session_id
+        try:
+            return reporter.begin_mainline_impact(materialized)
+        except Exception:
+            return None
+
+    def complete_checkpoint_mainline_impact(
+        self,
+        sample_id: str,
+        payload: dict,
+    ) -> bool:
+        """Finish a local pair after result handoff; evidence failure is inert."""
+
+        with self._lock:
+            reporter = self._checkpoint_observation_reporter
+        if reporter is None:
+            return False
+        try:
+            return reporter.complete_mainline_impact(sample_id, dict(payload))
+        except Exception:
+            return False
 
     def _show_notices(self, response: dict) -> None:
         """Print each bounded server notice at most once per runner process."""
@@ -95,6 +228,8 @@ class RunnerTelemetry:
     def start(self) -> None:
         if self._thread is not None:
             return
+        if self._checkpoint_observation_reporter is not None:
+            self._checkpoint_observation_reporter.start()
         self._thread = threading.Thread(
             target=self._loop, name="dradar-heartbeat", daemon=True)
         self._thread.start()
@@ -137,7 +272,7 @@ class RunnerTelemetry:
     def _payload(self) -> dict:
         with self._lock:
             self._seq += 1
-            return {
+            payload = {
                 "protocol_version": 2,
                 "client_version": __version__,
                 "session_id": self.session_id,
@@ -151,6 +286,12 @@ class RunnerTelemetry:
                 "platform": platform_family(),
                 "target_workers": self.target_workers,
             }
+            if self._checkpoint_container_backend is not None:
+                payload["container_backend"] = self._checkpoint_container_backend
+                payload["checkpoint_machine_fingerprint"] = (
+                    self._checkpoint_machine_fingerprint
+                )
+            return payload
 
     def _send_once(self) -> int:
         """Send once and return the server-selected next interval."""
@@ -214,6 +355,8 @@ class RunnerTelemetry:
         self._wake.set()
         if self._thread is not None:
             self._thread.join(timeout=1.0)
+        if self._checkpoint_observation_reporter is not None:
+            self._checkpoint_observation_reporter.close(timeout=0.25)
         if self._disabled:
             return
         with self._lock:

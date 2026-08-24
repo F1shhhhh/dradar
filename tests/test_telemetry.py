@@ -9,6 +9,7 @@ class FakeClient:
         self.responses = list(responses or [])
         self.heartbeats = []
         self.closes = []
+        self.checkpoint_observations = []
 
     def runner_heartbeat(self, payload):
         self.heartbeats.append(payload)
@@ -23,6 +24,51 @@ class FakeClient:
     def runner_close(self, payload):
         self.closes.append(payload)
         return {"ok": True}
+
+    def checkpoint_v2_observation(self, payload):
+        self.checkpoint_observations.append(payload)
+        return {
+            "ok": True,
+            "assignment_id": payload["assignment_id"],
+            "capture_id": payload["capture_id"],
+            "status": payload["status"],
+            "assignment_unchanged": True,
+            "paid_execution_authorized": False,
+        }
+
+
+def _checkpoint_observation():
+    return {
+        "observation_kind": "capture",
+        "assignment_id": "assignment-0001",
+        "operation_id": "operation-0001",
+        "capture_id": "capture-0001",
+        "checkpoint_id": "checkpoint-0001",
+        "checkpoint_lineage_id": "lineage-0001",
+        "snapshot_generation": 1,
+        "rollout_mode": "observe",
+        "status": "failed",
+        "stage": "capture",
+        "failure_code": "capture_failed",
+        "failure_type": "RuntimeError",
+        "identity_fingerprint": "a" * 64,
+        "checkpoint_core_abi": "dradar-checkpoint-core-v2/1",
+        "checkpoint_abi": "codex-openai/v1",
+        "capture_storage": "container_native",
+        "manifest_sha256": None,
+        "archive_sha256": None,
+        "archive_bytes": None,
+        "file_count": None,
+        "payload_bytes": None,
+        "elapsed_ms": 12,
+        "platform": "macos",
+        "container_backend": "orbstack",
+        "client_version": "0.5.97",
+        "adapter_version": "codex-openai/v1",
+        "remote_cleanup": "not_needed",
+        "authoritative": False,
+        "selected_local": False,
+    }
 
 
 def test_payload_is_one_session_not_one_per_assignment_and_stays_small():
@@ -58,6 +104,100 @@ def test_target_worker_count_is_bounded():
             assert "between 1 and 40" in str(exc)
         else:
             raise AssertionError("out-of-range target worker count was accepted")
+
+
+def test_checkpoint_runtime_identity_is_bounded_and_immutable():
+    client = FakeClient()
+    telemetry = RunnerTelemetry(client, jitter=False)
+    telemetry.configure_checkpoint_runtime(
+        container_backend="orbstack",
+        machine_fingerprint="f" * 64,
+    )
+    telemetry._send_once()
+    payload = client.heartbeats[-1]
+    assert payload["container_backend"] == "orbstack"
+    assert payload["checkpoint_machine_fingerprint"] == "f" * 64
+    try:
+        telemetry.configure_checkpoint_runtime(
+            container_backend="docker",
+            machine_fingerprint="e" * 64,
+        )
+    except ValueError as exc:
+        assert "immutable" in str(exc)
+    else:
+        raise AssertionError("checkpoint runtime identity drift was accepted")
+
+
+def test_checkpoint_observation_reporting_is_opt_in_and_account_scoped(tmp_path):
+    client = FakeClient()
+    telemetry = RunnerTelemetry(client, jitter=False)
+    payload = _checkpoint_observation()
+
+    assert telemetry.record_checkpoint_observation(payload) is False
+    assert telemetry.persist_checkpoint_observation(payload) is False
+    assert not (tmp_path / "checkpoint-v2").exists()
+
+    telemetry.configure_checkpoint_observation_reporting(tmp_path)
+    assert telemetry.record_checkpoint_observation(payload) is True
+    reporter = telemetry._checkpoint_observation_reporter
+    assert reporter is not None
+    result = reporter.flush_once()
+    assert result.persisted == 1
+    assert result.acknowledged == 1
+    assert client.checkpoint_observations == [payload]
+
+    durable_payload = dict(payload)
+    durable_payload.update({
+        "operation_id": "operation-0002",
+        "capture_id": "capture-0002",
+    })
+    assert telemetry.persist_checkpoint_observation(durable_payload) is True
+    assert reporter.spool.pending()[0][1] == durable_payload
+
+    assert telemetry.register_checkpoint_cohort({
+        "assignment_id": "assignment-0001",
+        "identity_fingerprint": "a" * 64,
+        "cohort": {
+            "platform": "macos",
+            "container_backend": "orbstack",
+            "harness": "codex",
+            "provider": "openai",
+            "client_version": "0.5.97",
+            "agent_version": "1.2.3",
+            "runtime_profile": "codex-runtime-v1",
+            "model_config_version": "codex-config-v1",
+            "runtime_compatibility_digest": "d" * 64,
+            "checkpoint_core_abi": "dradar-checkpoint-core-v2/1",
+            "checkpoint_abi": "codex-openai/v1",
+        },
+    }) is True
+    sample_id = telemetry.begin_checkpoint_mainline_impact({
+        "assignment_id": "assignment-0001",
+        "identity_fingerprint": "a" * 64,
+        "attempt_id": "attempt-0001",
+        "assignment_state_sha256": "b" * 64,
+        "started_at": "2026-08-24T00:00:00+00:00",
+    })
+    assert sample_id is not None
+    assert telemetry.complete_checkpoint_mainline_impact(sample_id, {
+        "completed_at": "2026-08-24T00:01:00+00:00",
+        "mainline_elapsed_ms": 60_000,
+        "checkpoint_sync_elapsed_ms": 10,
+        "outcome": "completed",
+        "result_preserved": True,
+        "assignment_state_sha256_after": "b" * 64,
+        "submission_preserved": True,
+        "comparable": True,
+        "exclusion_reason": None,
+    }) is True
+
+    telemetry.configure_checkpoint_observation_reporting(tmp_path)
+    try:
+        telemetry.configure_checkpoint_observation_reporting(tmp_path / "other")
+    except ValueError as exc:
+        assert "account boundary" in str(exc)
+    else:
+        raise AssertionError("checkpoint observation account boundary drift was accepted")
 
 
 def test_server_can_slow_cadence_but_not_make_it_pathological():
