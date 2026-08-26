@@ -319,7 +319,7 @@ Kimi CLI 版本，因此 macOS、Windows 与 Linux 用户都不会把错误平�
 ### ZCode GLM-5.3 系列国内 Coding Plan agent
 
 ZCode 使用国内 BigModel Coding Plan Key，不使用海外入口。先从
-[ZCode 官网](https://zcode.z.ai/cn)安装官方 ZCode `3.9.1`，再运行：
+[ZCode 官网](https://zcode.z.ai/cn)安装官方 ZCode `3.9.2`，再运行：
 
 ```bash
 dradar provider setup zcode
