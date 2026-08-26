@@ -316,25 +316,26 @@ Kimi CLI 版本，因此 macOS、Windows 与 Linux 用户都不会把错误平�
 自动推荐、排序或持续补题。checkpoint 保存工作区、Kimi session 与累计 usage stream，
 恢复使用官方 `--session`，不会追加恢复提示词。
 
-### ZCode GLM-5.3 国内 Coding Plan agent
+### ZCode GLM-5.3 系列国内 Coding Plan agent
 
 ZCode 使用国内 BigModel Coding Plan Key，不使用海外入口。先从
-[ZCode 官网](https://zcode.z.ai/cn)安装官方 ZCode `3.7.7`，再运行：
+[ZCode 官网](https://zcode.z.ai/cn)安装官方 ZCode `3.9.1`，再运行：
 
 ```bash
 dradar provider setup zcode
 dradar provider status zcode --live
 dradar doctor --agent zcode
 dradar go --pick TASK_ID:glm-5.3:high
+dradar go --pick TASK_ID:glm-5.3-flash:high
 ```
 
-`provider setup` 会从官方桌面安装的 `Resources/glm/zcode.cjs` 导入 CLI `0.16.3`，并在复制
+`provider setup` 会从官方桌面安装的 `Resources/glm/zcode.cjs` 导入 CLI `0.16.5`，并在复制
 前校验固定 SHA-256；高级用户也可以临时设置 `ZCODE_CLI_PATH` 指向该文件。Coding Plan Key
 通过关闭回显的交互式输入保存到 `~/.dradar/secrets`，不会进入命令行、配置 JSON、Git、
 DRadar 服务端或轨迹。容器启动后 Key 会立即转入 ZCode 的内存会话并删除临时文件。
 
-模型固定为 `glm-5.3`，档位为 `low`/`high`/`max`。它只参与 DeepSWE，不会出现在庞贝壁画
-认领表；只能显式领取，不进入自动推荐或补题。checkpoint 保存工作区和无凭据的 ZCode
+模型支持 `glm-5.3` 与 `glm-5.3-flash`，档位为 `low`/`high`/`max`。DeepSWE 与庞贝壁画
+均可显式领取，但不进入自动推荐或补题。checkpoint 保存工作区和无凭据的 ZCode
 session/rollout 状态，恢复使用原生 `session/resume` 并重新注入仅驻内存的运行凭据。
 
 体检失败不会领取任务。修复所有 `FAIL` 后重新运行即可。

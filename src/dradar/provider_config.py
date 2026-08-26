@@ -28,7 +28,7 @@ from .providers import (
     KIMI_CLI_VERSION,
     ZCODE_APP_VERSION,
     ZCODE_CLI_VERSION,
-    ZCODE_MODEL,
+    ZCODE_MODELS,
     ZCODE_OFFICIAL_DOWNLOAD_PAGE,
     deepseek_api_key,
     deepseek_credential_source,
@@ -504,7 +504,8 @@ def _status_zcode(*, live: bool) -> int:
     source = zcode_credential_source()
     print(
         f"ZCode provider ready via {source or 'local credential'} "
-        f"(value hidden, CLI {ZCODE_CLI_VERSION}, model {ZCODE_MODEL})."
+        f"(value hidden, CLI {ZCODE_CLI_VERSION}, models "
+        f"{', '.join(sorted(ZCODE_MODELS))})."
     )
     return _live_zcode_status(key) if live else 0
 
@@ -547,13 +548,18 @@ def _live_zcode_status(key: str) -> int:
         for item in payload.get("data", [])
         if isinstance(item, dict)
     } if isinstance(payload, dict) else set()
-    if ZCODE_MODEL not in available:
+    missing = sorted(ZCODE_MODELS - available)
+    if missing:
         print(
-            f"ZCode authentication succeeded, but {ZCODE_MODEL} is not available "
+            "ZCode authentication succeeded, but the following models are not "
+            f"available: {', '.join(missing)} "
             "to this Coding Plan account."
         )
         return 1
-    print(f"ZCode Coding Plan authentication and {ZCODE_MODEL} availability verified live.")
+    print(
+        "ZCode Coding Plan authentication and model availability verified live: "
+        + ", ".join(sorted(ZCODE_MODELS)) + "."
+    )
     return 0
 
 

@@ -23,7 +23,9 @@ from dradar.providers import (
     ZCODE_CAPABILITY,
     ZCODE_CLI_RELATIVE_PATH,
     ZCODE_CLI_VERSION,
+    ZCODE_FLASH_MODEL,
     ZCODE_MODEL,
+    ZCODE_MODELS,
     ZCODE_PROVIDER,
     advertised_capabilities,
     create_zcode_api_key_file,
@@ -61,9 +63,13 @@ def _private(path: Path, value: str = "sentinel-coding-plan-key") -> Path:
 
 
 def test_zcode_version_banner_is_parsed() -> None:
-    assert parse_zcode_cli_version("0.16.3\n") == ZCODE_CLI_VERSION
-    assert parse_zcode_cli_version("zcode 0.16.3\n") == ZCODE_CLI_VERSION
+    assert parse_zcode_cli_version("0.16.5\n") == ZCODE_CLI_VERSION
+    assert parse_zcode_cli_version("zcode 0.16.5\n") == ZCODE_CLI_VERSION
     assert parse_zcode_cli_version("unexpected") is None
+
+
+def test_zcode_model_family_includes_flash() -> None:
+    assert ZCODE_MODELS == {ZCODE_MODEL, ZCODE_FLASH_MODEL}
 
 
 def test_zcode_cli_candidates_include_official_macos_bundle(
@@ -97,6 +103,23 @@ def test_zcode_cli_path_preserves_invalid_explicit_path_for_diagnostics(
 ) -> None:
     missing = tmp_path / "missing-zcode.cjs"
     assert zcode_cli_path({"ZCODE_CLI_PATH": str(missing)}) == str(missing)
+
+
+def test_zcode_cli_path_skips_stale_import_for_verified_desktop_upgrade(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stale = _private(tmp_path / "imported.cjs", "old-runtime")
+    current = _private(tmp_path / "desktop.cjs", "new-runtime")
+    monkeypatch.setattr(
+        providers, "zcode_cli_candidates", lambda _env=None: (stale, current),
+    )
+    monkeypatch.setattr(
+        providers,
+        "zcode_cli_error",
+        lambda path=None, environ=None: None if Path(path) == current else "stale",
+    )
+
+    assert zcode_cli_path({}) == str(current)
 
 
 def test_verified_zcode_cli_is_imported_to_local_provider_slot(
@@ -200,10 +223,12 @@ def test_zcode_capability_requires_key_cli_integrity_and_adapter(
     assert ZCODE_CAPABILITY in capabilities
 
 
+@pytest.mark.parametrize("model", [ZCODE_MODEL, ZCODE_FLASH_MODEL])
 @pytest.mark.parametrize("effort", ["low", "high", "max"])
 def test_pier_command_uses_private_zcode_adapter_without_secret(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    model: str,
     effort: str,
 ) -> None:
     monkeypatch.setattr(runner.shutil, "which", lambda _name: "/usr/bin/pier")
@@ -216,11 +241,12 @@ def test_pier_command_uses_private_zcode_adapter_without_secret(
     cli = tmp_path / "zcode.cjs"
     cli.write_text("pinned", encoding="utf-8")
     cmd = runner.build_pier_command(
-        _assignment(effort=effort), tasks, tmp_path / "jobs", "job", home,
+        _assignment(model=model, effort=effort), tasks, tmp_path / "jobs", "job", home,
         provider_auth_path=key, provider_cli_path=cli,
     )
     joined = " ".join(cmd)
     assert runner.ZCODE_AGENT_IMPORT_PATH in cmd
+    assert cmd[cmd.index("--model") + 1] == model
     assert f"reasoning_effort={effort}" in cmd
     assert f"api_key_file={key}" in cmd
     assert f"zcode_cli_file={cli}" in cmd
@@ -299,6 +325,7 @@ def test_zcode_adapter_source_has_fixed_security_contract() -> None:
         in source
     )
     assert '"baseURL": "https://open.bigmodel.cn/api/anthropic"' in source
+    assert 'SUPPORTED_MODELS = frozenset({"glm-5.3", "glm-5.3-flash"})' in source
     assert '"apiKey": {"source": "inline", "value": key}' in source
     assert 'key_file.unlink()' in source
     assert '"memoryEnabled": False' in source

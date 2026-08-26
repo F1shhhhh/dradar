@@ -43,9 +43,9 @@ except ModuleNotFoundError:  # Local source-tree tests import the packaged modul
     )
 
 
-ZCODE_CLI_VERSION = "0.16.3"
+ZCODE_CLI_VERSION = "0.16.5"
 ZCODE_CLI_SHA256 = (
-    "4130592942dcaa070f898c2c0152a8345dbfacbf6efb6422b2753c626e756bf5"
+    "883c12ab99b790fadc5f3ec2f229acd269d8c5460654b4c279c1e18368c436d8"
 )
 NODE_VERSION = "22.23.2"
 NODE_SHA256 = {
@@ -53,6 +53,7 @@ NODE_SHA256 = {
     "arm64": "fff4078c5def658577f92c88db7db3bc0072924bfb93fe52c1e744a54e94abb8",
 }
 SUPPORTED_EFFORTS = frozenset({"low", "high", "max"})
+SUPPORTED_MODELS = frozenset({"glm-5.3", "glm-5.3-flash"})
 _ARTIFACT_ID_RE = re.compile(r"[0-9a-f]{32}")
 _SESSION_ID_RE = re.compile(r"sess_[A-Za-z0-9._:-]{1,155}")
 
@@ -136,10 +137,12 @@ class ProtocolError(RuntimeError):
 
 
 (
-    node, cli, key_path, instruction_path, effort, session_timeout_raw,
+    node, cli, key_path, instruction_path, model_name, effort, session_timeout_raw,
     outcome_path, events_path, stderr_path, diagnostic_path, compact_usage_path,
     resume_session_id, session_id_path,
 ) = sys.argv[1:]
+if model_name not in {"glm-5.3", "glm-5.3-flash"}:
+    raise ProtocolError("ZCode model is unsupported")
 try:
     session_timeout_sec = int(session_timeout_raw)
 except ValueError as exc:
@@ -159,9 +162,9 @@ if resume_session_id and not resume_session_id.startswith("sess_"):
 
 workspace = {"workspacePath": "/app", "workspaceKey": "dradar-zcode"}
 runtime_model = {
-    "revision": "dradar-zcode-glm-5.3-v1",
+    "revision": f"dradar-zcode-{model_name}-v2",
     "generatedAt": int(time.time() * 1000),
-    "model": {"providerId": "bigmodel-coding-plan", "modelId": "glm-5.3"},
+    "model": {"providerId": "bigmodel-coding-plan", "modelId": model_name},
     "provider": {
         "providerId": "bigmodel-coding-plan",
         "kind": "anthropic",
@@ -171,7 +174,7 @@ runtime_model = {
         "baseURL": "https://open.bigmodel.cn/api/anthropic",
         "apiKey": {"source": "inline", "value": key},
         "apiKeyRequired": True,
-        "models": [{"modelId": "glm-5.3", "label": "GLM-5.3"}],
+        "models": [{"modelId": model_name, "label": model_name.upper()}],
     },
     "thoughtLevel": effort,
 }
@@ -233,7 +236,7 @@ def write_runtime_diagnostic(status, turn_count, seen_running, terminal_observed
 def collect_rollout_usage(
     session_id, *, max_files=8, max_file_bytes=16 * 1024 * 1024,
     max_total_bytes=32 * 1024 * 1024, max_lines=20_000, max_records=10_000,
-    max_directory_entries=64,
+    max_directory_entries=64, expected_model="glm-5.3",
 ):
     """Extract only billing facts from ZCode's durable per-request ledger."""
     def result(events=None, invalid=0, duplicate=0, limit_reason=None):
@@ -249,7 +252,7 @@ def collect_rollout_usage(
         return result()
     root = Path.home() / ".zcode" / "cli" / "rollout"
     expected = root / f"model-io-{session_id}.jsonl"
-    # ZCode 0.16.3 can open the recorder before session metadata has been
+    # ZCode can open the recorder before session metadata has been
     # attached and then persist the request in model-io-no-session.jsonl.
     # Each run has an isolated HOME, so scan the bounded rollout directory and
     # select records by their embedded sessionId instead of trusting the name.
@@ -332,7 +335,7 @@ def collect_rollout_usage(
                     usage = response["usage"]
                     if (record.get("type") != "model_io"
                             or not isinstance(model, dict)
-                            or model.get("modelId") != "glm-5.3"
+                            or model.get("modelId") != expected_model
                             or not isinstance(usage, dict)):
                         raise ValueError
                     values = {
@@ -377,8 +380,10 @@ class CompactRolloutUsageCollector:
         self, session_id, output_path, *, max_files=8,
         max_directory_entries=64, max_line_bytes=64 * 1024 * 1024,
         max_records=10_000, max_compact_bytes=8 * 1024 * 1024,
+        expected_model="glm-5.3",
     ):
         self.session_id = session_id
+        self.expected_model = expected_model
         self.output_path = Path(output_path)
         self.limit_reason = None
         try:
@@ -416,7 +421,7 @@ class CompactRolloutUsageCollector:
             usage = response["usage"]
             if (record.get("type") != "model_io"
                     or not isinstance(model, dict)
-                    or model.get("modelId") != "glm-5.3"
+                    or model.get("modelId") != self.expected_model
                     or not isinstance(usage, dict)):
                 raise ValueError
             values = {
@@ -714,7 +719,7 @@ try:
     os.chmod(session_tmp, 0o600)
     os.replace(session_tmp, session_path)
     compact_collector = CompactRolloutUsageCollector(
-        session_id, compact_usage_path,
+        session_id, compact_usage_path, expected_model=model_name,
     )
     settings = created.get("settings") if isinstance(created, dict) else None
     thought = settings.get("thoughtLevel") if isinstance(settings, dict) else None
@@ -811,7 +816,7 @@ try:
     outcome = {
         "schema": "dradar-zcode-outcome-v1",
         "sessionId": session_id,
-        "model": "glm-5.3",
+        "model": model_name,
         "reasoningEffort": effort,
         "resumedFromCheckpoint": resumed_from_checkpoint,
         "seenRunning": seen_running,
@@ -857,7 +862,9 @@ if (isinstance(compact_usage, dict) and compact_usage.get("events")
         and not compact_usage.get("limitExceeded")):
     outcome["rolloutUsage"] = compact_usage
 else:
-    outcome["rolloutUsage"] = collect_rollout_usage(session_id)
+    outcome["rolloutUsage"] = collect_rollout_usage(
+        session_id, expected_model=model_name,
+    )
 safe_outcome = redact(outcome)
 encoded = json.dumps(safe_outcome, ensure_ascii=False, separators=(",", ":"))
 if key in encoded:
@@ -869,7 +876,7 @@ Path(events_path).write_text(
     encoding="utf-8",
 )
 os.chmod(events_path, 0o600)
-print(f"ZCode session {session_id} completed with GLM-5.3 ({effort}).")
+print(f"ZCode session {session_id} completed with {model_name} ({effort}).")
 '''
 
 
@@ -887,7 +894,7 @@ def _zcode_usage_facts(payload: dict) -> dict:
             return value
         return 0
 
-    # session/usage is a context-baseline projection in ZCode 0.16.3. It can
+    # session/usage is a context-baseline projection in ZCode. It can
     # include an extra non-provider request and intentionally does not equal
     # the provider token ledger. Keep it for diagnostics only.
     session_request_count = counter("modelRequestCount")
@@ -1096,7 +1103,7 @@ def _zcode_usage_facts(payload: dict) -> dict:
     return {
         "schema": "dradar-subscription-provider-usage-v1",
         "provider": "zcode",
-        "model": "glm-5.3",
+        "model": payload.get("model") or "glm-5.3",
         "complete": aggregate is not None,
         "request_count": request_count,
         "n_input_tokens": prompt,
@@ -1132,7 +1139,7 @@ def _zcode_usage_facts(payload: dict) -> dict:
 
 
 class ZCodeBigModel(BaseInstalledAgent):
-    """Run GLM-5.3 through ZCode's v1 stdio protocol."""
+    """Run the supported GLM-5.3 family through ZCode's v1 stdio protocol."""
 
     SUPPORTS_ATIF = True
     _REMOTE_HOME = PurePosixPath("/tmp/dradar-zcode-home")
@@ -1191,8 +1198,11 @@ class ZCodeBigModel(BaseInstalledAgent):
             raise ValueError("Pinned ZCode CLI is missing or unreadable") from exc
         if not stat.S_ISREG(cli_info.st_mode) or cli_digest != ZCODE_CLI_SHA256:
             raise ValueError("Pinned ZCode CLI integrity check failed")
-        if (model_name or "glm-5.3") != "glm-5.3":
-            raise ValueError("ZCode adapter enables only glm-5.3")
+        resolved_model = model_name or "glm-5.3"
+        if resolved_model not in SUPPORTED_MODELS:
+            raise ValueError(
+                "ZCode adapter enables only " + ", ".join(sorted(SUPPORTED_MODELS))
+            )
         if reasoning_effort not in SUPPORTED_EFFORTS:
             raise ValueError("ZCode reasoning_effort must be low, high, or max")
         if checkpoint_effort is not None and checkpoint_effort != reasoning_effort:
@@ -1220,19 +1230,20 @@ class ZCodeBigModel(BaseInstalledAgent):
         self._api_key_file = key_file
         self._zcode_cli_file = cli_file
         self._reasoning_effort = reasoning_effort
+        self._model_name = resolved_model
         self._session_timeout_sec = resolved_session_timeout
         self._credential_value = key_value
         self._instruction = ""
         run_secret_dir = self._REMOTE_SECRET_ROOT / uuid.uuid4().hex
         self._remote_secret_dir = run_secret_dir
         self._remote_api_key = run_secret_dir / "coding-plan-key"
-        super().__init__(*args, model_name="glm-5.3", version=resolved_version, **kwargs)
+        super().__init__(*args, model_name=resolved_model, version=resolved_version, **kwargs)
         self._checkpoint = DurableCheckpoint(
             logs_dir=self.logs_dir,
             enabled=checkpoint_enabled,
             assignment_id=checkpoint_assignment_id,
             task_id=checkpoint_task_id,
-            model="glm-5.3",
+            model=resolved_model,
             effort=checkpoint_effort or reasoning_effort,
             resume_generation=checkpoint_resume_generation,
             checkpoint_path=checkpoint_path,
@@ -1382,6 +1393,7 @@ class ZCodeBigModel(BaseInstalledAgent):
                 shlex.quote(item)
                 for item in (
                     "node", remote_cli, remote_key, instruction_path,
+                    self._model_name,
                     self._reasoning_effort, str(self._session_timeout_sec),
                     outcome, events, stderr, diagnostic, compact_usage,
                     resume_session_id or "", session_id_path,
@@ -1486,7 +1498,7 @@ class ZCodeBigModel(BaseInstalledAgent):
                         step_id=len(steps) + 1,
                         source="agent",
                         message=text,
-                        model_name="glm-5.3",
+                        model_name=self._model_name,
                         reasoning_effort=self._reasoning_effort,
                         llm_call_count=1,
                     )
@@ -1512,7 +1524,7 @@ class ZCodeBigModel(BaseInstalledAgent):
                                 step_id=len(steps) + 1,
                                 source="agent",
                                 message=text,
-                                model_name="glm-5.3",
+                                model_name=self._model_name,
                                 reasoning_effort=self._reasoning_effort,
                                 llm_call_count=1,
                             )
@@ -1569,7 +1581,7 @@ class ZCodeBigModel(BaseInstalledAgent):
             agent=Agent(
                 name=self.name(),
                 version=ZCODE_CLI_VERSION,
-                model_name="glm-5.3",
+                model_name=self._model_name,
                 extra={"provider": "bigmodel-coding-plan", "protocol": 1},
             ),
             steps=steps,

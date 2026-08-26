@@ -41,8 +41,9 @@ def _table(*cells):
          "billing_mode": "subscription", "manual_only": True}
         for effort in ("low", "high", "max")
     ] + [
-        {"agent": ZCODE_AGENT, "model": "glm-5.3", "effort": effort,
+        {"agent": ZCODE_AGENT, "model": model, "effort": effort,
          "billing_mode": "subscription", "manual_only": True}
+        for model in ("glm-5.3", "glm-5.3-flash")
         for effort in ("low", "high", "max")
     ] + [
         {"agent": GROK_AGENT, "model": "grok-4.6", "effort": effort,
@@ -245,6 +246,7 @@ def test_subscription_scope_rejects_model_or_effort_mismatch(
 @pytest.mark.parametrize(
     ("harness", "model", "effort", "agent"),
     [("zcode", "glm-5.3", "max", ZCODE_AGENT),
+     ("zcode", "glm-5.3-flash", "high", ZCODE_AGENT),
      ("grok", "grok-4.6", "xhigh", GROK_AGENT)],
 )
 def test_zcode_and_grok_scoped_refill(harness, model, effort, agent, tmp_path):
