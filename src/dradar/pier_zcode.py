@@ -45,7 +45,7 @@ except ModuleNotFoundError:  # Local source-tree tests import the packaged modul
 
 ZCODE_CLI_VERSION = "0.16.5"
 ZCODE_CLI_SHA256 = (
-    "883c12ab99b790fadc5f3ec2f229acd269d8c5460654b4c279c1e18368c436d8"
+    "780683d8f9c003c2e1b629214de7987c9a533cdc486ce0fa3e5f3f4d39ece184"
 )
 NODE_VERSION = "22.23.2"
 NODE_SHA256 = {
