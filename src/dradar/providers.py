@@ -173,19 +173,22 @@ _KIMI_VERSION_RE = re.compile(r"(?:^|\s)(\d+\.\d+\.\d+)(?:\s|$)")
 
 # ZCode is driven through the official desktop bundle's headless protocol.  A
 # fixed CLI digest and the domestic Coding Plan endpoint keep this preview lane
-# reproducible; only GLM-5.3's native low/high/max thought levels are exposed.
+# reproducible; both GLM-5.3 variants expose native low/high/max thought levels.
 ZCODE_PROVIDER = "bigmodel-coding-plan"
 ZCODE_AGENT = "zcode"
 ZCODE_MODEL = "glm-5.3"
-ZCODE_APP_VERSION = "3.7.7"
-ZCODE_CLI_VERSION = "0.16.3"
+ZCODE_FLASH_MODEL = "glm-5.3-flash"
+ZCODE_MODELS = frozenset({ZCODE_MODEL, ZCODE_FLASH_MODEL})
+ZCODE_APP_VERSION = "3.9.1"
+ZCODE_CLI_VERSION = "0.16.5"
 ZCODE_CLI_SHA256 = (
-    "4130592942dcaa070f898c2c0152a8345dbfacbf6efb6422b2753c626e756bf5"
+    "883c12ab99b790fadc5f3ec2f229acd269d8c5460654b4c279c1e18368c436d8"
 )
 ZCODE_SUPPORTED_EFFORTS = frozenset({"low", "high", "max"})
-ZCODE_CAPABILITY = "zcode-glm-5.3-bigmodel-coding-plan-v1"
-ZCODE_RUN_CONFIG_VERSION = "zcode-protocol-glm-5.3-v1"
-ZCODE_RUNTIME_PROFILE = "pier-zcode-glm-5.3-api-key-v1"
+ZCODE_LEGACY_CAPABILITY = "zcode-glm-5.3-bigmodel-coding-plan-v1"
+ZCODE_CAPABILITY = "zcode-glm-5.3-family-bigmodel-coding-plan-v2"
+ZCODE_RUN_CONFIG_VERSION = "zcode-protocol-glm-5.3-family-v2"
+ZCODE_RUNTIME_PROFILE = "pier-zcode-glm-5.3-family-api-key-v2"
 ZCODE_HOME_RELATIVE_PATH = Path("providers") / "zcode"
 ZCODE_CLI_RELATIVE_PATH = ZCODE_HOME_RELATIVE_PATH / "current" / "zcode.cjs"
 ZCODE_SECRET_RELATIVE_PATH = Path("secrets") / "zcode_coding_plan_api_key"
@@ -213,7 +216,7 @@ REFILL_HARNESS_CONSTRAINTS = {
     DSH_AGENT: (frozenset(DSH_MODELS), DSH_SUPPORTED_EFFORTS),
     KIMI_AGENT: (frozenset({KIMI_MODEL}), KIMI_SUPPORTED_EFFORTS),
     GROK_AGENT: (frozenset({GROK_MODEL}), GROK_SUPPORTED_EFFORTS),
-    ZCODE_AGENT: (frozenset({ZCODE_MODEL}), ZCODE_SUPPORTED_EFFORTS),
+    ZCODE_AGENT: (ZCODE_MODELS, ZCODE_SUPPORTED_EFFORTS),
 }
 REFILL_HARNESS_PROVIDERS = {
     DSH_AGENT: DEEPSEEK_PROVIDER,
@@ -753,10 +756,18 @@ def zcode_cli_path(environ: Mapping[str, str] | None = None) -> str | None:
     # report the integrity error instead of a misleading "not installed".
     if env.get("ZCODE_CLI_PATH"):
         return str(candidates[0])
+    first_installed: Path | None = None
     for candidate in candidates:
-        if candidate.is_file():
+        if not candidate.is_file():
+            continue
+        if first_installed is None:
+            first_installed = candidate
+        # A previously imported runtime is intentionally the first candidate,
+        # but it must not shadow a newly installed, digest-pinned desktop
+        # upgrade. This lets setup/status discover the verified replacement.
+        if zcode_cli_error(candidate) is None:
             return str(candidate)
-    return None
+    return str(first_installed) if first_installed is not None else None
 
 
 def parse_zcode_cli_version(output: str) -> str | None:

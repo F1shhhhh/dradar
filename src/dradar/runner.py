@@ -61,6 +61,7 @@ from .providers import (
     ZCODE_CLI_SHA256,
     ZCODE_CLI_VERSION,
     ZCODE_MODEL,
+    ZCODE_MODELS,
     ZCODE_PROVIDER,
     ZCODE_SUPPORTED_EFFORTS,
     assignment_codex_provider,
@@ -754,10 +755,10 @@ def _validate_zcode_assignment(assignment: dict) -> None:
             "ZCode assignments must explicitly use provider "
             f"{ZCODE_PROVIDER!r}"
         )
-    if assignment.get("model") != ZCODE_MODEL:
+    if assignment.get("model") not in ZCODE_MODELS:
         raise RunnerError(
             f"unsupported ZCode model {assignment.get('model')!r}; "
-            f"only {ZCODE_MODEL!r} is enabled"
+            f"enabled models are {', '.join(sorted(ZCODE_MODELS))}"
         )
     if assignment.get("effort") not in ZCODE_SUPPORTED_EFFORTS:
         raise RunnerError(
@@ -2647,7 +2648,7 @@ def _read_capped_json_object(path: Path | None, max_bytes: int) -> dict:
 def _zcode_quota_limit_facts(outcome_path: Path | None) -> dict[str, object] | None:
     """Return allowlisted facts for ZCode's account-window exhaustion event.
 
-    ZCode 0.16.3 reports Coding Plan exhaustion as a structured provider event
+    ZCode reports Coding Plan exhaustion as a structured provider event
     even when Pier later reduces the run to ``model.patch missing``.  A bare
     429 is only burst throttling and must remain retryable, so the account-wide
     terminal requires all of the provider code, HTTP status, reason,
@@ -2714,6 +2715,7 @@ def _zcode_false_success_reason(
     result_path: Path | None,
     usage_path: Path | None,
     runtime_diagnostic: dict[str, object],
+    expected_model: str = ZCODE_MODEL,
 ) -> str | None:
     """Recognize only hard ZCode rc=0 false-success evidence.
 
@@ -2750,7 +2752,7 @@ def _zcode_false_success_reason(
         sidecar_usage.get("schema")
         == "dradar-subscription-provider-usage-v1"
         and sidecar_usage.get("provider") == "zcode"
-        and sidecar_usage.get("model") == ZCODE_MODEL
+        and sidecar_usage.get("model") == expected_model
     ):
         sidecar_usage = {}
     provider_usage = sidecar_usage or embedded_usage
@@ -2759,7 +2761,7 @@ def _zcode_false_success_reason(
     provider_terminal = (
         provider_usage.get("schema") == "dradar-subscription-provider-usage-v1"
         and provider_usage.get("provider") == "zcode"
-        and provider_usage.get("model") == ZCODE_MODEL
+        and provider_usage.get("model") == expected_model
         and provider_usage.get("complete") is True
         and provider_usage.get("request_usage_complete") is True
         and provider_usage.get("request_usage_observed") is True
@@ -3470,6 +3472,7 @@ def run_trial(
             result,
             trial_dir / "agent" / "provider-usage.json",
             runtime_diagnostic,
+            expected_model=effective_assignment["model"],
         )
         if false_success_reason is not None:
             raise RunnerError(
