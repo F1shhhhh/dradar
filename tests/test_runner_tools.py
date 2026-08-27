@@ -2102,6 +2102,38 @@ def test_dsh_vision_artifact_binding_requires_attached_question_image(tmp_path):
         _verify_dsh_artifact_binding(trial, assignment)
 
 
+def test_dsh_vision_deepswe_binding_requires_text_only_input(tmp_path):
+    trial = tmp_path / "task__trial"
+    sidecar = trial / "agent" / "dsh-home" / "dsh-outcome.json"
+    sidecar.parent.mkdir(parents=True)
+    assignment = {
+        "assignment_id": "a" * 32,
+        "_artifact_run_id": "b" * 32,
+        "task_id": "httpx-streaming-json-iteration",
+        "model": "dsh-deepseek-v4-flash-vision-exp",
+        "effort": "max",
+    }
+    payload = {
+        "schema": "dradar-dsh-outcome-v1",
+        "assignmentId": assignment["assignment_id"],
+        "artifactRunId": assignment["_artifact_run_id"],
+        "taskId": assignment["task_id"],
+        "assignmentModel": assignment["model"],
+        "reasoningEffort": assignment["effort"],
+        "visionInputAttached": False,
+        "visionInput": None,
+    }
+    sidecar.write_text(json.dumps(payload))
+
+    binding = _verify_dsh_artifact_binding(trial, assignment)
+    assert binding["visionInputAttached"] is False
+
+    payload["visionInputAttached"] = True
+    sidecar.write_text(json.dumps(payload))
+    with pytest.raises(RunnerError, match="unexpectedly attached an image"):
+        _verify_dsh_artifact_binding(trial, assignment)
+
+
 def test_dsh_utf16_patch_is_normalized_only_after_git_validation(tmp_path):
     patch = tmp_path / "model.patch"
     diff = (

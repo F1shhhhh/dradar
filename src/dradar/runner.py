@@ -785,13 +785,6 @@ def _validate_dsh_assignment(assignment: dict) -> None:
             f"unsupported DSH model {assignment.get('model')!r}; enabled "
             f"models are {', '.join(DSH_MODELS)}"
         )
-    task_id = assignment.get("task_id")
-    if assignment.get("model") == DSH_VISION_MODEL and not (
-        isinstance(task_id, str) and task_id.startswith("pompeii-adjacency-rp-")
-    ):
-        raise RunnerError(
-            "DSH Vision Exp is restricted to Pompeii adjacency image tasks"
-        )
     if assignment.get("effort") not in DSH_SUPPORTED_EFFORTS:
         supported = ", ".join(sorted(DSH_SUPPORTED_EFFORTS))
         raise RunnerError(
@@ -1427,7 +1420,12 @@ def _verify_dsh_artifact_binding(
             "DSH artifact identity does not match the current assignment/run; "
             "the stale files were kept locally and will not be uploaded"
         )
-    if assignment.get("model") == DSH_VISION_MODEL:
+    if (
+        assignment.get("model") == DSH_VISION_MODEL
+        and str(assignment.get("task_id") or "").startswith(
+            "pompeii-adjacency-rp-"
+        )
+    ):
         image = value.get("visionInput")
         if (
             value.get("visionInputAttached") is not True
@@ -1454,6 +1452,15 @@ def _verify_dsh_artifact_binding(
             "visionInputAttached": True,
             "visionInput": image,
         }
+    if assignment.get("model") == DSH_VISION_MODEL:
+        if (
+            value.get("visionInputAttached") is not False
+            or value.get("visionInput") is not None
+        ):
+            raise RunnerError(
+                "DSH Vision Exp text run unexpectedly attached an image; "
+                "the artifact will not be uploaded"
+            )
     return {**expected, "visionInputAttached": False}
 
 

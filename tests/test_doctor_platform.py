@@ -442,7 +442,7 @@ def test_dsh_scoped_doctor_uses_public_uvx_without_host_pier(
 
     assert rc == 0
     assert "[ok ] uvx — isolated public DSH runner" in out
-    assert "[ok ] DeepSeek V4 Flash / Pro — DSH Minimal agent ready" in out
+    assert "[ok ] DeepSeek V4 Flash / Pro / Vision — DSH Minimal agent ready" in out
     assert "SecurityMind" not in out
     assert "[ok ] pier" not in out.lower()
 

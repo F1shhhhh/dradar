@@ -74,6 +74,9 @@ DSH_PRO_CAPABILITY = "dsh-minimal-deepseek-v4-pro-artifact-v5"
 DSH_VISION_CAPABILITY = (
     "dsh-minimal-deepseek-v4-flash-vision-exp-pompeii-image-v1"
 )
+DSH_VISION_TEXT_CAPABILITY = (
+    "dsh-minimal-deepseek-v4-flash-vision-exp-deepswe-text-v1"
+)
 DSH_FLASH_LEGACY_CAPABILITY = "dsh-minimal-deepseek-v4-flash-artifact-v4"
 DSH_PRO_LEGACY_CAPABILITY = "dsh-minimal-deepseek-v4-pro-artifact-v4"
 DSH_RUN_CONFIG_VERSION = "dsh-minimal-native-0.1.1-rc.1-v1"
@@ -1259,6 +1262,7 @@ def advertised_capabilities(
             DSH_FLASH_CAPABILITY,
             DSH_PRO_CAPABILITY,
             DSH_VISION_CAPABILITY,
+            DSH_VISION_TEXT_CAPABILITY,
             # Transitional compatibility: an old server knows only v4,
             # while the v5 marker lets the new server require timed usage.
             DSH_FLASH_LEGACY_CAPABILITY,

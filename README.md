@@ -253,6 +253,10 @@ DSH Minimal 是与 Codex 分开的实验 Harness。它复用同一份本地 Deep
 字符串替换编辑器）。网页认领 DSH 格子后，仍走普通志愿者的本机流程：本机 Docker、
 公开 CLI、当前账号已认领批次，再由 `resume` 启动，不需要单独安装宿主机 Pier。
 
+DSH 的 DeepSWE 模型面包含 V4 Pro、V4 Flash 和 V4 Flash Vision Exp。Vision Exp 在
+DeepSWE 中走官方纯文本能力，不附带图片；在庞贝壁画题中仍必须读取并绑定题目的
+`question.png`，两种输入路径的产物会分别校验，不能混用。
+
 ```bash
 dradar provider setup deepseek
 dradar provider status deepseek --live

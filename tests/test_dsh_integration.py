@@ -18,6 +18,8 @@ from dradar.providers import (
     DSH_PRO_MODEL,
     DSH_VERSION,
     DSH_VISION_CAPABILITY,
+    DSH_VISION_MODEL,
+    DSH_VISION_TEXT_CAPABILITY,
     advertised_capabilities,
 )
 from dradar.runner import RunnerError
@@ -72,11 +74,23 @@ def test_dsh_capabilities_require_a_configured_deepseek_key() -> None:
     assert DSH_FLASH_CAPABILITY not in advertised_capabilities({})
     assert DSH_PRO_CAPABILITY not in advertised_capabilities({})
     assert DSH_VISION_CAPABILITY not in advertised_capabilities({})
+    assert DSH_VISION_TEXT_CAPABILITY not in advertised_capabilities({})
 
     capabilities = advertised_capabilities({DEEPSEEK_API_KEY_ENV: "ready"})
     assert DSH_FLASH_CAPABILITY in capabilities
     assert DSH_PRO_CAPABILITY in capabilities
     assert DSH_VISION_CAPABILITY in capabilities
+    assert DSH_VISION_TEXT_CAPABILITY in capabilities
+
+
+def test_dsh_vision_accepts_deepswe_text_assignments() -> None:
+    assignment = _assignment(
+        task_id="httpx-streaming-json-iteration",
+        model=DSH_VISION_MODEL,
+        effort="max",
+    )
+
+    runner._validate_dsh_assignment(assignment)
 
 
 def test_dsh_temporary_key_file_is_private_and_rejects_whitespace(
