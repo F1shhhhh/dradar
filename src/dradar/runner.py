@@ -59,6 +59,7 @@ from .providers import (
     ZCODE_AGENT,
     ZCODE_API_KEY_ENV,
     ZCODE_CLI_SHA256,
+    ZCODE_CLI_SHA256S,
     ZCODE_CLI_VERSION,
     ZCODE_MODEL,
     ZCODE_MODELS,
@@ -1368,7 +1369,11 @@ def _validated_zcode_cli_path() -> Path:
     # ``zcode_cli_error`` already verified the byte digest. Keep the imported
     # constant in this runner's trusted surface so a release bump must update
     # both the path validation and adapter pin deliberately.
-    if len(ZCODE_CLI_SHA256) != 64:
+    if (
+        ZCODE_CLI_SHA256 not in ZCODE_CLI_SHA256S
+        or not ZCODE_CLI_SHA256S
+        or any(len(digest) != 64 for digest in ZCODE_CLI_SHA256S)
+    ):
         raise RunnerError("invalid built-in ZCode CLI digest pin")
     return cli
 

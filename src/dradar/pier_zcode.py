@@ -47,6 +47,10 @@ ZCODE_CLI_VERSION = "0.16.5"
 ZCODE_CLI_SHA256 = (
     "780683d8f9c003c2e1b629214de7987c9a533cdc486ce0fa3e5f3f4d39ece184"
 )
+ZCODE_CLI_SHA256S = frozenset({
+    "883c12ab99b790fadc5f3ec2f229acd269d8c5460654b4c279c1e18368c436d8",
+    ZCODE_CLI_SHA256,
+})
 NODE_VERSION = "22.23.2"
 NODE_SHA256 = {
     "x64": "d60acfe00a2932254bb0ad20e01b0d74397a0875595de719654b214f4b03f307",
@@ -1196,7 +1200,7 @@ class ZCodeBigModel(BaseInstalledAgent):
             cli_digest = hashlib.sha256(cli_file.read_bytes()).hexdigest()
         except OSError as exc:
             raise ValueError("Pinned ZCode CLI is missing or unreadable") from exc
-        if not stat.S_ISREG(cli_info.st_mode) or cli_digest != ZCODE_CLI_SHA256:
+        if not stat.S_ISREG(cli_info.st_mode) or cli_digest not in ZCODE_CLI_SHA256S:
             raise ValueError("Pinned ZCode CLI integrity check failed")
         resolved_model = model_name or "glm-5.3"
         if resolved_model not in SUPPORTED_MODELS:

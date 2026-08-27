@@ -26,7 +26,6 @@ from .providers import (
     KIMI_BINARY_BASE_URL,
     KIMI_BINARY_SHA256,
     KIMI_CLI_VERSION,
-    ZCODE_APP_VERSION,
     ZCODE_CLI_VERSION,
     ZCODE_MODELS,
     ZCODE_OFFICIAL_DOWNLOAD_PAGE,
@@ -428,8 +427,7 @@ def _setup_zcode() -> int:
     issue = zcode_cli_error(cli)
     if issue is not None:
         print(
-            "ZCode setup could not find the verified official ZCode "
-            f"{ZCODE_APP_VERSION} "
+            "ZCode setup could not find a verified compatible official "
             f"desktop runtime: {issue}\n"
             f"Install it from {ZCODE_OFFICIAL_DOWNLOAD_PAGE}, then retry. "
             "Advanced users may point ZCODE_CLI_PATH at "

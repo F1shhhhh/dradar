@@ -172,8 +172,9 @@ KIMI_API_KEY_ENVS = frozenset({
 _KIMI_VERSION_RE = re.compile(r"(?:^|\s)(\d+\.\d+\.\d+)(?:\s|$)")
 
 # ZCode is driven through the official desktop bundle's headless protocol.  A
-# fixed CLI digest and the domestic Coding Plan endpoint keep this preview lane
-# reproducible; both GLM-5.3 variants expose native low/high/max thought levels.
+# tested CLI digest allowlist and the domestic Coding Plan endpoint keep this
+# preview lane reproducible without forcing users onto one exact desktop app
+# release; both GLM-5.3 variants expose native low/high/max thought levels.
 ZCODE_PROVIDER = "bigmodel-coding-plan"
 ZCODE_AGENT = "zcode"
 ZCODE_MODEL = "glm-5.3"
@@ -184,6 +185,12 @@ ZCODE_CLI_VERSION = "0.16.5"
 ZCODE_CLI_SHA256 = (
     "780683d8f9c003c2e1b629214de7987c9a533cdc486ce0fa3e5f3f4d39ece184"
 )
+ZCODE_CLI_SHA256S = frozenset({
+    # ZCode 3.9.1 desktop bundle.
+    "883c12ab99b790fadc5f3ec2f229acd269d8c5460654b4c279c1e18368c436d8",
+    # ZCode 3.9.2 desktop bundle.
+    ZCODE_CLI_SHA256,
+})
 ZCODE_SUPPORTED_EFFORTS = frozenset({"low", "high", "max"})
 ZCODE_LEGACY_CAPABILITY = "zcode-glm-5.3-bigmodel-coding-plan-v1"
 ZCODE_CAPABILITY = "zcode-glm-5.3-family-bigmodel-coding-plan-v2"
@@ -791,10 +798,10 @@ def zcode_cli_error(
     if not stat.S_ISREG(info.st_mode):
         return "pinned ZCode CLI must resolve to a regular file"
     digest = hashlib.sha256(payload).hexdigest()
-    if digest != ZCODE_CLI_SHA256:
+    if digest not in ZCODE_CLI_SHA256S:
         return (
-            "ZCode CLI integrity check failed; reinstall the tested "
-            f"ZCode {ZCODE_APP_VERSION} runtime"
+            "ZCode CLI integrity check failed; install an official desktop "
+            "release containing a tested CLI runtime"
         )
     return None
 
