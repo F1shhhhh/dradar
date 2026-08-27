@@ -1207,6 +1207,74 @@ def test_definitively_rejected_upload_drops_ledger_entry(tmp_path: Path, monkeyp
     assert client.stopped == ["a1"]
 
 
+def test_zcode_pompeii_preflight_names_binary_file_before_submit(
+    tmp_path: Path, monkeypatch, capsys,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    raw_patch = (
+        b"diff --git a/model_answer.json b/model_answer.json\n"
+        b"index 9e26dfe..e9cfe4b 100644\n"
+        b"--- a/model_answer.json\n"
+        b"+++ b/model_answer.json\n"
+        b"@@ -1 +1 @@\n-{}\n+{\"edges\":[]}\n"
+        b"diff --git a/cache/stitch.png b/cache/stitch.png\n"
+        b"new file mode 100644\n"
+        b"index 0000000..1111111\n"
+        b"GIT binary patch\n"
+        b"literal 4\nLc${NkU|;|M00aO5\n\n"
+    )
+    (trial_dir / "artifacts" / "model.patch").write_bytes(raw_patch)
+    client = FakeClient(lambda _aid: pytest.fail("guarded patch must not submit"))
+    entry = _entry(
+        trial_dir,
+        task_id="pompeii-adjacency-rp-085",
+        meta={"model_runtime_profile": runloop.ZCODE_RUNTIME_PROFILE},
+    )
+
+    outcome = runloop._upload_trial(client, entry)
+
+    assert outcome == "rejected"
+    assert client.calls == []
+    assert client.stopped == ["a1"]
+    assert pending.load(tmp_path) == []
+    assert (trial_dir / "artifacts" / "model.patch").read_bytes() == raw_patch
+    out = capsys.readouterr().out
+    assert "patch preflight blocked upload" in out
+    assert "cache/stitch.png" in out
+    assert "binary" in out
+    assert "independent ZCode re-solve" in out
+
+
+def test_zcode_pompeii_preflight_allows_small_model_answer_patch(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    (trial_dir / "artifacts" / "model.patch").write_bytes(
+        b"diff --git a/model_answer.json b/model_answer.json\n"
+        b"index 9e26dfe..e9cfe4b 100644\n"
+        b"--- a/model_answer.json\n"
+        b"+++ b/model_answer.json\n"
+        b"@@ -1 +1 @@\n-{}\n+{\"edges\":[]}\n"
+    )
+    client = FakeClient(
+        lambda _aid: {"submission_id": "s1", "grade_status": "pending"},
+    )
+
+    outcome = runloop._upload_trial(
+        client,
+        _entry(
+            trial_dir,
+            task_id="pompeii-adjacency-rp-086",
+            meta={"zcode_protocol_version": 1},
+        ),
+    )
+
+    assert outcome == "submitted"
+    assert client.calls == ["a1"]
+
+
 def test_definitive_rejection_preserves_checkpoint_job(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(runloop, "HOME", tmp_path)
     aid = "4" * 32
