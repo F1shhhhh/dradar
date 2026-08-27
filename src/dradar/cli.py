@@ -310,6 +310,16 @@ def main(argv: list[str] | None = None) -> int:
             "--allow-task-drift", action="store_true",
             help="run even if your deep-swe checkout differs from the server's pinned version",
         )
+        p.add_argument(
+            "--expect-assignment", action="append", metavar="ID",
+            help="require this assignment ID to be present before any model starts "
+                 "(repeatable; the set is persisted across resume)",
+        )
+        p.add_argument(
+            "--forget-assignment-boundary", action="store_true",
+            help="explicitly discard a saved missing-assignment guard before "
+                 "starting a new boundary",
+        )
         p.add_argument("--dev-agent", help=argparse.SUPPRESS)  # oracle/nop for pipeline tests
         p.add_argument(
             "--parallel", action="store_true",

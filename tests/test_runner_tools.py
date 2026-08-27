@@ -1089,6 +1089,65 @@ def test_zcode_terminal_reader_rejects_oversized_json_without_loading_it(
     ) == {}
 
 
+def test_zcode_provider_failure_reader_exposes_only_bounded_network_facts(
+        tmp_path):
+    outcome = tmp_path / "zcode-outcome.json"
+    outcome.write_text(json.dumps({
+        "schema": "dradar-zcode-outcome-v1",
+        "events": {"events": [{
+            "type": "session.updated",
+            "payload": {
+                "type": "model_request_failed",
+                "reason": "network_error",
+                "statusCode": 0,
+                "retryable": False,
+                "message": "secret provider message",
+                "requestId": "secret-request-id",
+            },
+        }]},
+    }))
+
+    assert runner_mod._zcode_provider_failure_facts(outcome) == {
+        "zcode_provider_failure_reason": "network_error",
+        "zcode_provider_status_code": 0,
+        "zcode_provider_retryable": False,
+    }
+
+
+def test_zcode_failure_diagnostic_carries_structured_network_reason(
+        tmp_path):
+    task = tmp_path / "task"
+    task.mkdir()
+    outcome = tmp_path / "jobs" / "job" / "trial" / "agent" / "zcode-outcome.json"
+    outcome.parent.mkdir(parents=True)
+    outcome.write_text(json.dumps({
+        "schema": "dradar-zcode-outcome-v1",
+        "events": {"events": [{
+            "type": "session.updated",
+            "payload": {
+                "type": "model_request_failed",
+                "reason": "network_error",
+                "statusCode": 0,
+                "retryable": False,
+            },
+        }]},
+    }))
+    assignment = {
+        "agent": runner_mod.ZCODE_AGENT,
+        "model": runner_mod.ZCODE_MODEL,
+        "effort": "low",
+        "est_minutes": 30,
+    }
+
+    diagnostic = runner_mod._zcode_failure_diagnostic(
+        assignment, task, tmp_path / "jobs", "job", "agent_no_artifact",
+    )
+
+    assert diagnostic is not None
+    assert diagnostic["zcode_provider_failure_reason"] == "network_error"
+    assert diagnostic["zcode_provider_retryable"] is False
+
+
 def test_zcode_real_redacted_1308_fixture_is_account_quota_terminal() -> None:
     fixture = Path(__file__).with_name("fixtures") / "zcode_quota_1308_outcome.json"
 

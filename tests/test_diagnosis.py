@@ -497,6 +497,73 @@ def test_failed_trial_reports_only_structured_failure_diagnostic(
     assert "secret" not in json.dumps(stopped[0][1])
 
 
+def test_zcode_structured_network_failure_retries_once_serially(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
+    monkeypatch.setattr(runloop, "_ZCODE_NETWORK_RETRY_DELAY_SECONDS", 0)
+    assignment = {**ASSIGNMENT, "agent": "zcode"}
+    diagnostic = {
+        "schema": "dradar-runner-failure-v1",
+        "failure_code": "agent_no_artifact",
+        "zcode_provider_failure_reason": "network_error",
+        "zcode_provider_retryable": False,
+    }
+    art = _fake_art(tmp_path, rc=0)
+    calls = []
+
+    def transient_then_success(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RunnerError(
+                "redacted ZCode terminal failure",
+                failure_diagnostic=diagnostic,
+            )
+        return art
+
+    monkeypatch.setattr(runloop, "run_trial", transient_then_success)
+    stopped = []
+    client = SubmitClient({})
+    client.mark_stopped = lambda aid, **kw: stopped.append((aid, kw))
+
+    assert runloop._run_and_submit(
+        client, assignment, tmp_path, _args(), "abc",
+    ) == "submitted"
+    assert len(calls) == 2
+    assert stopped == [(assignment["assignment_id"], {
+        "defer_seconds": 0,
+        "failure_kind": "provider-transport",
+        "failure_diagnostic": diagnostic,
+    })]
+
+
+def test_zcode_network_retry_is_bounded_to_two_total_attempts(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
+    monkeypatch.setattr(runloop, "_ZCODE_NETWORK_RETRY_DELAY_SECONDS", 0)
+    assignment = {**ASSIGNMENT, "agent": "zcode"}
+    diagnostic = {
+        "schema": "dradar-runner-failure-v1",
+        "failure_code": "agent_no_artifact",
+        "zcode_provider_failure_reason": "network_error",
+    }
+    calls = []
+
+    def always_fails(*args, **kwargs):
+        calls.append(1)
+        raise RunnerError("redacted failure", failure_diagnostic=diagnostic)
+
+    monkeypatch.setattr(runloop, "run_trial", always_fails)
+    stopped = []
+    client = SubmitClient({})
+    client.mark_stopped = lambda aid, **kw: stopped.append((aid, kw))
+
+    assert runloop._run_and_submit(
+        client, assignment, tmp_path, _args(), "abc",
+    ) == "failed"
+    assert len(calls) == 2
+    assert [entry[1]["defer_seconds"] for entry in stopped] == [0, 300]
+
+
 def test_user_interrupt_without_checkpoint_reports_stopped_to_server(
         monkeypatch, tmp_path):
     monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
