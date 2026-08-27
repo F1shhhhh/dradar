@@ -99,8 +99,8 @@ def test_zcode_disabled_checkpoint_uses_normal_root_handoff(
     cli.write_text("pinned-zcode", encoding="utf-8")
     monkeypatch.setattr(
         pier_zcode,
-        "ZCODE_CLI_SHA256",
-        hashlib.sha256(cli.read_bytes()).hexdigest(),
+        "ZCODE_CLI_SHA256S",
+        frozenset({hashlib.sha256(cli.read_bytes()).hexdigest()}),
     )
     agent = pier_zcode.ZCodeBigModel(
         logs_dir=logs,

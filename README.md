@@ -319,7 +319,7 @@ Kimi CLI 版本，因此 macOS、Windows 与 Linux 用户都不会把错误平�
 ### ZCode GLM-5.3 系列国内 Coding Plan agent
 
 ZCode 使用国内 BigModel Coding Plan Key，不使用海外入口。先从
-[ZCode 官网](https://zcode.z.ai/cn)安装官方 ZCode `3.9.2`，再运行：
+[ZCode 官网](https://zcode.z.ai/cn)安装官方 ZCode，再运行：
 
 ```bash
 dradar provider setup zcode
@@ -329,8 +329,10 @@ dradar go --pick TASK_ID:glm-5.3:high
 dradar go --pick TASK_ID:glm-5.3-flash:high
 ```
 
-`provider setup` 会从官方桌面安装的 `Resources/glm/zcode.cjs` 导入 CLI `0.16.5`，并在复制
-前校验固定 SHA-256；高级用户也可以临时设置 `ZCODE_CLI_PATH` 指向该文件。Coding Plan Key
+`provider setup` 会从官方桌面安装的 `Resources/glm/zcode.cjs` 导入经过兼容验证的 CLI
+`0.16.5`。当前支持 ZCode `3.9.1` 和 `3.9.2` 内置的官方运行时，并在复制前校验对应的
+SHA-256；不会要求两个桌面版本的文件逐字节相同。高级用户也可以临时设置
+`ZCODE_CLI_PATH` 指向该文件。Coding Plan Key
 通过关闭回显的交互式输入保存到 `~/.dradar/secrets`，不会进入命令行、配置 JSON、Git、
 DRadar 服务端或轨迹。容器启动后 Key 会立即转入 ZCode 的内存会话并删除临时文件。
 

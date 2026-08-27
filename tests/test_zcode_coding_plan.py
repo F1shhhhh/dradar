@@ -105,6 +105,24 @@ def test_zcode_cli_path_preserves_invalid_explicit_path_for_diagnostics(
     assert zcode_cli_path({"ZCODE_CLI_PATH": str(missing)}) == str(missing)
 
 
+def test_zcode_cli_integrity_accepts_each_tested_desktop_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtimes = [
+        _private(tmp_path / "zcode-3.9.1.cjs", "official-runtime-3.9.1"),
+        _private(tmp_path / "zcode-3.9.2.cjs", "official-runtime-3.9.2"),
+    ]
+    digests = {
+        providers.hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in runtimes
+    }
+    monkeypatch.setattr(providers, "ZCODE_CLI_SHA256S", frozenset(digests))
+
+    assert all(providers.zcode_cli_error(path) is None for path in runtimes)
+    unknown = _private(tmp_path / "unknown.cjs", "unverified-runtime")
+    assert "integrity check failed" in (providers.zcode_cli_error(unknown) or "")
+
+
 def test_zcode_cli_path_skips_stale_import_for_verified_desktop_upgrade(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
