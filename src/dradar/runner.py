@@ -30,6 +30,12 @@ import httpx
 from . import checkpoints, egress
 from .manifest import task_content_hash
 from .providers import (
+    ANTIGRAVITY_AGENT,
+    ANTIGRAVITY_CLI_VERSION,
+    ANTIGRAVITY_MODEL,
+    ANTIGRAVITY_PROVIDER,
+    ANTIGRAVITY_RUNTIME_MODELS,
+    ANTIGRAVITY_SUPPORTED_EFFORTS,
     DEFAULT_CODEX_PROVIDER,
     DEEPSEEK_API_KEY_ENV,
     DEEPSEEK_CATALOG_REMOTE_PATH,
@@ -66,6 +72,7 @@ from .providers import (
     ZCODE_PROVIDER,
     ZCODE_SUPPORTED_EFFORTS,
     assignment_codex_provider,
+    antigravity_subscription_session,
     create_deepseek_api_key_file,
     create_deepseek_auth_json,
     create_zcode_api_key_file,
@@ -171,6 +178,8 @@ GROK_RECOVERY_MODULE_FILENAME = "_dradar_grok_recovery.py"
 KIMI_AGENT_IMPORT_PATH = "_dradar_pier_kimi:KimiCode"
 KIMI_AGENT_MODULE_FILENAME = "_dradar_pier_kimi.py"
 KIMI_RECOVERY_MODULE_FILENAME = "_dradar_kimi_recovery.py"
+ANTIGRAVITY_AGENT_IMPORT_PATH = "_dradar_pier_antigravity:Antigravity"
+ANTIGRAVITY_AGENT_MODULE_FILENAME = "_dradar_pier_antigravity.py"
 SHARED_OAUTH_ENV_IMPORT_PATH = (
     "_dradar_pier_shared_oauth_docker:SharedOAuthDockerEnvironment"
 )
@@ -191,7 +200,9 @@ DURABLE_CHECKPOINT_ROLLOUT_ENABLED = False
 def durable_checkpoint_rollout_enabled() -> bool:
     return DURABLE_CHECKPOINT_ROLLOUT_ENABLED
 BETA_SUBSCRIPTION_TRIAL_TIMEOUT_FLOOR_SEC = 120 * 60
-BETA_SUBSCRIPTION_AGENTS = frozenset({GROK_AGENT, KIMI_AGENT, ZCODE_AGENT})
+BETA_SUBSCRIPTION_AGENTS = frozenset({
+    GROK_AGENT, KIMI_AGENT, ZCODE_AGENT, ANTIGRAVITY_AGENT,
+})
 
 # Public Pier 0.3.0 only runs ``<task>/pre_artifacts.sh``.  Older published
 # DeepSWE packs may not contain that hook, so DSH gets a per-run compatibility
@@ -278,6 +289,7 @@ class TrialArtifacts:
     codex_cli_version: str | None = None
     grok_cli_version: str | None = None
     kimi_cli_version: str | None = None
+    antigravity_cli_version: str | None = None
     zcode_cli_version: str | None = None
     dsh_version: str | None = None
     dsh_artifact_binding: dict[str, object] | None = None
@@ -597,6 +609,17 @@ def _ensure_kimi_agent_module(home: Path) -> Path:
     )
 
 
+def _ensure_antigravity_agent_module(home: Path) -> Path:
+    source = Path(__file__).with_name("pier_antigravity.py")
+    if not source.is_file():
+        raise RunnerError(
+            "Antigravity Pier adapter is missing; reinstall or upgrade dradar"
+        )
+    return _materialize_shared_file(
+        home / ANTIGRAVITY_AGENT_MODULE_FILENAME, source.read_bytes()
+    )
+
+
 def _ensure_shared_oauth_environment_module(home: Path) -> Path:
     source = Path(__file__).with_name("pier_shared_oauth_docker.py")
     if not source.is_file():
@@ -616,7 +639,7 @@ def _shared_oauth_mounts_json(agent: str, auth_path: Path) -> str:
     except OSError as exc:
         raise RunnerError(f"subscription OAuth credential is unavailable: {exc}") from exc
     if canonical != auth_path or canonical.is_symlink():
-        raise RunnerError("subscription OAuth credential must be a canonical file")
+        raise RunnerError("subscription OAuth credential must be a canonical path")
     if agent == KIMI_AGENT:
         if canonical.name != "kimi-code.json" or canonical.parent.name != "credentials":
             raise RunnerError("Kimi OAuth credential is outside the managed store")
@@ -651,8 +674,28 @@ def _shared_oauth_mounts_json(agent: str, auth_path: Path) -> str:
             "source": str(root.resolve(strict=True)),
             "target": "/tmp/dradar-grok-user/.grok",
         }]
+    elif agent == ANTIGRAVITY_AGENT:
+        root = canonical.parent
+        if (
+            not canonical.is_dir()
+            or canonical.name != ".gemini"
+            or root.name != "antigravity"
+        ):
+            raise RunnerError(
+                "Antigravity OAuth home is outside the managed store"
+            )
+        if os.name != "nt":
+            os.chmod(root, 0o700)
+            os.chmod(canonical, 0o700)
+        mounts = [{
+            "type": "bind",
+            "source": str(canonical),
+            "target": "/tmp/dradar-antigravity-user/.gemini",
+        }]
     else:  # pragma: no cover - private helper misuse
-        raise RunnerError("shared OAuth mounts are only supported for Kimi and Grok")
+        raise RunnerError(
+            "shared OAuth mounts are only supported for Kimi, Grok, and Antigravity"
+        )
     return json.dumps(mounts, separators=(",", ":"), sort_keys=True)
 
 
@@ -783,6 +826,33 @@ def _validate_kimi_assignment(assignment: dict) -> None:
         )
 
 
+def _validate_antigravity_assignment(assignment: dict) -> None:
+    if assignment.get("provider") != ANTIGRAVITY_PROVIDER:
+        raise RunnerError(
+            "Antigravity assignments must explicitly use provider "
+            f"{ANTIGRAVITY_PROVIDER!r}"
+        )
+    if assignment.get("model") != ANTIGRAVITY_MODEL:
+        raise RunnerError(
+            f"unsupported Antigravity model {assignment.get('model')!r}; "
+            f"only {ANTIGRAVITY_MODEL!r} is enabled"
+        )
+    effort = assignment.get("effort")
+    if effort not in ANTIGRAVITY_SUPPORTED_EFFORTS:
+        raise RunnerError(
+            "Antigravity effort must be low, medium, or high; "
+            f"got {effort!r}"
+        )
+    if ANTIGRAVITY_RUNTIME_MODELS.get(effort) != f"{ANTIGRAVITY_MODEL}-{effort}":
+        raise RunnerError("Antigravity runtime model mapping is inconsistent")
+    requested = assignment.get("agent_version") or ANTIGRAVITY_CLI_VERSION
+    if requested != ANTIGRAVITY_CLI_VERSION:
+        raise RunnerError(
+            f"Antigravity runs are pinned to CLI {ANTIGRAVITY_CLI_VERSION}; "
+            f"the server requested unverified {requested!r}"
+        )
+
+
 def _validate_zcode_assignment(assignment: dict) -> None:
     if assignment.get("provider") != ZCODE_PROVIDER:
         raise RunnerError(
@@ -841,6 +911,7 @@ def _pier_process_env(
     deepseek_module_dir: Path | None = None,
     grok_module_dir: Path | None = None,
     kimi_module_dir: Path | None = None,
+    antigravity_module_dir: Path | None = None,
     zcode_module_dir: Path | None = None,
     dsh_module_dir: Path | None = None,
 ) -> dict[str, str]:
@@ -856,7 +927,8 @@ def _pier_process_env(
         path for path in (
             pier_bootstrap_dir, codex_module_dir, deepseek_module_dir,
             grok_module_dir,
-            kimi_module_dir, zcode_module_dir, dsh_module_dir,
+            kimi_module_dir, antigravity_module_dir,
+            zcode_module_dir, dsh_module_dir,
         ) if path is not None
     ]
     if python_dirs:
@@ -874,6 +946,12 @@ def _pier_process_env(
         env.pop(GROK_API_KEY_ENV, None)
     if assignment.get("agent") == KIMI_AGENT:
         for name in KIMI_API_KEY_ENVS:
+            env.pop(name, None)
+    if assignment.get("agent") == ANTIGRAVITY_AGENT:
+        for name in (
+            "GEMINI_API_KEY", "GOOGLE_API_KEY",
+            "GOOGLE_APPLICATION_CREDENTIALS", "AGY_ADC_AUTH",
+        ):
             env.pop(name, None)
     if assignment.get("agent") == ZCODE_AGENT:
         for name in (
@@ -1067,6 +1145,15 @@ def build_pier_command(
         _ensure_kimi_agent_module(home)
         _ensure_shared_oauth_environment_module(home)
         agent_args = ["--agent-import-path", KIMI_AGENT_IMPORT_PATH]
+    elif agent == ANTIGRAVITY_AGENT:
+        _validate_antigravity_assignment(assignment)
+        _ensure_antigravity_agent_module(home)
+        _ensure_shared_oauth_environment_module(home)
+        if resume_checkpoint is not None:
+            raise RunnerError(
+                "Antigravity checkpoints are not supported yet; start a fresh run"
+            )
+        agent_args = ["--agent-import-path", ANTIGRAVITY_AGENT_IMPORT_PATH]
     elif agent == ZCODE_AGENT:
         _validate_zcode_assignment(assignment)
         _ensure_zcode_agent_module(home)
@@ -1088,7 +1175,7 @@ def build_pier_command(
         "--disable-verification",
         "--yes",
     ]
-    if agent in (GROK_AGENT, KIMI_AGENT):
+    if agent in (GROK_AGENT, KIMI_AGENT, ANTIGRAVITY_AGENT):
         if provider_auth_path is None:
             raise RunnerError("subscription OAuth credential is unavailable")
         cmd += [
@@ -1261,6 +1348,23 @@ def build_pier_command(
                 assignment, resume_checkpoint,
                 enabled=bool(assignment.get("_durable_checkpoint_enabled", True)),
             ),
+        ]
+    elif agent == ANTIGRAVITY_AGENT:
+        if provider_auth_path is None or not provider_auth_path.is_dir():
+            raise RunnerError(
+                "Antigravity subscription OAuth is unavailable; run "
+                "`dradar provider setup antigravity` in your own interactive Terminal"
+            )
+        submission_prompt = _ensure_codex_submission_prompt(
+            home, assignment.get("benchmark_id")
+        )
+        cmd += [
+            "--model", assignment["model"],
+            "--ak", f"reasoning_effort={assignment['effort']}",
+            "--ak", f"auth_home_dir={provider_auth_path}",
+            "--ak", "shared_oauth=true",
+            "--ak", f"prompt_template_path={submission_prompt}",
+            "--ak", f"version={ANTIGRAVITY_CLI_VERSION}",
         ]
     elif agent == ZCODE_AGENT:
         if provider_auth_path is None or not provider_auth_path.is_file():
@@ -3171,6 +3275,7 @@ def run_trial(
     effective_assignment = assignment
     codex_cli_version = None
     kimi_cli_version = None
+    antigravity_cli_version = None
     zcode_cli_version = None
     dsh_version = None
     codex_provider = None
@@ -3231,6 +3336,17 @@ def run_trial(
             "agent_version": kimi_cli_version,
         }
         print(f"verified pinned Kimi subscription CLI: {kimi_cli_version}")
+    elif effective_agent == ANTIGRAVITY_AGENT:
+        _validate_antigravity_assignment(assignment)
+        antigravity_cli_version = ANTIGRAVITY_CLI_VERSION
+        effective_assignment = {
+            **assignment,
+            "agent_version": antigravity_cli_version,
+        }
+        print(
+            "verified pinned Antigravity subscription CLI: "
+            f"{antigravity_cli_version}"
+        )
     elif effective_agent == ZCODE_AGENT:
         _validate_zcode_assignment(assignment)
         zcode_cli_version = ZCODE_CLI_VERSION
@@ -3280,7 +3396,8 @@ def run_trial(
     live_error_counts: dict[str, int] = {}
     watch_live_account_errors = (
         (dev_agent or effective_assignment["agent"]) in (
-            "codex", DSH_AGENT, GROK_AGENT, KIMI_AGENT, ZCODE_AGENT,
+            "codex", DSH_AGENT, GROK_AGENT, KIMI_AGENT,
+            ANTIGRAVITY_AGENT, ZCODE_AGENT,
         )
     )
 
@@ -3314,6 +3431,13 @@ def run_trial(
                 )
             except (OSError, ValueError) as exc:
                 raise RunnerError(str(exc)) from exc
+        elif effective_agent == ANTIGRAVITY_AGENT:
+            try:
+                provider_auth_path = provider_stack.enter_context(
+                    antigravity_subscription_session(work_dir)
+                )
+            except (OSError, ValueError) as exc:
+                raise RunnerError(str(exc)) from exc
         elif effective_agent == ZCODE_AGENT:
             try:
                 provider_cli_path = _validated_zcode_cli_path()
@@ -3330,7 +3454,10 @@ def run_trial(
             }
             if (
                 codex_provider == DEEPSEEK_PROVIDER
-                or effective_agent in (GROK_AGENT, KIMI_AGENT, ZCODE_AGENT, DSH_AGENT)
+                or effective_agent in (
+                    GROK_AGENT, KIMI_AGENT, ANTIGRAVITY_AGENT,
+                    ZCODE_AGENT, DSH_AGENT,
+                )
             )
             else {}
         )
@@ -3371,6 +3498,9 @@ def run_trial(
             ),
             grok_module_dir=(work_dir if effective_agent == GROK_AGENT else None),
             kimi_module_dir=(work_dir if effective_agent == KIMI_AGENT else None),
+            antigravity_module_dir=(
+                work_dir if effective_agent == ANTIGRAVITY_AGENT else None
+            ),
             zcode_module_dir=(work_dir if effective_agent == ZCODE_AGENT else None),
             dsh_module_dir=(work_dir if effective_agent == DSH_AGENT else None),
         )
@@ -3670,6 +3800,7 @@ def run_trial(
             GROK_CLI_VERSION if effective_agent == GROK_AGENT else None
         ),
         kimi_cli_version=kimi_cli_version,
+        antigravity_cli_version=antigravity_cli_version,
         zcode_cli_version=zcode_cli_version,
         dsh_version=dsh_version,
         dsh_artifact_binding=dsh_artifact_binding,

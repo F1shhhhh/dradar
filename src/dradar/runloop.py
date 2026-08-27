@@ -35,6 +35,9 @@ from .local_config import (
 from .machine import acquire_run_lock, sweep_orphan_compose
 from .patch_guard import check_pompeii_patch, format_patch_guard_report
 from .providers import (
+    ANTIGRAVITY_AGENT,
+    ANTIGRAVITY_RUN_CONFIG_VERSION,
+    ANTIGRAVITY_RUNTIME_PROFILE,
     DEEPSEEK_CATALOG_SHA256,
     DEEPSEEK_PROVIDER,
     DEEPSEEK_RUN_CONFIG_VERSION,
@@ -1066,7 +1069,8 @@ def _subscription_trial_usage(trial_dir: Path, meta: dict) -> dict | None:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     expected_provider = (
-        "zcode" if meta.get("zcode_cli_version")
+        "antigravity" if meta.get("antigravity_cli_version")
+        else "zcode" if meta.get("zcode_cli_version")
         else "kimi-code" if meta.get("kimi_cli_version")
         else "grok" if meta.get("grok_cli_version")
         else None
@@ -1081,6 +1085,10 @@ def _subscription_trial_usage(trial_dir: Path, meta: dict) -> dict | None:
     complete = value.get("complete") is True
     incomplete_reason = value.get("usage_incomplete_reason")
     allowed_incomplete_reasons = {
+        "antigravity": {
+            "terminal_aggregate_missing_or_inconsistent",
+            "request_ledger_unavailable_or_invalid",
+        },
         "zcode": {"provider_aggregate_missing_or_invalid"},
         "grok": {
             "terminal_aggregate_missing_or_inconsistent",
@@ -1611,6 +1619,7 @@ def _upload_trial(
             "completed_turn_count", "turn_prompt_count",
             "cache_creation_tokens", "subscription_reported_cost_usd",
             "subscription_reported_cost_basis", "resume_attempts",
+            "thinking_tokens", "provider_runtime_model", "terminal_status",
         ):
             source_key = "sessions" if key == "agent_session_usage" else key
             if source_key in usage:
@@ -2489,6 +2498,7 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         "codex_cli_version": art.codex_cli_version,
         "grok_cli_version": art.grok_cli_version,
         "kimi_cli_version": art.kimi_cli_version,
+        "antigravity_cli_version": art.antigravity_cli_version,
         "zcode_cli_version": art.zcode_cli_version,
         "dsh_version": art.dsh_version,
         **stats,
@@ -2555,6 +2565,18 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             ),
             "subscription_oauth_coordination": "native-shared-lock-v1",
             "kimi_native_efforts": ["low", "high", "max"],
+        })
+    if assignment.get("agent") == ANTIGRAVITY_AGENT:
+        meta.update({
+            "model_config_version": ANTIGRAVITY_RUN_CONFIG_VERSION,
+            "model_runtime_profile": ANTIGRAVITY_RUNTIME_PROFILE,
+            "subscription_oauth": True,
+            "subscription_concurrency": (
+                telemetry.target_workers if telemetry is not None else 1
+            ),
+            "subscription_oauth_coordination": "shared-file-session-v1",
+            "antigravity_native_efforts": ["low", "medium", "high"],
+            "antigravity_terminal_sandbox": True,
         })
     if assignment.get("agent") == ZCODE_AGENT:
         meta.update({

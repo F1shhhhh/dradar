@@ -74,6 +74,13 @@ def test_validated_shared_mounts_accept_only_private_managed_targets(
             {"type": "bind", "source": str(source), "target": "/app"}
         ])
 
+    antigravity = _private_dir(tmp_path / "antigravity" / ".gemini")
+    assert _validated_shared_mounts([{
+        "type": "bind",
+        "source": str(antigravity),
+        "target": "/tmp/dradar-antigravity-user/.gemini",
+    }])[0]["target"] == "/tmp/dradar-antigravity-user/.gemini"
+
 
 def test_validated_shared_mounts_reject_symlink_and_broad_permissions(
     tmp_path: Path,

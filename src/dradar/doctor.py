@@ -14,6 +14,8 @@ from .capacity import docker_resources, worker_resource_warnings
 from .identity import _client
 from .local_config import _load_config, tasks_root_from_config
 from .providers import (
+    ANTIGRAVITY_AGENT,
+    ANTIGRAVITY_CLI_VERSION,
     DEEPSEEK_API_KEY_ENV,
     GROK_CLI_VERSION,
     GROK_AGENT,
@@ -21,6 +23,8 @@ from .providers import (
     KIMI_CLI_VERSION,
     ZCODE_AGENT,
     ZCODE_CLI_VERSION,
+    antigravity_auth_error,
+    antigravity_auth_path,
     deepseek_api_key,
     deepseek_catalog_error,
     deepseek_opted_in,
@@ -276,11 +280,13 @@ def cmd_doctor(args) -> int:
     grok_only = selected_agent == GROK_AGENT
     kimi_only = selected_agent == KIMI_AGENT
     zcode_only = selected_agent == ZCODE_AGENT
+    antigravity_only = selected_agent == ANTIGRAVITY_AGENT
     scopes = {
         "dsh-minimal": " — DSH Minimal",
         GROK_AGENT: " — Grok Build",
         KIMI_AGENT: " — Kimi Code",
         ZCODE_AGENT: " — ZCode",
+        ANTIGRAVITY_AGENT: " — Google Antigravity",
     }
     scope = scopes.get(selected_agent, "")
     print(f"dradar {__version__} doctor ({plat}{scope})")
@@ -448,6 +454,13 @@ def cmd_doctor(args) -> int:
     zcode_requested = zcode_only or (selected_agent is None and zcode_key_ready)
     zcode_cli_issue = zcode_cli_error(zcode_cli_path()) if zcode_requested else None
     zcode_ready = zcode_requested and zcode_key_ready and zcode_cli_issue is None
+    antigravity_requested = antigravity_only or (
+        selected_agent is None and antigravity_auth_path().exists()
+    )
+    antigravity_issue = (
+        antigravity_auth_error() if antigravity_requested else None
+    )
+    antigravity_ready = antigravity_requested and antigravity_issue is None
     deepseek_requested = deepseek_opted_in()
     deepseek_key_ready = bool(deepseek_api_key())
     if dsh_only:
@@ -459,7 +472,7 @@ def cmd_doctor(args) -> int:
         )
         if deepseek_key_ready:
             _check("DeepSeek V4 Flash / Pro / Vision — DSH Minimal agent ready", True)
-    elif grok_requested or kimi_requested or zcode_requested:
+    elif grok_requested or kimi_requested or zcode_requested or antigravity_requested:
         if grok_requested:
             all_ok &= _check(
                 f"Grok CLI {GROK_CLI_VERSION} — subscription runner",
@@ -511,6 +524,18 @@ def cmd_doctor(args) -> int:
             )
             if zcode_ready:
                 _check("ZCode GLM-5.3 — Coding Plan provider ready", True)
+        if antigravity_requested:
+            all_ok &= _check(
+                "Antigravity subscription OAuth — dedicated DRadar slot",
+                antigravity_issue is None,
+                antigravity_issue or "run `dradar provider setup antigravity`",
+            )
+            if antigravity_ready:
+                _check(
+                    f"Gemini 3.7 Flash low/medium/high — AGY CLI "
+                    f"{ANTIGRAVITY_CLI_VERSION} provider ready",
+                    True,
+                )
     elif deepseek_requested:
         catalog_issue = deepseek_catalog_error()
         catalog_ready = catalog_issue is None
