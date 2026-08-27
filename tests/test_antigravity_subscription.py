@@ -118,6 +118,32 @@ def test_oauth_home_rejects_links_and_broad_secret_files(
     assert "must not be a symlink" in (antigravity_auth_error() or "")
 
 
+def test_home_hardening_preserves_only_managed_runtime_executable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "dradar"
+    monkeypatch.setenv("DRADAR_HOME", str(home))
+    runtime = (
+        home / "providers" / "antigravity" / "runtime"
+        / ANTIGRAVITY_CLI_VERSION / "aarch64"
+    )
+    runtime.mkdir(parents=True)
+    executable = runtime / "antigravity"
+    executable.write_bytes(b"reviewed-binary")
+    proof = runtime / ".archive.sha512"
+    proof.write_text("reviewed-proof", encoding="utf-8")
+    auth_named_file = antigravity_auth_path() / "antigravity"
+    auth_named_file.parent.mkdir(parents=True)
+    auth_named_file.write_text("secret", encoding="utf-8")
+
+    privatize_antigravity_home()
+
+    if os.name != "nt":
+        assert executable.stat().st_mode & 0o777 == 0o700
+        assert proof.stat().st_mode & 0o777 == 0o600
+        assert auth_named_file.stat().st_mode & 0o777 == 0o600
+
+
 def test_subscription_session_exposes_only_canonical_gemini_tree(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
