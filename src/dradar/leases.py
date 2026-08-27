@@ -24,6 +24,62 @@ def _active(client) -> list[dict]:
     return active
 
 
+def _all_active(client) -> list[dict]:
+    """Return held assignments across every benchmark visible to this user.
+
+    Assignment lookup is intentionally benchmark-scoped for the run loop, but
+    ``leases`` and the interactive release picker are account-wide inventory
+    commands.  Query each advertised benchmark without changing the saved
+    benchmark or the scope used by a later ``resume``.
+
+    Servers old enough to lack the benchmark catalog keep the legacy current-
+    benchmark behavior.  A 403 for one catalog entry means that channel is not
+    runnable by this identity and is skipped; other errors must remain visible
+    rather than presenting a misleading partial inventory.
+    """
+    original_benchmark = getattr(client, "benchmark_id", None)
+    try:
+        try:
+            catalog = client.benchmarks()
+        except ApiError as exc:
+            if exc.status_code == 404:
+                return _active(client)
+            raise
+
+        benchmark_ids = [
+            item.get("id")
+            for item in (catalog.get("benchmarks") or [])
+            if isinstance(item, dict) and item.get("id")
+        ]
+        if original_benchmark and original_benchmark not in benchmark_ids:
+            benchmark_ids.insert(0, original_benchmark)
+        if not benchmark_ids:
+            return _active(client)
+
+        active: list[dict] = []
+        seen: set[str] = set()
+        for benchmark_id in benchmark_ids:
+            client.benchmark_id = benchmark_id
+            try:
+                scoped = _active(client)
+            except ApiError as exc:
+                if exc.status_code == 403:
+                    continue
+                raise
+            for item in scoped:
+                assignment_id = item.get("assignment_id")
+                if assignment_id and assignment_id in seen:
+                    continue
+                copy = dict(item)
+                copy.setdefault("benchmark_id", benchmark_id)
+                active.append(copy)
+                if assignment_id:
+                    seen.add(assignment_id)
+        return active
+    finally:
+        client.benchmark_id = original_benchmark
+
+
 def _expiry(iso: str | None) -> str:
     if not iso:
         return "unknown"
@@ -40,9 +96,12 @@ def _state(assignment: dict) -> str:
 
 def _print_active(active: list[dict]) -> None:
     for index, item in enumerate(active, 1):
+        benchmark = item.get("benchmark_id")
+        benchmark_label = f"  [{benchmark}]" if benchmark else ""
         print(
             f"  {index:>2}. {_state(item):9s}  "
-            f"{item['task_id']}  {item['model']}@{item['effort']}\n"
+            f"{item['task_id']}  {item['model']}@{item['effort']}"
+            f"{benchmark_label}\n"
             f"      {item['assignment_id']}  expires {_expiry(item.get('expires_at'))}"
         )
 
@@ -52,7 +111,7 @@ def cmd_leases(args) -> int:
     cfg = _load_config()
     client = _client(cfg)
     try:
-        active = _active(client)
+        active = _all_active(client)
     except ApiError as exc:
         sys.exit(f"lease check failed: {exc}")
     if not active:
@@ -107,7 +166,7 @@ def cmd_release(args) -> int:
 
     if not explicit and not args.all:
         try:
-            active = _active(client)
+            active = _all_active(client)
         except ApiError as exc:
             sys.exit(f"lease check failed: {exc}")
         if not active:

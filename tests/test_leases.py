@@ -17,9 +17,13 @@ def _cell(aid, *, started=False):
 
 
 class FakeClient:
-    def __init__(self, active):
+    def __init__(self, active, *, benchmark_id="deep-swe"):
         self.active = active
+        self.benchmark_id = benchmark_id
         self.release_calls = []
+
+    def benchmarks(self):
+        return {"benchmarks": [{"id": self.benchmark_id}]}
 
     def get_assignment(self):
         return {"active": self.active, "free_pick": True}
@@ -76,6 +80,88 @@ def test_started_history_without_healthy_runner_is_resumable_not_running(
     assert "1 running, 1 paused, 1 stale" in out
     assert "a1" in out and "stale" in out
     assert "not actually resumable" in out
+
+
+def test_leases_lists_and_labels_assignments_across_benchmarks(
+    monkeypatch, capsys,
+):
+    class MultiBenchmarkClient(FakeClient):
+        def __init__(self):
+            super().__init__([], benchmark_id="deep-swe")
+            self.by_benchmark = {
+                "deep-swe": [_cell("deep")],
+                "pompeii-adjacency": [{
+                    **_cell("pompeii"),
+                    "task_id": "pompeii-adjacency-rp-044",
+                    "model": "glm-5.3-flash",
+                    "effort": "high",
+                }],
+            }
+
+        def benchmarks(self):
+            return {"benchmarks": [
+                {"id": "deep-swe"}, {"id": "pompeii-adjacency"},
+            ]}
+
+        def get_assignment(self):
+            return {"active": self.by_benchmark[self.benchmark_id]}
+
+    client = MultiBenchmarkClient()
+    _wire(monkeypatch, client)
+
+    assert leases.cmd_leases(Namespace()) == 0
+
+    out = capsys.readouterr().out
+    assert "holding 2 cell(s)" in out
+    assert "task-deep" in out and "[deep-swe]" in out
+    assert "pompeii-adjacency-rp-044" in out
+    assert "glm-5.3-flash@high" in out
+    assert "[pompeii-adjacency]" in out
+    assert client.benchmark_id == "deep-swe"
+
+
+def test_cross_benchmark_inventory_deduplicates_assignment_ids(monkeypatch):
+    class DuplicateClient(FakeClient):
+        def benchmarks(self):
+            return {"benchmarks": [{"id": "deep-swe"}, {"id": "mirror"}]}
+
+        def get_assignment(self):
+            return {"active": [_cell("same")]}
+
+    client = DuplicateClient([_cell("same")])
+    _wire(monkeypatch, client)
+
+    assert len(leases._all_active(client)) == 1
+    assert client.benchmark_id == "deep-swe"
+
+
+def test_cross_benchmark_inventory_skips_inaccessible_channel(monkeypatch):
+    class RestrictedClient(FakeClient):
+        def benchmarks(self):
+            return {"benchmarks": [{"id": "deep-swe"}, {"id": "private"}]}
+
+        def get_assignment(self):
+            if self.benchmark_id == "private":
+                raise leases.ApiError("forbidden", status_code=403)
+            return {"active": [_cell("deep")]}
+
+    client = RestrictedClient([_cell("deep")])
+    _wire(monkeypatch, client)
+
+    assert [item["assignment_id"] for item in leases._all_active(client)] == ["deep"]
+    assert client.benchmark_id == "deep-swe"
+
+
+def test_cross_benchmark_inventory_falls_back_for_legacy_server(monkeypatch):
+    class LegacyClient(FakeClient):
+        def benchmarks(self):
+            raise leases.ApiError("not found", status_code=404)
+
+    client = LegacyClient([_cell("legacy")])
+    _wire(monkeypatch, client)
+
+    assert [item["assignment_id"] for item in leases._all_active(client)] == ["legacy"]
+    assert client.benchmark_id == "deep-swe"
 
 
 def test_release_all_protects_running_without_force(monkeypatch, capsys):
