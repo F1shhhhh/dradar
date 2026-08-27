@@ -291,6 +291,10 @@ class RunnerError(RuntimeError):
         self.failure_diagnostic = failure_diagnostic
 
 
+class RunnerCleanupUnconfirmedError(RunnerError):
+    """The local runtime may still be alive, so its lease must stay running."""
+
+
 class LiveAccountTerminalError(RunnerError):
     """A running agent reported an account-wide terminal provider failure."""
 
@@ -2221,8 +2225,8 @@ DEEP_SWE_REPO = "https://github.com/datacurve-ai/deep-swe"
 # Temporary SecurityMind Pier build containing datacurve-ai/pier#23 plus
 # persistent workspace/Codex-session checkpoints. Keep the immutable commit
 # pin until both fixes are released upstream, then follow the official tag.
-PIER_VERSION = "0.3.0.post3"
-PIER_COMMIT = "acd1d94a53c9ada225187e4b73206970f14ba415"
+PIER_VERSION = "0.3.0.post4"
+PIER_COMMIT = "fd5d8f18149844cbe255d7b98d655c7f7bbff030"
 PIER_SPEC = (
     "datacurve-pier @ git+https://github.com/SecurityMind/pier.git@"
     f"{PIER_COMMIT}"
@@ -2871,6 +2875,8 @@ def _zcode_false_success_reason(
         and steps > 0
     )
     status = runtime_diagnostic.get("zcode_last_status")
+    if runtime_diagnostic.get("zcode_terminal_observed") is not True:
+        return "terminal_not_observed"
     if status in {"error", "failed", "stopped"}:
         return "terminal_status"
     if explicit_model_error and not provider_turn_completed:
@@ -3023,6 +3029,24 @@ def _terminate_pier_process_tree(proc: subprocess.Popen) -> bool:
     return True
 
 
+def _cleanup_exited_pier_process_group(proc: subprocess.Popen) -> bool:
+    """Reap helpers left in Pier's isolated POSIX group after its leader exits."""
+
+    pid = getattr(proc, "pid", None)
+    if os.name == "nt" or not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.killpg(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError as exc:
+        raise RunnerError(
+            "Pier exited but its process group could not be audited",
+        ) from exc
+    _terminate_pier_process_tree(proc)
+    return True
+
+
 def _path_is_below(path: str, root: Path) -> bool:
     try:
         return Path(path).resolve().is_relative_to(root.resolve())
@@ -3030,7 +3054,13 @@ def _path_is_below(path: str, root: Path) -> bool:
         return False
 
 
-def _cleanup_terminated_pier_containers(job_root: Path) -> None:
+@dataclass(frozen=True)
+class PierContainerCleanup:
+    matched: int = 0
+    running: int = 0
+
+
+def _cleanup_terminated_pier_containers(job_root: Path) -> PierContainerCleanup:
     """Remove only surviving containers bound to the exact terminated job."""
 
     try:
@@ -3056,7 +3086,7 @@ def _cleanup_terminated_pier_containers(job_root: Path) -> None:
         if re.fullmatch(r"[0-9a-f]{12,64}", value)
     ]
     if not container_ids:
-        return
+        return PierContainerCleanup()
     try:
         inspected = subprocess.run(
             ["docker", "inspect", *container_ids],
@@ -3078,6 +3108,7 @@ def _cleanup_terminated_pier_containers(job_root: Path) -> None:
         raise RunnerError("Docker returned invalid orphan inspection data") from exc
 
     owned: list[str] = []
+    running: list[str] = []
     for container in containers:
         if not isinstance(container, dict):
             continue
@@ -3106,8 +3137,11 @@ def _cleanup_terminated_pier_containers(job_root: Path) -> None:
         )
         if mounts_owned or config_owned:
             owned.append(container_id)
+            state = container.get("State")
+            if isinstance(state, dict) and state.get("Running") is True:
+                running.append(container_id)
     if not owned:
-        return
+        return PierContainerCleanup()
     try:
         removed = subprocess.run(
             ["docker", "rm", "-f", *owned],
@@ -3123,6 +3157,7 @@ def _cleanup_terminated_pier_containers(job_root: Path) -> None:
         raise RunnerError(
             "terminated Pier task container could not be removed",
         )
+    return PierContainerCleanup(matched=len(owned), running=len(running))
 
 
 def run_trial(
@@ -3427,7 +3462,7 @@ def run_trial(
                 except RunnerError as cleanup_error:
                     cleanup_errors.append(str(cleanup_error))
                 if cleanup_errors:
-                    raise RunnerError(
+                    raise RunnerCleanupUnconfirmedError(
                         f"{exc}\nPier cleanup safety check failed: "
                         + "; ".join(cleanup_errors),
                     ) from exc
@@ -3441,6 +3476,39 @@ def run_trial(
                     terminal_error = exc
                 else:
                     raise
+        if effective_agent == ZCODE_AGENT:
+            cleanup_errors: list[str] = []
+            process_residue = False
+            try:
+                process_residue = _cleanup_exited_pier_process_group(proc)
+            except RunnerError as exc:
+                cleanup_errors.append(str(exc))
+            try:
+                cleanup = _cleanup_terminated_pier_containers(jobs_dir / job_name)
+            except RunnerError as exc:
+                cleanup_errors.append(str(exc))
+                cleanup = PierContainerCleanup()
+            if cleanup_errors:
+                raise RunnerCleanupUnconfirmedError(
+                    "Pier exited, but exact-job runtime cleanup could not be "
+                    "confirmed; the server lease was intentionally left running "
+                    "to prevent a duplicate retry ("
+                    + "; ".join(cleanup_errors)
+                    + ")",
+                )
+            if process_residue or cleanup.running:
+                raise RunnerError(
+                    "Pier exited while the ZCode runtime was still active; exact-job "
+                    "processes and containers were stopped before the "
+                    "assignment was made retryable",
+                    failure_diagnostic=_zcode_failure_diagnostic(
+                        effective_assignment,
+                        tasks_root / assignment["task_id"],
+                        jobs_dir,
+                        job_name,
+                        "agent_no_artifact",
+                    ),
+                )
     finally:
         if provider_auth_path is not None:
             if (
@@ -3562,7 +3630,7 @@ def run_trial(
         )
         if false_success_reason is not None:
             raise RunnerError(
-                "ZCode returned process status 0 without a gradeable terminal "
+                "Pier exited with process status 0 without a gradeable ZCode terminal "
                 f"result ({false_success_reason}); local artifacts were kept "
                 "and the assignment remains retryable",
                 failure_diagnostic=_zcode_failure_diagnostic(
