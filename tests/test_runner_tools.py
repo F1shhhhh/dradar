@@ -1325,6 +1325,121 @@ def test_run_trial_accepts_recovered_zcode_model_error_with_valid_patch(
     assert summarize_result(artifact.result)["n_agent_steps"] == 18
 
 
+def test_run_trial_accepts_recovered_zcode_tool_error_with_aggregate_usage(
+        tmp_path, monkeypatch):
+    """A recoverable tool failure must not poison a successful final turn.
+
+    This mirrors the retained ZCode case where ``File has been modified since
+    read`` incremented ``model_error_count``, but the agent recovered, emitted
+    a valid patch, and finished with a provider ``turn.completed`` aggregate.
+    The missing per-request reconciliation lowers usage confidence to
+    ``aggregate_only``; it does not invalidate the answer.
+    """
+    _prepare_fake_zcode(monkeypatch, tmp_path)
+    _fake_pier(
+        monkeypatch,
+        tmp_path,
+        result={
+            "agent_result": {
+                "n_agent_steps": 47,
+                "metadata": {"provider_usage": {
+                    "schema": "dradar-subscription-provider-usage-v1",
+                    "provider": "zcode",
+                    "model": runner_mod.ZCODE_MODEL,
+                    "complete": True,
+                    "request_count": 93,
+                    "request_usage_complete": False,
+                    "request_usage_observed": False,
+                    "usage_evidence_tier": "aggregate_only",
+                }},
+            },
+        },
+        trajectory_payload={
+            "steps": [{"source": "agent", "message": "completed patch"}],
+            "final_metrics": {"extra": {"model_error_count": 1}},
+        },
+        zcode_outcome={
+            "schema": "dradar-zcode-outcome-v1",
+            "sessionId": "sess_recovered_tool_error",
+            "state": {"projection": {"status": "idle", "turnCount": 1}},
+            "usage": {"modelErrorCount": 1, "modelRequestCount": 94},
+            "notifications": [{
+                "method": "v4/telemetry/event",
+                "params": {"kind": "turn.terminal", "status": "success"},
+            }],
+        },
+        provider_usage_sidecar={
+            "schema": "dradar-subscription-provider-usage-v1",
+            "provider": "zcode",
+            "model": runner_mod.ZCODE_MODEL,
+            "complete": True,
+            "request_count": 93,
+            "request_usage_complete": False,
+            "request_usage_observed": False,
+            "usage_evidence_tier": "aggregate_only",
+            "model_error_count": 1,
+        },
+        runtime_diagnostic={
+            "schema": "dradar-zcode-runtime-v1",
+            "status": "idle",
+            "turn_count": 1,
+            "seen_running": True,
+            "terminal_observed": True,
+        },
+        rc=0,
+    )
+
+    artifact = run_trial(_zcode_assignment_for_trial(), tmp_path, tmp_path)
+
+    assert artifact.returncode == 0
+    assert artifact.patch.read_text(encoding="utf-8") == "diff"
+    assert summarize_result(artifact.result)["n_agent_steps"] == 47
+
+
+def test_run_trial_rejects_zcode_failed_status_despite_completed_usage(
+        tmp_path, monkeypatch):
+    _prepare_fake_zcode(monkeypatch, tmp_path)
+    _fake_pier(
+        monkeypatch,
+        tmp_path,
+        result={"agent_result": {
+            "n_agent_steps": 47,
+            "metadata": {"provider_usage": {
+                "schema": "dradar-subscription-provider-usage-v1",
+                "provider": "zcode",
+                "model": runner_mod.ZCODE_MODEL,
+                "complete": True,
+                "request_count": 93,
+                "request_usage_complete": False,
+                "request_usage_observed": False,
+                "usage_evidence_tier": "aggregate_only",
+            }},
+        }},
+        provider_usage_sidecar={
+            "schema": "dradar-subscription-provider-usage-v1",
+            "provider": "zcode",
+            "model": runner_mod.ZCODE_MODEL,
+            "complete": True,
+            "request_count": 93,
+            "request_usage_complete": False,
+            "request_usage_observed": False,
+            "usage_evidence_tier": "aggregate_only",
+            "model_error_count": 1,
+        },
+        runtime_diagnostic={
+            "schema": "dradar-zcode-runtime-v1",
+            "status": "failed",
+            "turn_count": 1,
+            "seen_running": True,
+            "terminal_observed": True,
+        },
+        rc=0,
+    )
+
+    with pytest.raises(RunnerError, match="terminal_status"):
+        run_trial(_zcode_assignment_for_trial(), tmp_path, tmp_path)
+
+
 def test_run_trial_keeps_zcode_patch_gradeable_when_only_usage_is_incomplete(
         tmp_path, monkeypatch):
     _prepare_fake_zcode(monkeypatch, tmp_path)
