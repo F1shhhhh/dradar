@@ -7,13 +7,17 @@ from dradar import identity
 
 
 class FakeStatusClient:
-    def __init__(self, payload, active=None):
+    def __init__(self, payload, active=None, recent_inactive=None):
         self.payload = payload
         self.active = active or []
+        self.recent_inactive = recent_inactive or []
     def my_submissions(self):
         return self.payload
     def get_assignment(self):
-        return {"active": self.active}
+        return {
+            "active": self.active,
+            "recent_inactive": self.recent_inactive,
+        }
 
 
 def test_cmd_status_prints_summary(monkeypatch, capsys, tmp_path):
@@ -70,6 +74,32 @@ def test_cmd_status_makes_lease_recovery_commands_discoverable(monkeypatch, caps
     out = capsys.readouterr().out
     assert "1 running, 1 waiting" in out
     assert "dradar leases" in out and "dradar release" in out
+
+
+def test_cmd_status_summarizes_recent_inactive_unsubmitted_leases(
+    monkeypatch, capsys,
+):
+    payload = {"nickname": "v", "points": 0, "submissions": []}
+    recent = [
+        {"assignment_id": "a1", "status": "expired"},
+        {"assignment_id": "a2", "status": "released"},
+    ]
+    monkeypatch.setattr(
+        identity, "_load_config", lambda: {"server": "https://x", "token": "t"},
+    )
+    monkeypatch.setattr(
+        identity, "_client",
+        lambda cfg: FakeStatusClient(payload, recent_inactive=recent),
+    )
+    monkeypatch.setattr(identity.pending, "load", lambda home: [])
+    from types import SimpleNamespace
+
+    identity.cmd_status(SimpleNamespace())
+
+    out = capsys.readouterr().out
+    assert "2 recent unsubmitted lease(s) ended" in out
+    assert "1 expired" in out and "1 released" in out
+    assert "dradar leases" in out
 
 
 def test_cmd_status_uses_live_runner_health_not_historical_started_at(

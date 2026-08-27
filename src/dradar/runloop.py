@@ -97,6 +97,7 @@ _ACCOUNT_TERMINAL_OUTCOMES = {
 }
 _POOL_ABORT_ENV = "DRADAR_POOL_ABORT_FILE"
 _POOL_TARGET_FILE_ENV = "DRADAR_POOL_TARGET_FILE"
+_POOL_FAILURE_CUTOFF_ENV = "DRADAR_POOL_FAILURE_CUTOFF_FILE"
 _REPEAT_FAILURE_STATE_ENV = "DRADAR_REPEAT_FAILURE_STATE_FILE"
 _ASSIGNMENT_BOUNDARY_ENV = "DRADAR_ASSIGNMENT_BOUNDARY_FILE"
 _POOL_DRAIN_PREFIX = "drain:"
@@ -3706,6 +3707,7 @@ def _signal_workers(processes: list[subprocess.Popen]) -> None:
 
 def _assignment_is_ready_for_checkout(
     assignment: dict, *, now: datetime | None = None,
+    claimed_after: datetime | None = None,
 ) -> bool:
     """Whether a held cell is genuinely waiting for a worker right now.
 
@@ -3718,6 +3720,21 @@ def _assignment_is_ready_for_checkout(
             or assignment.get("execution_state") == "paused"
             or assignment.get("checkpoint_id")):
         return False
+    if claimed_after is not None:
+        leased_at = assignment.get("leased_at")
+        try:
+            claimed_at = datetime.fromisoformat(
+                str(leased_at).replace("Z", "+00:00")
+            )
+        except (TypeError, ValueError):
+            # Old servers do not expose leased_at. A degraded pool must fail
+            # closed rather than rotate a local fault through an assignment
+            # it cannot prove was claimed after the failure.
+            return False
+        if claimed_at.tzinfo is None:
+            claimed_at = claimed_at.replace(tzinfo=timezone.utc)
+        if claimed_at <= claimed_after:
+            return False
     retry_after = assignment.get("retry_after")
     if not retry_after:
         return True
@@ -3768,7 +3785,9 @@ def _assignment_is_recoverable_checkpoint(
     )
 
 
-def _pool_ready_work_count(client: ApiClient) -> int | None:
+def _pool_ready_work_count(
+    client: ApiClient, *, claimed_after: datetime | None = None,
+) -> int | None:
     """Read fresh checkout work plus safely recoverable checkpoints.
 
     ``None`` means the safety check itself failed. The supervisor then keeps
@@ -3784,17 +3803,85 @@ def _pool_ready_work_count(client: ApiClient) -> int | None:
         one = data.get("assignment")
         active = [one] if one else []
     waiting = sum(
-        _assignment_is_ready_for_checkout(assignment)
+        _assignment_is_ready_for_checkout(
+            assignment, claimed_after=claimed_after,
+        )
         for assignment in active
         if assignment
     )
     local = checkpoints.latest_by_assignment(HOME)
-    recoverable = sum(
-        _assignment_is_recoverable_checkpoint(assignment, local)
-        for assignment in active
-        if assignment
+    recoverable = (
+        0
+        if claimed_after is not None
+        else sum(
+            _assignment_is_recoverable_checkpoint(assignment, local)
+            for assignment in active
+            if assignment
+        )
     )
     return waiting + recoverable
+
+
+def _pool_failure_cutoff_path() -> Path | None:
+    raw = os.environ.get(_POOL_FAILURE_CUTOFF_ENV)
+    return Path(raw) if raw else None
+
+
+def _read_pool_failure_cutoff(path: Path | None = None) -> datetime | None:
+    path = path or _pool_failure_cutoff_path()
+    if path is None or not path.is_file():
+        return None
+    try:
+        cutoff = datetime.fromisoformat(
+            path.read_text(encoding="utf-8").strip().replace("Z", "+00:00")
+        )
+    except (OSError, TypeError, ValueError):
+        return datetime.max.replace(tzinfo=timezone.utc)
+    if cutoff.tzinfo is None:
+        cutoff = cutoff.replace(tzinfo=timezone.utc)
+    return cutoff
+
+
+def _write_pool_failure_cutoff(path: Path, cutoff: datetime) -> None:
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(cutoff.isoformat(), encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _pool_degraded_exclusions(client: ApiClient) -> set[str] | None:
+    """IDs held before the pool's latest child failure.
+
+    ``None`` means the authoritative inventory could not be read; callers
+    stop before checkout instead of guessing. The exclusion is refreshed on
+    every checkout so assignments explicitly claimed after the failure stay
+    eligible under the original parent process.
+    """
+    cutoff = _read_pool_failure_cutoff()
+    if cutoff is None:
+        return set()
+    try:
+        data = client.get_assignment()
+    except ApiError as exc:
+        print(
+            f"degraded pool inventory check failed ({exc}); stopping this "
+            "worker before checkout"
+        )
+        return None
+    active = data.get("active")
+    if active is None:
+        one = data.get("assignment")
+        active = [one] if one else []
+    return {
+        assignment["assignment_id"]
+        for assignment in active
+        if assignment and not _assignment_is_ready_for_checkout(
+            assignment, claimed_after=cutoff,
+        )
+        and assignment.get("assignment_id")
+    }
 
 
 def _run_worker_pool(args) -> int:
@@ -3916,6 +4003,10 @@ def _run_worker_pool(args) -> int:
         Path(tempfile.gettempdir())
         / f"dradar-repeat-failure-{os.getpid()}-{time.time_ns()}.json"
     )
+    failure_cutoff_file = (
+        Path(tempfile.gettempdir())
+        / f"dradar-pool-failure-cutoff-{os.getpid()}-{time.time_ns()}"
+    )
     owns_abort_file = configured_abort_file is None
     popen_kwargs = {}
     if os.name == "nt":
@@ -3925,6 +4016,7 @@ def _run_worker_pool(args) -> int:
     returncodes: list[tuple[int, int]] = []
     backfill_error: str | None = None
     backfill_disabled = False
+    failure_cutoff: datetime | None = None
     abort_reason: str | None = None
     abort_interrupts_siblings = False
 
@@ -3935,6 +4027,7 @@ def _run_worker_pool(args) -> int:
         repeat_failure_state_file.with_name(
             f"{repeat_failure_state_file.name}.lock"
         ).unlink(missing_ok=True)
+        failure_cutoff_file.unlink(missing_ok=True)
 
     def spawn_worker(slot: int) -> None:
         env = os.environ.copy()
@@ -3945,6 +4038,7 @@ def _run_worker_pool(args) -> int:
             env[_POOL_TARGET_FILE_ENV] = str(target_file)
         env[_POOL_ABORT_ENV] = str(pool_abort_file)
         env[_REPEAT_FAILURE_STATE_ENV] = str(repeat_failure_state_file)
+        env[_POOL_FAILURE_CUTOFF_ENV] = str(failure_cutoff_file)
         if boundary_path is not None:
             env[_ASSIGNMENT_BOUNDARY_ENV] = str(boundary_path)
         process = subprocess.Popen(command, env=env, **popen_kwargs)
@@ -3965,17 +4059,20 @@ def _run_worker_pool(args) -> int:
                 returncodes.append((slot, returncode))
                 del active_processes[slot]
                 if returncode != 0 and not backfill_disabled:
-                    # A child already returned its failed assignment to a
-                    # retryable state. Replacing that child automatically can
-                    # pick the same cell again as soon as its cooldown expires
-                    # (or rotate through other cells with the same local
-                    # fault). Drain only: paid sibling runs stay untouched,
-                    # while an explicit later `dradar resume` starts a fresh
-                    # pool after the operator has inspected the failure.
-                    backfill_disabled = True
+                    # Freeze everything that was already held when this local
+                    # failure surfaced. Replacement workers may only consume
+                    # assignments explicitly claimed later; the shared cutoff
+                    # is also enforced by every surviving child before its
+                    # next checkout. This preserves the old anti-cascade
+                    # drain while preventing later web claims from silently
+                    # expiring behind a still-live parent process.
+                    failure_cutoff = datetime.now(timezone.utc)
+                    _write_pool_failure_cutoff(
+                        failure_cutoff_file, failure_cutoff,
+                    )
                     print(
-                        f"worker {slot} exited {returncode}; disabling automatic "
-                        "backfill and draining workers already in flight"
+                        f"worker {slot} exited {returncode}; existing waiting "
+                        "work is frozen, watching only for assignments claimed later"
                     )
 
             if not active_processes:
@@ -4032,7 +4129,9 @@ def _run_worker_pool(args) -> int:
             if (not backfill_disabled
                     and len(active_processes) < target
                     and current_time >= next_backfill_check):
-                ready = _pool_ready_work_count(client)
+                ready = _pool_ready_work_count(
+                    client, claimed_after=failure_cutoff,
+                )
                 next_backfill_check = (
                     current_time + (
                         _POOL_BACKFILL_ERROR_RETRY_SECONDS
@@ -4273,6 +4372,11 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
         if getattr(args, "refill", False) and not refill_plan.is_running(HOME):
             print("continuous refill is stopped; leaving already held tasks for a later resume")
             break
+        degraded_exclusions = _pool_degraded_exclusions(client)
+        if degraded_exclusions is None:
+            results.append("degraded-pool-inventory-failed")
+            break
+        checkout_exclusions = failed_ids | degraded_exclusions
         try:
             # A failed local cell is marked stopped so it is retryable later,
             # but this session must not immediately take the same cell again.
@@ -4281,11 +4385,13 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
             if telemetry:
                 telemetry.flush()  # register queued state before atomic checkout
                 data = client.checkout(
-                    exclude_assignment_ids=failed_ids,
+                    exclude_assignment_ids=checkout_exclusions,
                     session_id=telemetry.session_id,
                 )
             else:
-                data = client.checkout(exclude_assignment_ids=failed_ids)
+                data = client.checkout(
+                    exclude_assignment_ids=checkout_exclusions,
+                )
         except ApiError as exc:
             if (telemetry and exc.status_code == 409
                     and "runner session" in str(exc)):
@@ -4296,7 +4402,7 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
                 telemetry.flush()
                 try:
                     data = client.checkout(
-                        exclude_assignment_ids=failed_ids,
+                        exclude_assignment_ids=checkout_exclusions,
                         session_id=telemetry.session_id,
                     )
                 except ApiError as retry_exc:
@@ -4314,16 +4420,20 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
                       "checked out (another session?) or submitted. "
                       "`dradar leases` shows exactly what is still held.")
             break
-        if assignment["assignment_id"] in failed_ids:
+        if assignment["assignment_id"] in checkout_exclusions:
             # Compatibility with an older server that ignores the exclusion
             # field: checkout just stamped this cell started again. Undo that
             # stamp before stopping, otherwise `resume` reports nothing to do
             # while the UI shows a permanently running cell (incident
             # 019f656c-cf16-70e2-ae4c-d1d51146acb2, 2026-07-15).
             _mark_stopped_quietly(client, assignment)
-            print(f"stopping after {assignment['task_id']} re-entered checkout — "
-                  "it already failed in this session. `dradar resume` retries it "
-                  "later; `dradar release` gives it back.")
+            print(
+                f"stopping after excluded assignment {assignment['task_id']} "
+                "re-entered checkout — it already failed in this session or "
+                "was held before the pool failure. Its checkout stamp was "
+                "returned; run a fresh `dradar resume` after inspecting the "
+                "earlier failure."
+            )
             break
         try:
             assignment_boundary.add_expected(
