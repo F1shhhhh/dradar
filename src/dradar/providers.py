@@ -1069,6 +1069,16 @@ def privatize_antigravity_home(home: Path | None = None) -> None:
     root = antigravity_home(home)
     if not root.exists():
         return
+    # AGY maintains this exact convenience link to its rotating log.  It is
+    # unnecessary in the credential mount and would make the otherwise
+    # symlink-free tree fail closed after every real login.  Unlink the known
+    # path without following it; every other symlink remains an error.
+    cli_log = antigravity_auth_path(home) / "antigravity-cli" / "cli.log"
+    try:
+        if stat.S_ISLNK(cli_log.lstat().st_mode):
+            cli_log.unlink()
+    except FileNotFoundError:
+        pass
     runtime = root / "runtime"
     for path in [root, *root.rglob("*")]:
         try:

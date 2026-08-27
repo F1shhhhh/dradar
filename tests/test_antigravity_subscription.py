@@ -135,6 +135,12 @@ def test_home_hardening_preserves_only_managed_runtime_executable(
     auth_named_file = antigravity_auth_path() / "antigravity"
     auth_named_file.parent.mkdir(parents=True)
     auth_named_file.write_text("secret", encoding="utf-8")
+    log_dir = antigravity_auth_path() / "antigravity-cli" / "log"
+    log_dir.mkdir(parents=True)
+    log_file = log_dir / "cli-20260828_000000.log"
+    log_file.write_text("official log", encoding="utf-8")
+    cli_log = log_dir.parent / "cli.log"
+    cli_log.symlink_to(Path("log") / log_file.name)
 
     privatize_antigravity_home()
 
@@ -142,6 +148,8 @@ def test_home_hardening_preserves_only_managed_runtime_executable(
         assert executable.stat().st_mode & 0o777 == 0o700
         assert proof.stat().st_mode & 0o777 == 0o600
         assert auth_named_file.stat().st_mode & 0o777 == 0o600
+        assert log_file.stat().st_mode & 0o777 == 0o600
+    assert not cli_log.exists()
 
 
 def test_subscription_session_exposes_only_canonical_gemini_tree(
