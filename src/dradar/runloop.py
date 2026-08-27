@@ -33,6 +33,7 @@ from .local_config import (
     DEFAULT_BENCHMARK, HOME, _load_config, tasks_root_from_config,
 )
 from .machine import acquire_run_lock, sweep_orphan_compose
+from .patch_guard import check_pompeii_patch, format_patch_guard_report
 from .providers import (
     DEEPSEEK_CATALOG_SHA256,
     DEEPSEEK_PROVIDER,
@@ -1539,6 +1540,32 @@ def _upload_trial(
         print(f"patch contained secret-shaped content "
               f"({', '.join(redacted_labels)}); uploading a structurally validated "
               "redacted copy. The raw patch stays local.")
+
+    entry_meta = entry.get("meta") or {}
+    is_zcode_pompeii = (
+        task_id.startswith(f"{POMPEII_BENCHMARK_ID}-")
+        and (
+            entry_meta.get("model_runtime_profile") == ZCODE_RUNTIME_PROFILE
+            or entry_meta.get("zcode_protocol_version") == 1
+        )
+    )
+    if is_zcode_pompeii:
+        guard = check_pompeii_patch(raw_patch)
+        if not guard.accepted:
+            print(
+                f"  {task_id}: ZCode patch preflight blocked upload; the "
+                "declared deliverable boundary was violated"
+            )
+            for line in format_patch_guard_report(guard):
+                print(f"    {line}")
+            print(f"    raw artifact preserved at: {patch}")
+            print(
+                "    assignment reopened for an independent ZCode re-solve; "
+                "no prior model answer is reused"
+            )
+            pending.remove(HOME, assignment_id)
+            settle_terminal_local_failure()
+            return "rejected"
 
     upload_meta = dict(entry.get("meta") or {})
     trial_dir = Path(entry["trial_dir"])

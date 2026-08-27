@@ -95,6 +95,44 @@ def test_pompeii_prompt_sets_simple_time_budget(tmp_path, monkeypatch):
     assert "complete, gradeable answer" in text
 
 
+def test_zcode_pompeii_prompt_enforces_single_declared_deliverable(
+    tmp_path, monkeypatch,
+):
+    _stub_pier(monkeypatch)
+    task = tmp_path / "abs-module-cache-flags"
+    task.mkdir()
+    (task / "task.toml").write_text("[agent]\ntimeout_sec = 7200.0\n")
+    home = tmp_path / "home"
+    home.mkdir()
+    key = tmp_path / "zcode-key"
+    key.write_text("secret")
+    cli = tmp_path / "zcode.cjs"
+    cli.write_text("pinned")
+    assignment = _assignment(
+        runner_mod.ZCODE_AGENT,
+        model=runner_mod.ZCODE_MODEL,
+        effort="low",
+    ) | {
+        "benchmark_id": runner_mod.POMPEII_BENCHMARK_ID,
+        "provider": runner_mod.ZCODE_PROVIDER,
+        "agent_version": runner_mod.ZCODE_CLI_VERSION,
+    }
+
+    cmd = build_pier_command(
+        assignment, tmp_path, tmp_path / "jobs", "j", home,
+        provider_auth_path=key, provider_cli_path=cli,
+    )
+
+    prompt = home / "zcode-submission-prompt-pompeii-v1.j2"
+    assert f"prompt_template_path={prompt}" in cmd
+    text = prompt.read_text()
+    assert "exactly one declared deliverable" in text
+    assert "git diff --name-only pompeii-base HEAD" in text
+    assert "Do not modify or commit `question.png`" in text
+    assert "generated images, caches" in text
+    assert "Do not reuse another model's answer" in text
+
+
 def test_dev_agent_codex_uses_durable_openai_provider_default(tmp_path, monkeypatch):
     _stub_pier(monkeypatch)
     task = tmp_path / "abs-module-cache-flags"

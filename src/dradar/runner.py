@@ -249,6 +249,21 @@ best current judgment to finish and commit. A complete, gradeable answer takes
 priority over further exploration.
 """
 
+ZCODE_POMPEII_SUBMISSION_PROMPT = POMPEII_SUBMISSION_PROMPT + """
+
+This benchmark has exactly one declared deliverable: `model_answer.json` in
+the repository root. Derive the answer independently from the task inputs and
+write only that final JSON file. Do not modify or commit `question.png`,
+`output_schema.json`, anything under `reference/`, generated images, caches,
+logs, or intermediate analysis artifacts. Keep temporary image-processing and
+analysis files outside `/app` (for example under `/tmp`) and remove any
+accidental repository artifacts before committing.
+
+Before finishing, verify that `git diff --name-only pompeii-base HEAD` prints
+exactly `model_answer.json`, and that the file conforms to
+`output_schema.json`. Do not reuse another model's answer.
+"""
+
 
 @dataclass
 class TrialArtifacts:
@@ -476,6 +491,20 @@ def _ensure_codex_submission_prompt(
         path = home / "codex-submission-prompt.j2"
         prompt = CODEX_SUBMISSION_PROMPT
     return _materialize_shared_file(path, prompt.encode())
+
+
+def _ensure_zcode_submission_prompt(
+    home: Path, benchmark_id: str | None = None,
+) -> Path:
+    if benchmark_id != POMPEII_BENCHMARK_ID:
+        return _ensure_codex_submission_prompt(home, benchmark_id)
+    # ZCode needs an explicit repository boundary for this schema-only visual
+    # benchmark. Keep it separate so other agents retain their existing prompt
+    # and concurrent workers never overwrite each other's template.
+    path = home / "zcode-submission-prompt-pompeii-v1.j2"
+    return _materialize_shared_file(
+        path, ZCODE_POMPEII_SUBMISSION_PROMPT.encode(),
+    )
 
 
 def _ensure_deepseek_config(home: Path) -> Path:
@@ -1240,7 +1269,7 @@ def build_pier_command(
                 "Pinned ZCode CLI is unavailable; run "
                 "`dradar provider status zcode` first"
             )
-        submission_prompt = _ensure_codex_submission_prompt(
+        submission_prompt = _ensure_zcode_submission_prompt(
             home, assignment.get("benchmark_id")
         )
         cmd += [
