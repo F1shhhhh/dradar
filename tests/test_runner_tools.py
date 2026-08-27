@@ -441,7 +441,7 @@ def test_ensure_pier_noop_when_required_version_present(monkeypatch):
 
 def test_ensure_pier_accepts_newer_compatible_post_release(monkeypatch):
     monkeypatch.setattr(runner_mod.shutil, "which", lambda n: "/usr/bin/pier")
-    monkeypatch.setattr(runner_mod, "_pier_version", lambda _: "0.3.0.post3")
+    monkeypatch.setattr(runner_mod, "_pier_version", lambda _: "0.3.0.post5")
     called = []
     monkeypatch.setattr(runner_mod.subprocess, "run", lambda *a, **k: called.append(a))
     ensure_pier()
@@ -693,6 +693,16 @@ def _fake_pier(monkeypatch, work_dir, *, patch=True, trajectory=True,
 
     monkeypatch.setattr(runner_mod, "build_pier_command", fake_build)
     monkeypatch.setattr(runner_mod.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(
+        runner_mod,
+        "_cleanup_exited_pier_process_group",
+        lambda _proc: False,
+    )
+    monkeypatch.setattr(
+        runner_mod,
+        "_cleanup_terminated_pier_containers",
+        lambda _job_root: runner_mod.PierContainerCleanup(),
+    )
     return captured
 
 
@@ -812,6 +822,30 @@ def test_terminate_pier_kills_children_after_leader_exits(monkeypatch):
     ]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process groups only")
+def test_cleanup_exited_pier_process_group_detects_surviving_helper(monkeypatch):
+    signals = []
+
+    class LeaderExited:
+        pid = 65432
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(
+        runner_mod.os, "killpg",
+        lambda pid, sig: signals.append((pid, sig)),
+    )
+
+    assert runner_mod._cleanup_exited_pier_process_group(LeaderExited()) is True
+    assert signals == [
+        (65432, 0),
+        (65432, runner_mod.signal.SIGTERM),
+        (65432, 0),
+        (65432, runner_mod.signal.SIGKILL),
+    ]
+
+
 def test_forced_cleanup_removes_only_container_bound_to_exact_job(
     tmp_path, monkeypatch,
 ):
@@ -832,6 +866,7 @@ def test_forced_cleanup_removes_only_container_bound_to_exact_job(
             containers = [
                 {
                     "Id": owned_id,
+                    "State": {"Running": True},
                     "Config": {"Labels": {
                         "com.docker.compose.project": "pier__abcdef",
                     }},
@@ -860,9 +895,66 @@ def test_forced_cleanup_removes_only_container_bound_to_exact_job(
 
     monkeypatch.setattr(runner_mod.subprocess, "run", fake_run)
 
-    runner_mod._cleanup_terminated_pier_containers(job_root)
+    cleanup = runner_mod._cleanup_terminated_pier_containers(job_root)
 
     assert calls[-1] == ["docker", "rm", "-f", owned_id]
+    assert cleanup == runner_mod.PierContainerCleanup(matched=1, running=1)
+
+
+def test_zcode_rc0_with_live_exact_job_container_is_reaped_before_retry(
+    tmp_path, monkeypatch,
+):
+    _prepare_fake_zcode(monkeypatch, tmp_path)
+    _fake_pier(
+        monkeypatch,
+        tmp_path,
+        runtime_diagnostic={
+            "schema": "dradar-zcode-runtime-v1",
+            "status": "running",
+            "turn_count": 1,
+            "seen_running": True,
+            "terminal_observed": False,
+        },
+        rc=0,
+    )
+    process_groups = []
+    monkeypatch.setattr(
+        runner_mod,
+        "_cleanup_terminated_pier_containers",
+        lambda _job_root: runner_mod.PierContainerCleanup(matched=1, running=1),
+    )
+    monkeypatch.setattr(
+        runner_mod,
+        "_cleanup_exited_pier_process_group",
+        lambda proc: process_groups.append(proc) or False,
+    )
+
+    with pytest.raises(
+        RunnerError, match="ZCode runtime was still active",
+    ):
+        run_trial(_zcode_assignment_for_trial(), tmp_path, tmp_path)
+
+    assert len(process_groups) == 1
+
+
+def test_zcode_rc0_keeps_lease_running_when_cleanup_cannot_be_proven(
+    tmp_path, monkeypatch,
+):
+    _prepare_fake_zcode(monkeypatch, tmp_path)
+    _fake_pier(monkeypatch, tmp_path, rc=0)
+
+    def cleanup_failed(_job_root):
+        raise RunnerError("docker daemon unavailable")
+
+    monkeypatch.setattr(
+        runner_mod, "_cleanup_terminated_pier_containers", cleanup_failed,
+    )
+
+    with pytest.raises(
+        runner_mod.RunnerCleanupUnconfirmedError,
+        match="lease was intentionally left running",
+    ):
+        run_trial(_zcode_assignment_for_trial(), tmp_path, tmp_path)
 
 
 def test_run_trial_stops_live_codex_quota_error_loop(tmp_path, monkeypatch):
@@ -1357,6 +1449,27 @@ def test_run_trial_rejects_zcode_rc0_without_meaningful_agent_result(
     )
 
     with pytest.raises(RunnerError, match="empty_agent_result"):
+        run_trial(_zcode_assignment_for_trial(), tmp_path, tmp_path)
+
+
+def test_run_trial_rejects_zcode_rc0_before_terminal_is_observed(
+        tmp_path, monkeypatch):
+    _prepare_fake_zcode(monkeypatch, tmp_path)
+    _fake_pier(
+        monkeypatch,
+        tmp_path,
+        result={"agent_result": {"n_agent_steps": 1}},
+        runtime_diagnostic={
+            "schema": "dradar-zcode-runtime-v1",
+            "status": "running",
+            "turn_count": 1,
+            "seen_running": True,
+            "terminal_observed": False,
+        },
+        rc=0,
+    )
+
+    with pytest.raises(RunnerError, match="terminal_not_observed"):
         run_trial(_zcode_assignment_for_trial(), tmp_path, tmp_path)
 
 

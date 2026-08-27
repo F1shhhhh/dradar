@@ -60,6 +60,7 @@ from .providers import (
 )
 from .runner import (
     CODEX_TRAJECTORY_BUNDLE_SCHEMA, DIAG_ADVICE, BuildFlakeError, RunnerError,
+    RunnerCleanupUnconfirmedError,
     POMPEII_BENCHMARK_ID,
     POMPEII_FINALIZATION_RESERVE_SEC, POMPEII_SOFT_BUDGET_SEC,
     POMPEII_TERMINAL_HEAVY_TIMEOUT_SEC,
@@ -2256,6 +2257,17 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                     client, assignment, failure_kind="environment_build_failed",
                 )
             return "environment-build-failed"
+        except RunnerCleanupUnconfirmedError as exc:
+            _signal_pool_abort(
+                "local Pier cleanup could not be confirmed",
+                interrupt_siblings=False,
+            )
+            print(
+                f"trial stopped: {exc}\n"
+                "the lease remains running because local cleanup was not proven; "
+                "automatic retry/backfill is disabled to prevent a duplicate agent"
+            )
+            return "cleanup-unconfirmed"
         except RunnerError as exc:
             failure_kind = classify_exception_message(str(exc))
             terminal_outcome = _terminal_failure_outcome(failure_kind)

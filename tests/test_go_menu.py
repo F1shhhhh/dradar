@@ -601,6 +601,38 @@ def test_task_content_mismatch_stops_before_model_run(
     assert "no model quota was consumed" in capsys.readouterr().out
 
 
+def test_cleanup_unconfirmed_drains_pool_without_marking_lease_stopped(
+    monkeypatch, tmp_path: Path, capsys,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
+    abort_file = tmp_path / "POOL_ABORT"
+    monkeypatch.setenv("DRADAR_POOL_ABORT_FILE", str(abort_file))
+
+    def fail(*_args, **_kwargs):
+        raise runloop.RunnerCleanupUnconfirmedError("exact runtime is unknown")
+
+    monkeypatch.setattr(runloop, "run_trial", fail)
+    stopped = []
+    monkeypatch.setattr(
+        runloop,
+        "_mark_stopped_quietly",
+        lambda *_args, **_kwargs: stopped.append(True),
+    )
+    client = SubmitClient({})
+
+    outcome = runloop._run_and_submit(
+        client, ASSIGNMENT, tmp_path, _args(), "abc123",
+    )
+
+    assert outcome == "cleanup-unconfirmed"
+    assert stopped == []
+    assert client.submissions == []
+    assert abort_file.read_text() == (
+        "drain:local Pier cleanup could not be confirmed"
+    )
+    assert "lease remains running" in capsys.readouterr().out
+
+
 def test_explicit_task_drift_override_keeps_existing_audited_behavior(
     monkeypatch, tmp_path: Path,
 ):

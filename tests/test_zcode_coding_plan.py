@@ -461,6 +461,27 @@ def test_zcode_session_id_is_durable_before_the_paid_turn() -> None:
     assert write_at < replace_at < unlink_at < send_at
 
 
+def test_zcode_terminal_outcome_is_atomic_and_published_last() -> None:
+    source = Path(providers.__file__).with_name("pier_zcode.py").read_text()
+    module = ast.parse(source)
+    runner_assignment = next(
+        node for node in module.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "_PROTOCOL_RUNNER"
+                for target in node.targets)
+    )
+    runner_source = ast.literal_eval(runner_assignment.value)
+    ast.parse(runner_source)
+    events_at = runner_source.index(
+        "write_private_json(events_path, redact(notifications))"
+    )
+    outcome_at = runner_source.index(
+        "write_private_json(outcome_path, safe_outcome)"
+    )
+    assert "os.replace(temporary, path)" in runner_source
+    assert events_at < outcome_at
+
+
 def test_zcode_session_deadline_tracks_long_assignment_budget(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

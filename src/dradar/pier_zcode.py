@@ -237,6 +237,25 @@ def write_runtime_diagnostic(status, turn_count, seen_running, terminal_observed
             pass
 
 
+def write_private_json(path_value, payload):
+    """Atomically publish a complete protocol artifact with private mode."""
+    path = Path(path_value)
+    temporary = path.with_name(path.name + f".tmp-{os.getpid()}")
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def collect_rollout_usage(
     session_id, *, max_files=8, max_file_bytes=16 * 1024 * 1024,
     max_total_bytes=32 * 1024 * 1024, max_lines=20_000, max_records=10_000,
@@ -873,13 +892,11 @@ safe_outcome = redact(outcome)
 encoded = json.dumps(safe_outcome, ensure_ascii=False, separators=(",", ":"))
 if key in encoded:
     raise ProtocolError("Coding Plan credential reached the ZCode outcome")
-Path(outcome_path).write_text(encoded + "\n", encoding="utf-8")
-os.chmod(outcome_path, 0o600)
-Path(events_path).write_text(
-    json.dumps(redact(notifications), ensure_ascii=False, separators=(",", ":")) + "\n",
-    encoding="utf-8",
-)
-os.chmod(events_path, 0o600)
+# Publish the outcome last. Its presence is the durable terminal boundary;
+# readers can never observe a partially-written JSON document or an outcome
+# whose companion event log has not been finalized yet.
+write_private_json(events_path, redact(notifications))
+write_private_json(outcome_path, safe_outcome)
 print(f"ZCode session {session_id} completed with {model_name} ({effort}).")
 '''
 
