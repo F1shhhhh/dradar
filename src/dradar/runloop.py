@@ -24,8 +24,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import (
-    __version__, artifact_staging, checkpoints, egress, failure_circuit,
-    image_cache, pending, refill as refill_plan,
+    __version__, artifact_staging, assignment_boundary, checkpoints, egress,
+    failure_circuit, image_cache, pending, refill as refill_plan,
 )
 from .api_client import ApiClient, ApiError
 from .identity import _client
@@ -96,6 +96,7 @@ _ACCOUNT_TERMINAL_OUTCOMES = {
 _POOL_ABORT_ENV = "DRADAR_POOL_ABORT_FILE"
 _POOL_TARGET_FILE_ENV = "DRADAR_POOL_TARGET_FILE"
 _REPEAT_FAILURE_STATE_ENV = "DRADAR_REPEAT_FAILURE_STATE_FILE"
+_ASSIGNMENT_BOUNDARY_ENV = "DRADAR_ASSIGNMENT_BOUNDARY_FILE"
 _POOL_DRAIN_PREFIX = "drain:"
 _POOL_SUPERVISOR_POLL_SECONDS = 0.2
 _POOL_BACKFILL_REFRESH_SECONDS = 2.0
@@ -107,6 +108,17 @@ _CHECKPOINT_BACKOFF_BASE_SECONDS = 30.0
 _CHECKPOINT_BACKOFF_MAX_SECONDS = 600.0
 _CHECKPOINT_RESUME_REPLAY_ATTEMPTS = 3
 _CHECKPOINT_RESUME_REPLAY_DELAY_SECONDS = 0.25
+_ZCODE_NETWORK_RETRY_DELAY_SECONDS = 2.0
+
+
+def _retryable_zcode_network_failure(assignment: dict, exc: RunnerError) -> bool:
+    diagnostic = exc.failure_diagnostic
+    return bool(
+        assignment.get("agent") == ZCODE_AGENT
+        and isinstance(diagnostic, dict)
+        and diagnostic.get("schema") == "dradar-runner-failure-v1"
+        and diagnostic.get("zcode_provider_failure_reason") == "network_error"
+    )
 
 
 @dataclass(frozen=True)
@@ -2232,6 +2244,26 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                       f"checkpoint {item.checkpoint_id} was kept; `dradar resume` "
                       "continues the same workspace/session")
                 return terminal_outcome or "paused"
+            if attempt == 1 and _retryable_zcode_network_failure(assignment, exc):
+                stopped = _mark_stopped_quietly(
+                    client,
+                    assignment,
+                    defer_seconds=0,
+                    failure_kind="provider-transport",
+                    failure_diagnostic=exc.failure_diagnostic,
+                )
+                if stopped:
+                    print(
+                        "ZCode reported a structured transient network failure; "
+                        "retrying this assignment once in the same runner..."
+                    )
+                    time.sleep(_ZCODE_NETWORK_RETRY_DELAY_SECONDS)
+                    continue
+                print(
+                    "ZCode reported a transient network failure, but checkout "
+                    "cleanup was not confirmed; refusing an unsafe retry"
+                )
+                return "failed"
             print(f"trial failed: {exc}\n"
                   "use `dradar resume` to retry later, or `dradar release` to "
                   "give the cell back")
@@ -2592,6 +2624,110 @@ def _active_by_id(client: ApiClient) -> dict[str, dict]:
     return {a["assignment_id"]: a for a in active if a}
 
 
+def _assignment_boundary_path(args) -> Path | None:
+    value = getattr(args, "_assignment_boundary_path", None)
+    if value:
+        return Path(value)
+    value = os.environ.get(_ASSIGNMENT_BOUNDARY_ENV)
+    return Path(value) if value else None
+
+
+def _prepare_assignment_boundary(
+    args,
+    client: ApiClient,
+    benchmark_id: str,
+    active: list[dict] | None = None,
+) -> Path | None:
+    """Validate/create the immutable non-refill assignment campaign set."""
+    inherited = _assignment_boundary_path(args)
+    if inherited is not None:
+        args._assignment_boundary_path = str(inherited)
+        return inherited
+    if getattr(args, "refill", False):
+        return None
+    if active is None:
+        try:
+            active = list(_active_by_id(client).values())
+        except ApiError as exc:
+            _exit_for(exc)
+    try:
+        path = assignment_boundary.prepare(
+            HOME,
+            benchmark_id,
+            active,
+            expected_ids=getattr(args, "expect_assignment", None),
+            forget_existing=getattr(args, "forget_assignment_boundary", False),
+        )
+    except (assignment_boundary.BoundaryError, OSError) as exc:
+        sys.exit(
+            f"assignment boundary check failed: {exc}. No model was started. "
+            "Inspect `dradar leases`; use --forget-assignment-boundary only "
+            "after intentionally accepting the missing assignment(s)."
+        )
+    if path is not None:
+        args._assignment_boundary_path = str(path)
+    return path
+
+
+def _record_assignment_boundary(args, assignment: dict, outcome: str) -> bool:
+    path = _assignment_boundary_path(args)
+    if path is None:
+        return True
+    try:
+        assignment_boundary.record_outcome(path, assignment, outcome)
+    except (assignment_boundary.BoundaryError, OSError) as exc:
+        # The model has already stopped at this point. Fail closed on the next
+        # checkout by opening the same pool drain used for other local faults.
+        _signal_pool_abort(
+            f"assignment boundary state could not be updated ({exc})",
+            interrupt_siblings=False,
+        )
+        print(f"assignment boundary update failed ({exc}); no later task will start")
+        return False
+    return True
+
+
+def _finish_assignment_boundary(
+    client: ApiClient, path: Path | None,
+) -> bool:
+    """Reconcile after a run; False means the campaign lost an assignment."""
+    if path is None:
+        return True
+    try:
+        active = list(_active_by_id(client).values())
+        report = assignment_boundary.reconcile(path, active)
+    except (ApiError, assignment_boundary.BoundaryError, OSError) as exc:
+        print(
+            f"could not verify the assignment boundary after the run ({exc}); "
+            "the boundary was kept and the next resume will re-check it"
+        )
+        return False
+    if report is None:
+        return True
+    if report.missing_ids:
+        print("assignment boundary violation: unresolved assignment(s) disappeared:")
+        for assignment_id in sorted(report.missing_ids):
+            print(f"  {assignment_id}")
+        print("no replacement task was claimed or started")
+        return False
+    if report.unexpected_ids:
+        print("assignment boundary violation: active assignment(s) are outside the campaign:")
+        for assignment_id in sorted(report.unexpected_ids):
+            print(f"  {assignment_id}")
+        print("no out-of-bound assignment was started")
+        return False
+    if report.complete:
+        try:
+            assignment_boundary.finish_if_complete(path, report)
+        except OSError as exc:
+            print(
+                f"could not remove the completed assignment boundary ({exc}); "
+                "the next resume will verify it again"
+            )
+            return False
+    return True
+
+
 def _checkpoint_upload_entry(
     item: checkpoints.Checkpoint, assignment: dict, args, local_commit: str | None,
 ) -> dict:
@@ -2949,7 +3085,17 @@ def _resume_local_checkpoints(
         )
         if outcome == "busy":
             continue
+        boundary_recorded = _record_assignment_boundary(
+            args,
+            active.get(item.assignment_id) or {
+                "assignment_id": item.assignment_id,
+                "task_id": getattr(item, "task_id", "unknown"),
+            },
+            outcome,
+        )
         results.append(outcome)
+        if not boundary_recorded:
+            break
         if outcome == "submitted" and getattr(args, "refill", False):
             refill_plan.mark_submitted(HOME, item.assignment_id)
         if outcome in _ACCOUNT_TERMINAL_OUTCOMES:
@@ -3268,6 +3414,8 @@ def cmd_go(args) -> int:
         workers != 1
         or not getattr(args, "parallel", False)
         or not getattr(args, "resume", False)
+        or getattr(args, "expect_assignment", None)
+        or getattr(args, "forget_assignment_boundary", False)
     ):
         sys.exit("invalid internal worker invocation")
     if (auto_workers or workers > 1) and getattr(args, "parallel", False):
@@ -3291,6 +3439,11 @@ def cmd_go(args) -> int:
     if any(value is not None for value in refill_options) and not getattr(args, "refill", False):
         sys.exit("refill limits and scope filters require --refill")
     if getattr(args, "refill", False):
+        if (
+            getattr(args, "expect_assignment", None)
+            or getattr(args, "forget_assignment_boundary", False)
+        ):
+            sys.exit("assignment boundary options cannot be combined with --refill")
         if getattr(args, "assignment", None):
             sys.exit("continuous refill cannot be combined with --assignment")
         if (getattr(args, "refill_harness", None) is None
@@ -3394,6 +3547,10 @@ def cmd_go(args) -> int:
         if not getattr(args, "worker_child", False):
             _retry_pending_uploads(client)
 
+        boundary_path = _prepare_assignment_boundary(
+            args, client, cfg["benchmark"],
+        )
+
         recovered, found_checkpoints = _resume_local_checkpoints(
             client, args, tasks_root, telemetry,
         )
@@ -3403,9 +3560,11 @@ def cmd_go(args) -> int:
         )
         if getattr(args, "assignment", None):
             close_reason = "completed" if recovery_ok and recovered else "paused"
-            return 0 if recovery_ok and recovered else 1
+            rc = 0 if recovery_ok and recovered else 1
+            return rc if _finish_assignment_boundary(client, boundary_path) else 1
         if recovered and not recovery_ok:
             close_reason = "paused"
+            _finish_assignment_boundary(client, boundary_path)
             return 1
         if found_checkpoints and getattr(args, "resume", False) and not recovered:
             # Every matching checkpoint is already owned by another local
@@ -3420,11 +3579,14 @@ def cmd_go(args) -> int:
                       "checking for a different waiting task")
             else:
                 close_reason = "paused"
+                _finish_assignment_boundary(client, boundary_path)
                 return 1
 
         rc = _go_menu(args, cfg, client, tasks_root, telemetry=telemetry)
         if not getattr(args, "parallel", False):
             _maintain_image_cache(client, cfg, phase="after run")
+        if not _finish_assignment_boundary(client, _assignment_boundary_path(args)):
+            rc = 1
         close_reason = "completed" if rc == 0 else "paused"
         return rc
     except (KeyboardInterrupt, EOFError):
@@ -3692,6 +3854,11 @@ def _run_worker_pool(args) -> int:
     active, _free_pick = _prepare_batch(args, client)
     if not active:
         return 0
+    boundary_path = _assignment_boundary_path(args)
+    if cfg.get("benchmark"):
+        boundary_path = _prepare_assignment_boundary(
+            args, client, cfg["benchmark"], active,
+        )
     maximum = args.workers
     target_file = _pool_target_file(args)
     target = _read_pool_target(target_file, default=maximum, maximum=maximum)
@@ -3739,6 +3906,8 @@ def _run_worker_pool(args) -> int:
             env[_POOL_TARGET_FILE_ENV] = str(target_file)
         env[_POOL_ABORT_ENV] = str(pool_abort_file)
         env[_REPEAT_FAILURE_STATE_ENV] = str(repeat_failure_state_file)
+        if boundary_path is not None:
+            env[_ASSIGNMENT_BOUNDARY_ENV] = str(boundary_path)
         process = subprocess.Popen(command, env=env, **popen_kwargs)
         processes.append(process)
         active_processes[slot] = process
@@ -3874,6 +4043,9 @@ def _run_worker_pool(args) -> int:
     cleanup_abort_file()
     failed = [(slot, rc) for slot, rc in returncodes if rc != 0]
     _maintain_image_cache(client, cfg, phase="after worker pool")
+    boundary_safe = _finish_assignment_boundary(client, boundary_path)
+    if not boundary_safe:
+        return 1
     if abort_reason is not None:
         if abort_interrupts_siblings:
             print(f"worker pool stopped cleanly by circuit breaker: {abort_reason}")
@@ -4007,9 +4179,12 @@ def _run_batch(args, client: ApiClient, tasks_root: Path, active: list[dict],
             telemetry.flush()
         outcome = _run_and_submit(
             client, assignment, tasks_root, args, local_commit, telemetry=telemetry)
+        boundary_recorded = _record_assignment_boundary(args, assignment, outcome)
         results.append(outcome)
         if telemetry:
             telemetry.set_phase("queued")
+        if not boundary_recorded:
+            break
         if outcome in _ACCOUNT_TERMINAL_OUTCOMES:
             _announce_account_stop(outcome)
             break
@@ -4111,6 +4286,21 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
                   "it already failed in this session. `dradar resume` retries it "
                   "later; `dradar release` gives it back.")
             break
+        try:
+            assignment_boundary.add_expected(
+                _assignment_boundary_path(args), [assignment],
+            )
+        except (assignment_boundary.BoundaryError, OSError) as exc:
+            _mark_stopped_quietly(
+                client, assignment, defer_seconds=0,
+                failure_kind="runner_failed",
+            )
+            print(
+                f"refusing to start {assignment['assignment_id']}: {exc}. "
+                "The checkout stamp was returned and the worker is stopping."
+            )
+            results.append("assignment-boundary-failed")
+            break
         extra = data.get("unstarted")
         if telemetry:
             telemetry.bind_batch(assignment.get("batch_id"))
@@ -4128,8 +4318,12 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
                   "the cell just reopens for someone else and nothing is counted.")
         outcome = _run_and_submit(
             client, assignment, tasks_root, args, local_commit, telemetry=telemetry)
+        boundary_recorded = _record_assignment_boundary(args, assignment, outcome)
         if telemetry:
             telemetry.set_phase("queued")
+        if not boundary_recorded:
+            results.append(outcome)
+            break
         if outcome in _ACCOUNT_TERMINAL_OUTCOMES:
             if getattr(args, "refill", False):
                 refill_plan.stop(HOME, f"account stop: {outcome}")
@@ -4469,6 +4663,16 @@ def _go_menu(args, cfg: dict, client: ApiClient, tasks_root: Path,
     active, free_pick = _prepare_batch(args, client)
     if not active:
         return 0
+    boundary_path = _assignment_boundary_path(args)
+    if cfg.get("benchmark"):
+        boundary_path = _prepare_assignment_boundary(
+            args, client, cfg["benchmark"], active,
+        )
+        try:
+            assignment_boundary.add_expected(boundary_path, active)
+        except (assignment_boundary.BoundaryError, OSError) as exc:
+            print(f"assignment boundary check failed: {exc}. No model was started.")
+            return 1
     if telemetry:
         telemetry.bind_batch(active[0].get("batch_id"))
     # Non-interactive free-pick runs go through the parallel-safe checkout
@@ -4498,6 +4702,14 @@ def _go_menu(args, cfg: dict, client: ApiClient, tasks_root: Path,
         if not fresh:
             break
         seen.update(a["assignment_id"] for a in fresh)
+        try:
+            assignment_boundary.add_expected(boundary_path, fresh)
+        except (assignment_boundary.BoundaryError, OSError) as exc:
+            print(
+                f"could not extend the assignment boundary ({exc}); "
+                "the newly claimed task(s) were left untouched"
+            )
+            return 1
         print(f"\n{len(fresh)} more cell(s) were claimed while that batch ran — continuing:")
         rc = _run_batch(args, client, tasks_root, fresh, telemetry=telemetry)
     return rc

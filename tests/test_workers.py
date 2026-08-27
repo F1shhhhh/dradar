@@ -16,6 +16,14 @@ def _enable_checkpoint_runtime_for_worker_mechanics(monkeypatch):
     monkeypatch.setattr(
         runloop, "durable_checkpoint_rollout_enabled", lambda: True,
     )
+    # Pool mechanics tests use clients intentionally stripped of API methods.
+    # Boundary integration has its own state/reconciliation coverage.
+    monkeypatch.setattr(
+        runloop, "_prepare_assignment_boundary", lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(
+        runloop, "_finish_assignment_boundary", lambda *_a, **_k: True,
+    )
 
 
 def _args(**overrides):
@@ -50,6 +58,18 @@ def test_cli_parses_archive_session_as_explicit_opt_in(monkeypatch):
     monkeypatch.setattr(cli, "cmd_go", lambda args: seen.append(args) or 0)
     assert cli.main(["go", "--archive-session", "-y"]) == 0
     assert seen[0].archive_session is True
+
+
+def test_cli_parses_repeatable_expected_assignment_boundary(monkeypatch):
+    seen = []
+    monkeypatch.setattr(cli, "cmd_go", lambda args: seen.append(args) or 0)
+
+    assert cli.main([
+        "resume", "-y",
+        "--expect-assignment", "a1",
+        "--expect-assignment", "a2",
+    ]) == 0
+    assert seen[0].expect_assignment == ["a1", "a2"]
 
 
 @pytest.mark.parametrize("workers", [0, 41])
@@ -156,6 +176,15 @@ def test_refill_pool_cannot_start_at_zero_workers(tmp_path):
 def test_refill_without_any_limit_is_rejected_before_setup():
     with pytest.raises(SystemExit, match="requires --max-estimated-quota-pct"):
         runloop.cmd_go(_args(refill=True))
+
+
+def test_refill_rejects_fixed_assignment_boundary_options():
+    with pytest.raises(SystemExit, match="cannot be combined with --refill"):
+        runloop.cmd_go(_args(
+            refill=True,
+            max_tasks=2,
+            expect_assignment=["a1"],
+        ))
 
 
 def test_worker_command_never_forwards_auto_selection():
@@ -391,6 +420,14 @@ def _patch_pool_setup(monkeypatch, active_count=5):
         runloop, "_prepare_batch",
         lambda _args, _client: ([{"assignment_id": str(i)} for i in range(active_count)], True),
     )
+    monkeypatch.setattr(
+        runloop, "_prepare_assignment_boundary",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        runloop, "_finish_assignment_boundary",
+        lambda *_args, **_kwargs: True,
+    )
 
 
 def test_auto_workers_use_capacity_recommendation(monkeypatch, capsys):
@@ -413,6 +450,31 @@ def test_auto_workers_use_capacity_recommendation(monkeypatch, capsys):
     assert runloop._run_worker_pool(_args(workers="auto")) == 0
     assert len(calls) == 2
     assert "auto=2" in capsys.readouterr().out
+
+
+def test_worker_parent_passes_one_shared_assignment_boundary_to_children(
+        monkeypatch, tmp_path):
+    _patch_pool_setup(monkeypatch, active_count=2)
+    boundary = tmp_path / "boundary.json"
+    monkeypatch.setattr(
+        runloop, "_prepare_assignment_boundary",
+        lambda *_args, **_kwargs: boundary,
+    )
+    calls = []
+    monkeypatch.setattr(
+        runloop.subprocess,
+        "Popen",
+        lambda command, env, **kwargs: (
+            calls.append(_Process(command, env, **kwargs)) or calls[-1]
+        ),
+    )
+
+    assert runloop._run_worker_pool(_args(workers=2)) == 0
+    assert len(calls) == 2
+    assert {
+        process.env[runloop._ASSIGNMENT_BOUNDARY_ENV]
+        for process in calls
+    } == {str(boundary)}
 
 
 def test_one_claim_auto_workers_refill_to_detected_concurrency(monkeypatch):

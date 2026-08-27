@@ -2603,6 +2603,46 @@ def _zcode_runtime_diagnostic(jobs_dir: Path, job_name: str) -> dict[str, object
     }
 
 
+def _zcode_provider_failure_facts(outcome_path: Path | None) -> dict[str, object]:
+    """Return bounded transport facts from the last structured ZCode failure.
+
+    Provider messages and request identifiers may contain private data, so the
+    runner exposes only the small enum/number/bool set needed for retry policy.
+    """
+    payload = _read_capped_json_object(
+        outcome_path, _ZCODE_TERMINAL_ARTIFACT_MAX_BYTES,
+    )
+    if payload.get("schema") != "dradar-zcode-outcome-v1":
+        return {}
+    events_object = payload.get("events")
+    events = events_object.get("events") if isinstance(events_object, dict) else None
+    if not isinstance(events, list) or len(events) > 5000:
+        return {}
+    result: dict[str, object] = {}
+    for event in events:
+        if not isinstance(event, dict) or event.get("type") != "session.updated":
+            continue
+        value = event.get("payload")
+        if not isinstance(value, dict) or value.get("type") != "model_request_failed":
+            continue
+        # Only the latest structured model failure controls retry policy. Do
+        # not accidentally combine fields from two different requests.
+        result = {}
+        reason = value.get("reason")
+        if reason in {
+            "network_error", "rate_limited", "authentication_error",
+            "permission_denied", "provider_error", "unknown",
+        }:
+            result["zcode_provider_failure_reason"] = reason
+        status = value.get("statusCode")
+        if isinstance(status, int) and not isinstance(status, bool) and 0 <= status <= 999:
+            result["zcode_provider_status_code"] = status
+        retryable = value.get("retryable")
+        if isinstance(retryable, bool):
+            result["zcode_provider_retryable"] = retryable
+    return result
+
+
 def _zcode_failure_diagnostic(
     assignment: dict,
     task_path: Path,
@@ -2632,6 +2672,12 @@ def _zcode_failure_diagnostic(
         diagnostic["task_agent_timeout_sec"] = int(base_timeout)
         diagnostic["pier_agent_timeout_sec"] = int(math.ceil(base_timeout * multiplier))
     diagnostic.update(_zcode_runtime_diagnostic(jobs_dir, job_name))
+    try:
+        outcomes = list((jobs_dir / job_name).glob("*/agent/zcode-outcome.json"))
+    except OSError:
+        outcomes = []
+    if len(outcomes) == 1:
+        diagnostic.update(_zcode_provider_failure_facts(outcomes[0]))
     return diagnostic
 
 
