@@ -540,6 +540,15 @@ def _setup_antigravity_subscription() -> int:
         print(f"could not start Antigravity login: {exc}")
         return 1
     if proc.returncode != 0:
+        try:
+            # Even an interrupted official login creates logs and local state.
+            # Restore the reviewed settings and owner-only permissions before
+            # returning so a failed setup never leaves a broad credential tree.
+            write_antigravity_settings()
+            privatize_antigravity_home()
+        except (OSError, ValueError) as exc:
+            print(f"Antigravity OAuth cleanup found unsafe local state: {exc}")
+            return 1
         print("Antigravity OAuth login did not complete successfully.")
         return proc.returncode or 1
     try:
