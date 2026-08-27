@@ -1069,6 +1069,7 @@ def privatize_antigravity_home(home: Path | None = None) -> None:
     root = antigravity_home(home)
     if not root.exists():
         return
+    runtime = root / "runtime"
     for path in [root, *root.rglob("*")]:
         try:
             info = path.lstat()
@@ -1081,7 +1082,15 @@ def privatize_antigravity_home(home: Path | None = None) -> None:
                 os.chmod(path, 0o700)
         elif stat.S_ISREG(info.st_mode):
             if os.name != "nt":
-                os.chmod(path, 0o600)
+                # The reviewed AGY Linux binary is cached below ``runtime``.
+                # Keep that one file owner-executable after credential
+                # hardening; Docker Desktop preserves the host mode on a
+                # read-only bind mount.  Every OAuth/config/proof file remains
+                # owner-readable only.
+                executable = (
+                    path.name == "antigravity" and runtime in path.parents
+                )
+                os.chmod(path, 0o700 if executable else 0o600)
         else:
             raise ValueError(f"Antigravity OAuth state contains a special file: {path}")
 
