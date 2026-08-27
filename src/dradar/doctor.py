@@ -458,7 +458,7 @@ def cmd_doctor(args) -> int:
             f"Terminal, or temporarily export {DEEPSEEK_API_KEY_ENV}",
         )
         if deepseek_key_ready:
-            _check("DeepSeek V4 Flash / Pro — DSH Minimal agent ready", True)
+            _check("DeepSeek V4 Flash / Pro / Vision — DSH Minimal agent ready", True)
     elif grok_requested or kimi_requested or zcode_requested:
         if grok_requested:
             all_ok &= _check(
@@ -528,7 +528,7 @@ def cmd_doctor(args) -> int:
         if deepseek_key_ready and catalog_ready:
             _check("DeepSeek V4 Flash / Pro — Codex provider ready", True)
         if deepseek_key_ready:
-            _check("DeepSeek V4 Flash / Pro — DSH Minimal agent ready", True)
+            _check("DeepSeek V4 Flash / Pro / Vision — DSH Minimal agent ready", True)
     elif codex_ready:
         _check("codex — agent ready", True)
     elif claude_ready:

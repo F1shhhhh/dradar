@@ -253,7 +253,8 @@ async function run(ctx, task, io) {
   if (!agents || !defaultModel || !presets || !sessions) return;
 
   const selection = defaultModel.currentSelection();
-  const visionInput = selection.model === "deepseek-v4-flash-vision-exp";
+  const visionInput = selection.model === "deepseek-v4-flash-vision-exp" &&
+    String(process.env.DRADAR_TASK_ID ?? "").startsWith("pompeii-adjacency-rp-");
   let imageRef = null;
   if (visionInput) {
     if (!attachments) {
