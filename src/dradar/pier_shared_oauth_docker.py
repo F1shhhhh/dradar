@@ -6,7 +6,7 @@ and the provider's own cross-process lock, while Pier's ordinary log mounts
 and every task workspace remain isolated.
 
 This module is copied into the per-run Pier import directory.  It deliberately
-accepts only the two credential targets used by DRadar's Kimi and Grok
+accepts only the credential targets used by DRadar's Kimi, Grok, and AGY
 adapters; arbitrary host mounts are rejected.
 """
 
@@ -25,6 +25,7 @@ _ALLOWED_TARGETS = frozenset({
     "/tmp/dradar-kimi-home/credentials",
     "/tmp/dradar-kimi-home/oauth",
     "/tmp/dradar-grok-user/.grok",
+    "/tmp/dradar-antigravity-user/.gemini",
 })
 
 

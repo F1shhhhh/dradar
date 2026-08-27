@@ -9,6 +9,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import urllib.request
 from pathlib import Path
@@ -17,6 +18,10 @@ from urllib.parse import urlsplit
 import httpx
 
 from .providers import (
+    ANTIGRAVITY_CLI_VERSION,
+    ANTIGRAVITY_LINUX_ARTIFACTS,
+    ANTIGRAVITY_MODEL,
+    ANTIGRAVITY_RUNTIME_MODELS,
     DEEPSEEK_API_KEY_ENV,
     DEEPSEEK_MODELS,
     GROK_API_KEY_ENV,
@@ -29,6 +34,10 @@ from .providers import (
     ZCODE_CLI_VERSION,
     ZCODE_MODELS,
     ZCODE_OFFICIAL_DOWNLOAD_PAGE,
+    antigravity_auth_error,
+    antigravity_auth_path,
+    antigravity_home,
+    antigravity_ready_path,
     deepseek_api_key,
     deepseek_credential_source,
     deepseek_secret_error,
@@ -48,6 +57,8 @@ from .providers import (
     parse_kimi_cli_version,
     parse_grok_cli_version,
     parse_zcode_cli_version,
+    mark_antigravity_ready,
+    privatize_antigravity_home,
     provider_subprocess_env,
     store_grok_auth,
     store_deepseek_api_key,
@@ -59,6 +70,7 @@ from .providers import (
     zcode_credential_source,
     zcode_secret_error,
     zcode_secret_path,
+    write_antigravity_settings,
 )
 
 _DEEPSEEK_MODELS_URL = "https://api.deepseek.com/models"
@@ -67,6 +79,7 @@ _GROK_INSTALLER_URL = "https://x.ai/cli/install.sh"
 _GROK_INSTALLER_SHA256 = (
     "43d0943123edade1383a476a4f778674877acee7c1f98a00f094c4a0f7349321"
 )
+_ANTIGRAVITY_SETUP_IMAGE = "debian:bookworm-slim"
 def _private_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
     if os.name != "nt":
@@ -294,6 +307,296 @@ def _ensure_kimi_cli() -> str | None:
     return _install_managed_kimi_cli()
 
 
+def _antigravity_docker_arch(docker: str) -> str | None:
+    try:
+        result = subprocess.run(
+            [docker, "info", "--format", "{{.Architecture}}"],
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip().lower()
+    if value in {"amd64", "x86_64"}:
+        return "x86_64"
+    if value in {"arm64", "aarch64"}:
+        return "aarch64"
+    return None
+
+
+def _managed_antigravity_linux_cli(arch: str) -> Path:
+    return (
+        antigravity_home() / "runtime" / ANTIGRAVITY_CLI_VERSION
+        / arch / "antigravity"
+    )
+
+
+def _ensure_antigravity_linux_cli(docker: str) -> Path | None:
+    """Download and verify Google's exact Linux artifact for Docker's arch."""
+
+    arch = _antigravity_docker_arch(docker)
+    artifact = ANTIGRAVITY_LINUX_ARTIFACTS.get(arch or "")
+    if artifact is None:
+        print("Antigravity setup needs a Docker Linux amd64 or arm64 engine.")
+        return None
+    target = _managed_antigravity_linux_cli(arch or "")
+    if target.is_file():
+        try:
+            payload = target.read_bytes()
+        except OSError:
+            payload = b""
+        # The manifest hash covers the tarball, not the extracted executable;
+        # a small adjacent proof binds this cached runtime to that reviewed
+        # archive without re-downloading it for every status check.
+        proof = target.with_suffix(".sha512")
+        try:
+            proof_lines = proof.read_text(encoding="ascii").splitlines()
+            expected_proof = [
+                "archive=" + artifact["sha512"],
+                "binary=" + hashlib.sha512(payload).hexdigest(),
+            ]
+            if proof_lines == expected_proof:
+                if os.name != "nt":
+                    target.chmod(0o700)
+                if payload:
+                    return target
+        except OSError:
+            pass
+    _private_directory(target.parent)
+    print(
+        f"Downloading official Antigravity CLI {ANTIGRAVITY_CLI_VERSION} "
+        f"for Docker {arch}..."
+    )
+    try:
+        response = _provider_httpx_get(
+            artifact["url"], timeout=120.0, follow_redirects=True,
+        )
+    except httpx.HTTPError as exc:
+        print(f"Could not download official Antigravity CLI: {type(exc).__name__}.")
+        return None
+    if response.status_code != 200:
+        print(
+            "Could not download official Antigravity CLI "
+            f"(HTTP {response.status_code})."
+        )
+        return None
+    if hashlib.sha512(response.content).hexdigest() != artifact["sha512"]:
+        print("Official Antigravity archive checksum mismatch; refusing to use it.")
+        return None
+    try:
+        with tempfile.TemporaryDirectory(prefix=".agy-", dir=target.parent) as name:
+            archive = Path(name) / "antigravity.tar.gz"
+            archive.write_bytes(response.content)
+            with tarfile.open(archive, mode="r:gz") as bundle:
+                members = bundle.getmembers()
+                if (
+                    len(members) != 1
+                    or members[0].name != "antigravity"
+                    or not members[0].isfile()
+                ):
+                    print("Official Antigravity archive has an unexpected layout.")
+                    return None
+                source = bundle.extractfile(members[0])
+                if source is None:
+                    return None
+                fd, temp_name = tempfile.mkstemp(prefix=".antigravity-", dir=target.parent)
+                temp = Path(temp_name)
+                try:
+                    with os.fdopen(fd, "wb") as handle:
+                        shutil.copyfileobj(source, handle)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    if os.name != "nt":
+                        temp.chmod(0o700)
+                    os.replace(temp, target)
+                except BaseException:
+                    try:
+                        temp.unlink()
+                    except OSError:
+                        pass
+                    raise
+            proof = target.with_suffix(".sha512")
+            installed = target.read_bytes()
+            proof.write_text(
+                "archive=" + artifact["sha512"] + "\n"
+                "binary=" + hashlib.sha512(installed).hexdigest() + "\n",
+                encoding="ascii",
+            )
+            if os.name != "nt":
+                proof.chmod(0o600)
+    except (OSError, tarfile.TarError) as exc:
+        print(f"Could not install Antigravity CLI: {exc}")
+        return None
+    return target
+
+
+def _antigravity_container_command(
+    docker: str, executable: Path, arguments: list[str], *, interactive: bool,
+) -> tuple[list[str], dict[str, str]]:
+    auth = antigravity_auth_path()
+    auth.mkdir(parents=True, exist_ok=True, mode=0o700)
+    command = [docker, "run", "--rm"]
+    if interactive:
+        command.append("-i")
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            command.append("-t")
+    if hasattr(os, "getuid") and hasattr(os, "getgid"):
+        command += ["--user", f"{os.getuid()}:{os.getgid()}"]
+    command += [
+        "--workdir", "/tmp",
+        "--env", "HOME=/tmp/dradar-antigravity-user",
+        "--env", "AGY_CLI_HIDE_LOGO=1",
+        "--mount",
+        f"type=bind,source={executable.resolve()},target=/opt/antigravity,readonly",
+        "--mount",
+        f"type=bind,source={auth.resolve()},target=/tmp/dradar-antigravity-user/.gemini",
+    ]
+    env = provider_subprocess_env()
+    for name in (
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+        "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+    ):
+        if env.get(name):
+            command += ["--env", name]
+    for name in (
+        "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS",
+        "AGY_ADC_AUTH",
+    ):
+        env.pop(name, None)
+    command += [_ANTIGRAVITY_SETUP_IMAGE, "/opt/antigravity", *arguments]
+    return command, env
+
+
+def _antigravity_models_live(docker: str, executable: Path) -> str | None:
+    command, env = _antigravity_container_command(
+        docker, executable, ["models"], interactive=False,
+    )
+    try:
+        proc = subprocess.run(
+            command, env=env, capture_output=True, text=True,
+            timeout=120, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"could not run the official models check: {type(exc).__name__}"
+    if proc.returncode != 0:
+        output = (proc.stdout + "\n" + proc.stderr).lower()
+        if "authentication" in output or "oauth" in output:
+            return "the isolated Google OAuth session was rejected"
+        return "the official models check failed; check Docker/network/proxy"
+    available = {
+        line.split()[0]
+        for line in proc.stdout.splitlines()
+        if line.strip()
+    }
+    missing = set(ANTIGRAVITY_RUNTIME_MODELS.values()) - available
+    if missing:
+        return "the account cannot access " + ", ".join(sorted(missing))
+    return None
+
+
+def _setup_antigravity_subscription() -> int:
+    docker = shutil.which("docker")
+    if not docker:
+        print("Antigravity setup needs Docker, which DRadar also uses for tasks.")
+        return 1
+    executable = _ensure_antigravity_linux_cli(docker)
+    if executable is None:
+        return 1
+    if antigravity_auth_error() is None:
+        issue = _antigravity_models_live(docker, executable)
+        if issue is None:
+            print(
+                f"Antigravity subscription provider is already ready (CLI "
+                f"{ANTIGRAVITY_CLI_VERSION}, {ANTIGRAVITY_MODEL} low/medium/high verified)."
+            )
+            return 0
+    if not sys.stdin.isatty():
+        print(
+            "Antigravity OAuth setup needs an interactive terminal. Run:\n"
+            "  dradar provider setup antigravity\n"
+            "This uses Google's official OAuth flow in a DRadar-owned container; "
+            "no API key is accepted."
+        )
+        return 2
+    try:
+        write_antigravity_settings()
+        privatize_antigravity_home()
+        command, env = _antigravity_container_command(
+            docker,
+            executable,
+            [
+                "--new-project", "--print", "/usage",
+                "--output-format", "json", "--print-timeout", "10m",
+            ],
+            interactive=True,
+        )
+        print(
+            "Starting official Google OAuth for the dedicated DRadar "
+            "Antigravity slot. Complete the browser/code prompt shown below."
+        )
+        proc = subprocess.run(command, env=env, check=False)
+    except (OSError, ValueError) as exc:
+        print(f"could not start Antigravity login: {exc}")
+        return 1
+    if proc.returncode != 0:
+        print("Antigravity OAuth login did not complete successfully.")
+        return proc.returncode or 1
+    try:
+        # Login may add presentation preferences.  Replace only settings.json;
+        # credentials live in separate files below the same private tree.
+        write_antigravity_settings()
+        privatize_antigravity_home()
+    except (OSError, ValueError) as exc:
+        print(f"Antigravity login returned unsafe local state: {exc}")
+        return 1
+    live_issue = _antigravity_models_live(docker, executable)
+    if live_issue is not None:
+        print(f"Antigravity login completed, but live model verification failed: {live_issue}.")
+        return 1
+    try:
+        mark_antigravity_ready()
+        privatize_antigravity_home()
+    except (OSError, ValueError) as exc:
+        print(f"could not seal Antigravity readiness state: {exc}")
+        return 1
+    issue = antigravity_auth_error()
+    if issue is not None:
+        print(f"Antigravity provider is not ready: {issue}")
+        return 1
+    print(
+        f"Antigravity subscription OAuth is ready at {antigravity_auth_path()} "
+        f"(tokens hidden, CLI {ANTIGRAVITY_CLI_VERSION}, three Gemini 3.7 Flash "
+        "effort levels verified)."
+    )
+    return 0
+
+
+def _status_antigravity_subscription(*, live: bool) -> int:
+    issue = antigravity_auth_error()
+    if issue is not None:
+        print(f"Antigravity subscription provider not ready: {issue}")
+        return 1
+    if live:
+        docker = shutil.which("docker")
+        if not docker:
+            print("Antigravity live status needs Docker.")
+            return 1
+        executable = _ensure_antigravity_linux_cli(docker)
+        if executable is None:
+            return 1
+        issue = _antigravity_models_live(docker, executable)
+        if issue is not None:
+            print(f"Antigravity subscription provider not ready: {issue}.")
+            return 1
+    print(
+        f"Antigravity subscription provider ready via {antigravity_auth_path()} "
+        f"(OAuth tokens hidden, CLI {ANTIGRAVITY_CLI_VERSION}, "
+        f"{ANTIGRAVITY_MODEL} low/medium/high, API keys disabled)."
+    )
+    return 0
+
+
 def cmd_provider_setup(args) -> int:
     """Read a DeepSeek key without echoing it or placing it in argv/history."""
 
@@ -303,6 +606,8 @@ def cmd_provider_setup(args) -> int:
         return _setup_kimi_subscription()
     if args.provider == "zcode":
         return _setup_zcode()
+    if args.provider in {"agy", "antigravity"}:
+        return _setup_antigravity_subscription()
     if args.provider != "deepseek":
         raise ValueError(f"unsupported provider: {args.provider}")
     if not sys.stdin.isatty():
@@ -343,6 +648,8 @@ def cmd_provider_status(args) -> int:
         return _status_kimi_subscription(live=live)
     if args.provider == "zcode":
         return _status_zcode(live=live)
+    if args.provider in {"agy", "antigravity"}:
+        return _status_antigravity_subscription(live=live)
     if args.provider != "deepseek":
         raise ValueError(f"unsupported provider: {args.provider}")
     path = deepseek_secret_path()

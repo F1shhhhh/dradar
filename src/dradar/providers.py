@@ -174,6 +174,59 @@ KIMI_API_KEY_ENVS = frozenset({
 })
 _KIMI_VERSION_RE = re.compile(r"(?:^|\s)(\d+\.\d+\.\d+)(?:\s|$)")
 
+# Google Antigravity is subscription/OAuth-only.  Authentication is performed
+# once inside Google's pinned Linux CLI so the resulting file-based session is
+# portable into Pier task containers.  The user's everyday ~/.gemini tree and
+# macOS keychain are never borrowed by DRadar.
+ANTIGRAVITY_PROVIDER = "google-antigravity-subscription"
+ANTIGRAVITY_AGENT = "antigravity"
+ANTIGRAVITY_MODEL = "gemini-3.7-flash"
+ANTIGRAVITY_CLI_VERSION = "1.1.22"
+ANTIGRAVITY_LINUX_RELEASE = "1.1.22-5711547746615296"
+ANTIGRAVITY_LINUX_ARTIFACTS = {
+    "x86_64": {
+        "url": (
+            "https://storage.googleapis.com/antigravity-public/"
+            "antigravity-cli/1.1.22-5711547746615296/linux-x64/"
+            "cli_linux_x64.tar.gz"
+        ),
+        "sha512": (
+            "40225d4b1f009412e905f0a234ba3d51487038d1ad1b8fa19331c84be55610a0"
+            "1f5b0ad9916fb871151cc45456c6bc30cc0b1ea5dab6c0616bc8fb262bcdd7a9"
+        ),
+    },
+    "aarch64": {
+        "url": (
+            "https://storage.googleapis.com/antigravity-public/"
+            "antigravity-cli/1.1.22-5711547746615296/linux-arm/"
+            "cli_linux_arm64.tar.gz"
+        ),
+        "sha512": (
+            "b37a718330eb5e270e1ca70135bf964a407ba626fbff7537ac58e094ea31bc623"
+            "e6d216ef197188fe8b5c46e6f57aee64a3b7c9e23fc855cefee43fe434179d3"
+        ),
+    },
+}
+ANTIGRAVITY_SUPPORTED_EFFORTS = frozenset({"low", "medium", "high"})
+ANTIGRAVITY_RUNTIME_MODELS = {
+    "low": "gemini-3.7-flash-low",
+    "medium": "gemini-3.7-flash-medium",
+    "high": "gemini-3.7-flash-high",
+}
+ANTIGRAVITY_CAPABILITY = (
+    "antigravity-gemini-3.7-flash-subscription-oauth-sandbox-v1"
+)
+ANTIGRAVITY_RUN_CONFIG_VERSION = (
+    "antigravity-gemini-3.7-flash-subscription-oauth-sandbox-v1"
+)
+ANTIGRAVITY_RUNTIME_PROFILE = (
+    "pier-antigravity-gemini-3.7-flash-shared-oauth-sandbox-v1"
+)
+ANTIGRAVITY_HOME_RELATIVE_PATH = Path("providers") / "antigravity"
+ANTIGRAVITY_GEMINI_RELATIVE_PATH = ANTIGRAVITY_HOME_RELATIVE_PATH / ".gemini"
+ANTIGRAVITY_READY_FILENAME = "ready.json"
+_ANTIGRAVITY_VERSION_RE = re.compile(r"(?:^|\s)(\d+\.\d+\.\d+)(?:\s|$)")
+
 # ZCode is driven through the official desktop bundle's headless protocol.  A
 # tested CLI digest allowlist and the domestic Coding Plan endpoint keep this
 # preview lane reproducible without forcing users onto one exact desktop app
@@ -220,21 +273,29 @@ REFILL_HARNESS_ALIASES = {
     "kimi-code": KIMI_AGENT,
     "grok": GROK_AGENT,
     "grok-build": GROK_AGENT,
+    "agy": ANTIGRAVITY_AGENT,
+    "antigravity": ANTIGRAVITY_AGENT,
     "zcode": ZCODE_AGENT,
 }
 REFILL_HARNESS_CONSTRAINTS = {
     DSH_AGENT: (frozenset(DSH_MODELS), DSH_SUPPORTED_EFFORTS),
     KIMI_AGENT: (frozenset({KIMI_MODEL}), KIMI_SUPPORTED_EFFORTS),
     GROK_AGENT: (frozenset({GROK_MODEL}), GROK_SUPPORTED_EFFORTS),
+    ANTIGRAVITY_AGENT: (
+        frozenset({ANTIGRAVITY_MODEL}), ANTIGRAVITY_SUPPORTED_EFFORTS,
+    ),
     ZCODE_AGENT: (ZCODE_MODELS, ZCODE_SUPPORTED_EFFORTS),
 }
 REFILL_HARNESS_PROVIDERS = {
     DSH_AGENT: DEEPSEEK_PROVIDER,
     KIMI_AGENT: KIMI_PROVIDER,
     GROK_AGENT: GROK_PROVIDER,
+    ANTIGRAVITY_AGENT: ANTIGRAVITY_PROVIDER,
     ZCODE_AGENT: ZCODE_PROVIDER,
 }
-SUBSCRIPTION_REFILL_AGENTS = frozenset({KIMI_AGENT, GROK_AGENT, ZCODE_AGENT})
+SUBSCRIPTION_REFILL_AGENTS = frozenset({
+    KIMI_AGENT, GROK_AGENT, ZCODE_AGENT, ANTIGRAVITY_AGENT,
+})
 PAID_API_REFILL_AGENTS = frozenset({DSH_AGENT})
 
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
@@ -834,6 +895,219 @@ def store_zcode_cli(
     return target
 
 
+_ANTIGRAVITY_REQUIRED_DENY_RULES = frozenset({
+    "read_file(/tmp/dradar-antigravity-user/.gemini)",
+    "write_file(/tmp/dradar-antigravity-user/.gemini)",
+    "read_file(/logs)",
+    "write_file(/logs)",
+    "read_url(*)",
+    "execute_url(*)",
+    "mcp(*)",
+    "unsandboxed(*)",
+})
+
+
+def antigravity_home(home: Path | None = None) -> Path:
+    if home is None:
+        home = Path(os.environ.get("DRADAR_HOME", Path.home() / ".dradar"))
+    return Path(home) / ANTIGRAVITY_HOME_RELATIVE_PATH
+
+
+def antigravity_auth_path(home: Path | None = None) -> Path:
+    """Return the narrow .gemini directory mounted into task containers."""
+
+    return antigravity_home(home) / ".gemini"
+
+
+def antigravity_settings_path(home: Path | None = None) -> Path:
+    return antigravity_auth_path(home) / "antigravity-cli" / "settings.json"
+
+
+def antigravity_ready_path(home: Path | None = None) -> Path:
+    return antigravity_home(home) / ANTIGRAVITY_READY_FILENAME
+
+
+def antigravity_settings_payload() -> dict[str, object]:
+    """Return the fail-closed headless policy used by every paid AGY run."""
+
+    return {
+        "enableTelemetry": False,
+        "enableTerminalSandbox": True,
+        "allowNonWorkspaceAccess": False,
+        "trustedWorkspaces": ["/app"],
+        "permissions": {
+            # Commands are autonomous only inside AGY's native nsjail ring.
+            # File tools are already auto-allowed in /app by the official CLI.
+            "allow": ["command(*)"],
+            "deny": sorted(_ANTIGRAVITY_REQUIRED_DENY_RULES),
+        },
+    }
+
+
+def _private_tree_error(path: Path) -> str | None:
+    """Reject links, special files, and group/world-readable OAuth state."""
+
+    try:
+        root_info = path.lstat()
+    except FileNotFoundError:
+        return f"Antigravity subscription OAuth is not configured at {path}"
+    except OSError as exc:
+        return f"cannot inspect {path}: {exc}"
+    if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+        return f"{path} must be a private directory, not a symlink"
+    try:
+        entries = [path, *path.rglob("*")]
+    except OSError as exc:
+        return f"cannot inspect Antigravity OAuth home: {exc}"
+    for entry in entries:
+        try:
+            info = entry.lstat()
+        except OSError as exc:
+            return f"cannot inspect {entry}: {exc}"
+        if stat.S_ISLNK(info.st_mode):
+            return f"{entry} must not be a symlink"
+        if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+            return f"{entry} must be a regular file or directory"
+        if os.name != "nt" and stat.S_IMODE(info.st_mode) & 0o077:
+            return f"{entry} is too broadly accessible; re-run provider setup"
+    return None
+
+
+def antigravity_auth_error(home: Path | None = None) -> str | None:
+    """Validate isolated OAuth state plus the mandatory sandbox policy."""
+
+    auth = antigravity_auth_path(home)
+    issue = _private_tree_error(auth)
+    if issue is not None:
+        return issue
+    settings = antigravity_settings_path(home)
+    try:
+        payload = json.loads(settings.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return f"Antigravity sandbox settings are unavailable or invalid: {exc}"
+    expected = antigravity_settings_payload()
+    if payload != expected:
+        return "Antigravity sandbox settings do not match DRadar's safe policy"
+    ready = antigravity_ready_path(home)
+    try:
+        ready_payload = json.loads(ready.read_text(encoding="utf-8"))
+        ready_info = ready.lstat()
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return f"Antigravity readiness proof is unavailable or invalid: {exc}"
+    if (
+        stat.S_ISLNK(ready_info.st_mode)
+        or not stat.S_ISREG(ready_info.st_mode)
+        or (os.name != "nt" and stat.S_IMODE(ready_info.st_mode) & 0o077)
+    ):
+        return "Antigravity readiness proof must be an owner-only regular file"
+    if not isinstance(ready_payload, dict) or (
+        ready_payload.get("schema") != "dradar-antigravity-ready-v1"
+        or ready_payload.get("cli_version") != ANTIGRAVITY_CLI_VERSION
+        or ready_payload.get("models")
+        != sorted(ANTIGRAVITY_RUNTIME_MODELS.values())
+    ):
+        return "Antigravity readiness proof does not match this DRadar release"
+    return None
+
+
+def write_antigravity_settings(home: Path | None = None) -> Path:
+    path = antigravity_settings_path(home)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name != "nt":
+        os.chmod(path.parent, 0o700)
+    fd, name = tempfile.mkstemp(prefix=".settings.", dir=path.parent)
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(
+                antigravity_settings_payload(), handle,
+                ensure_ascii=False, separators=(",", ":"),
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.name != "nt":
+            os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def mark_antigravity_ready(home: Path | None = None) -> Path:
+    path = antigravity_ready_path(home)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name != "nt":
+        os.chmod(path.parent, 0o700)
+    fd, name = tempfile.mkstemp(prefix=".ready.", dir=path.parent)
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({
+                "schema": "dradar-antigravity-ready-v1",
+                "cli_version": ANTIGRAVITY_CLI_VERSION,
+                "models": sorted(ANTIGRAVITY_RUNTIME_MODELS.values()),
+            }, handle, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.name != "nt":
+            os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def privatize_antigravity_home(home: Path | None = None) -> None:
+    root = antigravity_home(home)
+    if not root.exists():
+        return
+    for path in [root, *root.rglob("*")]:
+        try:
+            info = path.lstat()
+        except OSError:
+            continue
+        if stat.S_ISLNK(info.st_mode):
+            raise ValueError(f"Antigravity OAuth state contains a symlink: {path}")
+        if stat.S_ISDIR(info.st_mode):
+            if os.name != "nt":
+                os.chmod(path, 0o700)
+        elif stat.S_ISREG(info.st_mode):
+            if os.name != "nt":
+                os.chmod(path, 0o600)
+        else:
+            raise ValueError(f"Antigravity OAuth state contains a special file: {path}")
+
+
+def parse_antigravity_cli_version(output: str) -> str | None:
+    match = _ANTIGRAVITY_VERSION_RE.search(output.strip())
+    return match.group(1) if match else None
+
+
+@contextmanager
+def antigravity_subscription_session(
+    directory: Path, *, home: Path | None = None,
+):
+    """Expose only DRadar's validated .gemini tree to one Pier trial."""
+
+    issue = antigravity_auth_error(home)
+    if issue is not None:
+        raise ValueError(issue + "; run `dradar provider setup antigravity` first")
+    directory.mkdir(parents=True, exist_ok=True)
+    yield antigravity_auth_path(home)
+    privatize_antigravity_home(home)
+    issue = antigravity_auth_error(home)
+    if issue is not None:
+        raise ValueError("Antigravity returned unsafe OAuth state: " + issue)
+
+
 def grok_home(home: Path | None = None) -> Path:
     if home is None:
         home = Path(os.environ.get("DRADAR_HOME", Path.home() / ".dradar"))
@@ -1275,6 +1549,11 @@ def advertised_capabilities(
         capabilities.extend((GROK_CAPABILITY, GROK_LEGACY_CAPABILITY))
     if kimi_cli_path(environ) and kimi_auth_error() is None:
         capabilities.extend((KIMI_CAPABILITY, KIMI_LEGACY_CAPABILITY))
+    if (
+        antigravity_auth_error() is None
+        and Path(__file__).with_name("pier_antigravity.py").is_file()
+    ):
+        capabilities.append(ANTIGRAVITY_CAPABILITY)
     if (
         zcode_api_key(environ) is not None
         and zcode_cli_error(environ=environ) is None
