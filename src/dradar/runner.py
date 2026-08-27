@@ -2739,11 +2739,13 @@ def _zcode_false_success_reason(
     answer.
 
     Incomplete token telemetry alone is deliberately *not* a failure: the
-    accounting path already fails closed, and a real patch must still be
-    gradeable when the provider merely omitted usage.  A positive provider
-    model-error counter is different only when the session never recovered to
-    a complete, reconciled provider terminal: that combination is the known
-    false-success signature.
+    accounting path already records its own evidence tier, and a real patch
+    must still be gradeable when the per-request ledger is unavailable or
+    unreconciled.  ``complete`` here means ZCode emitted a provider-backed
+    ``turn.completed`` aggregate; request-ledger completeness only controls
+    accounting confidence.  A positive provider model-error counter is a
+    false-success signature only when the session never recovered to such a
+    completed provider turn.
     """
     result = _read_capped_json_object(
         result_path, _ZCODE_TERMINAL_ARTIFACT_MAX_BYTES,
@@ -2770,14 +2772,11 @@ def _zcode_false_success_reason(
     provider_usage = sidecar_usage or embedded_usage
 
     request_count = provider_usage.get("request_count")
-    provider_terminal = (
+    provider_turn_completed = (
         provider_usage.get("schema") == "dradar-subscription-provider-usage-v1"
         and provider_usage.get("provider") == "zcode"
         and provider_usage.get("model") == expected_model
         and provider_usage.get("complete") is True
-        and provider_usage.get("request_usage_complete") is True
-        and provider_usage.get("request_usage_observed") is True
-        and provider_usage.get("usage_evidence_tier") == "complete_reconciled"
         and isinstance(request_count, int)
         and not isinstance(request_count, bool)
         and request_count > 0
@@ -2799,9 +2798,9 @@ def _zcode_false_success_reason(
     status = runtime_diagnostic.get("zcode_last_status")
     if status in {"error", "failed", "stopped"}:
         return "terminal_status"
-    if explicit_model_error and not provider_terminal:
+    if explicit_model_error and not provider_turn_completed:
         return "provider_model_error"
-    if not meaningful_agent_result and not provider_terminal:
+    if not meaningful_agent_result and not provider_turn_completed:
         return "empty_agent_result"
     return None
 
