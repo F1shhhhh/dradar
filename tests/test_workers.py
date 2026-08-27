@@ -544,7 +544,9 @@ def test_pool_live_target_scales_up_without_restarting_existing_workers(
     target = tmp_path / "workers"
     target.write_text("2")
     monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(runloop, "_pool_ready_work_count", lambda _client: 2)
+    monkeypatch.setattr(
+        runloop, "_pool_ready_work_count", lambda _client, **_kwargs: 2,
+    )
     calls = []
 
     def popen(command, env, **kwargs):
@@ -570,7 +572,9 @@ def test_pool_live_scale_up_refills_to_new_worker_target(
     target = tmp_path / "workers"
     target.write_text("2")
     monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(runloop, "_pool_ready_work_count", lambda _client: 2)
+    monkeypatch.setattr(
+        runloop, "_pool_ready_work_count", lambda _client, **_kwargs: 2,
+    )
     resized = []
     replenished = []
     monkeypatch.setattr(
@@ -628,7 +632,9 @@ def test_pool_live_target_scales_down_without_signalling_inflight_workers(
         runloop, "_signal_workers",
         lambda _processes: pytest.fail("live scale-down must not signal workers"),
     )
-    monkeypatch.setattr(runloop, "_pool_ready_work_count", lambda _client: 4)
+    monkeypatch.setattr(
+        runloop, "_pool_ready_work_count", lambda _client, **_kwargs: 4,
+    )
     calls = []
 
     def popen(command, env, **kwargs):
@@ -782,22 +788,28 @@ def test_pool_restores_vacant_slot_when_fresh_held_work_is_waiting(
     assert "restoring worker slot 2/2" in capsys.readouterr().out
 
 
-def test_pool_child_failure_drains_sibling_without_backfill_or_signal(
+def test_pool_child_failure_keeps_sibling_and_backfills_new_held_work(
         monkeypatch, capsys):
     _patch_pool_setup(monkeypatch, active_count=3)
     monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(
-        runloop, "_pool_ready_work_count",
-        lambda _client: pytest.fail("failed pool must not inspect or backfill"),
-    )
-    monkeypatch.setattr(
         runloop, "_signal_workers",
         lambda _processes: pytest.fail("failed pool must not signal siblings"),
+    )
+    ready = iter((1, 0))
+    monkeypatch.setattr(
+        runloop, "_pool_ready_work_count",
+        lambda _client, **_kwargs: next(ready, 0),
     )
     calls = []
 
     def popen(command, env, **kwargs):
-        polls = [1] if not calls else [None, 0]
+        if not calls:
+            polls = [1]
+        elif len(calls) == 1:
+            polls = [None, None, 0]
+        else:
+            polls = [0]
         process = _ScriptedProcess(command, env, polls, **kwargs)
         calls.append(process)
         return process
@@ -805,11 +817,12 @@ def test_pool_child_failure_drains_sibling_without_backfill_or_signal(
     monkeypatch.setattr(runloop.subprocess, "Popen", popen)
 
     assert runloop._run_worker_pool(_args(workers=2)) == 1
-    assert len(calls) == 2
+    assert len(calls) == 3
     assert calls[1].polls == []
+    assert calls[2].env["DRADAR_WORKER_INDEX"] == "1"
     output = capsys.readouterr().out
-    assert "disabling automatic backfill" in output
-    assert "draining workers already in flight" in output
+    assert "watching only for assignments claimed later" in output
+    assert "restoring worker slot 1/2" in output
 
 
 def test_explicit_resume_can_start_fresh_pool_after_failure_drain(
@@ -1033,6 +1046,50 @@ def test_ready_assignment_filter_excludes_running_paused_and_bad_retry_time():
     assert not runloop._assignment_is_ready_for_checkout(
         {"started_at": None, "retry_after": "not-a-time"}, now=now,
     )
+
+
+def test_degraded_pool_only_accepts_assignments_claimed_after_failure():
+    cutoff = datetime.now(timezone.utc)
+    before = (cutoff - timedelta(seconds=1)).isoformat()
+    after = (cutoff + timedelta(seconds=1)).isoformat()
+
+    assert not runloop._assignment_is_ready_for_checkout(
+        {"started_at": None, "leased_at": before},
+        claimed_after=cutoff,
+    )
+    assert runloop._assignment_is_ready_for_checkout(
+        {"started_at": None, "leased_at": after},
+        claimed_after=cutoff,
+    )
+    assert not runloop._assignment_is_ready_for_checkout(
+        {"started_at": None}, claimed_after=cutoff,
+    )
+
+
+def test_surviving_worker_excludes_pre_failure_inventory(
+    tmp_path, monkeypatch,
+):
+    cutoff = datetime.now(timezone.utc)
+    cutoff_file = tmp_path / "failure-cutoff"
+    cutoff_file.write_text(cutoff.isoformat())
+    monkeypatch.setenv("DRADAR_POOL_FAILURE_CUTOFF_FILE", str(cutoff_file))
+
+    class Client:
+        def get_assignment(self):
+            return {"active": [
+                {
+                    "assignment_id": "old",
+                    "started_at": None,
+                    "leased_at": (cutoff - timedelta(seconds=1)).isoformat(),
+                },
+                {
+                    "assignment_id": "new",
+                    "started_at": None,
+                    "leased_at": (cutoff + timedelta(seconds=1)).isoformat(),
+                },
+            ]}
+
+    assert runloop._pool_degraded_exclusions(Client()) == {"old"}
 
 
 def test_backfill_counts_fresh_and_safely_recoverable_work(monkeypatch):

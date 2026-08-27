@@ -17,8 +17,9 @@ def _cell(aid, *, started=False):
 
 
 class FakeClient:
-    def __init__(self, active, *, benchmark_id="deep-swe"):
+    def __init__(self, active, *, recent_inactive=None, benchmark_id="deep-swe"):
         self.active = active
+        self.recent_inactive = recent_inactive or []
         self.benchmark_id = benchmark_id
         self.release_calls = []
 
@@ -26,7 +27,11 @@ class FakeClient:
         return {"benchmarks": [{"id": self.benchmark_id}]}
 
     def get_assignment(self):
-        return {"active": self.active, "free_pick": True}
+        return {
+            "active": self.active,
+            "recent_inactive": self.recent_inactive,
+            "free_pick": True,
+        }
 
     def release_assignments(self, assignment_ids=None, *, release_all=False, force=False):
         self.release_calls.append((assignment_ids, release_all, force))
@@ -60,6 +65,32 @@ def test_leases_lists_waiting_and_running_with_recovery_hint(monkeypatch, capsys
     assert "a1" in out and "a2" in out
     assert "dradar release --all" in out
     assert "--force" in out
+
+
+def test_leases_keeps_recent_expired_unsubmitted_assignment_visible(
+    monkeypatch, capsys,
+):
+    expired = {
+        "assignment_id": "expired-a1",
+        "task_id": "pompeii-adjacency-rp-089",
+        "model": "glm-5.3-flash",
+        "effort": "high",
+        "status": "expired",
+        "reason": "lease_deadline_elapsed",
+        "inactive_at": "2026-08-27T12:13:03+00:00",
+    }
+    client = FakeClient([], recent_inactive=[expired],
+                        benchmark_id="pompeii-adjacency")
+    _wire(monkeypatch, client)
+
+    assert leases.cmd_leases(Namespace()) == 0
+
+    out = capsys.readouterr().out
+    assert "no active leases" in out
+    assert "recent unsubmitted leases" in out
+    assert "expired-a1" in out
+    assert "pompeii-adjacency-rp-089" in out
+    assert "lease_deadline_elapsed" in out
 
 
 def test_started_history_without_healthy_runner_is_resumable_not_running(

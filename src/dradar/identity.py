@@ -241,6 +241,26 @@ def cmd_status(args) -> int:
             print(f"\n{len(active)} active lease(s): {state_summary(active)} "
                   "— inspect with `dradar leases`; "
                   "give back with `dradar release`")
+        recent_inactive = list(lease_data.get("recent_inactive") or [])
+        if recent_inactive:
+            expired = sum(
+                item.get("status") == "expired" for item in recent_inactive
+            )
+            released = sum(
+                item.get("status") == "released" for item in recent_inactive
+            )
+            parts = []
+            if expired:
+                parts.append(f"{expired} expired")
+            if released:
+                parts.append(f"{released} released")
+            other = len(recent_inactive) - expired - released
+            if other:
+                parts.append(f"{other} ended")
+            print(
+                f"\n{len(recent_inactive)} recent unsubmitted lease(s) ended: "
+                f"{', '.join(parts)} — inspect IDs and reasons with `dradar leases`"
+            )
     except ApiError:
         pass
     return 0

@@ -15,16 +15,20 @@ from .identity import _client
 from .local_config import _load_config
 
 
-def _active(client) -> list[dict]:
+def _inventory(client) -> tuple[list[dict], list[dict]]:
     data = client.get_assignment()
     active = data.get("active")
     if active is None:
         one = data.get("assignment")
         active = [one] if one else []
-    return active
+    return active, list(data.get("recent_inactive") or [])
 
 
-def _all_active(client) -> list[dict]:
+def _active(client) -> list[dict]:
+    return _inventory(client)[0]
+
+
+def _all_inventory(client) -> tuple[list[dict], list[dict]]:
     """Return held assignments across every benchmark visible to this user.
 
     Assignment lookup is intentionally benchmark-scoped for the run loop, but
@@ -43,7 +47,7 @@ def _all_active(client) -> list[dict]:
             catalog = client.benchmarks()
         except ApiError as exc:
             if exc.status_code == 404:
-                return _active(client)
+                return _inventory(client)
             raise
 
         benchmark_ids = [
@@ -54,30 +58,48 @@ def _all_active(client) -> list[dict]:
         if original_benchmark and original_benchmark not in benchmark_ids:
             benchmark_ids.insert(0, original_benchmark)
         if not benchmark_ids:
-            return _active(client)
+            return _inventory(client)
 
         active: list[dict] = []
-        seen: set[str] = set()
+        recent_inactive: list[dict] = []
+        seen_active: set[str] = set()
+        seen_inactive: set[str] = set()
         for benchmark_id in benchmark_ids:
             client.benchmark_id = benchmark_id
             try:
-                scoped = _active(client)
+                scoped, scoped_inactive = _inventory(client)
             except ApiError as exc:
                 if exc.status_code == 403:
                     continue
                 raise
             for item in scoped:
                 assignment_id = item.get("assignment_id")
-                if assignment_id and assignment_id in seen:
+                if assignment_id and assignment_id in seen_active:
                     continue
                 copy = dict(item)
                 copy.setdefault("benchmark_id", benchmark_id)
                 active.append(copy)
                 if assignment_id:
-                    seen.add(assignment_id)
-        return active
+                    seen_active.add(assignment_id)
+            for item in scoped_inactive:
+                assignment_id = item.get("assignment_id")
+                if assignment_id and assignment_id in seen_inactive:
+                    continue
+                copy = dict(item)
+                copy.setdefault("benchmark_id", benchmark_id)
+                recent_inactive.append(copy)
+                if assignment_id:
+                    seen_inactive.add(assignment_id)
+        recent_inactive.sort(
+            key=lambda item: item.get("inactive_at") or "", reverse=True,
+        )
+        return active, recent_inactive[:10]
     finally:
         client.benchmark_id = original_benchmark
+
+
+def _all_active(client) -> list[dict]:
+    return _all_inventory(client)[0]
 
 
 def _expiry(iso: str | None) -> str:
@@ -106,32 +128,54 @@ def _print_active(active: list[dict]) -> None:
         )
 
 
+def _print_recent_inactive(items: list[dict]) -> None:
+    print("recent unsubmitted leases that are no longer held:")
+    for item in items:
+        benchmark = item.get("benchmark_id")
+        benchmark_label = f"  [{benchmark}]" if benchmark else ""
+        status = item.get("status") or "ended"
+        reason = item.get("reason") or status
+        print(
+            f"  {status:9s}  {item.get('task_id', 'unknown')}  "
+            f"{item.get('model', 'unknown')}@{item.get('effort', 'unknown')}"
+            f"{benchmark_label}\n"
+            f"      {item.get('assignment_id', 'unknown')}  "
+            f"{reason} at {_expiry(item.get('inactive_at'))}"
+        )
+
+
 def cmd_leases(args) -> int:
     """List every live cell held by the current identity."""
     cfg = _load_config()
     client = _client(cfg)
     try:
-        active = _all_active(client)
+        active, recent_inactive = _all_inventory(client)
     except ApiError as exc:
         sys.exit(f"lease check failed: {exc}")
-    if not active:
+    if not active and not recent_inactive:
         print("no active leases")
         return 0
 
-    running = sum(_state(item) == "running" for item in active)
-    stale = sum(_state(item) == "stale" for item in active)
-    print(f"holding {len(active)} cell(s): {state_summary(active)}")
-    _print_active(active)
-    print("\nrelease waiting cells: `dradar release <assignment-id>` or "
-          "`dradar release --all`")
-    if running:
-        print("a running cell is protected; only use `--force` after its local "
-              "runner has definitely stopped")
-    if stale:
-        print("a stale cell has no usable checkpoint and is not actually resumable; "
-              "do not start a duplicate local model process. Retry after the server "
-              "refreshes it, or use `dradar release --force` only after confirming "
-              "the original runner/container is gone")
+    if active:
+        running = sum(_state(item) == "running" for item in active)
+        stale = sum(_state(item) == "stale" for item in active)
+        print(f"holding {len(active)} cell(s): {state_summary(active)}")
+        _print_active(active)
+        print("\nrelease waiting cells: `dradar release <assignment-id>` or "
+              "`dradar release --all`")
+        if running:
+            print("a running cell is protected; only use `--force` after its local "
+                  "runner has definitely stopped")
+        if stale:
+            print("a stale cell has no usable checkpoint and is not actually resumable; "
+                  "do not start a duplicate local model process. Retry after the server "
+                  "refreshes it, or use `dradar release --force` only after confirming "
+                  "the original runner/container is gone")
+    else:
+        print("no active leases")
+    if recent_inactive:
+        print()
+        _print_recent_inactive(recent_inactive)
     return 0
 
 
