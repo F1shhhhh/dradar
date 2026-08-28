@@ -78,9 +78,6 @@ from .providers import (
 _DEEPSEEK_MODELS_URL = "https://api.deepseek.com/models"
 _ZCODE_MODELS_URL = "https://open.bigmodel.cn/api/coding/paas/v4/models"
 _GROK_INSTALLER_URL = "https://x.ai/cli/install.sh"
-_GROK_INSTALLER_SHA256 = (
-    "43d0943123edade1383a476a4f778674877acee7c1f98a00f094c4a0f7349321"
-)
 _ANTIGRAVITY_SETUP_IMAGE = "debian:bookworm-slim"
 _ANTIGRAVITY_CA_BUNDLE_TARGET = "/tmp/dradar-ca-certificates.crt"
 
@@ -162,7 +159,7 @@ def _kimi_cli_version(executable: str | Path) -> str | None:
 
 
 def _install_managed_grok_cli() -> str | None:
-    """Install the current stable Grok release into DRadar's private slot."""
+    """Install DRadar's required Grok release into its private runtime slot."""
 
     bash = shutil.which("bash")
     if not bash:
@@ -186,12 +183,6 @@ def _install_managed_grok_cli() -> str | None:
         print(
             "Could not download the official Grok installer "
             f"(HTTP {response.status_code})."
-        )
-        return None
-    if hashlib.sha256(response.content).hexdigest() != _GROK_INSTALLER_SHA256:
-        print(
-            "The official Grok installer changed since this DRadar release; "
-            "refusing to execute it until the new script is reviewed."
         )
         return None
     try:
@@ -784,17 +775,17 @@ def _setup_zcode() -> int:
     issue = zcode_cli_error(cli)
     if issue is not None:
         print(
-            "ZCode setup could not find a verified compatible official "
+            "ZCode setup could not find a compatible official "
             f"desktop runtime: {issue}\n"
             f"Install it from {ZCODE_OFFICIAL_DOWNLOAD_PAGE}, then retry. "
             "Advanced users may point ZCODE_CLI_PATH at "
-            "Resources/glm/zcode.cjs; DRadar verifies its SHA-256 before use."
+            "Resources/glm/zcode.cjs; DRadar verifies its CLI version before use."
         )
         return 1
     try:
         imported_cli = store_zcode_cli(cli)
     except (OSError, ValueError) as exc:
-        print(f"could not import the verified ZCode runtime: {exc}")
+        print(f"could not import the compatible ZCode runtime: {exc}")
         return 1
     key = getpass.getpass("BigModel Coding Plan API key (input hidden): ")
     try:
@@ -804,7 +795,7 @@ def _setup_zcode() -> int:
         return 1
     print(
         f"ZCode Coding Plan API key saved locally at {path} (value hidden).\n"
-        f"Verified ZCode runtime imported to {imported_cli}.\n"
+        f"Compatible ZCode runtime imported to {imported_cli}.\n"
         "It is never sent to the DRadar server."
     )
     if _live_zcode_status(key) != 0:

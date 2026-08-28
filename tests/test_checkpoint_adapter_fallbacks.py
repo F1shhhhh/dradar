@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import sys
 from pathlib import Path
@@ -97,11 +96,6 @@ def test_zcode_disabled_checkpoint_uses_normal_root_handoff(
     key.chmod(0o600)
     cli = tmp_path / "zcode.cjs"
     cli.write_text("pinned-zcode", encoding="utf-8")
-    monkeypatch.setattr(
-        pier_zcode,
-        "ZCODE_CLI_SHA256S",
-        frozenset({hashlib.sha256(cli.read_bytes()).hexdigest()}),
-    )
     agent = pier_zcode.ZCodeBigModel(
         logs_dir=logs,
         model_name="glm-5.3",

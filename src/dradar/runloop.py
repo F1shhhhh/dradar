@@ -2543,6 +2543,7 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         "kimi_cli_version": art.kimi_cli_version,
         "antigravity_cli_version": art.antigravity_cli_version,
         "zcode_cli_version": art.zcode_cli_version,
+        "zcode_cli_sha256": art.zcode_cli_sha256,
         "dsh_version": art.dsh_version,
         **stats,
     }

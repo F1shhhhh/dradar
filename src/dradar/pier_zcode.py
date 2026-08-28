@@ -1,14 +1,13 @@
 """Credential-isolated Pier adapter for ZCode with BigModel Coding Plan.
 
-The adapter runs the official ZCode Protocol server from a digest-pinned
-desktop bundle.  The Coding Plan key is uploaded as an owner-only run file,
+The adapter runs a version-checked ZCode Protocol server imported from the
+desktop bundle. The Coding Plan key is uploaded as an owner-only run file,
 moved into ZCode's in-memory session-secret store during ``session/create`` or
 ``session/resume``, and then unlinked before the model may execute a tool.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -44,13 +43,6 @@ except ModuleNotFoundError:  # Local source-tree tests import the packaged modul
 
 
 ZCODE_CLI_VERSION = "0.16.5"
-ZCODE_CLI_SHA256 = (
-    "780683d8f9c003c2e1b629214de7987c9a533cdc486ce0fa3e5f3f4d39ece184"
-)
-ZCODE_CLI_SHA256S = frozenset({
-    "883c12ab99b790fadc5f3ec2f229acd269d8c5460654b4c279c1e18368c436d8",
-    ZCODE_CLI_SHA256,
-})
 NODE_VERSION = "22.23.2"
 NODE_SHA256 = {
     "x64": "d60acfe00a2932254bb0ad20e01b0d74397a0875595de719654b214f4b03f307",
@@ -1214,11 +1206,10 @@ class ZCodeBigModel(BaseInstalledAgent):
             raise ValueError("ZCode Coding Plan key permissions must be 0600 or stricter")
         try:
             cli_info = cli_file.stat()
-            cli_digest = hashlib.sha256(cli_file.read_bytes()).hexdigest()
         except OSError as exc:
-            raise ValueError("Pinned ZCode CLI is missing or unreadable") from exc
-        if not stat.S_ISREG(cli_info.st_mode) or cli_digest not in ZCODE_CLI_SHA256S:
-            raise ValueError("Pinned ZCode CLI integrity check failed")
+            raise ValueError("ZCode CLI is missing or unreadable") from exc
+        if not stat.S_ISREG(cli_info.st_mode):
+            raise ValueError("ZCode CLI must be a regular file")
         resolved_model = model_name or "glm-5.3"
         if resolved_model not in SUPPORTED_MODELS:
             raise ValueError(

@@ -237,17 +237,7 @@ ZCODE_AGENT = "zcode"
 ZCODE_MODEL = "glm-5.3"
 ZCODE_FLASH_MODEL = "glm-5.3-flash"
 ZCODE_MODELS = frozenset({ZCODE_MODEL, ZCODE_FLASH_MODEL})
-ZCODE_APP_VERSION = "3.9.2"
 ZCODE_CLI_VERSION = "0.16.5"
-ZCODE_CLI_SHA256 = (
-    "780683d8f9c003c2e1b629214de7987c9a533cdc486ce0fa3e5f3f4d39ece184"
-)
-ZCODE_CLI_SHA256S = frozenset({
-    # ZCode 3.9.1 desktop bundle.
-    "883c12ab99b790fadc5f3ec2f229acd269d8c5460654b4c279c1e18368c436d8",
-    # ZCode 3.9.2 desktop bundle.
-    ZCODE_CLI_SHA256,
-})
 ZCODE_SUPPORTED_EFFORTS = frozenset({"low", "high", "max"})
 ZCODE_LEGACY_CAPABILITY = "zcode-glm-5.3-bigmodel-coding-plan-v1"
 ZCODE_CAPABILITY = "zcode-glm-5.3-family-bigmodel-coding-plan-v2"
@@ -765,9 +755,9 @@ def zcode_cli_candidates(
 ) -> tuple[Path, ...]:
     """Return explicit, imported, and official desktop ZCode CLI locations.
 
-    DRadar never downloads or redistributes ZCode.  Setup imports the
-    digest-pinned CLI from the user's official desktop installation (or from
-    an explicit ``ZCODE_CLI_PATH``) into DRadar's owner-only provider slot.
+    DRadar never downloads or redistributes ZCode. Setup imports a compatible
+    CLI from the user's official desktop installation (or from an explicit
+    ``ZCODE_CLI_PATH``) into DRadar's owner-only provider slot.
     """
 
     env = os.environ if environ is None else environ
@@ -825,7 +815,7 @@ def zcode_cli_path(environ: Mapping[str, str] | None = None) -> str | None:
         return None
     env = os.environ if environ is None else environ
     # Preserve an explicit path even when it is invalid so status/doctor can
-    # report the integrity error instead of a misleading "not installed".
+    # report the compatibility error instead of a misleading "not installed".
     if env.get("ZCODE_CLI_PATH"):
         return str(candidates[0])
     first_installed: Path | None = None
@@ -835,8 +825,9 @@ def zcode_cli_path(environ: Mapping[str, str] | None = None) -> str | None:
         if first_installed is None:
             first_installed = candidate
         # A previously imported runtime is intentionally the first candidate,
-        # but it must not shadow a newly installed, digest-pinned desktop
-        # upgrade. This lets setup/status discover the verified replacement.
+        # but it must not shadow a newly installed compatible desktop upgrade.
+        # This lets setup/status discover a replacement after the CLI version
+        # changes without tying compatibility to desktop packaging bytes.
         if zcode_cli_error(candidate) is None:
             return str(candidate)
     return str(first_installed) if first_installed is not None else None
@@ -857,16 +848,45 @@ def zcode_cli_error(
     try:
         resolved = Path(candidate).expanduser().resolve(strict=True)
         info = resolved.stat()
-        payload = resolved.read_bytes()
     except OSError as exc:
-        return f"cannot inspect pinned ZCode CLI: {exc}"
+        return f"cannot inspect ZCode CLI: {exc}"
     if not stat.S_ISREG(info.st_mode):
-        return "pinned ZCode CLI must resolve to a regular file"
-    digest = hashlib.sha256(payload).hexdigest()
-    if digest not in ZCODE_CLI_SHA256S:
+        return "ZCode CLI must resolve to a regular file"
+    env = os.environ if environ is None else environ
+    node = (
+        shutil.which("node")
+        if environ is None
+        else shutil.which("node", path=env.get("PATH"))
+    )
+    if not node:
+        return "Node.js is required to verify the ZCode CLI version"
+    # Version probes do not need provider credentials or the user's home. Keep
+    # the child environment deliberately small because an explicit
+    # ZCODE_CLI_PATH is user-selected executable JavaScript.
+    probe_env = {
+        name: env[name]
+        for name in (
+            "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR",
+            "TMPDIR", "TEMP", "TMP",
+        )
+        if env.get(name)
+    }
+    try:
+        proc = subprocess.run(
+            [node, str(resolved), "version"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+            env=probe_env,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"could not verify the ZCode CLI version: {type(exc).__name__}"
+    found = parse_zcode_cli_version(proc.stdout + "\n" + proc.stderr)
+    if proc.returncode != 0 or found != ZCODE_CLI_VERSION:
         return (
-            "ZCode CLI integrity check failed; install an official desktop "
-            "release containing a tested CLI runtime"
+            f"ZCode CLI {ZCODE_CLI_VERSION} is required; "
+            f"found {found or 'an unrecognized version'}"
         )
     return None
 
@@ -876,7 +896,7 @@ def store_zcode_cli(
     *,
     home: Path | None = None,
 ) -> Path:
-    """Import a verified official ZCode CLI into DRadar's local-only slot."""
+    """Import a compatible ZCode CLI into DRadar's local-only slot."""
 
     issue = zcode_cli_error(source)
     if issue is not None:
@@ -1551,7 +1571,7 @@ def grok_subscription_session(directory: Path, *, home: Path | None = None):
 def advertised_capabilities(
     environ: Mapping[str, str] | None = None,
 ) -> tuple[str, ...]:
-    """Advertise only a complete, integrity-checked paid-provider runtime."""
+    """Advertise only a complete, compatibility-checked paid-provider runtime."""
 
     capabilities = []
     if deepseek_catalog_error() is None:

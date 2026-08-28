@@ -546,7 +546,8 @@ class SubmitClient(FakeClient):
 
 
 def _fake_art(base: Path, rc: int = 0, result_data: dict | None = None,
-              codex_cli_version: str | None = "0.145.0") -> TrialArtifacts:
+              codex_cli_version: str | None = "0.145.0",
+              zcode_cli_sha256: str | None = None) -> TrialArtifacts:
     trial_dir = base / "trial"
     (trial_dir / "artifacts").mkdir(parents=True, exist_ok=True)
     patch = trial_dir / "artifacts" / "model.patch"
@@ -560,7 +561,8 @@ def _fake_art(base: Path, rc: int = 0, result_data: dict | None = None,
     return TrialArtifacts(job_dir=job_dir, trial_dir=trial_dir, patch=patch,
                           trajectory=None, result=result, returncode=rc,
                           duration_sec=61.0, log_path=base / "pier.log",
-                          codex_cli_version=codex_cli_version)
+                          codex_cli_version=codex_cli_version,
+                          zcode_cli_sha256=zcode_cli_sha256)
 
 
 def test_clean_run_submits_outcome_completed(monkeypatch, tmp_path: Path):
@@ -572,6 +574,21 @@ def test_clean_run_submits_outcome_completed(monkeypatch, tmp_path: Path):
     assert tag == "submitted"
     assert client.submissions[0]["outcome"] == "completed"
     assert client.submissions[0]["meta"]["codex_cli_version"] == "0.145.0"
+
+
+def test_submission_attests_observed_zcode_cli_sha256(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
+    digest = "3" * 64
+    art = _fake_art(tmp_path, rc=0, zcode_cli_sha256=digest)
+    monkeypatch.setattr(runloop, "run_trial", lambda *a, **kw: art)
+    client = SubmitClient({})
+
+    tag = runloop._run_and_submit(
+        client, ASSIGNMENT, tmp_path, _args(), "abc123",
+    )
+
+    assert tag == "submitted"
+    assert client.submissions[0]["meta"]["zcode_cli_sha256"] == digest
 
 
 def test_task_content_mismatch_stops_before_model_run(
