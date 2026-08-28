@@ -300,6 +300,7 @@ class Antigravity(BaseInstalledAgent):
             "accounts.google.com",
             "antigravity-unleash.goog",
             "daily-cloudcode-pa.googleapis.com",
+            "lh3.googleusercontent.com",
             "oauth2.googleapis.com",
             "storage.googleapis.com",
             "www.googleapis.com",

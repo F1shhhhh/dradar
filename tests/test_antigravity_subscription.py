@@ -288,7 +288,9 @@ def test_adapter_never_uses_dangerous_permissions_or_scratch_workspace() -> None
     assert "sha512sum --check --strict" in source
     assert "storage.googleapis.com" in source
     assert '"www.googleapis.com"' in source
+    assert '"lh3.googleusercontent.com"' in source
     assert "*.googleapis.com" not in source
+    assert "*.googleusercontent.com" not in source
 
 
 def test_runtime_model_preflight_accepts_the_official_tabular_output() -> None:
