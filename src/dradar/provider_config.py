@@ -7,6 +7,7 @@ import hashlib
 import os
 import platform
 import shutil
+import ssl
 import subprocess
 import sys
 import tarfile
@@ -15,6 +16,7 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import certifi
 import httpx
 
 from .providers import (
@@ -80,6 +82,9 @@ _GROK_INSTALLER_SHA256 = (
     "43d0943123edade1383a476a4f778674877acee7c1f98a00f094c4a0f7349321"
 )
 _ANTIGRAVITY_SETUP_IMAGE = "debian:bookworm-slim"
+_ANTIGRAVITY_CA_BUNDLE_TARGET = "/tmp/dradar-ca-certificates.crt"
+
+
 def _private_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
     if os.name != "nt":
@@ -436,6 +441,7 @@ def _antigravity_container_command(
 ) -> tuple[list[str], dict[str, str]]:
     auth = antigravity_auth_path()
     auth.mkdir(parents=True, exist_ok=True, mode=0o700)
+    ca_bundle = _antigravity_ca_bundle()
     command = [docker, "run", "--rm"]
     if interactive:
         command.append("-i")
@@ -447,10 +453,16 @@ def _antigravity_container_command(
         "--workdir", "/tmp",
         "--env", "HOME=/tmp/dradar-antigravity-user",
         "--env", "AGY_CLI_HIDE_LOGO=1",
+        "--env", f"SSL_CERT_FILE={_ANTIGRAVITY_CA_BUNDLE_TARGET}",
         "--mount",
         f"type=bind,source={executable.resolve()},target=/opt/antigravity,readonly",
         "--mount",
         f"type=bind,source={auth.resolve()},target=/tmp/dradar-antigravity-user/.gemini",
+        "--mount",
+        (
+            f"type=bind,source={ca_bundle},"
+            f"target={_ANTIGRAVITY_CA_BUNDLE_TARGET},readonly"
+        ),
     ]
     env = provider_subprocess_env()
     for name in (
@@ -468,17 +480,50 @@ def _antigravity_container_command(
     return command, env
 
 
+def _antigravity_ca_bundle() -> Path:
+    """Return a canonical, non-empty CA bundle for the slim setup container."""
+
+    try:
+        bundle = Path(certifi.where()).resolve(strict=True)
+        size = bundle.stat().st_size
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError("the trusted CA bundle is unavailable") from exc
+    if not bundle.is_file() or size <= 0:
+        raise ValueError("the trusted CA bundle is not a non-empty regular file")
+    try:
+        ssl.create_default_context(cafile=str(bundle))
+    except (OSError, ssl.SSLError) as exc:
+        raise ValueError("the trusted CA bundle is not valid PEM") from exc
+    return bundle
+
+
 def _antigravity_models_live(docker: str, executable: Path) -> str | None:
-    command, env = _antigravity_container_command(
-        docker, executable, ["models"], interactive=False,
-    )
+    try:
+        command, env = _antigravity_container_command(
+            docker, executable, ["models"], interactive=False,
+        )
+    except (OSError, ValueError) as exc:
+        return f"could not prepare the official models check: {type(exc).__name__}"
+    proc = None
+    run_issue = None
     try:
         proc = subprocess.run(
             command, env=env, capture_output=True, text=True,
             timeout=120, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return f"could not run the official models check: {type(exc).__name__}"
+        run_issue = f"could not run the official models check: {type(exc).__name__}"
+    try:
+        # Even read-only AGY commands currently normalize away explicit false
+        # settings.  Restore the reviewed fail-closed policy after every live
+        # check so status/setup never weakens or invalidates the paid runtime.
+        write_antigravity_settings()
+        privatize_antigravity_home()
+    except (OSError, ValueError) as exc:
+        return f"the official models check left unsafe local state: {type(exc).__name__}"
+    if run_issue is not None:
+        return run_issue
+    assert proc is not None
     if proc.returncode != 0:
         output = (proc.stdout + "\n" + proc.stderr).lower()
         if "authentication" in output or "oauth" in output:
