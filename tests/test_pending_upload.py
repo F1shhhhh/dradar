@@ -1257,7 +1257,7 @@ def test_zcode_pompeii_preflight_names_binary_file_before_submit(
 
     outcome = runloop._upload_trial(client, entry)
 
-    assert outcome == "rejected"
+    assert outcome == "assignment-reopened"
     assert client.calls == []
     assert client.stopped == ["a1"]
     assert pending.load(tmp_path) == []

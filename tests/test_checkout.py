@@ -126,14 +126,15 @@ def test_checkout_loop_never_retries_a_cell_that_failed_this_session(
     assert rc == 1                            # the failure still fails the run
 
 
+@pytest.mark.parametrize("outcome", ["failed", "rejected", "not-uploaded"])
 def test_supervised_worker_stops_checkout_after_any_failed_outcome(
-        monkeypatch, capsys, tmp_path):
+        monkeypatch, capsys, tmp_path, outcome):
     monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)
     attempts = []
 
     def run(client, assignment, *a, **kw):
         attempts.append(assignment["assignment_id"])
-        return "failed"
+        return outcome
 
     monkeypatch.setattr(runloop, "_run_and_submit", run)
     client = CheckoutClient(
@@ -178,6 +179,38 @@ def test_supervised_worker_continues_after_expired_old_batch_assignment(
     assert runloop._go_menu(args, {}, client, tmp_path) == 0
     assert attempts == ["old", "new"]
     assert client.checkout_exclusions == [set(), set(), set()]
+    assert "stopping this automatic batch runner" not in capsys.readouterr().out
+
+
+def test_supervised_worker_continues_after_assignment_local_rejection(
+        monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)
+    attempts = []
+
+    def run(client, assignment, *a, **kw):
+        attempts.append(assignment["assignment_id"])
+        if assignment["assignment_id"] == "invalid-answer":
+            return "assignment-reopened"
+        return "submitted"
+
+    monkeypatch.setattr(runloop, "_run_and_submit", run)
+    cells = [_cell("invalid-answer"), _cell("next")]
+    client = CheckoutClient(
+        {"active": cells, "free_pick": True},
+        [
+            {"assignment": cells[0], "held": 2, "unstarted": 1},
+            {"assignment": cells[1], "held": 1, "unstarted": 0},
+            {"assignment": None, "held": 0, "unstarted": 0},
+        ],
+    )
+    args = _args()
+    args.worker_child = True
+
+    assert runloop._go_menu(args, {}, client, tmp_path) == 0
+    assert attempts == ["invalid-answer", "next"]
+    assert client.checkout_exclusions == [
+        set(), {"invalid-answer"}, {"invalid-answer"},
+    ]
     assert "stopping this automatic batch runner" not in capsys.readouterr().out
 
 
