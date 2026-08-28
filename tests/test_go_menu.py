@@ -601,7 +601,7 @@ def test_task_content_mismatch_stops_before_model_run(
     assert "no model quota was consumed" in capsys.readouterr().out
 
 
-def test_cleanup_unconfirmed_drains_pool_without_marking_lease_stopped(
+def test_cleanup_unconfirmed_quarantines_slot_without_marking_lease_stopped(
     monkeypatch, tmp_path: Path, capsys,
 ):
     monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
@@ -627,10 +627,71 @@ def test_cleanup_unconfirmed_drains_pool_without_marking_lease_stopped(
     assert outcome == "cleanup-unconfirmed"
     assert stopped == []
     assert client.submissions == []
-    assert abort_file.read_text() == (
-        "drain:local Pier cleanup could not be confirmed"
+    assert not abort_file.exists()
+    output = capsys.readouterr().out
+    assert "lease remains running" in output
+    assert "worker slot is quarantined" in output
+
+
+def test_task_retryable_failure_isolates_assignment_without_pool_abort(
+    monkeypatch, tmp_path: Path, capsys,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
+    abort_file = tmp_path / "POOL_ABORT"
+    monkeypatch.setenv("DRADAR_POOL_ABORT_FILE", str(abort_file))
+    diagnostic = {"schema": "dradar-runner-failure-v1", "reason": "terminal_status"}
+
+    def fail(*_args, **_kwargs):
+        raise runloop.RunnerTaskRetryableError(
+            "ZCode terminal state is not gradeable",
+            failure_diagnostic=diagnostic,
+        )
+
+    monkeypatch.setattr(runloop, "run_trial", fail)
+    stopped = []
+    monkeypatch.setattr(
+        runloop,
+        "_mark_stopped_quietly",
+        lambda _client, assignment, **kwargs: stopped.append(
+            (assignment["assignment_id"], kwargs)
+        ) or True,
     )
-    assert "lease remains running" in capsys.readouterr().out
+    client = SubmitClient({})
+
+    outcome = runloop._run_and_submit(
+        client, ASSIGNMENT, tmp_path, _args(), "abc123",
+    )
+
+    assert outcome == "assignment-isolated"
+    assert stopped == [("a1", {
+        "failure_kind": "runner_failed",
+        "failure_diagnostic": diagnostic,
+    })]
+    assert not abort_file.exists()
+    assert "other worker slots may continue" in capsys.readouterr().out
+
+
+def test_legacy_batch_quarantines_cleanup_unconfirmed_worker_slot(
+    monkeypatch, tmp_path: Path,
+):
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        runloop, "_run_and_submit", lambda *_args, **_kwargs: "cleanup-unconfirmed",
+    )
+    args = _args()
+    args.worker_child = True
+    telemetry = type("Telemetry", (), {
+        "bind_batch": lambda self, _batch_id: None,
+        "flush": lambda self: None,
+        "set_phase": lambda self, *values: setattr(self, "phase", values),
+    })()
+
+    rc = runloop._run_batch(
+        args, SubmitClient({}), tmp_path, [ASSIGNMENT], telemetry=telemetry,
+    )
+
+    assert rc == runloop._WORKER_SLOT_QUARANTINED_EXIT_CODE
+    assert telemetry.phase == ("paused", "a1", None)
 
 
 def test_explicit_task_drift_override_keeps_existing_audited_behavior(

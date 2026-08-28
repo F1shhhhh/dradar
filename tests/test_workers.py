@@ -825,6 +825,40 @@ def test_pool_child_failure_keeps_sibling_and_backfills_new_held_work(
     assert "restoring worker slot 1/2" in output
 
 
+def test_pool_quarantines_uncertain_slot_without_freezing_siblings(
+        monkeypatch, capsys):
+    _patch_pool_setup(monkeypatch, active_count=2)
+    monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
+    ready_after_quarantine = []
+
+    def ready(_client, **kwargs):
+        ready_after_quarantine.append(kwargs.get("claimed_after"))
+        return 1
+
+    monkeypatch.setattr(runloop, "_pool_ready_work_count", ready)
+    calls = []
+
+    def popen(command, env, **kwargs):
+        polls = (
+            [runloop._WORKER_SLOT_QUARANTINED_EXIT_CODE]
+            if not calls else [None, 0]
+        )
+        process = _ScriptedProcess(command, env, polls, **kwargs)
+        calls.append(process)
+        return process
+
+    monkeypatch.setattr(runloop.subprocess, "Popen", popen)
+
+    assert runloop._run_worker_pool(_args(workers=2)) == 1
+    assert len(calls) == 2
+    assert ready_after_quarantine == [None]
+    output = capsys.readouterr().out
+    assert "worker 1 quarantined" in output
+    assert "sibling workers will continue" in output
+    assert "existing waiting work is frozen" not in output
+    assert "restoring worker slot 1/2" not in output
+
+
 def test_explicit_resume_can_start_fresh_pool_after_failure_drain(
         monkeypatch):
     _patch_pool_setup(monkeypatch, active_count=1)

@@ -323,6 +323,10 @@ class RunnerCleanupUnconfirmedError(RunnerError):
     """The local runtime may still be alive, so its lease must stay running."""
 
 
+class RunnerTaskRetryableError(RunnerError):
+    """The exact local runtime is gone, so only this assignment must retry."""
+
+
 class LiveAccountTerminalError(RunnerError):
     """A running agent reported an account-wide terminal provider failure."""
 
@@ -3242,49 +3246,67 @@ class PierContainerCleanup:
 def _cleanup_terminated_pier_containers(job_root: Path) -> PierContainerCleanup:
     """Remove only surviving containers bound to the exact terminated job."""
 
-    try:
-        listed = subprocess.run(
-            [
-                "docker", "ps", "-aq", "--filter",
-                "label=com.docker.compose.project",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RunnerError(
-            "Docker could not be queried for terminated Pier containers",
-        ) from exc
-    if listed.returncode != 0:
-        raise RunnerError(
-            "Docker rejected the terminated Pier container check",
-        )
-    container_ids = [
-        value for value in listed.stdout.split()
-        if re.fullmatch(r"[0-9a-f]{12,64}", value)
-    ]
-    if not container_ids:
-        return PierContainerCleanup()
-    try:
-        inspected = subprocess.run(
-            ["docker", "inspect", *container_ids],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RunnerError(
-            "terminated Pier container ownership is unknown",
-        ) from exc
-    if inspected.returncode != 0:
-        raise RunnerError(
-            "terminated Pier container inspection failed",
-        )
-    try:
-        containers = json.loads(inspected.stdout or "[]")
-    except json.JSONDecodeError as exc:
-        raise RunnerError("Docker returned invalid orphan inspection data") from exc
+    # Docker Desktop/daemon queries can fail between ``ps`` and ``inspect``
+    # while a just-exited compose project is disappearing. Re-run the whole
+    # ownership audit a few times: every attempt still requires positive
+    # exact-job ownership before removal, so retries do not broaden cleanup.
+    audit_error: RunnerError | None = None
+    for attempt in range(3):
+        try:
+            try:
+                listed = subprocess.run(
+                    [
+                        "docker", "ps", "-aq", "--filter",
+                        "label=com.docker.compose.project",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise RunnerError(
+                    "Docker could not be queried for terminated Pier containers",
+                ) from exc
+            if listed.returncode != 0:
+                raise RunnerError(
+                    "Docker rejected the terminated Pier container check",
+                )
+            container_ids = [
+                value for value in listed.stdout.split()
+                if re.fullmatch(r"[0-9a-f]{12,64}", value)
+            ]
+            if not container_ids:
+                return PierContainerCleanup()
+            try:
+                inspected = subprocess.run(
+                    ["docker", "inspect", *container_ids],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise RunnerError(
+                    "terminated Pier container ownership is unknown",
+                ) from exc
+            if inspected.returncode != 0:
+                raise RunnerError(
+                    "terminated Pier container inspection failed",
+                )
+            try:
+                containers = json.loads(inspected.stdout or "[]")
+            except json.JSONDecodeError as exc:
+                raise RunnerError(
+                    "Docker returned invalid orphan inspection data",
+                ) from exc
+            break
+        except RunnerError as exc:
+            audit_error = exc
+            if attempt == 2:
+                raise
+            time.sleep(0.5 * (attempt + 1))
+    else:  # pragma: no cover - the bounded loop either breaks or raises
+        assert audit_error is not None
+        raise audit_error
 
     owned: list[str] = []
     running: list[str] = []
@@ -3711,7 +3733,7 @@ def run_trial(
                     + ")",
                 )
             if process_residue or cleanup.running:
-                raise RunnerError(
+                raise RunnerTaskRetryableError(
                     "Pier exited while the ZCode runtime was still active; exact-job "
                     "processes and containers were stopped before the "
                     "assignment was made retryable",
@@ -3843,7 +3865,7 @@ def run_trial(
             expected_model=effective_assignment["model"],
         )
         if false_success_reason is not None:
-            raise RunnerError(
+            raise RunnerTaskRetryableError(
                 "Pier exited with process status 0 without a gradeable ZCode terminal "
                 f"result ({false_success_reason}); local artifacts were kept "
                 "and the assignment remains retryable",
