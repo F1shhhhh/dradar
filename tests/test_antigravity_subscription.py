@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -73,6 +74,21 @@ def _usage_helper():
         namespace,
     )
     return namespace["_antigravity_usage_facts"]
+
+
+def _model_line_pattern_helper():
+    source = Path(providers.__file__).with_name("pier_antigravity.py").read_text()
+    module = ast.parse(source)
+    helper = next(
+        node for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_model_line_pattern"
+    )
+    namespace = {"re": re}
+    exec(
+        compile(ast.Module(body=[helper], type_ignores=[]), "pier_antigravity.py", "exec"),
+        namespace,
+    )
+    return namespace["_model_line_pattern"]
 
 
 def _usage(input_tokens: int, output_tokens: int, cache: int, thinking: int) -> dict:
@@ -271,6 +287,15 @@ def test_adapter_never_uses_dangerous_permissions_or_scratch_workspace() -> None
     assert 'init.get("permission_mode") != "always-proceed"' in source
     assert "sha512sum --check --strict" in source
     assert "storage.googleapis.com" in source
+
+
+def test_runtime_model_preflight_accepts_the_official_tabular_output() -> None:
+    helper = _model_line_pattern_helper()
+    slug = ANTIGRAVITY_RUNTIME_MODELS["low"]
+    assert helper(slug) == "^" + re.escape(slug) + r"([[:space:]]|$)"
+    source = Path(providers.__file__).with_name("pier_antigravity.py").read_text()
+    assert "grep -Eq" in source
+    assert "grep -Fqx {shlex.quote(slug)}" not in source
 
 
 def test_official_step_ledger_reconciles_without_double_counting_thinking() -> None:
