@@ -1105,6 +1105,17 @@ def privatize_antigravity_home(home: Path | None = None) -> None:
             raise ValueError(f"Antigravity OAuth state contains a special file: {path}")
 
 
+def restore_antigravity_settings(home: Path | None = None) -> Path:
+    """Safely restore the reviewed policy after the official CLI mutates it."""
+
+    # Inspect and harden first so an untrusted symlink created by the runtime
+    # can never redirect the subsequent atomic settings replacement.
+    privatize_antigravity_home(home)
+    path = write_antigravity_settings(home)
+    privatize_antigravity_home(home)
+    return path
+
+
 def parse_antigravity_cli_version(output: str) -> str | None:
     match = _ANTIGRAVITY_VERSION_RE.search(output.strip())
     return match.group(1) if match else None
@@ -1120,11 +1131,17 @@ def antigravity_subscription_session(
     if issue is not None:
         raise ValueError(issue + "; run `dradar provider setup antigravity` first")
     directory.mkdir(parents=True, exist_ok=True)
-    yield antigravity_auth_path(home)
-    privatize_antigravity_home(home)
-    issue = antigravity_auth_error(home)
-    if issue is not None:
-        raise ValueError("Antigravity returned unsafe OAuth state: " + issue)
+    try:
+        yield antigravity_auth_path(home)
+    finally:
+        # The official CLI currently normalizes explicit false settings after
+        # both successful and failed runs.  Reassert the reviewed policy before
+        # validating the credential tree so a harmless normalization cannot
+        # strand a lease, while every genuinely unsafe mutation still fails.
+        restore_antigravity_settings(home)
+        issue = antigravity_auth_error(home)
+        if issue is not None:
+            raise ValueError("Antigravity returned unsafe OAuth state: " + issue)
 
 
 def grok_home(home: Path | None = None) -> Path:

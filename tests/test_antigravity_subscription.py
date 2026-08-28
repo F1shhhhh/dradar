@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -159,6 +160,51 @@ def test_subscription_session_exposes_only_canonical_gemini_tree(
     with antigravity_subscription_session(tmp_path / "work") as shared:
         assert shared.resolve() == auth
         assert shared.name == ".gemini"
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_subscription_session_restores_policy_after_every_trial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raises: bool,
+) -> None:
+    auth = _ready_home(tmp_path, monkeypatch)
+    settings = auth / "antigravity-cli" / "settings.json"
+
+    def run() -> None:
+        with antigravity_subscription_session(tmp_path / "work"):
+            payload = json.loads(settings.read_text(encoding="utf-8"))
+            payload.pop("allowNonWorkspaceAccess")
+            settings.write_text(json.dumps(payload), encoding="utf-8")
+            if raises:
+                raise RuntimeError("trial interrupted")
+
+    if raises:
+        with pytest.raises(RuntimeError, match="trial interrupted"):
+            run()
+    else:
+        run()
+
+    assert json.loads(settings.read_text(encoding="utf-8")) == (
+        antigravity_settings_payload()
+    )
+    assert antigravity_auth_error() is None
+
+
+def test_subscription_session_never_follows_a_runtime_created_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = _ready_home(tmp_path, monkeypatch)
+    settings_parent = auth / "antigravity-cli"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "settings.json"
+    sentinel.write_text("outside must stay untouched", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="contains a symlink"):
+        with antigravity_subscription_session(tmp_path / "work"):
+            shutil.rmtree(settings_parent)
+            settings_parent.symlink_to(outside, target_is_directory=True)
+
+    assert sentinel.read_text(encoding="utf-8") == "outside must stay untouched"
 
 
 @pytest.mark.parametrize("effort", ["low", "medium", "high"])
