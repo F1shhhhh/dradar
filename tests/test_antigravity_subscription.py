@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -58,6 +59,96 @@ def _ready_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     mark_antigravity_ready()
     privatize_antigravity_home()
     return auth.resolve()
+
+
+def test_antigravity_task_overlay_captures_complete_worktree(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.invalid"],
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "DRadar Test"],
+        cwd=repository,
+        check=True,
+    )
+    (repository / "committed.txt").write_text("base\n", encoding="utf-8")
+    (repository / "unstaged.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repository, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=repository, check=True)
+    base = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=repository, text=True,
+    ).strip()
+
+    (repository / "committed.txt").write_text("committed\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-qam", "agent commit"], cwd=repository, check=True)
+    (repository / "staged.txt").write_text("staged\n", encoding="utf-8")
+    subprocess.run(["git", "add", "staged.txt"], cwd=repository, check=True)
+    (repository / "unstaged.txt").write_text("unstaged\n", encoding="utf-8")
+    (repository / "untracked.txt").write_text("untracked\n", encoding="utf-8")
+
+    tasks = tmp_path / "tasks"
+    task = tasks / "task-1"
+    task.mkdir(parents=True)
+    (task / "task.toml").write_text(
+        'schema_version = "1.3"\n[metadata]\nbase_commit_hash = "'
+        + base
+        + '"\n',
+        encoding="utf-8",
+    )
+    original = task / "pre_artifacts.sh"
+    original.write_text("#!/bin/sh\ngit diff HEAD\n", encoding="utf-8")
+
+    work = tmp_path / "work"
+    with runner._antigravity_tasks_overlay(
+        _assignment(), tasks, work, "job",
+    ) as overlay:
+        assert overlay != tasks
+        hook = overlay / "task-1" / "pre_artifacts.sh"
+        script = hook.read_text(encoding="utf-8")
+        assert "git add -N -- ." in script
+        assert f"base_ref='{base}'" in script
+        assert 'git diff --binary "$base" --' in script
+        assert 'git diff --binary "$base" HEAD' not in script
+        assert original.read_text(encoding="utf-8") == "#!/bin/sh\ngit diff HEAD\n"
+
+        logs = tmp_path / "logs"
+        runnable = tmp_path / "collect.sh"
+        runnable.write_text(
+            script.replace("cd /app", f"cd {repository}").replace(
+                "/logs/artifacts", str(logs / "artifacts")
+            ),
+            encoding="utf-8",
+        )
+        subprocess.run(["sh", str(runnable)], check=True)
+        patch = (logs / "artifacts" / "model.patch").read_text(encoding="utf-8")
+        for filename in (
+            "committed.txt", "staged.txt", "unstaged.txt", "untracked.txt",
+        ):
+            assert filename in patch
+
+    assert not any(work.iterdir())
+
+
+def test_antigravity_task_overlay_rejects_unverifiable_base(
+    tmp_path: Path,
+) -> None:
+    task = tmp_path / "tasks" / "task-1"
+    task.mkdir(parents=True)
+    (task / "task.toml").write_text(
+        '[metadata]\nbase_commit_hash = "not-a-commit"\n', encoding="utf-8",
+    )
+
+    with pytest.raises(RunnerError, match="invalid metadata.base_commit_hash"):
+        with runner._antigravity_tasks_overlay(
+            _assignment(), tmp_path / "tasks", tmp_path / "work", "job",
+        ):
+            pass
 
 
 def _usage_helper():

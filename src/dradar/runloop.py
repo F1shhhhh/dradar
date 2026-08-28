@@ -36,6 +36,7 @@ from .machine import acquire_run_lock, sweep_orphan_compose
 from .patch_guard import check_pompeii_patch, format_patch_guard_report
 from .providers import (
     ANTIGRAVITY_AGENT,
+    ANTIGRAVITY_ARTIFACT_CAPTURE,
     ANTIGRAVITY_RUN_CONFIG_VERSION,
     ANTIGRAVITY_RUNTIME_PROFILE,
     DEEPSEEK_CATALOG_SHA256,
@@ -2577,6 +2578,7 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             "subscription_oauth_coordination": "shared-file-session-v1",
             "antigravity_native_efforts": ["low", "medium", "high"],
             "antigravity_terminal_sandbox": True,
+            "antigravity_artifact_capture": ANTIGRAVITY_ARTIFACT_CAPTURE,
         })
     if assignment.get("agent") == ZCODE_AGENT:
         meta.update({
