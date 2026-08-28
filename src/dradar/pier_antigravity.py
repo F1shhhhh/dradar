@@ -67,17 +67,27 @@ def _usage_values(value: object) -> dict[str, int] | None:
     parsed = {name: _nonnegative_int(value.get(name)) for name in names}
     if any(item is None for item in parsed.values()):
         return None
-    result = {name: int(item) for name, item in parsed.items() if item is not None}
-    # AGY reports thinking as a subset of output.  Its total is prompt plus
-    # output, so adding thinking again would overcharge every reasoning turn.
+    raw = {name: int(item) for name, item in parsed.items() if item is not None}
+    # AGY's official stream reports uncached prompt tokens in ``input_tokens``
+    # and cached prompt tokens separately in ``cache_read_tokens``.  Its
+    # ``total_tokens`` therefore excludes cache reads and includes thinking as
+    # part of output.  DRadar's shared billing contract instead expects input
+    # to include cache reads, with cache as a discounted subset.  Normalize at
+    # this adapter boundary so the server can apply that contract without a
+    # provider-specific exception or double-charging thinking.
     if (
-        result["total_tokens"]
-        != result["input_tokens"] + result["output_tokens"]
-        or result["cache_read_tokens"] > result["input_tokens"]
-        or result["thinking_tokens"] > result["output_tokens"]
+        raw["total_tokens"] != raw["input_tokens"] + raw["output_tokens"]
+        or raw["thinking_tokens"] > raw["output_tokens"]
     ):
         return None
-    return result
+    normalized_input = raw["input_tokens"] + raw["cache_read_tokens"]
+    return {
+        "input_tokens": normalized_input,
+        "output_tokens": raw["output_tokens"],
+        "thinking_tokens": raw["thinking_tokens"],
+        "cache_read_tokens": raw["cache_read_tokens"],
+        "total_tokens": normalized_input + raw["output_tokens"],
+    }
 
 
 def _antigravity_usage_facts(

@@ -327,11 +327,67 @@ def test_official_step_ledger_reconciles_without_double_counting_thinking() -> N
     facts = helper(events, expected_runtime_model=runtime)
     assert facts["complete"] is True
     assert facts["request_count"] == 2
-    assert facts["n_input_tokens"] == 110
+    # DRadar input includes the cached subset, while AGY's raw input excludes
+    # it.  Thinking remains a subset of output and must not be added again.
+    assert facts["n_input_tokens"] == 170
     assert facts["n_cache_tokens"] == 60
     assert facts["n_output_tokens"] == 22
     assert facts["thinking_tokens"] == 15
+    assert sum(item["n_input_tokens"] for item in facts["token_usage_events"]) == 170
     assert sum(item["n_output_tokens"] for item in facts["token_usage_events"]) == 22
+
+
+def test_official_cache_can_exceed_uncached_input_and_still_reconcile() -> None:
+    helper = _usage_helper()
+    runtime = ANTIGRAVITY_RUNTIME_MODELS["low"]
+    # Aggregate captured from a real AGY 1.1.22 Pompeii run.  Its official
+    # input is uncached-only and its total excludes the separate cache bucket.
+    usage = _usage(81_240, 4_603, 182_532, 3_280)
+    events = [
+        {"event": "init", "init": {
+            "model": runtime, "cwd": "/app", "permission_mode": "request-review",
+        }},
+        {"event": "step_update", "step_update": {
+            "step_index": 1, "step_type": "agent_response", "state": "DONE",
+            "usage": usage,
+        }},
+        {"event": "result", "result": {
+            "status": "SUCCESS", "num_turns": 1, "usage": usage,
+        }},
+    ]
+
+    facts = helper(events, expected_runtime_model=runtime)
+
+    assert facts["complete"] is True
+    assert facts["n_input_tokens"] == 263_772
+    assert facts["n_cache_tokens"] == 182_532
+    assert facts["n_output_tokens"] == 4_603
+    assert facts["thinking_tokens"] == 3_280
+
+
+@pytest.mark.parametrize("broken_field", ["total_tokens", "thinking_tokens"])
+def test_invalid_official_usage_never_reconciles(broken_field: str) -> None:
+    helper = _usage_helper()
+    runtime = ANTIGRAVITY_RUNTIME_MODELS["high"]
+    usage = _usage(10, 2, 30, 1)
+    usage[broken_field] = 13 if broken_field == "total_tokens" else 3
+    events = [
+        {"event": "init", "init": {
+            "model": runtime, "cwd": "/app", "permission_mode": "request-review",
+        }},
+        {"event": "step_update", "step_update": {
+            "step_index": 1, "step_type": "agent_response", "state": "DONE",
+            "usage": usage,
+        }},
+        {"event": "result", "result": {
+            "status": "SUCCESS", "num_turns": 1, "usage": usage,
+        }},
+    ]
+
+    facts = helper(events, expected_runtime_model=runtime)
+
+    assert facts["complete"] is False
+    assert facts["usage_evidence_tier"] == "unavailable"
 
 
 def test_conflicting_duplicate_or_wrong_runtime_never_becomes_complete() -> None:
