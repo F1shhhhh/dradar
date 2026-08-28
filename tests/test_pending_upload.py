@@ -175,6 +175,29 @@ def test_intent_registration_conflict_keeps_artifact_without_submit(
     assert pending.load(tmp_path)[0]["runner_session_id"] == "session-1234"
 
 
+def test_expired_intent_registration_is_terminal_for_only_that_run(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+
+    class ExpiredIntentClient(FakeClient):
+        def register_submission_upload_intent(self, *_args, **_kwargs):
+            raise ApiError(
+                "server returned 410: batch deadline passed",
+                status_code=410,
+            )
+
+    client = ExpiredIntentClient(lambda _aid: pytest.fail("must not submit"))
+    outcome = runloop._upload_trial(
+        client, _entry(trial_dir, runner_session_id="session-expired"),
+    )
+
+    assert outcome == "expired"
+    assert client.calls == []
+    assert pending.load(tmp_path) == []
+
+
 def test_old_server_without_intent_endpoint_keeps_legacy_submit_compatibility(
     tmp_path: Path, monkeypatch,
 ):
