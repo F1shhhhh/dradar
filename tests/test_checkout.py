@@ -153,6 +153,34 @@ def test_supervised_worker_stops_checkout_after_any_failed_outcome(
     assert "before resuming" in capsys.readouterr().out
 
 
+def test_supervised_worker_continues_after_expired_old_batch_assignment(
+        monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)
+    attempts = []
+
+    def run(client, assignment, *a, **kw):
+        attempts.append(assignment["assignment_id"])
+        return "expired" if assignment["assignment_id"] == "old" else "submitted"
+
+    monkeypatch.setattr(runloop, "_run_and_submit", run)
+    cells = [_cell("old"), _cell("new")]
+    client = CheckoutClient(
+        {"active": cells, "free_pick": True},
+        [
+            {"assignment": cells[0], "held": 2, "unstarted": 1},
+            {"assignment": cells[1], "held": 1, "unstarted": 0},
+            {"assignment": None, "held": 0, "unstarted": 0},
+        ],
+    )
+    args = _args()
+    args.worker_child = True
+
+    assert runloop._go_menu(args, {}, client, tmp_path) == 0
+    assert attempts == ["old", "new"]
+    assert client.checkout_exclusions == [set(), set(), set()]
+    assert "stopping this automatic batch runner" not in capsys.readouterr().out
+
+
 def test_auto_batch_stops_after_failure_without_checking_out_next_task(
         monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)

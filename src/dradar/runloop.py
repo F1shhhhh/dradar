@@ -94,6 +94,9 @@ DEFAULT_REFILL_TASK_SAFETY_CAP = 1000
 _TERMINAL_LOCAL_OUTCOMES = {
     "not-uploaded", "rejected", "task-content-mismatch",
 }
+_NON_FAULT_RUNNER_OUTCOMES = {
+    "submitted", "interrupted", "expired",
+}
 _ACCOUNT_TERMINAL_OUTCOMES = {
     "auth-failure", "insufficient-balance", "quota-exhausted",
     "recovery-exhausted", "runtime-incompatible", "provider-preflight-failed",
@@ -1763,6 +1766,22 @@ def _upload_trial(
                         calculated_intent_id,
                     )
                 except ApiError as exc:
+                    if exc.status_code == 410:
+                        # The assignment (or its claim batch) expired before
+                        # the content-bound recovery fence could be registered.
+                        # This is terminal for this one completed run, exactly
+                        # like a 410 returned by submit below.  Treating it as
+                        # a generic upload transport failure makes supervised
+                        # worker pools open a shared failure cutoff and freezes
+                        # unrelated work from a newer healthy batch.
+                        print(
+                            f"  {task_id}: lease or claim batch expired before "
+                            "upload recovery could be registered — the cell "
+                            "reopened, dropping it"
+                        )
+                        pending.remove(HOME, assignment_id)
+                        cleanup_settled()
+                        return "expired"
                     if exc.status_code != 404:
                         print(
                             f"  {task_id}: could not register the content-bound "
@@ -4584,11 +4603,11 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
                           "run the same `dradar resume` command later to continue.")
         worker_failure = (
             getattr(args, "worker_child", False)
-            and outcome not in ("submitted", "interrupted")
+            and outcome not in _NON_FAULT_RUNNER_OUTCOMES
         )
         continuous_claim_failure = (
             (getattr(args, "auto", None) is not None or len(active) > 1)
-            and outcome not in ("submitted", "interrupted")
+            and outcome not in _NON_FAULT_RUNNER_OUTCOMES
         )
         configured_failure = configured_fail_fast and outcome != "submitted"
         if worker_failure or continuous_claim_failure or configured_failure:
@@ -4605,7 +4624,7 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
         if outcome == "failed" or outcome in _TERMINAL_LOCAL_OUTCOMES:
             failed_ids.add(assignment["assignment_id"])
         results.append(outcome)
-    ok = all(o in ("submitted", "interrupted") for o in results)
+    ok = all(o in _NON_FAULT_RUNNER_OUTCOMES for o in results)
     return 0 if ok else 1
 
 
