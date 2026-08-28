@@ -2,6 +2,7 @@
 
 import json
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -10,6 +11,7 @@ import pytest
 from dradar import provider_config
 from dradar.providers import (
     DEEPSEEK_API_KEY_ENV,
+    antigravity_settings_payload,
     create_deepseek_auth_json,
     deepseek_api_key,
     deepseek_credential_source,
@@ -323,6 +325,86 @@ def test_existing_valid_subscription_is_reused_without_new_login(
 
     assert provider_config.cmd_provider_setup(SimpleNamespace(provider=provider)) == 0
     assert "already ready" in capsys.readouterr().out
+
+
+def test_antigravity_setup_mounts_a_verified_ca_bundle_readonly(
+    tmp_path, monkeypatch,
+):
+    executable = tmp_path / "antigravity"
+    executable.write_bytes(b"official-binary")
+    ca_bundle = Path(provider_config.certifi.where()).resolve()
+
+    command, _env = provider_config._antigravity_container_command(
+        "/usr/bin/docker", executable, ["models"], interactive=False,
+    )
+
+    assert "SSL_CERT_FILE=/tmp/dradar-ca-certificates.crt" in command
+    mounts = [
+        command[index + 1]
+        for index, item in enumerate(command[:-1])
+        if item == "--mount"
+    ]
+    assert (
+        f"type=bind,source={ca_bundle.resolve()},"
+        "target=/tmp/dradar-ca-certificates.crt,readonly"
+    ) in mounts
+    assert command[-3:] == [
+        "debian:bookworm-slim", "/opt/antigravity", "models",
+    ]
+
+
+@pytest.mark.parametrize("kind", ["missing", "directory", "empty", "invalid"])
+def test_antigravity_setup_rejects_an_unusable_ca_bundle(
+    kind, tmp_path, monkeypatch,
+):
+    ca_bundle = tmp_path / "ca-bundle"
+    if kind == "directory":
+        ca_bundle.mkdir()
+    elif kind == "empty":
+        ca_bundle.touch()
+    elif kind == "invalid":
+        ca_bundle.write_text("not a PEM certificate bundle\n", encoding="ascii")
+    monkeypatch.setattr(provider_config.certifi, "where", lambda: str(ca_bundle))
+
+    with pytest.raises(ValueError, match="trusted CA bundle"):
+        provider_config._antigravity_ca_bundle()
+
+
+def test_antigravity_live_check_restores_the_fail_closed_settings(
+    tmp_path, monkeypatch,
+):
+    executable = tmp_path / "antigravity"
+    executable.write_bytes(b"official-binary")
+    provider_config.write_antigravity_settings()
+
+    def run(*_args, **_kwargs):
+        settings = (
+            provider_config.antigravity_auth_path()
+            / "antigravity-cli" / "settings.json"
+        )
+        payload = json.loads(settings.read_text(encoding="utf-8"))
+        payload.pop("allowNonWorkspaceAccess")
+        settings.write_text(json.dumps(payload), encoding="utf-8")
+        return SimpleNamespace(
+            returncode=0,
+            stdout="\n".join(
+                provider_config.ANTIGRAVITY_RUNTIME_MODELS.values()
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(provider_config.subprocess, "run", run)
+
+    assert provider_config._antigravity_models_live(
+        "/usr/bin/docker", executable,
+    ) is None
+    settings = (
+        provider_config.antigravity_auth_path()
+        / "antigravity-cli" / "settings.json"
+    )
+    assert json.loads(settings.read_text(encoding="utf-8")) == (
+        antigravity_settings_payload()
+    )
 
 
 @pytest.mark.parametrize("provider", ["grok", "kimi"])
