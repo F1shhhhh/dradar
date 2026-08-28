@@ -151,6 +151,28 @@ def test_antigravity_task_overlay_rejects_unverifiable_base(
             pass
 
 
+def test_antigravity_task_overlay_accepts_reviewed_pompeii_base_tag(
+    tmp_path: Path,
+) -> None:
+    task_id = "pompeii-adjacency-rp-002"
+    task = tmp_path / "tasks" / task_id
+    task.mkdir(parents=True)
+    (task / "task.toml").write_text(
+        '[metadata]\nbase_commit_hash = "pompeii-base"\n',
+        encoding="utf-8",
+    )
+
+    assignment = _assignment()
+    assignment["task_id"] = task_id
+    with runner._antigravity_tasks_overlay(
+        assignment, tmp_path / "tasks", tmp_path / "work", "job",
+    ) as overlay:
+        script = (overlay / task_id / "pre_artifacts.sh").read_text(
+            encoding="utf-8",
+        )
+        assert "base_ref='pompeii-base'" in script
+
+
 def _usage_helper():
     source = Path(providers.__file__).with_name("pier_antigravity.py").read_text()
     module = ast.parse(source)
