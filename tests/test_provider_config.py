@@ -375,7 +375,7 @@ def test_antigravity_live_check_restores_the_fail_closed_settings(
 ):
     executable = tmp_path / "antigravity"
     executable.write_bytes(b"official-binary")
-    provider_config.write_antigravity_settings()
+    provider_config.restore_antigravity_settings()
 
     def run(*_args, **_kwargs):
         settings = (

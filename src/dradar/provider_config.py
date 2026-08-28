@@ -61,6 +61,7 @@ from .providers import (
     parse_zcode_cli_version,
     mark_antigravity_ready,
     privatize_antigravity_home,
+    restore_antigravity_settings,
     provider_subprocess_env,
     store_grok_auth,
     store_deepseek_api_key,
@@ -72,7 +73,6 @@ from .providers import (
     zcode_credential_source,
     zcode_secret_error,
     zcode_secret_path,
-    write_antigravity_settings,
 )
 
 _DEEPSEEK_MODELS_URL = "https://api.deepseek.com/models"
@@ -517,8 +517,7 @@ def _antigravity_models_live(docker: str, executable: Path) -> str | None:
         # Even read-only AGY commands currently normalize away explicit false
         # settings.  Restore the reviewed fail-closed policy after every live
         # check so status/setup never weakens or invalidates the paid runtime.
-        write_antigravity_settings()
-        privatize_antigravity_home()
+        restore_antigravity_settings()
     except (OSError, ValueError) as exc:
         return f"the official models check left unsafe local state: {type(exc).__name__}"
     if run_issue is not None:
@@ -565,8 +564,7 @@ def _setup_antigravity_subscription() -> int:
         )
         return 2
     try:
-        write_antigravity_settings()
-        privatize_antigravity_home()
+        restore_antigravity_settings()
         command, env = _antigravity_container_command(
             docker,
             executable,
@@ -589,8 +587,7 @@ def _setup_antigravity_subscription() -> int:
             # Even an interrupted official login creates logs and local state.
             # Restore the reviewed settings and owner-only permissions before
             # returning so a failed setup never leaves a broad credential tree.
-            write_antigravity_settings()
-            privatize_antigravity_home()
+            restore_antigravity_settings()
         except (OSError, ValueError) as exc:
             print(f"Antigravity OAuth cleanup found unsafe local state: {exc}")
             return 1
@@ -599,8 +596,7 @@ def _setup_antigravity_subscription() -> int:
     try:
         # Login may add presentation preferences.  Replace only settings.json;
         # credentials live in separate files below the same private tree.
-        write_antigravity_settings()
-        privatize_antigravity_home()
+        restore_antigravity_settings()
     except (OSError, ValueError) as exc:
         print(f"Antigravity login returned unsafe local state: {exc}")
         return 1
