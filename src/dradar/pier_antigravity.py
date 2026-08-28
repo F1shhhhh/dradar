@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import uuid
 from pathlib import Path, PurePosixPath
@@ -42,6 +43,12 @@ ANTIGRAVITY_LINUX_SHA512 = {
         "e6d216ef197188fe8b5c46e6f57aee64a3b7c9e23fc855cefee43fe434179d3"
     ),
 }
+
+
+def _model_line_pattern(model: str) -> str:
+    """Match one exact model id in AGY's tabular ``models`` output."""
+
+    return "^" + re.escape(model) + r"([[:space:]]|$)"
 
 
 def _nonnegative_int(value: object) -> int | None:
@@ -328,7 +335,10 @@ class Antigravity(BaseInstalledAgent):
         )
         models_file = "/tmp/dradar-antigravity-models.txt"
         model_checks = " && ".join(
-            f"grep -Fqx {shlex.quote(slug)} {shlex.quote(models_file)}"
+            (
+                f"grep -Eq {shlex.quote(_model_line_pattern(slug))} "
+                f"{shlex.quote(models_file)}"
+            )
             for slug in ANTIGRAVITY_RUNTIME_MODELS.values()
         )
         await self.exec_as_agent(
