@@ -287,6 +287,8 @@ def test_adapter_never_uses_dangerous_permissions_or_scratch_workspace() -> None
     assert 'init.get("permission_mode") != "always-proceed"' in source
     assert "sha512sum --check --strict" in source
     assert "storage.googleapis.com" in source
+    assert '"www.googleapis.com"' in source
+    assert "*.googleapis.com" not in source
 
 
 def test_runtime_model_preflight_accepts_the_official_tabular_output() -> None:
