@@ -92,10 +92,10 @@ from .taskpacks import TaskPackError, ensure_benchmark_task_pack
 # regression; normal quota-bounded plans should never reach it.
 DEFAULT_REFILL_TASK_SAFETY_CAP = 1000
 _TERMINAL_LOCAL_OUTCOMES = {
-    "not-uploaded", "rejected", "task-content-mismatch",
+    "assignment-reopened", "not-uploaded", "rejected", "task-content-mismatch",
 }
 _NON_FAULT_RUNNER_OUTCOMES = {
-    "submitted", "interrupted", "expired",
+    "submitted", "interrupted", "expired", "assignment-reopened",
 }
 _ACCOUNT_TERMINAL_OUTCOMES = {
     "auth-failure", "insufficient-balance", "quota-exhausted",
@@ -1579,7 +1579,13 @@ def _upload_trial(
             )
             pending.remove(HOME, assignment_id)
             settle_terminal_local_failure()
-            return "rejected"
+            # This guard is assignment-local: the model completed normally,
+            # but did not produce the one allowed deliverable.  The server has
+            # reopened this cell for an independent attempt, so a supervised
+            # worker may safely exclude it for this session and continue with
+            # another waiting cell.  Keep transport, auth, secret, and payload
+            # rejections on the fail-closed ``rejected`` path below.
+            return "assignment-reopened"
 
     upload_meta = dict(entry.get("meta") or {})
     trial_dir = Path(entry["trial_dir"])
