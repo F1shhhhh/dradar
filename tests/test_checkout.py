@@ -214,6 +214,128 @@ def test_supervised_worker_continues_after_assignment_local_rejection(
     assert "stopping this automatic batch runner" not in capsys.readouterr().out
 
 
+def test_supervised_worker_continues_after_task_local_runtime_failure(
+        monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)
+    attempts = []
+
+    def run(client, assignment, *a, **kw):
+        attempts.append(assignment["assignment_id"])
+        if assignment["assignment_id"] == "zcode-terminal-missing":
+            return "assignment-isolated"
+        return "submitted"
+
+    monkeypatch.setattr(runloop, "_run_and_submit", run)
+    cells = [_cell("zcode-terminal-missing"), _cell("next")]
+    client = CheckoutClient(
+        {"active": cells, "free_pick": True},
+        [
+            {"assignment": cells[0], "held": 2, "unstarted": 1},
+            {"assignment": cells[1], "held": 1, "unstarted": 0},
+            {"assignment": None, "held": 0, "unstarted": 0},
+        ],
+    )
+    args = _args()
+    args.worker_child = True
+
+    assert runloop._go_menu(args, {}, client, tmp_path) == 0
+    assert attempts == ["zcode-terminal-missing", "next"]
+    assert client.checkout_exclusions == [
+        set(), {"zcode-terminal-missing"}, {"zcode-terminal-missing"},
+    ]
+    assert "stopping this automatic batch runner" not in capsys.readouterr().out
+
+
+def test_cleanup_unconfirmed_quarantines_only_supervised_worker_slot(
+        monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)
+    attempts = []
+
+    def run(_client, assignment, *_args, **_kwargs):
+        attempts.append(assignment["assignment_id"])
+        return "cleanup-unconfirmed"
+
+    monkeypatch.setattr(runloop, "_run_and_submit", run)
+    cells = [_cell("cleanup-unknown"), _cell("must-stay-waiting")]
+    client = CheckoutClient(
+        {"active": cells, "free_pick": True},
+        [
+            {"assignment": cells[0], "held": 2, "unstarted": 1},
+            {"assignment": cells[1], "held": 2, "unstarted": 0},
+        ],
+    )
+    args = _args()
+    args.worker_child = True
+    telemetry = StubTelemetry()
+
+    assert runloop._run_checkout_loop(
+        args, client, tmp_path, cells, telemetry=telemetry,
+    ) == runloop._WORKER_SLOT_QUARANTINED_EXIT_CODE
+    assert attempts == ["cleanup-unknown"]
+    assert len(client._checkouts) == 1
+    assert telemetry.phases[-1] == ("paused", "cleanup-unknown", None)
+    assert "sibling slots may continue" in capsys.readouterr().out
+
+
+def test_refill_continues_after_task_local_runtime_isolation(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)
+    monkeypatch.setattr(runloop.refill_plan, "is_running", lambda _home: True)
+    monkeypatch.setattr(
+        runloop.refill_plan, "complete_if_empty", lambda *_args: None,
+    )
+    stopped = []
+    submitted = []
+    replenished = []
+    monkeypatch.setattr(
+        runloop.refill_plan, "stop",
+        lambda _home, reason: stopped.append(reason),
+    )
+    monkeypatch.setattr(
+        runloop.refill_plan, "mark_submitted",
+        lambda _home, assignment_id: submitted.append(assignment_id),
+    )
+    monkeypatch.setattr(
+        runloop.refill_plan, "refill_once",
+        lambda *_args: replenished.append(True) or {"claimed": 0, "held": 1},
+    )
+    monkeypatch.setattr(
+        runloop.refill_plan, "load", lambda _home: {"refill_to": 2},
+    )
+    monkeypatch.setattr(runloop, "_sync_worker_refill_target", lambda: None)
+    monkeypatch.setattr(runloop, "_load_config", lambda: {})
+    monkeypatch.setattr(runloop, "_disk_allows_refill", lambda _cfg: True)
+
+    attempts = []
+
+    def run(_client, assignment, *_args, **_kwargs):
+        attempts.append(assignment["assignment_id"])
+        return (
+            "assignment-isolated"
+            if assignment["assignment_id"] == "zcode-terminal-missing"
+            else "submitted"
+        )
+
+    monkeypatch.setattr(runloop, "_run_and_submit", run)
+    cells = [_cell("zcode-terminal-missing"), _cell("next")]
+    client = CheckoutClient(
+        {"active": cells, "free_pick": True},
+        [
+            {"assignment": cells[0], "held": 2, "unstarted": 1},
+            {"assignment": cells[1], "held": 1, "unstarted": 0},
+            {"assignment": None, "held": 0, "unstarted": 0},
+        ],
+    )
+    args = _args()
+    args.refill = True
+
+    assert runloop._run_checkout_loop(args, client, tmp_path, cells) == 0
+    assert attempts == ["zcode-terminal-missing", "next"]
+    assert stopped == []
+    assert submitted == ["next"]
+    assert replenished == [True, True]
+
+
 def test_auto_batch_stops_after_failure_without_checking_out_next_task(
         monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)

@@ -901,6 +901,89 @@ def test_forced_cleanup_removes_only_container_bound_to_exact_job(
     assert cleanup == runner_mod.PierContainerCleanup(matched=1, running=1)
 
 
+def test_forced_cleanup_retries_transient_docker_inspection(
+    tmp_path, monkeypatch,
+):
+    container_id = "a" * 64
+    job_root = tmp_path / "jobs" / "aa1"
+    calls = []
+    sleeps = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if command[:2] == ["docker", "ps"]:
+            return subprocess.CompletedProcess(
+                command, 0, stdout=container_id[:12] + "\n", stderr="",
+            )
+        if command[:2] == ["docker", "inspect"]:
+            inspect_attempt = sum(
+                call[:2] == ["docker", "inspect"] for call in calls
+            )
+            if inspect_attempt == 1:
+                return subprocess.CompletedProcess(
+                    command, 1, stdout="", stderr="daemon restarted",
+                )
+            containers = [{
+                "Id": container_id,
+                "State": {"Running": False},
+                "Config": {"Labels": {
+                    "com.docker.compose.project": "pier__abcdef",
+                }},
+                "Mounts": [{
+                    "Type": "bind", "Source": str(job_root / "task__t0"),
+                }],
+            }]
+            return subprocess.CompletedProcess(
+                command, 0, stdout=json.dumps(containers), stderr="",
+            )
+        if command[:3] == ["docker", "rm", "-f"]:
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        raise AssertionError(command)
+
+    monkeypatch.setattr(runner_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        runner_mod.time, "sleep", lambda seconds: sleeps.append(seconds),
+    )
+
+    cleanup = runner_mod._cleanup_terminated_pier_containers(job_root)
+
+    assert cleanup == runner_mod.PierContainerCleanup(matched=1, running=0)
+    assert sleeps == [0.5]
+    assert sum(call[:2] == ["docker", "ps"] for call in calls) == 2
+    assert sum(call[:2] == ["docker", "inspect"] for call in calls) == 2
+
+
+def test_forced_cleanup_fails_closed_after_bounded_docker_audit_retries(
+    tmp_path, monkeypatch,
+):
+    container_id = "a" * 64
+    calls = []
+    sleeps = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if command[:2] == ["docker", "ps"]:
+            return subprocess.CompletedProcess(
+                command, 0, stdout=container_id[:12] + "\n", stderr="",
+            )
+        if command[:2] == ["docker", "inspect"]:
+            return subprocess.CompletedProcess(
+                command, 1, stdout="", stderr="daemon unavailable",
+            )
+        raise AssertionError(command)
+
+    monkeypatch.setattr(runner_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        runner_mod.time, "sleep", lambda seconds: sleeps.append(seconds),
+    )
+
+    with pytest.raises(RunnerError, match="container inspection failed"):
+        runner_mod._cleanup_terminated_pier_containers(tmp_path / "jobs" / "aa1")
+
+    assert sleeps == [0.5, 1.0]
+    assert sum(call[:2] == ["docker", "inspect"] for call in calls) == 3
+
+
 def test_zcode_rc0_with_live_exact_job_container_is_reaped_before_retry(
     tmp_path, monkeypatch,
 ):
@@ -930,7 +1013,8 @@ def test_zcode_rc0_with_live_exact_job_container_is_reaped_before_retry(
     )
 
     with pytest.raises(
-        RunnerError, match="ZCode runtime was still active",
+        runner_mod.RunnerTaskRetryableError,
+        match="ZCode runtime was still active",
     ):
         run_trial(_zcode_assignment_for_trial(), tmp_path, tmp_path)
 
@@ -1646,7 +1730,9 @@ def test_run_trial_rejects_zcode_failed_status_despite_completed_usage(
         rc=0,
     )
 
-    with pytest.raises(RunnerError, match="terminal_status"):
+    with pytest.raises(
+        runner_mod.RunnerTaskRetryableError, match="terminal_status",
+    ):
         run_trial(_zcode_assignment_for_trial(), tmp_path, tmp_path)
 
 

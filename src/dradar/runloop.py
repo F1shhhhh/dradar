@@ -64,7 +64,7 @@ from .providers import (
 )
 from .runner import (
     CODEX_TRAJECTORY_BUNDLE_SCHEMA, DIAG_ADVICE, BuildFlakeError, RunnerError,
-    RunnerCleanupUnconfirmedError,
+    RunnerCleanupUnconfirmedError, RunnerTaskRetryableError,
     POMPEII_BENCHMARK_ID,
     POMPEII_FINALIZATION_RESERVE_SEC, POMPEII_SOFT_BUDGET_SEC,
     POMPEII_TERMINAL_HEAVY_TIMEOUT_SEC,
@@ -92,10 +92,12 @@ from .taskpacks import TaskPackError, ensure_benchmark_task_pack
 # regression; normal quota-bounded plans should never reach it.
 DEFAULT_REFILL_TASK_SAFETY_CAP = 1000
 _TERMINAL_LOCAL_OUTCOMES = {
-    "assignment-reopened", "not-uploaded", "rejected", "task-content-mismatch",
+    "assignment-isolated", "assignment-reopened", "not-uploaded", "rejected",
+    "task-content-mismatch",
 }
 _NON_FAULT_RUNNER_OUTCOMES = {
-    "submitted", "interrupted", "expired", "assignment-reopened",
+    "submitted", "interrupted", "expired", "assignment-isolated",
+    "assignment-reopened",
 }
 _ACCOUNT_TERMINAL_OUTCOMES = {
     "auth-failure", "insufficient-balance", "quota-exhausted",
@@ -108,6 +110,9 @@ _POOL_FAILURE_CUTOFF_ENV = "DRADAR_POOL_FAILURE_CUTOFF_FILE"
 _REPEAT_FAILURE_STATE_ENV = "DRADAR_REPEAT_FAILURE_STATE_FILE"
 _ASSIGNMENT_BOUNDARY_ENV = "DRADAR_ASSIGNMENT_BOUNDARY_FILE"
 _POOL_DRAIN_PREFIX = "drain:"
+# EX_TEMPFAIL: a supervised child uses this to distinguish one unsafe slot
+# from a generic failure that must freeze the pool's shared waiting queue.
+_WORKER_SLOT_QUARANTINED_EXIT_CODE = 75
 _POOL_SUPERVISOR_POLL_SECONDS = 0.2
 _POOL_BACKFILL_REFRESH_SECONDS = 2.0
 _POOL_BACKFILL_ERROR_RETRY_SECONDS = 10.0
@@ -2294,16 +2299,28 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                 )
             return "environment-build-failed"
         except RunnerCleanupUnconfirmedError as exc:
-            _signal_pool_abort(
-                "local Pier cleanup could not be confirmed",
-                interrupt_siblings=False,
-            )
             print(
                 f"trial stopped: {exc}\n"
                 "the lease remains running because local cleanup was not proven; "
-                "automatic retry/backfill is disabled to prevent a duplicate agent"
+                "this worker slot is quarantined to prevent a duplicate agent"
             )
             return "cleanup-unconfirmed"
+        except RunnerTaskRetryableError as exc:
+            stopped = _mark_stopped_quietly(
+                client,
+                assignment,
+                failure_kind="runner_failed",
+                failure_diagnostic=exc.failure_diagnostic,
+            )
+            retry_state = (
+                "the assignment was returned for a later retry"
+                if stopped
+                else "the server will recover the isolated lease after it goes stale"
+            )
+            print(
+                f"trial isolated: {exc}\n{retry_state}; other worker slots may continue"
+            )
+            return "assignment-isolated"
         except RunnerError as exc:
             failure_kind = classify_exception_message(str(exc))
             terminal_outcome = _terminal_failure_outcome(failure_kind)
@@ -4063,6 +4080,7 @@ def _run_worker_pool(args) -> int:
     processes: list[subprocess.Popen] = []
     active_processes: dict[int, subprocess.Popen] = {}
     returncodes: list[tuple[int, int]] = []
+    quarantined_slots: set[int] = set()
     backfill_error: str | None = None
     backfill_disabled = False
     failure_cutoff: datetime | None = None
@@ -4107,7 +4125,14 @@ def _run_worker_pool(args) -> int:
                     continue
                 returncodes.append((slot, returncode))
                 del active_processes[slot]
-                if returncode != 0 and not backfill_disabled:
+                if returncode == _WORKER_SLOT_QUARANTINED_EXIT_CODE:
+                    quarantined_slots.add(slot)
+                    print(
+                        f"worker {slot} quarantined after cleanup could not be "
+                        "confirmed; sibling workers will continue and this slot "
+                        "will not be reused"
+                    )
+                elif returncode != 0 and not backfill_disabled:
                     # Freeze everything that was already held when this local
                     # failure surfaced. Replacement workers may only consume
                     # assignments explicitly claimed later; the shared cutoff
@@ -4190,6 +4215,7 @@ def _run_worker_pool(args) -> int:
                 if ready:
                     vacant_slots = sorted(
                         set(range(1, target + 1)) - set(active_processes)
+                        - quarantined_slots
                     )
                     for slot in vacant_slots[:ready]:
                         print(
@@ -4228,7 +4254,10 @@ def _run_worker_pool(args) -> int:
         cleanup_abort_file()
         return 1
     cleanup_abort_file()
-    failed = [(slot, rc) for slot, rc in returncodes if rc != 0]
+    failed = [
+        (slot, rc) for slot, rc in returncodes
+        if rc not in (0, _WORKER_SLOT_QUARANTINED_EXIT_CODE)
+    ]
     _maintain_image_cache(client, cfg, phase="after worker pool")
     boundary_safe = _finish_assignment_boundary(client, boundary_path)
     if not boundary_safe:
@@ -4248,6 +4277,17 @@ def _run_worker_pool(args) -> int:
         print(f"worker pool finished with errors: {detail}")
         print("completed uploads are preserved; use `dradar leases`, `dradar checkpoints`, "
               "and `dradar resume` for remaining work")
+        return 1
+    if quarantined_slots:
+        detail = ", ".join(str(slot) for slot in sorted(quarantined_slots))
+        print(
+            f"worker pool finished with quarantined slot(s): {detail}. "
+            "Their leases were kept running because exact-job cleanup was not proven."
+        )
+        print(
+            "Completed sibling work is preserved; inspect the affected runtime "
+            "before starting replacement workers."
+        )
         return 1
     print("all workers finished")
     return 0
@@ -4369,8 +4409,22 @@ def _run_batch(args, client: ApiClient, tasks_root: Path, active: list[dict],
         boundary_recorded = _record_assignment_boundary(args, assignment, outcome)
         results.append(outcome)
         if telemetry:
-            telemetry.set_phase("queued")
+            if outcome == "cleanup-unconfirmed":
+                telemetry.set_phase(
+                    "paused", assignment["assignment_id"],
+                    assignment.get("resume_generation"),
+                )
+            else:
+                telemetry.set_phase("queued")
         if not boundary_recorded:
+            break
+        if outcome == "cleanup-unconfirmed":
+            if getattr(args, "worker_child", False):
+                print(
+                    "quarantining this worker slot; sibling slots may continue "
+                    "without starting another held task here"
+                )
+                return _WORKER_SLOT_QUARANTINED_EXIT_CODE
             break
         if outcome in _ACCOUNT_TERMINAL_OUTCOMES:
             _announce_account_stop(outcome)
@@ -4394,7 +4448,7 @@ def _run_batch(args, client: ApiClient, tasks_root: Path, active: list[dict],
                 "later cells were left untouched and the local evidence was kept"
             )
             break
-    ok = all(o in ("submitted", "interrupted") for o in results)
+    ok = all(o in _NON_FAULT_RUNNER_OUTCOMES for o in results)
     return 0 if ok else 1
 
 
@@ -4518,9 +4572,24 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
             client, assignment, tasks_root, args, local_commit, telemetry=telemetry)
         boundary_recorded = _record_assignment_boundary(args, assignment, outcome)
         if telemetry:
-            telemetry.set_phase("queued")
+            if outcome == "cleanup-unconfirmed":
+                telemetry.set_phase(
+                    "paused", assignment["assignment_id"],
+                    assignment.get("resume_generation"),
+                )
+            else:
+                telemetry.set_phase("queued")
         if not boundary_recorded:
             results.append(outcome)
+            break
+        if outcome == "cleanup-unconfirmed":
+            results.append(outcome)
+            if getattr(args, "worker_child", False):
+                print(
+                    "quarantining this worker slot; sibling slots may continue "
+                    "without checking out another task here"
+                )
+                return _WORKER_SLOT_QUARANTINED_EXIT_CODE
             break
         if outcome in _ACCOUNT_TERMINAL_OUTCOMES:
             if getattr(args, "refill", False):
@@ -4547,13 +4616,14 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
             "1", "true", "yes", "on",
         }
         if getattr(args, "refill", False):
-            if outcome not in ("submitted", "interrupted"):
+            if outcome not in _NON_FAULT_RUNNER_OUTCOMES:
                 refill_plan.stop(HOME, f"task outcome={outcome}")
                 print(f"continuous refill stopped after outcome={outcome}; no new tasks "
                       "will be claimed, and existing leases/checkpoints stay untouched")
                 results.append(outcome)
                 break
-            refill_plan.mark_submitted(HOME, assignment["assignment_id"])
+            if outcome in ("submitted", "interrupted"):
+                refill_plan.mark_submitted(HOME, assignment["assignment_id"])
             try:
                 _sync_worker_refill_target()
             except refill_plan.RefillError as exc:
@@ -4592,10 +4662,15 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
                 claimed = replenished.get("claimed", 0)
                 held = replenished.get("held", data.get("held", "?"))
                 target = (refill_plan.load(HOME) or {}).get("refill_to", "?")
+                progress = (
+                    "submitted 1 task"
+                    if outcome in ("submitted", "interrupted")
+                    else f"isolated task outcome={outcome}"
+                )
                 if claimed:
-                    print(f"submitted 1 task; held {held}/{target}; auto-claimed {claimed}")
+                    print(f"{progress}; held {held}/{target}; auto-claimed {claimed}")
                 elif replenished.get("seed_pending"):
-                    print(f"submitted 1 selected task; waiting for "
+                    print(f"{progress}; waiting for "
                           f"{replenished['seed_pending']} selected task(s) before auto-refill")
                 elif replenished.get("status") == "draining":
                     print("refill limit reached; no more tasks will be claimed, "
