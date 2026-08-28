@@ -221,6 +221,22 @@ fi
 git diff --binary "$base" HEAD > /logs/artifacts/model.patch
 """
 
+# Antigravity frequently finishes with a valid implementation still staged or
+# uncommitted even though the prompt asks it to commit.  The published task
+# hook only compares the starting commit with HEAD, silently turning that work
+# into an empty patch.  Use a provider-owned hook that snapshots the complete
+# final worktree. ``git add -N`` makes new, non-ignored files visible to
+# ``git diff`` without staging their contents or creating a commit.
+ANTIGRAVITY_PRE_ARTIFACTS_SCRIPT = """#!/bin/sh
+set -eu
+cd /app
+mkdir -p /logs/artifacts
+base_ref='__DRADAR_BASE_COMMIT__'
+base=$(git rev-parse --verify "${base_ref}^{commit}")
+git add -N -- .
+git diff --binary "$base" -- > /logs/artifacts/model.patch
+"""
+
 # Claude Code: deny the web tools (and keep pier's default EnterPlanMode deny).
 CLAUDE_DISALLOWED_TOOLS = "WebSearch WebFetch EnterPlanMode"
 
@@ -3070,6 +3086,65 @@ def _dsh_tasks_overlay(
         yield overlay_root
 
 
+@contextmanager
+def _antigravity_tasks_overlay(
+    assignment: dict,
+    tasks_root: Path,
+    work_dir: Path,
+    job_name: str,
+):
+    """Collect Antigravity's complete final worktree via public Pier.
+
+    The overlay is per-run and leaves the downloaded benchmark task untouched.
+    It deliberately replaces even an existing task hook: older hooks compare
+    only ``base..HEAD`` and lose Antigravity edits that remain staged,
+    unstaged, or newly created at terminal SUCCESS.
+    """
+
+    task_id = assignment.get("task_id")
+    if (
+        not isinstance(task_id, str)
+        or not task_id
+        or Path(task_id).name != task_id
+    ):
+        raise RunnerError(f"unsafe Antigravity task id {task_id!r}")
+    source = tasks_root / task_id
+    if not source.is_dir():
+        raise RunnerError(f"Antigravity task directory is missing: {source}")
+    task_toml = source / "task.toml"
+    try:
+        task_config = tomllib.loads(task_toml.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise RunnerError(f"Antigravity task.toml is unreadable: {exc}") from exc
+    base_commit = task_config.get("metadata", {}).get("base_commit_hash")
+    if (
+        not isinstance(base_commit, str)
+        or re.fullmatch(r"[0-9a-f]{40}", base_commit) is None
+    ):
+        raise RunnerError(
+            "Antigravity task has an invalid metadata.base_commit_hash"
+        )
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=f".{job_name}-antigravity-task-", dir=work_dir,
+    ) as temporary:
+        overlay_root = Path(temporary)
+        overlay_task = overlay_root / task_id
+        shutil.copytree(source, overlay_task, symlinks=True)
+        hook = overlay_task / "pre_artifacts.sh"
+        if hook.exists() or hook.is_symlink():
+            hook.unlink()
+        hook.write_text(
+            ANTIGRAVITY_PRE_ARTIFACTS_SCRIPT.replace(
+                "__DRADAR_BASE_COMMIT__", base_commit
+            ),
+            encoding="utf-8",
+        )
+        hook.chmod(0o755)
+        yield overlay_root
+
+
 _PIER_RUNTIME_PROJECT_RE = re.compile(
     r"[a-z0-9][a-z0-9-]*__[a-z0-9]{6,8}$", re.IGNORECASE,
 )
@@ -3465,6 +3540,15 @@ def run_trial(
         if effective_agent == DSH_AGENT:
             pier_tasks_root = provider_stack.enter_context(
                 _dsh_tasks_overlay(
+                    effective_assignment,
+                    tasks_root,
+                    work_dir,
+                    job_name,
+                )
+            )
+        elif effective_agent == ANTIGRAVITY_AGENT:
+            pier_tasks_root = provider_stack.enter_context(
+                _antigravity_tasks_overlay(
                     effective_assignment,
                     tasks_root,
                     work_dir,

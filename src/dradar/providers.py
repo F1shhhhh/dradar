@@ -222,6 +222,7 @@ ANTIGRAVITY_RUN_CONFIG_VERSION = (
 ANTIGRAVITY_RUNTIME_PROFILE = (
     "pier-antigravity-gemini-3.7-flash-shared-oauth-sandbox-v1"
 )
+ANTIGRAVITY_ARTIFACT_CAPTURE = "full-worktree-v1"
 ANTIGRAVITY_HOME_RELATIVE_PATH = Path("providers") / "antigravity"
 ANTIGRAVITY_GEMINI_RELATIVE_PATH = ANTIGRAVITY_HOME_RELATIVE_PATH / ".gemini"
 ANTIGRAVITY_READY_FILENAME = "ready.json"
