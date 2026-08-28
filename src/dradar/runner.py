@@ -6,6 +6,7 @@ pre_artifacts.sh, then downloaded by pier into the trial dir.
 """
 
 import glob
+import hashlib
 import json
 import math
 import os
@@ -64,8 +65,6 @@ from .providers import (
     KIMI_SUPPORTED_EFFORTS,
     ZCODE_AGENT,
     ZCODE_API_KEY_ENV,
-    ZCODE_CLI_SHA256,
-    ZCODE_CLI_SHA256S,
     ZCODE_CLI_VERSION,
     ZCODE_MODEL,
     ZCODE_MODELS,
@@ -84,7 +83,6 @@ from .providers import (
     kimi_subscription_session,
     parse_kimi_cli_version,
     parse_grok_cli_version,
-    parse_zcode_cli_version,
     zcode_cli_error,
     zcode_cli_path,
 )
@@ -307,6 +305,7 @@ class TrialArtifacts:
     kimi_cli_version: str | None = None
     antigravity_cli_version: str | None = None
     zcode_cli_version: str | None = None
+    zcode_cli_sha256: str | None = None
     dsh_version: str | None = None
     dsh_artifact_binding: dict[str, object] | None = None
 
@@ -1487,7 +1486,7 @@ def _validated_kimi_cli_path() -> Path:
 
 
 def _validated_zcode_cli_path() -> Path:
-    """Resolve, digest-check, and version-check the official protocol runtime."""
+    """Resolve and version-check the selected official protocol runtime."""
 
     discovered = zcode_cli_path()
     issue = zcode_cli_error(discovered)
@@ -1496,35 +1495,7 @@ def _validated_zcode_cli_path() -> Path:
     try:
         cli = Path(discovered).expanduser().resolve(strict=True)
     except (AttributeError, OSError) as exc:
-        raise RunnerError(f"cannot inspect pinned ZCode CLI: {exc}") from exc
-    node = _resolve_user_tool("node")
-    if not node:
-        raise RunnerError("Node.js is required to verify the pinned ZCode CLI")
-    try:
-        result = subprocess.run(
-            [node, str(cli), "version"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RunnerError(f"could not verify pinned ZCode CLI: {exc}") from exc
-    found = parse_zcode_cli_version(result.stdout + "\n" + result.stderr)
-    if result.returncode != 0 or found != ZCODE_CLI_VERSION:
-        raise RunnerError(
-            f"ZCode runs require CLI {ZCODE_CLI_VERSION}; "
-            f"found {found or 'an unrecognized version'}"
-        )
-    # ``zcode_cli_error`` already verified the byte digest. Keep the imported
-    # constant in this runner's trusted surface so a release bump must update
-    # both the path validation and adapter pin deliberately.
-    if (
-        ZCODE_CLI_SHA256 not in ZCODE_CLI_SHA256S
-        or not ZCODE_CLI_SHA256S
-        or any(len(digest) != 64 for digest in ZCODE_CLI_SHA256S)
-    ):
-        raise RunnerError("invalid built-in ZCode CLI digest pin")
+        raise RunnerError(f"cannot inspect ZCode CLI: {exc}") from exc
     return cli
 
 
@@ -3374,6 +3345,7 @@ def run_trial(
     kimi_cli_version = None
     antigravity_cli_version = None
     zcode_cli_version = None
+    zcode_cli_sha256 = None
     dsh_version = None
     codex_provider = None
     effective_agent = dev_agent or assignment["agent"]
@@ -3451,7 +3423,7 @@ def run_trial(
             **assignment,
             "agent_version": zcode_cli_version,
         }
-        print(f"verified pinned ZCode CLI: {zcode_cli_version}")
+        print(f"verified ZCode CLI version: {zcode_cli_version}")
     elif effective_agent == DSH_AGENT:
         _validate_dsh_assignment(assignment)
         dsh_version = DSH_VERSION
@@ -3538,6 +3510,9 @@ def run_trial(
         elif effective_agent == ZCODE_AGENT:
             try:
                 provider_cli_path = _validated_zcode_cli_path()
+                zcode_cli_sha256 = hashlib.sha256(
+                    provider_cli_path.read_bytes()
+                ).hexdigest()
                 provider_auth_path = create_zcode_api_key_file(work_dir)
             except (OSError, ValueError) as exc:
                 raise RunnerError(str(exc)) from exc
@@ -3908,6 +3883,7 @@ def run_trial(
         kimi_cli_version=kimi_cli_version,
         antigravity_cli_version=antigravity_cli_version,
         zcode_cli_version=zcode_cli_version,
+        zcode_cli_sha256=zcode_cli_sha256,
         dsh_version=dsh_version,
         dsh_artifact_binding=dsh_artifact_binding,
     )

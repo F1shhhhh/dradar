@@ -462,11 +462,6 @@ def test_grok_auto_install_is_isolated_and_versioned(tmp_path, monkeypatch):
     monkeypatch.setattr(provider_config.shutil, "which", lambda name: "/bin/bash")
     monkeypatch.setattr(
         provider_config,
-        "_GROK_INSTALLER_SHA256",
-        provider_config.hashlib.sha256(installer).hexdigest(),
-    )
-    monkeypatch.setattr(
-        provider_config,
         "_provider_httpx_get",
         lambda *args, **kwargs: SimpleNamespace(
             status_code=200, content=installer,
@@ -491,8 +486,11 @@ def test_grok_auto_install_is_isolated_and_versioned(tmp_path, monkeypatch):
     assert seen["env"]["HOME"].startswith(str(target.parent.parent))
 
 
-def test_grok_auto_install_rejects_changed_installer(tmp_path, monkeypatch, capsys):
+def test_grok_auto_install_accepts_updated_official_installer(
+    tmp_path, monkeypatch,
+):
     target = tmp_path / "dradar/providers/grok/runtime/1.0.3/bin/grok"
+    seen = {}
     monkeypatch.setattr(provider_config, "managed_grok_cli_path", lambda: target)
     monkeypatch.setattr(provider_config.shutil, "which", lambda name: "/bin/bash")
     monkeypatch.setattr(
@@ -502,14 +500,43 @@ def test_grok_auto_install_rejects_changed_installer(tmp_path, monkeypatch, caps
             status_code=200, content=b"#!/bin/bash\necho changed\n",
         ),
     )
+    def run(command, **kwargs):
+        seen.update(command=command, kwargs=kwargs)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("managed-grok")
+        target.chmod(0o700)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(provider_config.subprocess, "run", run)
+    monkeypatch.setattr(
+        provider_config, "_grok_cli_version", lambda _target: "1.0.3",
+    )
+
+    assert provider_config._install_managed_grok_cli() == str(target)
+    assert seen["command"][-1] == "1.0.3"
+
+
+def test_grok_auto_install_rejects_non_script_response(
+    tmp_path, monkeypatch,
+):
+    target = tmp_path / "dradar/providers/grok/runtime/1.0.3/bin/grok"
+    monkeypatch.setattr(provider_config, "managed_grok_cli_path", lambda: target)
+    monkeypatch.setattr(provider_config.shutil, "which", lambda name: "/bin/bash")
+    monkeypatch.setattr(
+        provider_config,
+        "_provider_httpx_get",
+        lambda *args, **kwargs: SimpleNamespace(
+            status_code=200,
+            content=b"not a script",
+        ),
+    )
     monkeypatch.setattr(
         provider_config.subprocess,
         "run",
-        lambda *args, **kwargs: pytest.fail("unreviewed installer must not execute"),
+        lambda *args, **kwargs: pytest.fail("non-script response must not execute"),
     )
 
     assert provider_config._install_managed_grok_cli() is None
-    assert "refusing to execute" in capsys.readouterr().out
 
 
 def test_provider_http_client_uses_os_proxy_and_honors_no_proxy(monkeypatch):

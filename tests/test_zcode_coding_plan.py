@@ -6,7 +6,6 @@ import ast
 import json
 import os
 import re
-import stat
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -105,22 +104,39 @@ def test_zcode_cli_path_preserves_invalid_explicit_path_for_diagnostics(
     assert zcode_cli_path({"ZCODE_CLI_PATH": str(missing)}) == str(missing)
 
 
-def test_zcode_cli_integrity_accepts_each_tested_desktop_runtime(
+def test_zcode_cli_accepts_new_desktop_packaging_with_exact_runtime_version(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    runtimes = [
-        _private(tmp_path / "zcode-3.9.1.cjs", "official-runtime-3.9.1"),
-        _private(tmp_path / "zcode-3.9.2.cjs", "official-runtime-3.9.2"),
-    ]
-    digests = {
-        providers.hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in runtimes
-    }
-    monkeypatch.setattr(providers, "ZCODE_CLI_SHA256S", frozenset(digests))
+    runtime = _private(tmp_path / "zcode-3.10.1.cjs", "new-package-bytes")
+    seen = {}
+    monkeypatch.setenv("ZCODE_API_KEY", "must-not-reach-version-probe")
+    monkeypatch.setattr(providers.shutil, "which", lambda _name: "/usr/bin/node")
 
-    assert all(providers.zcode_cli_error(path) is None for path in runtimes)
-    unknown = _private(tmp_path / "unknown.cjs", "unverified-runtime")
-    assert "integrity check failed" in (providers.zcode_cli_error(unknown) or "")
+    def run(command, **kwargs):
+        seen.update(command=command, kwargs=kwargs)
+        return SimpleNamespace(returncode=0, stdout="0.16.5\n", stderr="")
+
+    monkeypatch.setattr(providers.subprocess, "run", run)
+
+    assert providers.zcode_cli_error(runtime) is None
+    assert seen["command"] == ["/usr/bin/node", str(runtime.resolve()), "version"]
+    assert "ZCODE_API_KEY" not in seen["kwargs"]["env"]
+
+
+def test_zcode_cli_rejects_incompatible_runtime_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _private(tmp_path / "zcode.cjs", "future-runtime")
+    monkeypatch.setattr(providers.shutil, "which", lambda _name: "/usr/bin/node")
+    monkeypatch.setattr(
+        providers.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0, stdout="0.16.6\n", stderr="",
+        ),
+    )
+
+    assert "0.16.5 is required" in (providers.zcode_cli_error(runtime) or "")
 
 
 def test_zcode_cli_path_skips_stale_import_for_verified_desktop_upgrade(
@@ -229,7 +245,7 @@ def test_zcode_secret_rejects_symlink_and_broad_mode(tmp_path: Path) -> None:
         assert "too broadly readable" in (zcode_secret_error(target) or "")
 
 
-def test_zcode_capability_requires_key_cli_integrity_and_adapter(
+def test_zcode_capability_requires_key_compatible_cli_and_adapter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     assert ZCODE_CAPABILITY not in advertised_capabilities({})
