@@ -302,6 +302,7 @@ class Antigravity(BaseInstalledAgent):
             "daily-cloudcode-pa.googleapis.com",
             "oauth2.googleapis.com",
             "storage.googleapis.com",
+            "www.googleapis.com",
         ])
 
     @with_prompt_template
