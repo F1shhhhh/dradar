@@ -3092,10 +3092,18 @@ def _antigravity_tasks_overlay(
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         raise RunnerError(f"Antigravity task.toml is unreadable: {exc}") from exc
     base_commit = task_config.get("metadata", {}).get("base_commit_hash")
-    if (
-        not isinstance(base_commit, str)
-        or re.fullmatch(r"[0-9a-f]{40}", base_commit) is None
-    ):
+    valid_commit = (
+        isinstance(base_commit, str)
+        and re.fullmatch(r"[0-9a-f]{40}", base_commit) is not None
+    )
+    # Pompeii's reviewed task pack creates a fixed local tag rather than a
+    # portable 40-byte commit id.  Keep the shell substitution fail-closed:
+    # only that exact tag is accepted, and only for Pompeii task ids.
+    valid_pompeii_tag = (
+        base_commit == "pompeii-base"
+        and task_id.startswith(POMPEII_BENCHMARK_ID + "-")
+    )
+    if not (valid_commit or valid_pompeii_tag):
         raise RunnerError(
             "Antigravity task has an invalid metadata.base_commit_hash"
         )
