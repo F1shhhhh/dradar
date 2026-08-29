@@ -11,6 +11,8 @@ import pytest
 from dradar import provider_config
 from dradar.providers import (
     DEEPSEEK_API_KEY_ENV,
+    GROK_CLI_VERSION,
+    KIMI_CLI_VERSION,
     antigravity_settings_payload,
     create_deepseek_auth_json,
     deepseek_api_key,
@@ -272,8 +274,8 @@ def test_live_status_distinguishes_rejected_key_from_transport_failure(
 @pytest.mark.parametrize(
     ("provider", "ensure_name", "auth_error_name", "version"),
     [
-        ("grok", "_ensure_grok_cli", "grok_auth_error", "1.0.3"),
-        ("kimi", "_ensure_kimi_cli", "kimi_auth_error", "0.36.1"),
+        ("grok", "_ensure_grok_cli", "grok_auth_error", GROK_CLI_VERSION),
+        ("kimi", "_ensure_kimi_cli", "kimi_auth_error", KIMI_CLI_VERSION),
     ],
 )
 def test_subscription_setup_prepares_runtime_before_requesting_interactive_oauth(
@@ -525,7 +527,7 @@ def test_interrupted_reauthentication_preserves_previous_credential(
 
 
 def test_grok_auto_install_is_isolated_and_versioned(tmp_path, monkeypatch):
-    target = tmp_path / "dradar/providers/grok/runtime/1.0.3/bin/grok"
+    target = tmp_path / f"dradar/providers/grok/runtime/{GROK_CLI_VERSION}/bin/grok"
     seen = {}
     installer = b"#!/bin/bash\nexit 0\n"
     monkeypatch.setattr(provider_config, "managed_grok_cli_path", lambda: target)
@@ -547,11 +549,11 @@ def test_grok_auto_install_is_isolated_and_versioned(tmp_path, monkeypatch):
 
     monkeypatch.setattr(provider_config.subprocess, "run", run)
     monkeypatch.setattr(
-        provider_config, "_grok_cli_version", lambda executable: "1.0.3",
+        provider_config, "_grok_cli_version", lambda executable: GROK_CLI_VERSION,
     )
 
     assert provider_config._install_managed_grok_cli() == str(target)
-    assert seen["cmd"][-1] == "1.0.3"
+    assert seen["cmd"][-1] == GROK_CLI_VERSION
     assert seen["env"]["GROK_BIN_DIR"] == str(target.parent)
     assert seen["env"]["HOME"].startswith(str(target.parent.parent))
 
@@ -559,7 +561,7 @@ def test_grok_auto_install_is_isolated_and_versioned(tmp_path, monkeypatch):
 def test_grok_auto_install_accepts_updated_official_installer(
     tmp_path, monkeypatch,
 ):
-    target = tmp_path / "dradar/providers/grok/runtime/1.0.3/bin/grok"
+    target = tmp_path / f"dradar/providers/grok/runtime/{GROK_CLI_VERSION}/bin/grok"
     seen = {}
     monkeypatch.setattr(provider_config, "managed_grok_cli_path", lambda: target)
     monkeypatch.setattr(provider_config.shutil, "which", lambda name: "/bin/bash")
@@ -579,17 +581,17 @@ def test_grok_auto_install_accepts_updated_official_installer(
 
     monkeypatch.setattr(provider_config.subprocess, "run", run)
     monkeypatch.setattr(
-        provider_config, "_grok_cli_version", lambda _target: "1.0.3",
+        provider_config, "_grok_cli_version", lambda _target: GROK_CLI_VERSION,
     )
 
     assert provider_config._install_managed_grok_cli() == str(target)
-    assert seen["command"][-1] == "1.0.3"
+    assert seen["command"][-1] == GROK_CLI_VERSION
 
 
 def test_grok_auto_install_rejects_non_script_response(
     tmp_path, monkeypatch,
 ):
-    target = tmp_path / "dradar/providers/grok/runtime/1.0.3/bin/grok"
+    target = tmp_path / f"dradar/providers/grok/runtime/{GROK_CLI_VERSION}/bin/grok"
     monkeypatch.setattr(provider_config, "managed_grok_cli_path", lambda: target)
     monkeypatch.setattr(provider_config.shutil, "which", lambda name: "/bin/bash")
     monkeypatch.setattr(
@@ -694,7 +696,7 @@ def test_grok_login_inherits_os_proxy_environment(tmp_path, monkeypatch):
 
 
 def test_kimi_auto_install_uses_reviewed_official_binary(tmp_path, monkeypatch):
-    target = tmp_path / "dradar/providers/kimi/runtime/0.36.1/bin/kimi"
+    target = tmp_path / f"dradar/providers/kimi/runtime/{KIMI_CLI_VERSION}/bin/kimi"
     binary = b"official-kimi-node-bundle"
     monkeypatch.setattr(provider_config, "managed_kimi_cli_path", lambda: target)
     monkeypatch.setattr(
@@ -712,7 +714,7 @@ def test_kimi_auto_install_uses_reviewed_official_binary(tmp_path, monkeypatch):
         return SimpleNamespace(status_code=200, content=binary)
     monkeypatch.setattr(provider_config, "_provider_httpx_get", get)
     monkeypatch.setattr(
-        provider_config, "_kimi_cli_version", lambda executable: "0.36.1",
+        provider_config, "_kimi_cli_version", lambda executable: KIMI_CLI_VERSION,
     )
 
     assert provider_config._install_managed_kimi_cli() == str(target)

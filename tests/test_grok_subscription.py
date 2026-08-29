@@ -39,6 +39,16 @@ def _oauth(token: str = "access", refresh: str = "refresh") -> dict:
     }
 
 
+def test_grok_upgrade_does_not_advertise_old_server_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(providers, "grok_cli_path", lambda _env=None: Path("/grok"))
+    monkeypatch.setattr(providers, "grok_auth_error", lambda *_args, **_kwargs: None)
+    capabilities = providers.advertised_capabilities({})
+    assert providers.GROK_CAPABILITY in capabilities
+    assert providers.GROK_LEGACY_CAPABILITY not in capabilities
+
+
 def _write_auth(path: Path, payload: dict | None = None) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload or _oauth()), encoding="utf-8")
@@ -63,7 +73,9 @@ def _assignment(**overrides) -> dict:
 
 
 def test_official_grok_version_banner_is_parsed():
-    assert parse_grok_cli_version("grok 1.0.3 (release)\n") == GROK_CLI_VERSION
+    assert parse_grok_cli_version(
+        f"grok {GROK_CLI_VERSION} (release)\n"
+    ) == GROK_CLI_VERSION
     assert parse_grok_cli_version("unexpected") is None
 
 
@@ -190,7 +202,7 @@ def test_grok_adapter_primes_dynamic_46_model_catalog() -> None:
     assert '"HOME": remote_user_home' in source
     assert '"GROK_HOME": remote_home' not in source
     assert 'f"models_output=$({shlex.quote(remote_cli)} models 2>&1); "' in source
-    assert "panics on EPIPE" in source
+    assert "EPIPE" in source
     assert "grep -Fq" in source
     assert "grok-4.6" in source
     assert "DRADAR_GROK_PREFLIGHT_FAILURE=%s" in source

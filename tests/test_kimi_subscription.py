@@ -21,6 +21,7 @@ from dradar.providers import (
     KIMI_AGENT,
     KIMI_API_KEY_ENVS,
     KIMI_CAPABILITY,
+    KIMI_LEGACY_CAPABILITY,
     KIMI_CLI_VERSION,
     KIMI_MODEL,
     KIMI_PROVIDER,
@@ -67,8 +68,10 @@ def _assignment(**overrides: object) -> dict:
 
 
 def test_official_kimi_version_banner_is_parsed() -> None:
-    assert parse_kimi_cli_version("0.36.1\n") == KIMI_CLI_VERSION
-    assert parse_kimi_cli_version("kimi version 0.36.1\n") == KIMI_CLI_VERSION
+    assert parse_kimi_cli_version(f"{KIMI_CLI_VERSION}\n") == KIMI_CLI_VERSION
+    assert parse_kimi_cli_version(
+        f"kimi version {KIMI_CLI_VERSION}\n"
+    ) == KIMI_CLI_VERSION
     assert parse_kimi_cli_version("unexpected") is None
 
 
@@ -184,7 +187,9 @@ def test_kimi_capability_requires_cli_and_safe_oauth(
     monkeypatch.setenv("DRADAR_HOME", str(tmp_path / "home"))
     assert KIMI_CAPABILITY not in advertised_capabilities({})
     _write_auth(kimi_auth_path())
-    assert KIMI_CAPABILITY in advertised_capabilities({"KIMI_CLI_PATH": "/kimi"})
+    capabilities = advertised_capabilities({"KIMI_CLI_PATH": "/kimi"})
+    assert KIMI_CAPABILITY in capabilities
+    assert KIMI_LEGACY_CAPABILITY not in capabilities
 
 
 @pytest.mark.parametrize("effort", ["low", "high", "max"])
@@ -817,7 +822,7 @@ def test_kimi_replays_real_cliffy_429_retry_fixture() -> None:
     assert facts["n_cache_tokens"] == expected["n_cache_tokens"]
     assert facts["n_output_tokens"] == expected["n_output_tokens"]
     assert facts["request_ledger_source"] == (
-        "kimi-code-0.36.1-main-wire-retry-v2"
+        "kimi-code-0.39.1-main-wire-retry-v3"
     )
 
 

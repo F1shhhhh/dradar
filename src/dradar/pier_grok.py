@@ -31,11 +31,11 @@ from _dradar_grok_recovery import (
 )
 
 
-GROK_CLI_VERSION = "1.0.3"
+GROK_CLI_VERSION = "1.0.13"
 GROK_VERSION_PATTERN = GROK_CLI_VERSION.replace(".", r"\.")
 GROK_LINUX_SHA256 = {
-    "x86_64": "2a7d46dea3fbed067e4072258b835d401e017d6848dc996279f0fb3d668a0961",
-    "aarch64": "ed44950eab90573b6f475191f5791713a56943939b3b9a62e3f4e95edd14acd9",
+    "x86_64": "edf79521581bb5e6b95abef848491a6a742e860da3e237ebe86a280d30dce4c1",
+    "aarch64": "b926fc5308374396e260e7efbd6107231a8dae13c084ddaf0fe89b7ebb3edd25",
 }
 
 
@@ -63,7 +63,7 @@ def _grok_model_preflight_command(remote_cli: str) -> str:
         "  exit 78; "
         "fi; "
         # Do not pipe the Rust CLI directly into grep -q. grep exits on the
-        # first match and Grok 1.0.3 then panics on EPIPE.
+        # first match and some Grok releases then panic on EPIPE.
         "if ! printf '%s\\n' \"$models_output\" "
         "  | grep -Fq grok-4.6; then "
         "  printf 'DRADAR_GROK_PREFLIGHT_FAILURE=catalog\\n'; "
