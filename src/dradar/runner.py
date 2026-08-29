@@ -79,7 +79,9 @@ from .providers import (
     deepseek_catalog_path,
     grok_cli_path,
     grok_subscription_session,
+    kimi_auth_path,
     kimi_cli_path,
+    kimi_home,
     kimi_subscription_session,
     parse_kimi_cli_version,
     parse_grok_cli_version,
@@ -662,12 +664,23 @@ def _shared_oauth_mounts_json(agent: str, auth_path: Path) -> str:
     if canonical != auth_path or canonical.is_symlink():
         raise RunnerError("subscription OAuth credential must be a canonical path")
     if agent == KIMI_AGENT:
-        if canonical.name != "kimi-code.json" or canonical.parent.name != "credentials":
+        expected_auth = kimi_auth_path()
+        root = kimi_home()
+        try:
+            expected_canonical = expected_auth.resolve(strict=True)
+            canonical_root = root.resolve(strict=True)
+        except OSError as exc:
+            raise RunnerError(
+                f"Kimi OAuth managed store is unavailable: {exc}"
+            ) from exc
+        if (
+            expected_auth != expected_canonical
+            or root != canonical_root
+            or canonical != expected_canonical
+            or canonical.parent.parent != canonical_root
+        ):
             raise RunnerError("Kimi OAuth credential is outside the managed store")
-        root = canonical.parent.parent
-        if root.name != "kimi":
-            raise RunnerError("Kimi OAuth credential is outside the managed store")
-        oauth = root / "oauth"
+        oauth = canonical_root / "oauth"
         oauth.mkdir(parents=True, exist_ok=True, mode=0o700)
         if os.name != "nt":
             os.chmod(canonical.parent, 0o700)
@@ -3958,6 +3971,8 @@ def classify_exception_message(message: str) -> str | None:
         "unauthorized", "authentication failed", "invalid authentication",
         "invalid api key", "invalid credentials", "token expired",
         "account suspended", "account disabled", "account deactivated",
+        "invalid_grant", "provided authorization grant is invalid",
+        "oauth refresh was rejected",
     )):
         return "auth"
     # Codex can receive a 403 while negotiating its optional WebSocket

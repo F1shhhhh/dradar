@@ -123,6 +123,9 @@ def test_fresh_harness_commands_omit_all_checkpoint_arguments(
     home.mkdir()
     credential = _private_file(tmp_path / "provider-credential")
     if credential_kind == "kimi":
+        monkeypatch.setenv(
+            "DRADAR_KIMI_HOME", str(tmp_path / "providers" / "kimi")
+        )
         credential = _private_file(
             tmp_path / "providers" / "kimi" / "credentials" / "kimi-code.json",
             '{"access_token":"access","refresh_token":"refresh"}',

@@ -20,6 +20,7 @@ from dradar.pier_checkpoint import AgentLogStore, UnsafeAgentLog
 from dradar.providers import (
     KIMI_AGENT,
     KIMI_API_KEY_ENVS,
+    KIMI_ACCOUNT_HOME_ENV,
     KIMI_CAPABILITY,
     KIMI_LEGACY_CAPABILITY,
     KIMI_CLI_VERSION,
@@ -92,6 +93,64 @@ def test_kimi_oauth_validator_rejects_symlink_and_broad_mode(
         assert "too broadly readable" in (kimi_auth_error(target) or "")
 
 
+def test_kimi_oauth_validator_classifies_official_revoked_tombstone(
+    tmp_path: Path,
+) -> None:
+    path = _write_auth(tmp_path / "auth.json", {
+        "access_token": "",
+        "refresh_token": "",
+        "expires_at": 0,
+        "expires_in": 0,
+        "scope": "kimi-code",
+        "token_type": "Bearer",
+    })
+
+    issue = kimi_auth_error(path) or ""
+    assert "OAuth refresh was rejected" in issue
+    assert "provider setup kimi" in issue
+
+
+def test_kimi_shared_oauth_mounts_accept_account_home_with_arbitrary_basename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account_home = tmp_path / "accounts" / "kimi-account-a"
+    monkeypatch.setenv(KIMI_ACCOUNT_HOME_ENV, str(account_home))
+    auth = _write_auth(kimi_auth_path())
+
+    mounts = json.loads(runner._shared_oauth_mounts_json(KIMI_AGENT, auth))
+
+    assert mounts == [
+        {
+            "source": str(account_home / "credentials"),
+            "target": "/tmp/dradar-kimi-home/credentials",
+            "type": "bind",
+        },
+        {
+            "source": str(account_home / "oauth"),
+            "target": "/tmp/dradar-kimi-home/oauth",
+            "type": "bind",
+        },
+    ]
+
+
+def test_kimi_shared_oauth_mounts_reject_same_shape_from_other_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current_home = tmp_path / "accounts" / "kimi-account-a"
+    monkeypatch.setenv(KIMI_ACCOUNT_HOME_ENV, str(current_home))
+    _write_auth(kimi_auth_path())
+    foreign_auth = _write_auth(
+        tmp_path
+        / "accounts"
+        / "kimi-account-b"
+        / "credentials"
+        / "kimi-code.json"
+    )
+
+    with pytest.raises(RunnerError, match="outside the managed store"):
+        runner._shared_oauth_mounts_json(KIMI_AGENT, foreign_auth)
+
+
 def test_kimi_subscription_session_uses_canonical_native_lock_store(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -107,10 +166,116 @@ def test_kimi_subscription_session_uses_canonical_native_lock_store(
     assert canonical.is_file()
 
 
+def test_kimi_account_home_shares_rotated_oauth_across_campaign_homes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account_home = tmp_path / "accounts" / "kimi-account-a"
+    campaign_a = tmp_path / "campaign-a"
+    campaign_b = tmp_path / "campaign-b"
+    monkeypatch.setenv(KIMI_ACCOUNT_HOME_ENV, str(account_home))
+    monkeypatch.setenv("DRADAR_HOME", str(campaign_a))
+    canonical = _write_auth(kimi_auth_path(), _oauth("old", "old-refresh"))
+
+    monkeypatch.setenv("DRADAR_HOME", str(campaign_b))
+    with kimi_subscription_session(tmp_path / "work-b") as shared:
+        assert shared == canonical
+        _write_auth(shared, _oauth("new", "rotated-refresh"))
+
+    monkeypatch.setenv("DRADAR_HOME", str(campaign_a))
+    assert kimi_auth_path() == canonical
+    assert json.loads(kimi_auth_path().read_text())["refresh_token"] == (
+        "rotated-refresh"
+    )
+    assert not (campaign_a / "providers" / "kimi").exists()
+    assert not (campaign_b / "providers" / "kimi").exists()
+
+
+def test_kimi_account_homes_are_physically_isolated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account_a = tmp_path / "accounts" / "a"
+    account_b = tmp_path / "accounts" / "b"
+    monkeypatch.setenv(KIMI_ACCOUNT_HOME_ENV, str(account_a))
+    auth_a = _write_auth(kimi_auth_path(), _oauth("access-a", "refresh-a"))
+
+    monkeypatch.setenv(KIMI_ACCOUNT_HOME_ENV, str(account_b))
+    auth_b = _write_auth(kimi_auth_path(), _oauth("access-b", "refresh-b"))
+
+    assert auth_a != auth_b
+    assert json.loads(auth_a.read_text())["refresh_token"] == "refresh-a"
+    assert json.loads(auth_b.read_text())["refresh_token"] == "refresh-b"
+
+
+def test_kimi_cli_discovery_uses_account_scoped_runtime(
+    tmp_path: Path,
+) -> None:
+    account_home = tmp_path / "accounts" / "kimi-account-a"
+    executable = (
+        account_home / "runtime" / KIMI_CLI_VERSION / "bin" / "kimi"
+    )
+    executable.parent.mkdir(parents=True)
+    executable.write_text("binary", encoding="utf-8")
+    executable.chmod(0o700)
+
+    found = providers.kimi_cli_path({
+        KIMI_ACCOUNT_HOME_ENV: str(account_home),
+        "DRADAR_HOME": str(tmp_path / "campaign"),
+        "PATH": "",
+    })
+
+    assert found == str(executable)
+
+
+def test_kimi_subscription_session_preserves_invalid_grant_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("DRADAR_HOME", str(home))
+    canonical = _write_auth(kimi_auth_path(), _oauth("old", "stale-refresh"))
+    tombstone = {
+        "access_token": "",
+        "refresh_token": "",
+        "expires_at": 0,
+        "expires_in": 0,
+        "scope": "kimi-code",
+        "token_type": "Bearer",
+    }
+
+    with pytest.raises(RuntimeError, match="authorization grant is invalid"):
+        with kimi_subscription_session(tmp_path / "work") as shared:
+            assert shared == canonical
+            _write_auth(shared, tombstone)
+            raise RuntimeError("The provided authorization grant is invalid")
+
+    assert "OAuth refresh was rejected" in (kimi_auth_error(canonical) or "")
+
+
+def test_kimi_subscription_session_reports_revoked_tombstone_after_clean_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("DRADAR_HOME", str(home))
+    canonical = _write_auth(kimi_auth_path())
+
+    with pytest.raises(ValueError, match="OAuth refresh was rejected"):
+        with kimi_subscription_session(tmp_path / "work") as shared:
+            _write_auth(shared, {
+                "access_token": "",
+                "refresh_token": "",
+                "expires_at": 0,
+                "expires_in": 0,
+                "scope": "kimi-code",
+                "token_type": "Bearer",
+            })
+
+
 def test_kimi_live_probe_uses_proxy_and_writes_back_rotated_token(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    auth = _write_auth(tmp_path / "auth.json", _oauth("old", "old-refresh"))
+    auth = _write_auth(
+        tmp_path / "home" / "credentials" / "kimi-code.json",
+        _oauth("old", "old-refresh"),
+    )
     seen = {}
     monkeypatch.setattr(
         providers,
@@ -143,10 +308,44 @@ def test_kimi_live_probe_uses_proxy_and_writes_back_rotated_token(
     assert "new-refresh" not in " ".join(seen["cmd"])
 
 
+def test_kimi_live_probe_uses_account_home_without_copying_oauth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account_home = tmp_path / "accounts" / "kimi-account-a"
+    monkeypatch.setenv(KIMI_ACCOUNT_HOME_ENV, str(account_home))
+    canonical = _write_auth(kimi_auth_path(), _oauth("old", "old-refresh"))
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen.update(cmd=cmd, env=kwargs["env"])
+        assert Path(kwargs["env"]["KIMI_CODE_HOME"]) == account_home
+        assert kimi_auth_path() == canonical
+        _write_auth(canonical, _oauth("new", "rotated-refresh"))
+        (account_home / "config.toml").write_text(
+            '[models."kimi-code/k3"]\nmodel = "k3"\n'
+        )
+        return providers.subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(providers.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        providers, "_replace_private_file",
+        lambda *_args, **_kwargs: pytest.fail(
+            "canonical account OAuth must not be copied for a live probe"
+        ),
+    )
+
+    assert kimi_live_error("/managed/kimi") is None
+    assert json.loads(canonical.read_text())["refresh_token"] == "rotated-refresh"
+    assert seen["cmd"] == ["/managed/kimi", "login"]
+
+
 def test_kimi_live_probe_rejects_missing_k3_without_losing_refresh(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    auth = _write_auth(tmp_path / "auth.json", _oauth("old", "old-refresh"))
+    auth = _write_auth(
+        tmp_path / "home" / "credentials" / "kimi-code.json",
+        _oauth("old", "old-refresh"),
+    )
     def fake_run(cmd, **kwargs):
         native = (
             Path(kwargs["env"]["KIMI_CODE_HOME"])
@@ -167,7 +366,9 @@ def test_kimi_live_probe_rejects_missing_k3_without_losing_refresh(
 def test_kimi_live_probe_distinguishes_revoked_oauth_from_network(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    auth = _write_auth(tmp_path / "auth.json")
+    auth = _write_auth(
+        tmp_path / "home" / "credentials" / "kimi-code.json",
+    )
     monkeypatch.setattr(
         providers.subprocess,
         "run",
@@ -201,6 +402,7 @@ def test_pier_command_uses_private_kimi_adapter_without_secrets(
     monkeypatch.setattr(runner.shutil, "which", lambda _name: "/usr/bin/pier")
     for name in KIMI_API_KEY_ENVS:
         monkeypatch.setenv(name, "must-not-leak")
+    monkeypatch.setenv("DRADAR_HOME", str(tmp_path))
     tasks = tmp_path / "tasks"
     (tasks / "task-1").mkdir(parents=True)
     home = tmp_path / "home"
@@ -285,13 +487,13 @@ def test_kimi_checkpoint_resume_passes_durable_metadata(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(runner.shutil, "which", lambda _name: "/usr/bin/pier")
+    account_home = tmp_path / "kimi"
+    monkeypatch.setenv(KIMI_ACCOUNT_HOME_ENV, str(account_home))
     tasks = tmp_path / "tasks"
     (tasks / "task-1").mkdir(parents=True)
     home = tmp_path / "home"
     home.mkdir()
-    auth = _write_auth(
-        tmp_path / "kimi" / "credentials" / "kimi-code.json"
-    )
+    auth = _write_auth(kimi_auth_path())
     cli = tmp_path / "kimi-cli"
     cli.write_text("binary", encoding="utf-8")
     checkpoint = tmp_path / "previous" / "checkpoint"

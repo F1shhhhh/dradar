@@ -318,7 +318,10 @@ dradar doctor --agent kimi-code
 dradar go --pick TASK_ID:k3:high
 ```
 
-DRadar 把 OAuth 保存在 `~/.dradar/providers/kimi`，不会借用或覆盖日常 Kimi Code 配置。
+DRadar 默认把 OAuth 保存在 `~/.dradar/providers/kimi`，不会借用或覆盖日常 Kimi Code
+配置。若同一账号需要从多个 campaign `DRADAR_HOME` 运行，必须给这些进程设置同一个绝对
+路径 `DRADAR_KIMI_HOME`；不同账号则必须使用不同目录。Kimi 会轮换 refresh token，禁止
+把 `kimi-code.json` 复制到多个 campaign 目录，否则其中一个副本刷新后，其余副本会失效。
 宿主机 CLI 只负责官方 OAuth 与领题前验版；任务镜像使用校验过的 `uv` 安装同一精确
 Kimi CLI 版本，因此 macOS、Windows 与 Linux 用户都不会把错误平台的本机程序传进
 容器。容器只挂载 provider 专用的 `credentials` 与 `oauth` 目录，任务 session、配置、
