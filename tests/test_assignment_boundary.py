@@ -144,3 +144,37 @@ def test_runloop_reconciliation_reports_a_lost_assignment(
     assert runloop._finish_assignment_boundary(Client(), path) is False
     assert "a2" in capsys.readouterr().out
     assert path is not None and path.is_file()
+
+
+def test_worker_child_does_not_reconcile_parent_owned_boundary(
+        tmp_path, monkeypatch):
+    path = tmp_path / "shared-boundary.json"
+    monkeypatch.setenv(runloop._ASSIGNMENT_BOUNDARY_ENV, str(path))
+    reconciled = []
+    monkeypatch.setattr(
+        runloop, "_finish_assignment_boundary",
+        lambda _client, _path: reconciled.append(_path) or False,
+    )
+    args = SimpleNamespace(worker_child=True)
+
+    assert runloop._finish_invocation_assignment_boundary(
+        args, object(), path,
+    ) is True
+    assert reconciled == []
+
+
+def test_standalone_invocation_still_reconciles_its_boundary(
+        tmp_path, monkeypatch):
+    path = tmp_path / "owned-boundary.json"
+    reconciled = []
+    monkeypatch.delenv(runloop._ASSIGNMENT_BOUNDARY_ENV, raising=False)
+    monkeypatch.setattr(
+        runloop, "_finish_assignment_boundary",
+        lambda _client, _path: reconciled.append(_path) or True,
+    )
+    args = SimpleNamespace(worker_child=True)
+
+    assert runloop._finish_invocation_assignment_boundary(
+        args, object(), path,
+    ) is True
+    assert reconciled == [path]
