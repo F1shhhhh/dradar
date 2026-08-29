@@ -420,7 +420,12 @@ def test_kimi_adapter_source_has_fixed_security_contract() -> None:
     source = Path(providers.__file__).with_name("pier_kimi.py").read_text()
     assert 'return NetworkAllowlist(domains=["auth.kimi.com", "api.kimi.com"])' in source
     assert "[tools]" not in source
-    assert '"--auto"' in source
+    # Kimi 0.39.1 rejects ``--prompt`` together with ``--auto``.  Prompt mode
+    # remains fully autonomous through ``default_permission_mode = "auto"``
+    # in the isolated config, so the mutually exclusive CLI flag must never be
+    # added to the generated command.
+    assert 'default_permission_mode = "auto"' in source
+    assert '"--auto"' not in source
     assert "KIMI_CODE_AGENT_SWARM_MAX_CONCURRENCY" not in source
     assert "Agent|AgentSwarm" in source
     assert 'event = "PreToolUse"' in source
