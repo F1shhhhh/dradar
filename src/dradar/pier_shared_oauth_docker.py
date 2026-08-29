@@ -153,9 +153,8 @@ class SharedOAuthDockerEnvironment(DockerEnvironment):
         ):
             return
         owner = f"{getuid()}:{getgid()}"
-        roots = ("/logs/agent", *self._shared_oauth_targets)
         operations: list[str] = ["set -eu"]
-        for root in roots:
+        for root in ("/logs/agent",):
             quoted = shlex.quote(root)
             operations.extend((
                 f"test -d {quoted}",
@@ -164,11 +163,41 @@ class SharedOAuthDockerEnvironment(DockerEnvironment):
                 f"find -P {quoted} -xdev -type d -exec chmod 700 -- {{}} +",
                 f"find -P {quoted} -xdev -type f -exec chmod 600 -- {{}} +",
             ))
+        oauth_root = self._shared_oauth_targets[0]
+        quoted_root = shlex.quote(oauth_root)
+        if oauth_root == "/tmp/dradar-antigravity-user/.gemini":
+            operations.extend((
+                f"test -d {quoted_root}",
+                f"test ! -L {quoted_root}",
+                f"find -P {quoted_root} -xdev -exec chown -h -- {owner} {{}} +",
+                f"find -P {quoted_root} -xdev -type d -exec chmod 700 -- {{}} +",
+                f"find -P {quoted_root} -xdev -type f -exec chmod 600 -- {{}} +",
+            ))
+        else:
+            # Grok's bind is its complete native home, not a credentials-only
+            # directory. It also contains the managed CLI runtime and session
+            # artifacts, so recursively chmod'ing the bind removes the
+            # executable bit from runtime/<version>/bin/grok. Reconcile only
+            # the two exact OAuth coordination files that root may replace.
+            operations.extend((
+                f"test -d {quoted_root}",
+                f"test ! -L {quoted_root}",
+                f"chown -- {owner} {quoted_root}",
+                f"chmod 700 -- {quoted_root}",
+            ))
+            for name in ("auth.json", "auth.json.lock"):
+                quoted_file = shlex.quote(f"{oauth_root}/{name}")
+                operations.append(
+                    f"if test -e {quoted_file}; then "
+                    f"test -f {quoted_file}; test ! -L {quoted_file}; "
+                    f"chown -- {owner} {quoted_file}; "
+                    f"chmod 600 -- {quoted_file}; fi"
+                )
         result = await super().exec(
             command="; ".join(operations), user="root", timeout_sec=120,
         )
         if getattr(result, "return_code", 1) != 0:
-            raise RuntimeError("failed to reconcile Antigravity host ownership")
+            raise RuntimeError("failed to reconcile shared OAuth host ownership")
 
     async def exec(
         self,
