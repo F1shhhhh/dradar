@@ -307,8 +307,8 @@ def configure(
     refill_effort: str | None = None,
     replace_existing: bool = False,
 ) -> dict:
-    if refill_to < 1 or max_tasks < 1 or max_tasks < len(active):
-        raise RefillError("max tasks must be at least the currently held task count")
+    if refill_to < 1 or max_tasks < 1:
+        raise RefillError("refill target and max tasks must be positive")
     if quota_tier not in TIERS:
         raise RefillError(f"unknown quota tier: {quota_tier}")
     if refill_harness is None and (refill_model is not None or refill_effort is not None):
@@ -330,6 +330,16 @@ def configure(
         "refill_model": refill_model,
         "refill_effort": refill_effort,
     }
+    # A scoped plan owns only its Harness/model/effort lane.  The account may
+    # legitimately hold work for other independent Harness campaigns; treating
+    # those assignments as seeds would block this plan until the entire account
+    # drained and would also consume its max-tasks budget.  Keep unscoped plans
+    # unchanged, but isolate scoped accounting from the first persisted write.
+    if refill_harness is not None:
+        active = [assignment for assignment in active
+                  if _matches_scope(desired, assignment)]
+    if max_tasks < len(active):
+        raise RefillError("max tasks must be at least the currently held task count")
     with _locked(home):
         current = _load_unlocked(home)
         replaced_plan_id = None
@@ -633,6 +643,9 @@ def refill_once(home: Path, client) -> dict:
         if active is None:
             one = data.get("assignment")
             active = [one] if one else []
+        if plan.get("refill_harness"):
+            active = [assignment for assignment in active
+                      if _matches_scope(plan, assignment)]
         try:
             for assignment in active:
                 _reserve(plan, assignment)
