@@ -249,7 +249,6 @@ def test_pier_command_uses_private_kimi_adapter_without_secrets(
         ({"provider": "kimi-api"}, "explicitly use provider"),
         ({"model": "k3-256k"}, "unsupported Kimi subscription model"),
         ({"effort": "medium"}, "effort must be low, high, or max"),
-        ({"agent_version": "9.9.9"}, "pinned to CLI"),
     ],
 )
 def test_unverified_kimi_assignments_fail_before_paid_run(
@@ -275,6 +274,11 @@ def test_unverified_kimi_assignments_fail_before_paid_run(
             provider_auth_path=auth,
             provider_cli_path=cli,
         )
+
+
+def test_kimi_assignment_version_is_only_a_hint() -> None:
+    runner._validate_kimi_assignment(_assignment(agent_version="0.36.1"))
+    runner._validate_kimi_assignment(_assignment(agent_version="9.9.9"))
 
 
 def test_kimi_checkpoint_resume_passes_durable_metadata(

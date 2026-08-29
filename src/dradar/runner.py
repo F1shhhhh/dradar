@@ -83,8 +83,10 @@ from .providers import (
     kimi_subscription_session,
     parse_kimi_cli_version,
     parse_grok_cli_version,
+    parse_zcode_cli_version,
     zcode_cli_error,
     zcode_cli_path,
+    zcode_cli_version_is_compatible,
 )
 
 # The egress allowlist alone does NOT stop the agent from searching the web:
@@ -813,12 +815,6 @@ def _validate_grok_assignment(assignment: dict) -> None:
             "Grok subscription effort must be low, medium, high, or xhigh; "
             f"got {assignment.get('effort')!r}"
         )
-    requested = assignment.get("agent_version") or GROK_CLI_VERSION
-    if requested != GROK_CLI_VERSION:
-        raise RunnerError(
-            f"Grok subscription runs are pinned to CLI {GROK_CLI_VERSION}; "
-            f"the server requested unverified {requested!r}"
-        )
 
 
 def _validate_kimi_assignment(assignment: dict) -> None:
@@ -836,12 +832,6 @@ def _validate_kimi_assignment(assignment: dict) -> None:
         raise RunnerError(
             "Kimi subscription effort must be low, high, or max; "
             f"got {assignment.get('effort')!r}"
-        )
-    requested = assignment.get("agent_version") or KIMI_CLI_VERSION
-    if requested != KIMI_CLI_VERSION:
-        raise RunnerError(
-            f"Kimi subscription runs are pinned to CLI {KIMI_CLI_VERSION}; "
-            f"the server requested unverified {requested!r}"
         )
 
 
@@ -864,12 +854,6 @@ def _validate_antigravity_assignment(assignment: dict) -> None:
         )
     if ANTIGRAVITY_RUNTIME_MODELS.get(effort) != f"{ANTIGRAVITY_MODEL}-{effort}":
         raise RunnerError("Antigravity runtime model mapping is inconsistent")
-    requested = assignment.get("agent_version") or ANTIGRAVITY_CLI_VERSION
-    if requested != ANTIGRAVITY_CLI_VERSION:
-        raise RunnerError(
-            f"Antigravity runs are pinned to CLI {ANTIGRAVITY_CLI_VERSION}; "
-            f"the server requested unverified {requested!r}"
-        )
 
 
 def _validate_zcode_assignment(assignment: dict) -> None:
@@ -887,12 +871,6 @@ def _validate_zcode_assignment(assignment: dict) -> None:
         raise RunnerError(
             "ZCode effort must be low, high, or max; "
             f"got {assignment.get('effort')!r}"
-        )
-    requested = assignment.get("agent_version") or ZCODE_CLI_VERSION
-    if requested != ZCODE_CLI_VERSION:
-        raise RunnerError(
-            f"ZCode runs are pinned to CLI {ZCODE_CLI_VERSION}; "
-            f"the server requested unverified {requested!r}"
         )
 
 
@@ -912,12 +890,6 @@ def _validate_dsh_assignment(assignment: dict) -> None:
         raise RunnerError(
             f"DSH effort must be one of {supported}; "
             f"got {assignment.get('effort')!r}"
-        )
-    requested = assignment.get("agent_version") or DSH_VERSION
-    if requested != DSH_VERSION:
-        raise RunnerError(
-            f"DSH Minimal runs are pinned to {DSH_VERSION}; "
-            f"the server requested unverified {requested!r}"
         )
 
 
@@ -1399,6 +1371,14 @@ def build_pier_command(
         submission_prompt = _ensure_zcode_submission_prompt(
             home, assignment.get("benchmark_id")
         )
+        # Server assignment versions are compatibility hints, not runtime
+        # pins. Normal runs replace this with the locally observed version;
+        # direct command builders default to the newest verified runtime.
+        zcode_version = (
+            assignment.get("agent_version")
+            if assignment.get("_zcode_cli_version_observed") is True
+            else ZCODE_CLI_VERSION
+        )
         cmd += [
             "--model", assignment["model"],
             "--ak", f"reasoning_effort={assignment['effort']}",
@@ -1406,7 +1386,7 @@ def build_pier_command(
             "--ak", f"zcode_cli_file={provider_cli_path}",
             "--ak", f"session_timeout_sec={_zcode_session_timeout_sec(assignment)}",
             "--ak", f"prompt_template_path={submission_prompt}",
-            "--ak", f"version={ZCODE_CLI_VERSION}",
+            "--ak", f"version={zcode_version}",
             *_checkpoint_agent_kwargs(
                 assignment, resume_checkpoint,
                 enabled=bool(assignment.get("_durable_checkpoint_enabled", True)),
@@ -1485,18 +1465,30 @@ def _validated_kimi_cli_path() -> Path:
     return executable
 
 
-def _validated_zcode_cli_path() -> Path:
-    """Resolve and version-check the selected official protocol runtime."""
+def _validated_zcode_cli_path(*, model: str | None = None) -> tuple[Path, str]:
+    """Resolve the selected official protocol runtime and its actual version."""
 
     discovered = zcode_cli_path()
-    issue = zcode_cli_error(discovered)
+    issue = zcode_cli_error(discovered, model=model)
     if issue is not None:
         raise RunnerError(issue)
     try:
         cli = Path(discovered).expanduser().resolve(strict=True)
     except (AttributeError, OSError) as exc:
         raise RunnerError(f"cannot inspect ZCode CLI: {exc}") from exc
-    return cli
+    try:
+        result = subprocess.run(
+            ["node", str(cli), "version"], capture_output=True, text=True,
+            timeout=15, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RunnerError(f"could not verify ZCode CLI: {exc}") from exc
+    version = parse_zcode_cli_version(result.stdout + "\n" + result.stderr)
+    if result.returncode != 0 or not zcode_cli_version_is_compatible(
+        version, model=model,
+    ):
+        raise RunnerError("could not determine a compatible ZCode CLI version")
+    return cli, version
 
 
 def locate_artifacts(jobs_dir: Path, job_name: str) -> tuple[Path, Path]:
@@ -3426,12 +3418,11 @@ def run_trial(
         )
     elif effective_agent == ZCODE_AGENT:
         _validate_zcode_assignment(assignment)
-        zcode_cli_version = ZCODE_CLI_VERSION
-        effective_assignment = {
-            **assignment,
-            "agent_version": zcode_cli_version,
-        }
-        print(f"verified ZCode CLI version: {zcode_cli_version}")
+        # ZCode's desktop release and embedded protocol CLI use independent
+        # version numbers. Resolve the actual compatible protocol runtime only
+        # after the provider slot is opened below; never trust the assignment
+        # hint as the observed version.
+        effective_assignment = dict(assignment)
     elif effective_agent == DSH_AGENT:
         _validate_dsh_assignment(assignment)
         dsh_version = DSH_VERSION
@@ -3517,7 +3508,15 @@ def run_trial(
                 raise RunnerError(str(exc)) from exc
         elif effective_agent == ZCODE_AGENT:
             try:
-                provider_cli_path = _validated_zcode_cli_path()
+                provider_cli_path, zcode_cli_version = _validated_zcode_cli_path(
+                    model=effective_assignment["model"],
+                )
+                effective_assignment = {
+                    **effective_assignment,
+                    "agent_version": zcode_cli_version,
+                    "_zcode_cli_version_observed": True,
+                }
+                print(f"verified ZCode CLI version: {zcode_cli_version}")
                 zcode_cli_sha256 = hashlib.sha256(
                     provider_cli_path.read_bytes()
                 ).hexdigest()
