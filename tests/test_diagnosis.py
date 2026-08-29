@@ -104,6 +104,18 @@ def test_diagnose_classifies_403_as_auth_terminal(tmp_path):
     assert d["kind"] == "auth"
 
 
+@pytest.mark.parametrize("message", [
+    "internal: The provided authorization grant is invalid",
+    "invalid_grant",
+    "Kimi OAuth refresh was rejected; authenticate again",
+])
+def test_diagnose_classifies_kimi_oauth_rejection_as_auth_terminal(
+    tmp_path, message,
+):
+    d = diagnose_exception(_result(tmp_path, message))
+    assert d["kind"] == "auth"
+
+
 def test_diagnose_classifies_https_api_403_as_auth_terminal(tmp_path):
     d = diagnose_exception(_result(
         tmp_path,

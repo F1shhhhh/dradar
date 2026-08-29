@@ -163,9 +163,7 @@ KIMI_BINARY_SHA256 = {
     "win32-arm64": "b6b3c22576eb44ae9f1956bca4913ab3957cc110812d71212055ad8c89641a28",
 }
 KIMI_HOME_RELATIVE_PATH = Path("providers") / "kimi"
-KIMI_RUNTIME_RELATIVE_PATH = (
-    KIMI_HOME_RELATIVE_PATH / "runtime" / KIMI_CLI_VERSION
-)
+KIMI_ACCOUNT_HOME_ENV = "DRADAR_KIMI_HOME"
 KIMI_AUTH_RELATIVE_PATH = Path("credentials") / "kimi-code.json"
 KIMI_API_KEY_ENVS = frozenset({
     "KIMI_API_KEY",
@@ -1420,7 +1418,19 @@ def parse_grok_cli_version(output: str) -> str | None:
 
 
 def kimi_home(home: Path | None = None) -> Path:
+    """Return the account-scoped Kimi provider home.
+
+    ``DRADAR_HOME`` remains the default for ordinary single-profile users.
+    Operators that keep campaign state in separate DRADAR_HOME directories
+    must point every campaign for the same Kimi account at one explicit
+    ``DRADAR_KIMI_HOME``.  Kimi rotates refresh tokens, so copying its OAuth
+    JSON into campaign-local homes creates mutually stale credential forks.
+    """
+
     if home is None:
+        account_home = os.environ.get(KIMI_ACCOUNT_HOME_ENV)
+        if account_home:
+            return Path(account_home).expanduser()
         home = Path(os.environ.get("DRADAR_HOME", Path.home() / ".dradar"))
     return Path(home) / KIMI_HOME_RELATIVE_PATH
 
@@ -1435,6 +1445,21 @@ def _valid_kimi_auth_payload(payload: object) -> bool:
     return all(
         isinstance(payload.get(name), str) and bool(payload[name].strip())
         for name in ("access_token", "refresh_token", "token_type")
+    )
+
+
+def _revoked_kimi_auth_payload(payload: object) -> bool:
+    """Recognize the official CLI's invalid-grant tombstone."""
+
+    if not isinstance(payload, dict):
+        return False
+    return (
+        payload.get("access_token") == ""
+        and payload.get("refresh_token") == ""
+        and payload.get("expires_at") == 0
+        and payload.get("expires_in") == 0
+        and isinstance(payload.get("token_type"), str)
+        and bool(payload["token_type"].strip())
     )
 
 
@@ -1458,6 +1483,11 @@ def kimi_auth_error(path: Path | None = None) -> str | None:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         return f"Kimi credential is unreadable or invalid JSON: {exc}"
+    if _revoked_kimi_auth_payload(payload):
+        return (
+            "Kimi OAuth refresh was rejected; run "
+            "`dradar provider setup kimi` to authenticate again"
+        )
     if not _valid_kimi_auth_payload(payload):
         return "Kimi credential is not a refreshable subscription OAuth session"
     return None
@@ -1466,13 +1496,13 @@ def kimi_auth_error(path: Path | None = None) -> str | None:
 def _run_kimi_live_probe(
     executable: str | Path,
     credential: Path,
-    root: Path,
+    data_home: Path,
 ) -> str | None:
-    share = root / "home"
-    native_auth = share / KIMI_AUTH_RELATIVE_PATH
-    _replace_private_file(credential, native_auth)
+    native_auth = data_home / KIMI_AUTH_RELATIVE_PATH
+    if native_auth != credential:
+        return "Kimi OAuth credential is outside the account-scoped home"
     env = provider_subprocess_env()
-    env["KIMI_CODE_HOME"] = str(share)
+    env["KIMI_CODE_HOME"] = str(data_home)
     env["KIMI_DISABLE_TELEMETRY"] = "1"
     env["KIMI_CODE_NO_AUTO_UPDATE"] = "1"
     for name in KIMI_API_KEY_ENVS:
@@ -1488,18 +1518,13 @@ def _run_kimi_live_probe(
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return f"Kimi live OAuth check failed: {type(exc).__name__}"
-    finally:
-        # The official refresh endpoint rotates tokens. Retain a valid new
-        # credential even if the following model-catalog check failed.
-        if kimi_auth_error(native_auth) is None:
-            _replace_private_file(native_auth, credential)
     if proc.returncode != 0:
         output = (proc.stdout + "\n" + proc.stderr).lower()
         if any(marker in output for marker in ("unauthorized", "invalid_grant", "rejected")):
             return "Kimi OAuth session was rejected; run `dradar provider setup kimi`"
         return "Kimi OAuth refresh failed; check this machine's network/proxy"
     try:
-        config_text = (share / "config.toml").read_text(encoding="utf-8")
+        config_text = (data_home / "config.toml").read_text(encoding="utf-8")
     except OSError:
         return "Kimi login did not provision the official model catalog"
     if '"kimi-code/k3"' not in config_text:
@@ -1520,12 +1545,26 @@ def kimi_live_error(
     issue = kimi_auth_error(canonical)
     if issue is not None:
         return issue
-    with tempfile.TemporaryDirectory(prefix="dradar-kimi-probe-") as name:
-        root = Path(name)
-        if auth_path is None:
-            with kimi_subscription_session(root / "slot") as run_copy:
-                return _run_kimi_live_probe(cli, run_copy, root)
-        return _run_kimi_live_probe(cli, canonical, root)
+    data_home = kimi_home()
+    if auth_path is not None:
+        if (
+            canonical.name != KIMI_AUTH_RELATIVE_PATH.name
+            or canonical.parent.name != KIMI_AUTH_RELATIVE_PATH.parent.name
+        ):
+            return "Kimi OAuth credential is outside an account-scoped home"
+        data_home = canonical.parent.parent
+    if auth_path is None:
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix="dradar-kimi-probe-work-"
+            ) as name:
+                with kimi_subscription_session(Path(name) / "slot") as shared:
+                    return _run_kimi_live_probe(
+                        cli, shared, data_home,
+                    )
+        except ValueError as exc:
+            return str(exc)
+    return _run_kimi_live_probe(cli, canonical, data_home)
 
 
 def kimi_cli_path(environ: Mapping[str, str] | None = None) -> str | None:
@@ -1533,9 +1572,16 @@ def kimi_cli_path(environ: Mapping[str, str] | None = None) -> str | None:
     explicit = env.get("KIMI_CLI_PATH")
     if explicit:
         return explicit
-    managed = managed_kimi_cli_path(
-        Path(env["DRADAR_HOME"]) if env.get("DRADAR_HOME") else None
-    )
+    if env.get(KIMI_ACCOUNT_HOME_ENV):
+        executable = "kimi.exe" if os.name == "nt" else "kimi"
+        managed = (
+            Path(env[KIMI_ACCOUNT_HOME_ENV]).expanduser()
+            / "runtime" / KIMI_CLI_VERSION / "bin" / executable
+        )
+    else:
+        managed = managed_kimi_cli_path(
+            Path(env["DRADAR_HOME"]) if env.get("DRADAR_HOME") else None
+        )
     if managed.is_file() and os.access(managed, os.X_OK):
         return str(managed)
     if environ is None:
@@ -1554,10 +1600,12 @@ def kimi_cli_path(environ: Mapping[str, str] | None = None) -> str | None:
 def managed_kimi_cli_path(home: Path | None = None) -> Path:
     """Return DRadar's versioned Kimi runtime without consulting ``PATH``."""
 
-    if home is None:
-        home = Path(os.environ.get("DRADAR_HOME", Path.home() / ".dradar"))
     executable = "kimi.exe" if os.name == "nt" else "kimi"
-    return Path(home) / KIMI_RUNTIME_RELATIVE_PATH / "bin" / executable
+    if home is None:
+        root = kimi_home()
+    else:
+        root = Path(home) / KIMI_HOME_RELATIVE_PATH
+    return root / "runtime" / KIMI_CLI_VERSION / "bin" / executable
 
 
 def parse_kimi_cli_version(output: str) -> str | None:
@@ -1590,18 +1638,31 @@ def kimi_subscription_session(directory: Path, *, home: Path | None = None):
     if os.name != "nt":
         os.chmod(native_lock, 0o600)
     directory.mkdir(parents=True, exist_ok=True)
-    yield canonical
-    if os.name != "nt":
-        # A concurrent rootful task container may have just atomically
-        # replaced the shared credential.  Its in-container ownership guard
-        # repairs the new inode; allow that bounded handoff to settle before
-        # treating a transient EACCES as an invalid OAuth refresh.
-        deadline = time.monotonic() + 1.0
-        while not os.access(canonical, os.R_OK) and time.monotonic() < deadline:
-            time.sleep(0.02)
-    issue = kimi_auth_error(canonical)
-    if issue is not None:
-        raise ValueError("Kimi returned an invalid refreshed OAuth credential: " + issue)
+    body_failed = False
+    try:
+        yield canonical
+    except BaseException:
+        # Preserve the provider/Pier exception and its stderr.  In particular,
+        # Kimi writes a revoked tombstone after invalid_grant; replacing the
+        # original exception with a structural JSON error hides the root cause.
+        body_failed = True
+        raise
+    finally:
+        if os.name != "nt":
+            # A concurrent rootful task container may have just atomically
+            # replaced the shared credential.  Its in-container ownership guard
+            # repairs the new inode; allow that bounded handoff to settle before
+            # treating a transient EACCES as an invalid OAuth refresh.
+            deadline = time.monotonic() + 1.0
+            while not os.access(canonical, os.R_OK) and time.monotonic() < deadline:
+                time.sleep(0.02)
+        issue = kimi_auth_error(canonical)
+        if issue is not None and not body_failed:
+            if issue.startswith("Kimi OAuth refresh was rejected"):
+                raise ValueError(issue)
+            raise ValueError(
+                "Kimi returned an invalid refreshed OAuth credential: " + issue
+            )
 
 
 def _replace_private_file(source: Path, target: Path) -> None:
