@@ -312,6 +312,55 @@ def test_preflight_hardens_official_cli_log_permissions(
         assert stat.S_IMODE(log_file.stat().st_mode) == 0o600
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ownership semantics")
+def test_preflight_accepts_private_files_owned_by_live_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = _ready_home(tmp_path, monkeypatch)
+    media = auth / "antigravity-cli" / "brain" / "run" / "media.png"
+    media.parent.mkdir(parents=True)
+    for directory in (media.parent, *media.parent.parents):
+        if directory == auth.parent:
+            break
+        directory.chmod(0o700)
+    media.write_bytes(b"volatile")
+    media.chmod(0o600)
+    real_uid = os.geteuid()
+    monkeypatch.setattr(providers.os, "geteuid", lambda: real_uid + 1)
+    chmod_calls = []
+    monkeypatch.setattr(
+        providers.os, "chmod",
+        lambda path, mode: chmod_calls.append((Path(path), mode)),
+    )
+
+    assert prepare_antigravity_auth() is None
+    assert ANTIGRAVITY_CAPABILITY in advertised_capabilities({})
+    assert chmod_calls == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ownership semantics")
+def test_preflight_rejects_broad_files_owned_by_live_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = _ready_home(tmp_path, monkeypatch)
+    media = auth / "antigravity-cli" / "brain" / "run" / "media.png"
+    media.parent.mkdir(parents=True)
+    for directory in (media.parent, *media.parent.parents):
+        if directory == auth.parent:
+            break
+        directory.chmod(0o700)
+    media.write_bytes(b"volatile")
+    media.chmod(0o644)
+    real_uid = os.geteuid()
+    monkeypatch.setattr(providers.os, "geteuid", lambda: real_uid + 1)
+
+    issue = prepare_antigravity_auth()
+
+    assert issue is not None
+    assert "foreign-owned entry" in issue
+    assert "too broadly accessible" in issue
+
+
 def test_preflight_preserves_regular_cli_log_file(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

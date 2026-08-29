@@ -1146,6 +1146,29 @@ def _remove_antigravity_cli_log_link(home: Path | None = None) -> None:
         pass
 
 
+def _harden_antigravity_entry(path: Path, info: os.stat_result, mode: int) -> None:
+    """Make owned state private without fighting a live container's UID.
+
+    Linux bind mounts preserve the UID written by the process inside the
+    container.  A root-running official CLI can therefore create volatile
+    conversation/media files owned by root even though its command starts
+    under ``umask 077``.  The host user cannot chmod those files, but their
+    existing owner-only mode is already private.  Accept that exact safe
+    state; continue to fail closed for any foreign-owned entry with group or
+    world bits, and keep hardening every entry owned by this process.
+    """
+    if os.name == "nt":
+        return
+    if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
+        if stat.S_IMODE(info.st_mode) & 0o077:
+            raise ValueError(
+                "Antigravity OAuth state contains a foreign-owned entry "
+                f"that is too broadly accessible: {path}"
+            )
+        return
+    os.chmod(path, mode)
+
+
 def privatize_antigravity_home(home: Path | None = None) -> None:
     root = antigravity_home(home)
     if not root.exists():
@@ -1160,19 +1183,18 @@ def privatize_antigravity_home(home: Path | None = None) -> None:
         if stat.S_ISLNK(info.st_mode):
             raise ValueError(f"Antigravity OAuth state contains a symlink: {path}")
         if stat.S_ISDIR(info.st_mode):
-            if os.name != "nt":
-                os.chmod(path, 0o700)
+            _harden_antigravity_entry(path, info, 0o700)
         elif stat.S_ISREG(info.st_mode):
-            if os.name != "nt":
-                # The reviewed AGY Linux binary is cached below ``runtime``.
-                # Keep that one file owner-executable after credential
-                # hardening; Docker Desktop preserves the host mode on a
-                # read-only bind mount.  Every OAuth/config/proof file remains
-                # owner-readable only.
-                executable = (
-                    path.name == "antigravity" and runtime in path.parents
-                )
-                os.chmod(path, 0o700 if executable else 0o600)
+            # The reviewed AGY Linux binary is cached below ``runtime``.
+            # Keep that one file owner-executable after credential hardening;
+            # Docker Desktop preserves the host mode on a read-only bind
+            # mount. Every OAuth/config/proof file remains owner-readable only.
+            executable = (
+                path.name == "antigravity" and runtime in path.parents
+            )
+            _harden_antigravity_entry(
+                path, info, 0o700 if executable else 0o600,
+            )
         else:
             raise ValueError(f"Antigravity OAuth state contains a special file: {path}")
 
