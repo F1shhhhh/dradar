@@ -286,6 +286,52 @@ def test_scoped_seed_barrier_still_blocks_every_auto_claim(tmp_path: Path):
     assert client.claimed == []
 
 
+def test_scoped_plan_ignores_other_harness_assignments_at_configuration(
+    tmp_path: Path,
+):
+    wanted = _assignment("wanted")
+    unrelated = [
+        _assignment("zcode", agent=ZCODE_AGENT,
+                    model="glm-5.3-flash", effort="high"),
+        _assignment("codex", agent="codex",
+                    model="gpt-5.6-luna", effort="high"),
+    ]
+
+    plan = _configure(
+        tmp_path, refill_to=2, max_tasks=2,
+        active=[wanted, *unrelated],
+    )
+
+    assert plan["seed_assignment_ids"] == ["wanted"]
+    assert set(plan["assignments"]) == {"wanted"}
+
+
+def test_scoped_reconcile_counts_only_its_harness_active_assignments(
+    tmp_path: Path,
+):
+    wanted = _assignment("wanted")
+    unrelated = [
+        _assignment("zcode", agent=ZCODE_AGENT,
+                    model="glm-5.3-flash", effort="high"),
+        _assignment("codex", agent="codex",
+                    model="gpt-5.6-luna", effort="high"),
+    ]
+    client = ScopedClient(_table(
+        ("next", KIMI_AGENT, "k3", "low", "open"),
+    ), active=[wanted, *unrelated])
+    _configure(tmp_path, refill_to=2, max_tasks=3, active=[wanted])
+    refill.mark_submitted(tmp_path, "wanted")
+
+    result = refill.refill_once(tmp_path, client)
+
+    assert result["claimed"] == 1
+    assert result["held"] == 2
+    assert client.claimed == [("next", "k3", "low")]
+    assert set(refill.load(tmp_path)["assignments"]) == {
+        "wanted", "a-next",
+    }
+
+
 def test_scoped_plan_persists_scope_and_conflicts_safely(tmp_path: Path):
     first = _configure(tmp_path)
     stored = refill.load(tmp_path)
