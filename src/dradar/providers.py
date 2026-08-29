@@ -1109,10 +1109,7 @@ def mark_antigravity_ready(home: Path | None = None) -> Path:
     return path
 
 
-def privatize_antigravity_home(home: Path | None = None) -> None:
-    root = antigravity_home(home)
-    if not root.exists():
-        return
+def _remove_antigravity_cli_log_link(home: Path | None = None) -> None:
     # AGY maintains this exact convenience link to its rotating log.  It is
     # unnecessary in the credential mount and would make the otherwise
     # symlink-free tree fail closed after every real login.  Unlink the known
@@ -1123,6 +1120,13 @@ def privatize_antigravity_home(home: Path | None = None) -> None:
             cli_log.unlink()
     except FileNotFoundError:
         pass
+
+
+def privatize_antigravity_home(home: Path | None = None) -> None:
+    root = antigravity_home(home)
+    if not root.exists():
+        return
+    _remove_antigravity_cli_log_link(home)
     runtime = root / "runtime"
     for path in [root, *root.rglob("*")]:
         try:
@@ -1169,6 +1173,16 @@ def prepare_antigravity_auth(home: Path | None = None) -> str | None:
     capability advertisement, and provider status so an ordinary CLI upgrade
     cannot strand a valid account before the per-trial context is entered.
     """
+
+    # The official CLI recreates this one convenience symlink during ordinary
+    # commands.  Remove it before the strict tree validation; otherwise the
+    # known-safe cleanup below is unreachable and a valid account is stranded.
+    # No target is followed, and every symlink at every other path still fails
+    # closed in ``antigravity_auth_error``.
+    try:
+        _remove_antigravity_cli_log_link(home)
+    except OSError as exc:
+        return f"could not remove Antigravity CLI log link: {exc}"
 
     issue = antigravity_auth_error(home)
     if issue != _ANTIGRAVITY_POLICY_MISMATCH:
