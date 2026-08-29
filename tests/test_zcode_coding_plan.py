@@ -364,8 +364,9 @@ def test_zcode_adapter_source_has_fixed_security_contract() -> None:
     assert 'key_file.unlink()' in source
     assert '"memoryEnabled": False' in source
     assert '"titleGenerationEnabled": False' in source
-    assert '"WebFetch", "WebSearch", "web_search"' in source
-    assert 'required_tools = {"Read", "Write", "Edit", "Bash"}' in source
+    assert "tool_allowlist" not in source
+    assert "tool_denylist" not in source
+    assert 'required_tools = {"Read", "Write", "Edit", "Bash", "Agent"}' in source
     assert '"Read(/tmp/dradar-zcode-*)"' not in source
     assert 'message.get("content") or message.get("parts")' in source
     assert 'info.get("role") if isinstance(info, dict) else None' in source

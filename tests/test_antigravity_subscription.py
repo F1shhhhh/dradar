@@ -214,24 +214,26 @@ def _usage(input_tokens: int, output_tokens: int, cache: int, thinking: int) -> 
     }
 
 
-def test_isolated_oauth_home_requires_exact_sandbox_policy(
+def test_isolated_oauth_home_requires_exact_full_container_policy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     auth = _ready_home(tmp_path, monkeypatch)
     assert antigravity_auth_error() is None
-    assert antigravity_settings_payload()["permissions"]["allow"] == ["command(*)"]
-    deny = set(antigravity_settings_payload()["permissions"]["deny"])
-    assert "read_file(/tmp/dradar-antigravity-user/.gemini)" in deny
-    assert "unsandboxed(*)" in deny
-    assert "read_url(*)" in deny
+    payload = antigravity_settings_payload()
+    assert payload["enableTerminalSandbox"] is False
+    assert payload["allowNonWorkspaceAccess"] is True
+    assert set(payload["permissions"]["allow"]) >= {
+        "command(*)", "read_file(*)", "write_file(*)", "unsandboxed(*)",
+    }
+    assert payload["permissions"]["deny"] == []
 
     settings = auth / "antigravity-cli" / "settings.json"
     payload = json.loads(settings.read_text())
-    payload["enableTerminalSandbox"] = False
+    payload["enableTerminalSandbox"] = True
     settings.write_text(json.dumps(payload), encoding="utf-8")
     if os.name != "nt":
         settings.chmod(0o600)
-    assert "safe policy" in (antigravity_auth_error() or "")
+    assert "full-container policy" in (antigravity_auth_error() or "")
 
 
 def test_oauth_home_rejects_links_and_broad_secret_files(
@@ -289,6 +291,36 @@ def test_subscription_session_exposes_only_canonical_gemini_tree(
     with antigravity_subscription_session(tmp_path / "work") as shared:
         assert shared.resolve() == auth
         assert shared.name == ".gemini"
+
+
+def test_subscription_session_migrates_legacy_policy_without_reauthentication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = _ready_home(tmp_path, monkeypatch)
+    settings = auth / "antigravity-cli" / "settings.json"
+    legacy = json.loads(settings.read_text(encoding="utf-8"))
+    legacy["enableTerminalSandbox"] = True
+    legacy["allowNonWorkspaceAccess"] = False
+    legacy["permissions"] = {"allow": ["command(*)"], "deny": ["unsandboxed(*)"]}
+    settings.write_text(json.dumps(legacy), encoding="utf-8")
+    if os.name != "nt":
+        settings.chmod(0o600)
+
+    with antigravity_subscription_session(tmp_path / "work") as shared:
+        assert shared == auth
+        assert json.loads(settings.read_text(encoding="utf-8")) == (
+            antigravity_settings_payload()
+        )
+
+
+def test_subscription_session_does_not_create_a_missing_oauth_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DRADAR_HOME", str(tmp_path / "missing"))
+    with pytest.raises(ValueError, match="OAuth is not configured"):
+        with antigravity_subscription_session(tmp_path / "work"):
+            pass
+    assert not antigravity_auth_path().exists()
 
 
 @pytest.mark.parametrize("raises", [False, True])
@@ -391,13 +423,13 @@ def test_unverified_assignments_fail_before_a_paid_run(
         )
 
 
-def test_adapter_never_uses_dangerous_permissions_or_scratch_workspace() -> None:
+def test_adapter_uses_full_permissions_inside_pier_container() -> None:
     source = Path(providers.__file__).with_name("pier_antigravity.py").read_text()
     assert '"--new-project"' in source
-    assert '"--sandbox"' in source
-    assert "--dangerously-skip-permissions" not in source
+    assert '"--sandbox"' not in source
+    assert '"--dangerously-skip-permissions"' in source
     assert 'init.get("cwd") == "/app"' in source
-    assert 'init.get("permission_mode") != "always-proceed"' in source
+    assert 'init.get("permission_mode") == "always-proceed"' in source
     assert "sha512sum --check --strict" in source
     assert "storage.googleapis.com" in source
     assert '"www.googleapis.com"' in source
@@ -423,7 +455,7 @@ def test_official_step_ledger_reconciles_without_double_counting_thinking() -> N
     terminal = _usage(110, 22, 60, 15)
     events = [
         {"event": "init", "init": {
-            "model": runtime, "cwd": "/app", "permission_mode": "request-review",
+            "model": runtime, "cwd": "/app", "permission_mode": "always-proceed",
         }},
         {"event": "step_update", "step_update": {
             "step_index": 1, "step_type": "agent_response", "state": "DONE",
@@ -458,7 +490,7 @@ def test_official_cache_can_exceed_uncached_input_and_still_reconcile() -> None:
     usage = _usage(81_240, 4_603, 182_532, 3_280)
     events = [
         {"event": "init", "init": {
-            "model": runtime, "cwd": "/app", "permission_mode": "request-review",
+            "model": runtime, "cwd": "/app", "permission_mode": "always-proceed",
         }},
         {"event": "step_update", "step_update": {
             "step_index": 1, "step_type": "agent_response", "state": "DONE",
@@ -486,7 +518,7 @@ def test_invalid_official_usage_never_reconciles(broken_field: str) -> None:
     usage[broken_field] = 13 if broken_field == "total_tokens" else 3
     events = [
         {"event": "init", "init": {
-            "model": runtime, "cwd": "/app", "permission_mode": "request-review",
+            "model": runtime, "cwd": "/app", "permission_mode": "always-proceed",
         }},
         {"event": "step_update", "step_update": {
             "step_index": 1, "step_type": "agent_response", "state": "DONE",
@@ -508,7 +540,7 @@ def test_conflicting_duplicate_or_wrong_runtime_never_becomes_complete() -> None
     runtime = ANTIGRAVITY_RUNTIME_MODELS["medium"]
     events = [
         {"event": "init", "init": {
-            "model": runtime, "cwd": "/app", "permission_mode": "request-review",
+            "model": runtime, "cwd": "/app", "permission_mode": "always-proceed",
         }},
         {"event": "step_update", "step_update": {
             "step_index": 1, "step_type": "agent_response", "state": "DONE",

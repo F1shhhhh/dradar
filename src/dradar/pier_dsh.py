@@ -1,9 +1,11 @@
-"""Portable Pier adapter for DeepSeek Harness' two-tool minimal agent.
+"""Portable Pier adapter for DeepSeek Harness' full-container minimal agent.
 
 The adapter uses only the published Pier 0.3.0 extension interface and the
 published ``@deepseek-ai/dsh`` package. Runtime model egress is restricted to
 DeepSeek's API, while the task's Docker container remains the
-filesystem/process isolation boundary.
+filesystem/process isolation boundary.  The ``minimal`` persona keeps its
+small root shell/editor surface while inheriting DSH's local delegation,
+workflow, filesystem, background-job, goal, and todo facilities.
 """
 
 from __future__ import annotations
@@ -52,48 +54,16 @@ _ARTIFACT_ID_RE = re.compile(r"[0-9a-f]{32}")
 
 _MINIMAL_PATCH = """\
 # Run DSH's shipped `minimal` agent preset through a one-shot headless runner.
-# The headless base contributes a global coding toolset, while a preset is
-# supposed to own the model-facing composition. Disable those global tools so
-# the scoped shipped preset supplies exactly persistent bash and the editor.
+# Pier's disposable Docker container is the security boundary, so the agent
+# keeps the base profile's filesystem, background-job, compaction, delegation,
+# workflow, goal, and todo tools.  Only duplicate shell/editor rows, ambient
+# skills, and network-backed Web tools stay disabled.  DSH_PERMISSION_MODE is
+# separately pinned to danger-full-access/never-ask below.
 - id: tool-bash
   disabled: true
 - id: tool-pwsh
   disabled: true
-- id: tool-jobs
-  disabled: true
-- id: tool-fs
-  disabled: true
-- id: tool-fs-search
-  disabled: true
-- id: agent-instructions
-  disabled: true
 - id: tool-skill
-  disabled: true
-- id: plan-mode
-  disabled: true
-- id: compaction-basic
-  disabled: true
-- id: command-compact
-  disabled: true
-- id: tool-subagent-control
-  disabled: true
-- id: tool-subagent-list-agents
-  disabled: true
-- id: tool-subagent
-  disabled: true
-- id: tool-subagent-fork
-  disabled: true
-- id: tool-subagent-report
-  disabled: true
-- id: tool-workflow
-  disabled: true
-- id: tool-result-pruner
-  disabled: true
-- id: tool-todo
-  disabled: true
-- id: tool-goal
-  disabled: true
-- id: tool-ralph
   disabled: true
 - id: tool-str-replace-editor
   disabled: true
@@ -102,8 +72,6 @@ _MINIMAL_PATCH = """\
 - id: web-search-deepseek
   disabled: true
 - id: web
-  disabled: true
-- id: repeat-tool-reminder
   disabled: true
 
 # Headless does not normally mount the agent-preset roster. Pin it to the

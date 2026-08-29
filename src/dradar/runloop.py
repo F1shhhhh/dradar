@@ -54,6 +54,11 @@ from .providers import (
     KIMI_AGENT,
     KIMI_RUN_CONFIG_VERSION,
     KIMI_RUNTIME_PROFILE,
+    HONEY_CHILD_AGENT_ACCESS,
+    HONEY_EXECUTION_SECURITY_PROFILE,
+    HONEY_INNER_PERMISSION_MODE,
+    HONEY_OUTER_ISOLATION,
+    HONEY_SECURITY_AGENTS,
     ZCODE_AGENT,
     ZCODE_RUN_CONFIG_VERSION,
     ZCODE_RUNTIME_PROFILE,
@@ -2574,6 +2579,13 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             "terminal_tool_timeout_cap_sec": POMPEII_TERMINAL_HEAVY_TIMEOUT_SEC,
             "finalization_reserve_sec": POMPEII_FINALIZATION_RESERVE_SEC,
         })
+    if (assignment.get("agent") or "codex") in HONEY_SECURITY_AGENTS:
+        meta.update({
+            "honey_execution_security_profile": HONEY_EXECUTION_SECURITY_PROFILE,
+            "honey_inner_permission_mode": HONEY_INNER_PERMISSION_MODE,
+            "honey_child_agent_access": HONEY_CHILD_AGENT_ACCESS,
+            "honey_outer_isolation": HONEY_OUTER_ISOLATION,
+        })
     if assignment_codex_provider(assignment) == DEEPSEEK_PROVIDER:
         # Server-side audit/gating can distinguish corrected official-catalog
         # runs from the earlier fallback-metadata benchmark without deleting
@@ -2620,7 +2632,7 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             ),
             "subscription_oauth_coordination": "shared-file-session-v1",
             "antigravity_native_efforts": ["low", "medium", "high"],
-            "antigravity_terminal_sandbox": True,
+            "antigravity_terminal_sandbox": False,
             "antigravity_artifact_capture": ANTIGRAVITY_ARTIFACT_CAPTURE,
         })
     if assignment.get("agent") == ZCODE_AGENT:

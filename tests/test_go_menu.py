@@ -754,6 +754,14 @@ def test_deepseek_submission_attests_catalog_and_runtime_profile(
     assert meta["model_config_version"] == DEEPSEEK_RUN_CONFIG_VERSION
     assert meta["model_catalog_sha256"] == DEEPSEEK_CATALOG_SHA256
     assert meta["model_runtime_profile"] == DEEPSEEK_RUNTIME_PROFILE
+    assert meta["honey_execution_security_profile"] == (
+        "full-container-tools-outer-boundary-v1"
+    )
+    assert meta["honey_inner_permission_mode"] == "full-auto-approve"
+    assert meta["honey_child_agent_access"] == "native-enabled"
+    assert meta["honey_outer_isolation"] == (
+        "pier-docker-exact-egress-minimal-credentials-v1"
+    )
 
 
 def test_dsh_submission_attests_minimal_native_runtime(
@@ -783,6 +791,10 @@ def test_dsh_submission_attests_minimal_native_runtime(
     assert meta["model_runtime_profile"] == DSH_RUNTIME_PROFILE
     assert meta["dsh_minimal_tools"] == ["bash", "str_replace_editor"]
     assert meta["dsh_native_efforts"] == ["off", "high", "max"]
+    assert meta["honey_execution_security_profile"] == (
+        "full-container-tools-outer-boundary-v1"
+    )
+    assert meta["honey_child_agent_access"] == "native-enabled"
 
 
 def test_nonzero_pier_rc_submits_outcome_interrupted_with_meta(monkeypatch, tmp_path: Path):

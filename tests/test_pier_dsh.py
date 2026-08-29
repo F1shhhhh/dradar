@@ -297,7 +297,12 @@ def test_run_supports_model_effort_matrix_without_logging_secret(
     assert "includeUserRoot: false" in patch
     assert "config/agent-presets" in patch
     assert "id: tool-web\n  disabled: true" in patch
-    assert "id: tool-subagent\n  disabled: true" in patch
+    assert "id: tool-subagent\n  disabled: true" not in patch
+    assert "id: tool-subagent-fork\n  disabled: true" not in patch
+    assert "id: tool-subagent-control\n  disabled: true" not in patch
+    assert "id: tool-subagent-list-agents\n  disabled: true" not in patch
+    assert "id: tool-subagent-report\n  disabled: true" not in patch
+    assert "id: tool-jobs\n  disabled: true" not in patch
     assert "id: system-prompt\n  disabled: true" not in patch
     assert "id: headless-runner\n  disabled: true" in patch
     assert "id: minimal-headless-runner" in patch

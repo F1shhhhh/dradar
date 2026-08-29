@@ -174,18 +174,6 @@ runtime_model = {
     },
     "thoughtLevel": effort,
 }
-tool_allowlist = [
-    "Read", "Write", "Edit", "ApplyPatch", "Bash", "Glob", "Grep",
-    "TodoRead", "TodoWrite",
-]
-tool_denylist = [
-    "WebFetch", "WebSearch", "web_search", "Agent", "Task", "Skill",
-    "AskUserQuestion", "SendMessage", "RespondToCoordinator", "TaskOutput",
-    "TaskStop", "js", "js_reset", "js_add_node_module_dir",
-    "mcp__node_repl__*",
-]
-
-
 def redact(value):
     if isinstance(value, str):
         return value.replace(key, "[REDACTED_ZCODE_CREDENTIAL]")
@@ -694,8 +682,6 @@ try:
                 "runtimeModel": runtime_model,
                 "thoughtLevel": effort,
                 "mcpServers": [],
-                "toolAllowlist": tool_allowlist,
-                "toolDenylist": tool_denylist,
             },
             timeout=120.0,
         )
@@ -710,12 +696,10 @@ try:
                 "persistence": "deferred",
                 "titleGenerationEnabled": False,
                 "mcpServers": [],
-                "toolAllowlist": tool_allowlist,
-                # ZCode normalizes deny rules such as ``Read(/tmp/...)`` to the
-                # tool name before registering tools, so path-shaped rules would
-                # disable the coding tool completely.  The key file is instead
-                # unlinked below before the first model-controlled tool can run.
-                "toolDenylist": tool_denylist,
+                # Omit both tool lists: in ZCode Protocol an absent allowlist
+                # means the complete built-in tool catalog, including Agent
+                # delegation.  Pier's Docker mounts and egress allowlist—not
+                # an inner tool filter—enforce the benchmark security boundary.
             },
             timeout=120.0,
         )
@@ -817,8 +801,9 @@ try:
                 enabled_tools.update(name for name, enabled in tools.items() if enabled is True)
     # With Bash available ZCode may select its embedded-search branch and
     # intentionally unregister the standalone Glob/Grep tools.  Read, write,
-    # edit, and shell execution are the invariant coding surface.
-    required_tools = {"Read", "Write", "Edit", "Bash"}
+    # edit, shell execution, and child-agent delegation are the invariant
+    # full-container surface.
+    required_tools = {"Read", "Write", "Edit", "Bash", "Agent"}
     if not required_tools.issubset(enabled_tools):
         missing = ", ".join(sorted(required_tools - enabled_tools))
         raise ProtocolError(f"ZCode coding tools were unavailable: {missing}")

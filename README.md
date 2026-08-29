@@ -36,6 +36,10 @@ Pier + Docker 作为现阶段的任务执行方案；未来可以继续接入其
   安装层缓存失效；本机 npm 不可达时，只接受服务端最近确认仍新鲜的精确版本。两边
   都无法确认最新版时不会启动模型，也不会消耗额度。已经运行中的任务不会被中途升级，
   下一道任务或下次恢复时再更新。
+- **Honey 权限在容器内完整、边界在容器外**：Codex、DSH、ZCode、Kimi Code 和
+  Antigravity 统一使用无人值守的完整编码/子代理权限，由 Docker 挂载、网络出口和凭证
+  生命周期防作弊。新增 Honey 必须逐项通过
+  [Honey 容器内完整权限与容器外隔离契约](docs/HONEY_EXECUTION_SECURITY.md) 的接入门禁。
 
 ## 环境要求
 
@@ -249,9 +253,11 @@ DeepSeek API 价格按北京时间分段：每天 `09:00–12:00`、`14:00–18:
 ### DeepSeek Harness Minimal
 
 DSH Minimal 是与 Codex 分开的实验 Harness。它复用同一份本地 DeepSeek key，但只接受
-`off`、`high`、`max` 三档，并固定使用 DSH 自带的 `minimal` 双工具组合（持久 Bash 与
-字符串替换编辑器）。网页认领 DSH 格子后，仍走普通志愿者的本机流程：本机 Docker、
-公开 CLI、当前账号已认领批次，再由 `resume` 启动，不需要单独安装宿主机 Pier。
+`off`、`high`、`max` 三档，并固定使用 DSH 自带 `minimal` persona、持久 Bash 与字符串
+替换编辑器；同时保留容器内的文件搜索、后台任务、原生 spawn/fork 子代理、workflow、
+todo/goal 与 compaction。所有调用使用 `danger-full-access`/`never`，Docker 与精确网络
+出口负责隔离。网页认领 DSH 格子后，仍走普通志愿者的本机流程：本机 Docker、公开
+CLI、当前账号已认领批次，再由 `resume` 启动，不需要单独安装宿主机 Pier。
 
 DSH 的 DeepSWE 模型面包含 V4 Pro、V4 Flash 和 V4 Flash Vision Exp。Vision Exp 在
 DeepSWE 中走官方纯文本能力，不附带图片；在庞贝壁画题中仍必须读取并绑定题目的
@@ -315,7 +321,9 @@ dradar go --pick TASK_ID:k3:high
 DRadar 把 OAuth 保存在 `~/.dradar/providers/kimi`，不会借用或覆盖日常 Kimi Code 配置。
 宿主机 CLI 只负责官方 OAuth 与领题前验版；任务镜像使用校验过的 `uv` 安装同一精确
 Kimi CLI 版本，因此 macOS、Windows 与 Linux 用户都不会把错误平台的本机程序传进
-容器。容器只收到一次运行所需的锁定凭证副本，退出后会回收刷新状态并删除临时副本。
+容器。容器只挂载 provider 专用的 `credentials` 与 `oauth` 目录，任务 session、配置、
+日志和工作区仍逐题隔离；刷新后会验证文件结构、权限和所有者，容器退出时其余运行状态
+全部销毁。模型以 `--auto` 运行，保留官方完整工具和 Agent/AgentSwarm 子代理能力。
 模型固定为 `k3`，只接受 `low`/`high`/`max`；DeepSWE 与庞贝壁画均可显式领取，但不进入
 自动推荐、排序或持续补题。checkpoint 保存工作区、Kimi session 与累计 usage stream，
 恢复使用官方 `--session`，不会追加恢复提示词。
@@ -341,8 +349,20 @@ SHA-256 改变而被拒绝。实际 SHA-256 会随结果上报以便异常成绩
 DRadar 服务端或轨迹。容器启动后 Key 会立即转入 ZCode 的内存会话并删除临时文件。
 
 模型支持 `glm-5.3` 与 `glm-5.3-flash`，档位为 `low`/`high`/`max`。DeepSWE 与庞贝壁画
-均可显式领取，但不进入自动推荐或补题。checkpoint 保存工作区和无凭据的 ZCode
-session/rollout 状态，恢复使用原生 `session/resume` 并重新注入仅驻内存的运行凭据。
+均可显式领取，但不进入自动推荐或补题。Protocol 固定使用 `yolo`，不设置内部工具
+allowlist/denylist，保留完整编码和 `Agent` 子代理能力；网络仍只允许 ZCode 控制面与模型
+端点。checkpoint 保存工作区和无凭据的 ZCode session/rollout 状态，恢复使用原生
+`session/resume` 并重新注入仅驻内存的运行凭据。
+
+### Google Antigravity Gemini 3.7 Flash 订阅 OAuth agent
+
+Antigravity 只使用 DRadar 独立的 Google OAuth 状态和固定 Linux CLI `1.1.22`，模型固定为
+`gemini-3.7-flash` 的 `low`/`medium`/`high` 三档。每题在 Pier Docker 中使用
+`--dangerously-skip-permissions`，不再叠加 CLI terminal sandbox；文件、命令和原生子代理
+不会因 headless 审批被静默拒绝。容器只挂载独立 `.gemini` 树，网络只开放 Google OAuth、
+Antigravity 模型控制面和固定运行时下载的精确域名；日常 Gemini 配置、宿主 HOME 与其他
+账号凭证不会进入任务容器。旧的安全策略文件会在不重新登录的情况下原子迁移到当前
+full-container 策略。
 
 体检失败不会领取任务。修复所有 `FAIL` 后重新运行即可。
 
