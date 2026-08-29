@@ -55,10 +55,10 @@ DEEPSEEK_RUN_CONFIG_VERSION = "deepseek-codex-official-catalog-v2"
 DEEPSEEK_RUNTIME_PROFILE = "public-pier-0.3.0-catalog-v1"
 
 # DSH Minimal is a separate Pier agent, not a Codex provider alias. It reuses
-# the same local DeepSeek credential while preserving DSH 0.1.1-rc.1's native
+# the same local DeepSeek credential while preserving DSH 0.1.1-rc.2's native
 # effort surface: off/high/max (there is deliberately no synthetic low mode).
 DSH_AGENT = "dsh-minimal"
-DSH_VERSION = "0.1.1-rc.1"
+DSH_VERSION = "0.1.1-rc.2"
 DSH_FLASH_MODEL = "dsh-deepseek-v4-flash"
 DSH_PRO_MODEL = "dsh-deepseek-v4-pro"
 DSH_VISION_MODEL = "dsh-deepseek-v4-flash-vision-exp"
@@ -69,18 +69,18 @@ DSH_RUNTIME_MODELS = {
     DSH_VISION_MODEL: "deepseek-v4-flash-vision-exp",
 }
 DSH_SUPPORTED_EFFORTS = frozenset({"off", "high", "max"})
-DSH_FLASH_CAPABILITY = "dsh-minimal-deepseek-v4-flash-artifact-v5"
-DSH_PRO_CAPABILITY = "dsh-minimal-deepseek-v4-pro-artifact-v5"
+DSH_FLASH_CAPABILITY = "dsh-minimal-deepseek-v4-flash-artifact-v6"
+DSH_PRO_CAPABILITY = "dsh-minimal-deepseek-v4-pro-artifact-v6"
 DSH_VISION_CAPABILITY = (
-    "dsh-minimal-deepseek-v4-flash-vision-exp-pompeii-image-v1"
+    "dsh-minimal-deepseek-v4-flash-vision-exp-pompeii-image-v2"
 )
 DSH_VISION_TEXT_CAPABILITY = (
-    "dsh-minimal-deepseek-v4-flash-vision-exp-deepswe-text-v1"
+    "dsh-minimal-deepseek-v4-flash-vision-exp-deepswe-text-v2"
 )
 DSH_FLASH_LEGACY_CAPABILITY = "dsh-minimal-deepseek-v4-flash-artifact-v4"
 DSH_PRO_LEGACY_CAPABILITY = "dsh-minimal-deepseek-v4-pro-artifact-v4"
-DSH_RUN_CONFIG_VERSION = "dsh-minimal-native-full-container-0.1.1-rc.1-v2"
-DSH_RUNTIME_PROFILE = "public-pier-0.3.0-dsh-minimal-full-container-v2"
+DSH_RUN_CONFIG_VERSION = "dsh-minimal-native-full-container-0.1.1-rc.2-v3"
+DSH_RUNTIME_PROFILE = "public-pier-0.3.0-dsh-minimal-full-container-v3"
 
 # Grok Build is intentionally subscription/OAuth-only.  In particular, the
 # runner strips XAI_API_KEY from Pier's environment and never accepts a key in
@@ -89,12 +89,12 @@ DSH_RUNTIME_PROFILE = "public-pier-0.3.0-dsh-minimal-full-container-v2"
 GROK_PROVIDER = "xai-subscription"
 GROK_AGENT = "grok-build"
 GROK_MODEL = "grok-4.6"
-GROK_CLI_VERSION = "1.0.3"
+GROK_CLI_VERSION = "1.0.13"
 GROK_SUPPORTED_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
-GROK_CAPABILITY = "grok-build-4.6-subscription-oauth-concurrent-v4"
-GROK_LEGACY_CAPABILITY = "grok-build-4.6-subscription-oauth-v3"
-GROK_RUN_CONFIG_VERSION = "grok-4.6-subscription-oauth-concurrent-v4"
-GROK_RUNTIME_PROFILE = "pier-grok-build-4.6-shared-oauth-lock-v4"
+GROK_CAPABILITY = "grok-build-4.6-subscription-oauth-concurrent-v5"
+GROK_LEGACY_CAPABILITY = "grok-build-4.6-subscription-oauth-concurrent-v4"
+GROK_RUN_CONFIG_VERSION = "grok-4.6-subscription-oauth-concurrent-v5"
+GROK_RUNTIME_PROFILE = "pier-grok-build-4.6-shared-oauth-lock-v5"
 GROK_HOME_RELATIVE_PATH = Path("providers") / "grok"
 GROK_RUNTIME_RELATIVE_PATH = (
     GROK_HOME_RELATIVE_PATH / "runtime" / GROK_CLI_VERSION
@@ -147,20 +147,20 @@ _GROK_VERSION_RE = re.compile(r"(?:^|\s)(\d+\.\d+\.\d+)(?:\s|$)")
 KIMI_PROVIDER = "kimi-subscription"
 KIMI_AGENT = "kimi-code"
 KIMI_MODEL = "k3"
-KIMI_CLI_VERSION = "0.36.1"
+KIMI_CLI_VERSION = "0.39.1"
 KIMI_SUPPORTED_EFFORTS = frozenset({"low", "high", "max"})
-KIMI_CAPABILITY = "kimi-code-k3-subscription-oauth-node-concurrent-v2"
-KIMI_LEGACY_CAPABILITY = "kimi-code-k3-subscription-oauth-node-v1"
-KIMI_RUN_CONFIG_VERSION = "kimi-code-k3-subscription-oauth-full-container-v3"
-KIMI_RUNTIME_PROFILE = "pier-kimi-code-k3-shared-oauth-full-container-v3"
-KIMI_BINARY_BASE_URL = "https://code.kimi.com/kimi-code/binaries/0.36.1"
+KIMI_CAPABILITY = "kimi-code-k3-subscription-oauth-node-concurrent-v3"
+KIMI_LEGACY_CAPABILITY = "kimi-code-k3-subscription-oauth-node-concurrent-v2"
+KIMI_RUN_CONFIG_VERSION = "kimi-code-k3-subscription-oauth-full-container-v4"
+KIMI_RUNTIME_PROFILE = "pier-kimi-code-k3-shared-oauth-full-container-v4"
+KIMI_BINARY_BASE_URL = "https://code.kimi.com/kimi-code/binaries/0.39.1"
 KIMI_BINARY_SHA256 = {
-    "linux-x64": "78c07b255e0bdc8dfe90d0cbd3204a3d862957394a08ca99c6e31144732451c7",
-    "linux-arm64": "a48e90f49cacee600310b4aebb87df417bf7af9fc3ddc282e721d9fb811391a0",
-    "darwin-x64": "037b201bf8dccca987fcc98645ea746d6d683bd2d8cc201891c062bf0b14798e",
-    "darwin-arm64": "53b8a5d9380131a23c58937f28d64e93830c56aa92c41432f24ab9d8eccf0e50",
-    "win32-x64": "9da56c617b2c51a55a313a33d52aebfe5729734e36b2fe6d5c989b4a51b7d327",
-    "win32-arm64": "70e14eb27776e65b0ddc0660d06d020b7de88930fe412a7b504f26371c0ae533",
+    "linux-x64": "585547e082f2f3a32dd80825626a1c8dd4e82f55b4d6a8aa14e6397c00758eca",
+    "linux-arm64": "f2e16073823cdeda207e3d228ef899cb9e43c8623ab21ddd3edd75702ae19ca3",
+    "darwin-x64": "b0d1897ae3fdd7f651939296655c4784ec8f3558c30ebb8bb8b954ba1fff55db",
+    "darwin-arm64": "762ee3be8b67796657409b8d5074ab0beed6f42162035bd4a274055ef0c44cdd",
+    "win32-x64": "ce3a74ead55994eb1350cc45a1d0d9bf083158f2bba4da49a5ee6168a1830338",
+    "win32-arm64": "b6b3c22576eb44ae9f1956bca4913ab3957cc110812d71212055ad8c89641a28",
 }
 KIMI_HOME_RELATIVE_PATH = Path("providers") / "kimi"
 KIMI_RUNTIME_RELATIVE_PATH = (
@@ -1605,7 +1605,7 @@ def _replace_private_file(source: Path, target: Path) -> None:
 def grok_subscription_session(directory: Path, *, home: Path | None = None):
     """Validate and expose Grok's shared native OAuth home.
 
-    Grok 1.0.3 coordinates refreshes with ``auth.json.lock`` next to the
+    The pinned Grok CLI coordinates refreshes with ``auth.json.lock`` next to the
     credential.  Sharing that narrow provider home lets independent task
     containers use the official lock instead of serializing whole trials.
     """
@@ -1650,18 +1650,14 @@ def advertised_capabilities(
             DSH_PRO_CAPABILITY,
             DSH_VISION_CAPABILITY,
             DSH_VISION_TEXT_CAPABILITY,
-            # Transitional compatibility: an old server knows only v4,
-            # while the v5 marker lets the new server require timed usage.
-            DSH_FLASH_LEGACY_CAPABILITY,
-            DSH_PRO_LEGACY_CAPABILITY,
         ))
     # Unlike API-key providers, a subscription slot is scarce and stateful.
     # Advertise it only when both the CLI and a safe refreshable OAuth session
     # are actually present, preventing the server from assigning unusable work.
     if grok_cli_path(environ) and grok_auth_error() is None:
-        capabilities.extend((GROK_CAPABILITY, GROK_LEGACY_CAPABILITY))
+        capabilities.append(GROK_CAPABILITY)
     if kimi_cli_path(environ) and kimi_auth_error() is None:
-        capabilities.extend((KIMI_CAPABILITY, KIMI_LEGACY_CAPABILITY))
+        capabilities.append(KIMI_CAPABILITY)
     if (
         prepare_antigravity_auth() is None
         and Path(__file__).with_name("pier_antigravity.py").is_file()

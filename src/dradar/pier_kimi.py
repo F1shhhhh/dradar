@@ -112,10 +112,10 @@ if any(marker in tool_input for marker in PROTECTED):
     raise SystemExit(2)
 '''
 
-KIMI_CLI_VERSION = "0.36.1"
+KIMI_CLI_VERSION = "0.39.1"
 KIMI_BINARY_SHA256 = {
-    "x86_64": "78c07b255e0bdc8dfe90d0cbd3204a3d862957394a08ca99c6e31144732451c7",
-    "aarch64": "a48e90f49cacee600310b4aebb87df417bf7af9fc3ddc282e721d9fb811391a0",
+    "x86_64": "585547e082f2f3a32dd80825626a1c8dd4e82f55b4d6a8aa14e6397c00758eca",
+    "aarch64": "f2e16073823cdeda207e3d228ef899cb9e43c8623ab21ddd3edd75702ae19ca3",
 }
 
 
@@ -146,7 +146,7 @@ def _kimi_usage_facts(
     cached subset. Keeping that invariant matches Pier/DRadar's normalized
     contract: n_input_tokens already includes n_cache_tokens.
 
-    Kimi 0.36.1 emits one ``usage.record`` for every successful provider
+    Kimi 0.39.1 emits one ``usage.record`` for every successful provider
     response but advances ``turnStep`` for retryable failed attempts such as
     HTTP 429.  Those failures have no usage.  The stream-json output carries a
     separate, credential-free ``turn.step.retrying`` event for every failed
@@ -456,7 +456,7 @@ def _kimi_usage_facts(
         "request_usage_observed": complete or observed,
         "timed_usage_complete": timed_complete,
         "request_ledger_duplicate_count": duplicate_count,
-        "request_ledger_source": "kimi-code-0.36.1-main-wire-retry-v2",
+        "request_ledger_source": "kimi-code-0.39.1-main-wire-retry-v3",
         "provider_actual_cost_observed": False,
         "cost_semantics": (
             "api_equivalent_from_complete_tokens" if complete

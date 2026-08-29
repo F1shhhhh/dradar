@@ -36,8 +36,8 @@ Pier + Docker 作为现阶段的任务执行方案；未来可以继续接入其
   安装层缓存失效；本机 npm 不可达时，只接受服务端最近确认仍新鲜的精确版本。两边
   都无法确认最新版时不会启动模型，也不会消耗额度。已经运行中的任务不会被中途升级，
   下一道任务或下次恢复时再更新。
-- **Honey 权限在容器内完整、边界在容器外**：Codex、DSH、ZCode、Kimi Code 和
-  Antigravity 统一使用无人值守的完整编码/子代理权限，由 Docker 挂载、网络出口和凭证
+- **Honey 权限在容器内完整、边界在容器外**：Codex、DSH、ZCode、Kimi Code、
+  Antigravity 和 Grok 统一使用无人值守的完整编码/子代理权限，由 Docker 挂载、网络出口和凭证
   生命周期防作弊。新增 Honey 必须逐项通过
   [Honey 容器内完整权限与容器外隔离契约](docs/HONEY_EXECUTION_SECURITY.md) 的接入门禁。
 
@@ -299,7 +299,7 @@ Pier 容器同时刷新同一个 token。
 SHA-256，避免把 macOS/Windows 可执行文件误传给 Linux。OAuth 凭证和日常 `~/.grok`
 目录都不会烘焙进镜像，凭证只在容器启动后临时注入。
 
-当前 canary 边界：新领题使用官方 Grok CLI `1.0.3`，模型固定为 `grok-4.6`，档位为
+当前 canary 边界：新领题使用官方 Grok CLI `1.0.13`，模型固定为 `grok-4.6`，档位为
 `low`/`medium`/`high`/`xhigh`；只能显式领取，不进入自动推荐或补题；禁用 web search、memory、
 subagents 和 plan，并把容器运行时网络限制为 `auth.x.ai` 与
 `cli-chat-proxy.grok.com`、`code.grok.com`。第一版不支持 checkpoint。轨迹按 ATIF-v1.7 保存，但订阅
@@ -308,7 +308,7 @@ subagents 和 plan，并把容器运行时网络限制为 `auth.x.ai` 与
 ### Kimi Code K3 订阅 OAuth agent
 
 Kimi Code 只使用官方订阅 OAuth，不接受 `KIMI_API_KEY`、`MOONSHOT_API_KEY` 等按量 key。
-`provider setup` 会自动准备官方 Kimi Code CLI `0.36.1` 到 DRadar 的隔离运行目录，
+`provider setup` 会自动准备官方 Kimi Code CLI `0.39.1` 到 DRadar 的隔离运行目录，
 然后在跑题机器自己的交互式终端中建立 DRadar 专用会话：
 
 ```bash

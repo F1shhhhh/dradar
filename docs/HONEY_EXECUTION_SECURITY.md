@@ -8,8 +8,8 @@ DRadar 用 Honey 驱动不同模型完成同一类 benchmark。模型能力评�
 > 模型及其子代理在一次性任务容器内获得完整、无人值守的编码权限；可信边界位于
 > Docker、挂载、网络出口和凭证生命周期，而不位于模型可见的工具审批层。
 
-本契约适用于当前五个 Honey：Codex、DeepSeek Harness（DSH）、ZCode、Kimi Code 和
-Google Antigravity。以后接入任何新 Honey，设计评审、实现、测试和金丝雀都必须逐项
+本契约适用于当前六个 Honey：Codex、DeepSeek Harness（DSH）、ZCode、Kimi Code、
+Google Antigravity 和 Grok。以后接入任何新 Honey，设计评审、实现、测试和金丝雀都必须逐项
 检查本文，不能只证明“CLI 能启动”。
 
 ## 容器内必须放行的能力
@@ -65,7 +65,7 @@ Codex 的做法是基准：宿主先校验私有凭证，按题把它放入容�
 - 凭证存在于容器期间，安全性依赖一次性容器、最小挂载、出口白名单和产物脱敏；不得再
   用会阻断正常编码工具或子代理的内层审批规则“保护”凭证。
 
-## 当前五个 Honey 的合规映射
+## 当前六个 Honey 的合规映射
 
 | Honey | 容器内模式 | 子代理策略 | 凭证策略 | 外层网络 |
 | --- | --- | --- | --- | --- |
@@ -74,6 +74,7 @@ Codex 的做法是基准：宿主先校验私有凭证，按题把它放入容�
 | ZCode | Protocol `mode=yolo`，不传工具 allow/deny 列表 | 保留原生 `Agent` 与任务工具 | key 在 session 建立后、首个模型工具前 unlink | `open.bigmodel.cn`、`zcode.z.ai` |
 | Kimi Code | `--auto` | 保留 Agent/AgentSwarm，不设适配器并发上限 | 独立 KIMI_CODE_HOME，OAuth 私有回写，退出清理 | `auth.kimi.com`、`api.kimi.com` |
 | Antigravity | `--dangerously-skip-permissions`，不启用内层 terminal sandbox | 权限模式传递到原生子代理 | 独立 `.gemini` OAuth 树，私有权限与运行后复核 | Google OAuth/Antigravity 精确域名 |
+| Grok | `--auto-approve`，保留编码工具 | 当前官方 CLI 不提供子代理工具，不做适配器伪造 | 独立 `.grok` OAuth 树，使用官方共享锁，退出复核 | xAI/Grok OAuth 与模型精确域名 |
 
 ## 新 Honey 接入门禁
 
@@ -82,6 +83,11 @@ Codex 的做法是基准：宿主先校验私有凭证，按题把它放入容�
 再发布新 CLI，不能让在途旧任务被误拒绝。当前运行还必须上报统一的
 `honey_execution_security_profile`、`honey_inner_permission_mode`、
 `honey_child_agent_access` 和 `honey_outer_isolation`，使服务端能够验签而不是只相信文档。
+
+官方 CLI 升级同样适用上述顺序：先核对官方来源、精确版本和各平台摘要，再比较命令行、
+结构化流、退出码、会话/凭证布局、模型与 effort 映射、usage 账本和 Patch 语义；服务端先
+加入新旧 runtime tuple 的并行验签，客户端再发布。若官方包在版本号不变时重打包（例如
+桌面应用内嵌 CLI），必须按新摘要重新做协议和金丝雀验证，不能只凭 `--version` 放行。
 
 新适配器合并前必须提供自动化证据和一次真实金丝雀：
 

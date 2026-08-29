@@ -31,7 +31,7 @@ except ModuleNotFoundError as exc:  # Local source/test import before materializ
         raise
     from dradar.pier_checkpoint import DurableCheckpoint, StatePath
 
-DSH_VERSION = "0.1.1-rc.1"
+DSH_VERSION = "0.1.1-rc.2"
 NODE_VERSION = "22.23.2"
 NODE_SHA256 = {
     "x64": "d60acfe00a2932254bb0ad20e01b0d74397a0875595de719654b214f4b03f307",
@@ -535,7 +535,7 @@ class DshMinimal(BaseInstalledAgent):
                 f"test \"$(dsh --version)\" = '{DSH_VERSION}'"
             ),
             cache_key=(
-                f"dradar-dsh-minimal-{DSH_VERSION}-node-{NODE_VERSION}-patch-v4"
+                f"dradar-dsh-minimal-{DSH_VERSION}-node-{NODE_VERSION}-patch-v5"
             ),
         )
 

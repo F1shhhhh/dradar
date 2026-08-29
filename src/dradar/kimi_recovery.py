@@ -36,7 +36,7 @@ def pier_exit_code(error: BaseException) -> int | None:
 
 
 def kimi_provider_connection_stderr_is_retryable(stderr_line: str) -> bool:
-    """Accept only Kimi 0.36.1's exact CLI-owned terminal error line."""
+    """Accept only the pinned Kimi CLI's exact terminal error line."""
 
     return stderr_line.rstrip("\r\n") == _KIMI_PROVIDER_CONNECTION_ERROR
 
@@ -60,7 +60,7 @@ async def _failure_is_retryable(
 def validated_session_id(value: str | None) -> str | None:
     """Return Kimi's canonical ``session_<UUID>`` identifier.
 
-    Kimi Code 0.36.x stores sessions in directories named
+    Kimi Code 0.39.x stores sessions in directories named
     ``session_<UUID>`` and its ``--session`` flag requires that full basename.
     Accepting a bare UUID keeps older DRadar checkpoints recoverable, but all
     callers receive the current CLI-owned spelling.
