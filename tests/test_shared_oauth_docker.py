@@ -222,7 +222,10 @@ def test_grok_exec_guards_atomic_refresh_and_reconciles_host_ownership(
     maintenance = str(calls[1]["command"])
     assert calls[1]["user"] == "root"
     assert "find -P /logs/agent -xdev" in maintenance
-    assert "find -P /tmp/dradar-grok-user/.grok -xdev" in maintenance
+    assert "find -P /tmp/dradar-grok-user/.grok -xdev" not in maintenance
+    assert "/tmp/dradar-grok-user/.grok/auth.json" in maintenance
+    assert "/tmp/dradar-grok-user/.grok/auth.json.lock" in maintenance
+    assert "/tmp/dradar-grok-user/.grok/runtime" not in maintenance
     assert f"chown -h -- {os.getuid()}:{os.getgid()}" in maintenance
 
 

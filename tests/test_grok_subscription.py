@@ -79,6 +79,22 @@ def test_official_grok_version_banner_is_parsed():
     assert parse_grok_cli_version("unexpected") is None
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX executable mode repair")
+def test_grok_cli_path_repairs_exact_0600_managed_runtime(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "dradar"
+    managed = providers.managed_grok_cli_path(home)
+    managed.parent.mkdir(parents=True)
+    managed.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    managed.chmod(0o600)
+
+    discovered = providers.grok_cli_path({"DRADAR_HOME": str(home)})
+
+    assert discovered == str(managed)
+    assert managed.stat().st_mode & 0o777 == 0o700
+
+
 def test_oauth_validator_rejects_api_key_shaped_auth(tmp_path: Path):
     path = _write_auth(
         tmp_path / "auth.json",

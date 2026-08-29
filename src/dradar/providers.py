@@ -1421,6 +1421,24 @@ def grok_cli_path(environ: Mapping[str, str] | None = None) -> str | None:
     managed = managed_grok_cli_path(
         Path(env["DRADAR_HOME"]) if env.get("DRADAR_HOME") else None
     )
+    if managed.is_file() and not os.access(managed, os.X_OK) and os.name != "nt":
+        # CLI 0.5.138 briefly reconciled the whole Grok home as private data,
+        # which could turn this exact user-owned managed executable from 0700
+        # into 0600. Repair only that known mode/owner combination; never make
+        # an unknown, symlinked, foreign-owned, or broadly accessible file
+        # executable.
+        try:
+            info = managed.lstat()
+            getuid = getattr(os, "getuid", None)
+            if (
+                stat.S_ISREG(info.st_mode)
+                and callable(getuid)
+                and info.st_uid == getuid()
+                and stat.S_IMODE(info.st_mode) == 0o600
+            ):
+                os.chmod(managed, 0o700)
+        except OSError:
+            pass
     if managed.is_file() and os.access(managed, os.X_OK):
         return str(managed)
     # Keep the ordinary call signature compatible with doctor/test shims that
