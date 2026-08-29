@@ -229,7 +229,7 @@ ANTIGRAVITY_READY_FILENAME = "ready.json"
 _ANTIGRAVITY_VERSION_RE = re.compile(r"(?:^|\s)(\d+\.\d+\.\d+)(?:\s|$)")
 
 # ZCode is driven through the official desktop bundle's headless protocol.  A
-# tested CLI digest allowlist and the domestic Coding Plan endpoint keep this
+# compatible protocol line and the domestic Coding Plan endpoint keep this
 # preview lane reproducible without forcing users onto one exact desktop app
 # release; both GLM-5.3 variants expose native low/high/max thought levels.
 ZCODE_PROVIDER = "bigmodel-coding-plan"
@@ -238,6 +238,8 @@ ZCODE_MODEL = "glm-5.3"
 ZCODE_FLASH_MODEL = "glm-5.3-flash"
 ZCODE_MODELS = frozenset({ZCODE_MODEL, ZCODE_FLASH_MODEL})
 ZCODE_CLI_VERSION = "0.16.5"
+ZCODE_MIN_COMPATIBLE_CLI_VERSION = "0.16.3"
+ZCODE_FLASH_MIN_CLI_VERSION = ZCODE_CLI_VERSION
 ZCODE_SUPPORTED_EFFORTS = frozenset({"low", "high", "max"})
 ZCODE_LEGACY_CAPABILITY = "zcode-glm-5.3-bigmodel-coding-plan-v1"
 ZCODE_CAPABILITY = "zcode-glm-5.3-family-bigmodel-coding-plan-v2"
@@ -854,9 +856,26 @@ def parse_zcode_cli_version(output: str) -> str | None:
     return match.group(1) if match else None
 
 
+def zcode_cli_version_is_compatible(
+    version: str | None, *, model: str | None = None,
+) -> bool:
+    """Accept compatible protocol patches without pinning desktop packaging."""
+
+    if version is None:
+        return False
+    try:
+        major, minor, patch = (int(part) for part in version.split("."))
+    except (TypeError, ValueError):
+        return False
+    minimum_patch = 5 if model == ZCODE_FLASH_MODEL else 3
+    return (major, minor) == (0, 16) and patch >= minimum_patch
+
+
 def zcode_cli_error(
     path: str | Path | None = None,
     environ: Mapping[str, str] | None = None,
+    *,
+    model: str | None = None,
 ) -> str | None:
     candidate = path if path is not None else zcode_cli_path(environ)
     if not candidate:
@@ -899,9 +918,16 @@ def zcode_cli_error(
     except (OSError, subprocess.TimeoutExpired) as exc:
         return f"could not verify the ZCode CLI version: {type(exc).__name__}"
     found = parse_zcode_cli_version(proc.stdout + "\n" + proc.stderr)
-    if proc.returncode != 0 or found != ZCODE_CLI_VERSION:
+    if proc.returncode != 0 or not zcode_cli_version_is_compatible(
+        found, model=model,
+    ):
+        minimum = (
+            ZCODE_FLASH_MIN_CLI_VERSION
+            if model == ZCODE_FLASH_MODEL
+            else ZCODE_MIN_COMPATIBLE_CLI_VERSION
+        )
         return (
-            f"ZCode CLI {ZCODE_CLI_VERSION} is required; "
+            f"a compatible ZCode CLI 0.16.x >= {minimum} is required; "
             f"found {found or 'an unrecognized version'}"
         )
     return None

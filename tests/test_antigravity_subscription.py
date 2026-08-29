@@ -525,7 +525,6 @@ def test_all_three_efforts_build_the_same_public_card_model(
         ({"provider": "google-api"}, "explicitly use provider"),
         ({"model": "gemini-other"}, "unsupported Antigravity model"),
         ({"effort": "max"}, "effort must be low, medium, or high"),
-        ({"agent_version": "9.9.9"}, "pinned to CLI"),
     ],
 )
 def test_unverified_assignments_fail_before_a_paid_run(
@@ -543,6 +542,15 @@ def test_unverified_assignments_fail_before_a_paid_run(
             assignment, tasks, tmp_path / "jobs", "job", tmp_path,
             provider_auth_path=auth.resolve(),
         )
+
+
+def test_antigravity_assignment_version_is_only_a_hint() -> None:
+    runner._validate_antigravity_assignment(
+        _assignment(agent_version="1.1.21")
+    )
+    runner._validate_antigravity_assignment(
+        _assignment(agent_version="9.9.9")
+    )
 
 
 def test_adapter_uses_full_permissions_inside_pier_container() -> None:

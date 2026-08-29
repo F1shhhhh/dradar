@@ -159,7 +159,6 @@ def test_all_grok_46_efforts_build_the_pinned_command(
         ({"provider": "xai-api"}, "explicitly use provider"),
         ({"model": "grok-other"}, "unsupported Grok subscription model"),
         ({"effort": "max"}, "effort must be low, medium, high, or xhigh"),
-        ({"agent_version": "9.9.9"}, "pinned to CLI"),
     ],
 )
 def test_unverified_grok_assignments_fail_before_paid_run(
@@ -178,6 +177,11 @@ def test_unverified_grok_assignments_fail_before_paid_run(
             provider_auth_path=auth,
             provider_cli_path=cli,
         )
+
+
+def test_grok_assignment_version_is_only_a_hint() -> None:
+    runner._validate_grok_assignment(_assignment(agent_version="1.0.3"))
+    runner._validate_grok_assignment(_assignment(agent_version="9.9.9"))
 
 
 def test_grok_checkpoint_resume_is_rejected(tmp_path: Path, monkeypatch):

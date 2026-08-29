@@ -161,7 +161,6 @@ def test_main_flow_builds_isolated_dsh_minimal_command(
         ({"model": "deepseek-other"}, "unsupported DSH model"),
         ({"effort": "low"}, "effort must be one of high, max, off"),
         ({"effort": "medium"}, "effort must be one of high, max, off"),
-        ({"agent_version": "0.1.0-rc.5"}, "pinned to"),
     ],
 )
 def test_dsh_rejects_unverified_assignment_before_paid_run(
@@ -173,6 +172,11 @@ def test_dsh_rejects_unverified_assignment_before_paid_run(
     assignment = _assignment(**overrides)
     with pytest.raises(RunnerError, match=message):
         _command(tmp_path, monkeypatch, assignment)
+
+
+def test_dsh_assignment_version_is_only_a_hint() -> None:
+    runner._validate_dsh_assignment(_assignment(agent_version="0.1.1-rc.1"))
+    runner._validate_dsh_assignment(_assignment(agent_version="9.9.9"))
 
 
 def test_dsh_checkpoint_resume_passes_durable_metadata(

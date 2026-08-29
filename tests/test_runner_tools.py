@@ -1286,7 +1286,11 @@ def _prepare_fake_zcode(monkeypatch, tmp_path):
     cli.write_text("pinned", encoding="utf-8")
     key = tmp_path / "zcode-key"
     key.write_text("secret", encoding="utf-8")
-    monkeypatch.setattr(runner_mod, "_validated_zcode_cli_path", lambda: cli)
+    monkeypatch.setattr(
+        runner_mod,
+        "_validated_zcode_cli_path",
+        lambda **_kwargs: (cli, runner_mod.ZCODE_CLI_VERSION),
+    )
     monkeypatch.setattr(
         runner_mod, "create_zcode_api_key_file", lambda _work_dir: key,
     )

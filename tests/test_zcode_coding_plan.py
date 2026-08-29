@@ -14,6 +14,7 @@ import pytest
 
 import dradar.providers as providers
 import dradar.provider_config as provider_config
+import dradar.runloop as runloop
 import dradar.runner as runner
 from dradar.pier_checkpoint import AgentLogStore, UnsafeAgentLog
 from dradar.providers import (
@@ -123,7 +124,7 @@ def test_zcode_cli_accepts_new_desktop_packaging_with_exact_runtime_version(
     assert "ZCODE_API_KEY" not in seen["kwargs"]["env"]
 
 
-def test_zcode_cli_rejects_incompatible_runtime_version(
+def test_zcode_cli_accepts_newer_patch_on_compatible_protocol_line(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = _private(tmp_path / "zcode.cjs", "future-runtime")
@@ -136,7 +137,44 @@ def test_zcode_cli_rejects_incompatible_runtime_version(
         ),
     )
 
-    assert "0.16.5 is required" in (providers.zcode_cli_error(runtime) or "")
+    assert providers.zcode_cli_error(runtime) is None
+
+
+def test_zcode_cli_rejects_incompatible_runtime_minor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _private(tmp_path / "zcode.cjs", "future-runtime")
+    monkeypatch.setattr(providers.shutil, "which", lambda _name: "/usr/bin/node")
+    monkeypatch.setattr(
+        providers.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0, stdout="0.17.0\n", stderr="",
+        ),
+    )
+
+    assert "compatible ZCode CLI 0.16.x" in (
+        providers.zcode_cli_error(runtime) or ""
+    )
+
+
+def test_zcode_cli_accepts_previous_protocol_for_glm_but_not_flash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _private(tmp_path / "zcode.cjs", "previous-runtime")
+    monkeypatch.setattr(providers.shutil, "which", lambda _name: "/usr/bin/node")
+    monkeypatch.setattr(
+        providers.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0, stdout="0.16.3\n", stderr="",
+        ),
+    )
+
+    assert providers.zcode_cli_error(runtime, model="glm-5.3") is None
+    assert "compatible ZCode CLI 0.16.x >= 0.16.5" in (
+        providers.zcode_cli_error(runtime, model="glm-5.3-flash") or ""
+    )
 
 
 def test_zcode_cli_path_skips_stale_import_for_verified_desktop_upgrade(
@@ -304,7 +342,6 @@ def test_pier_command_uses_private_zcode_adapter_without_secret(
         ({"provider": "foreign"}, "explicitly use provider"),
         ({"model": "glm-5"}, "unsupported ZCode model"),
         ({"effort": "medium"}, "effort must be low, high, or max"),
-        ({"agent_version": "9.9.9"}, "pinned to CLI"),
     ],
 )
 def test_unverified_zcode_assignment_fails_before_paid_run(
@@ -323,6 +360,25 @@ def test_unverified_zcode_assignment_fails_before_paid_run(
             provider_auth_path=_private(tmp_path / "key"),
             provider_cli_path=tmp_path / "zcode.cjs",
         )
+
+
+def test_zcode_assignment_version_is_only_a_hint() -> None:
+    runner._validate_zcode_assignment(_assignment(agent_version="0.16.3"))
+    runner._validate_zcode_assignment(_assignment(agent_version="9.9.9"))
+
+
+def test_zcode_checkpoint_accepts_observed_compatible_runtime() -> None:
+    checkpoint = SimpleNamespace(
+        task_id="task-1",
+        model=ZCODE_MODEL,
+        effort="high",
+        harness=ZCODE_AGENT,
+        provider=ZCODE_PROVIDER,
+        agent_version="0.16.3",
+    )
+    assert runloop._checkpoint_identity_mismatches(
+        checkpoint, _assignment(agent_version=ZCODE_CLI_VERSION),
+    ) == []
 
 
 def test_zcode_checkpoint_resume_is_forwarded_with_exact_runtime_identity(

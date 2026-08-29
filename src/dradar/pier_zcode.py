@@ -1211,8 +1211,17 @@ class ZCodeBigModel(BaseInstalledAgent):
         if not 60 <= resolved_session_timeout <= 24 * 60 * 60:
             raise ValueError("ZCode session_timeout_sec is outside the safe range")
         resolved_version = version or ZCODE_CLI_VERSION
-        if resolved_version != ZCODE_CLI_VERSION:
-            raise ValueError(f"ZCode adapter requires exact CLI {ZCODE_CLI_VERSION}")
+        try:
+            version_parts = tuple(int(part) for part in resolved_version.split("."))
+        except (TypeError, ValueError):
+            version_parts = ()
+        minimum_patch = 5 if resolved_model == "glm-5.3-flash" else 3
+        if (
+            len(version_parts) != 3
+            or version_parts[:2] != (0, 16)
+            or version_parts[2] < minimum_patch
+        ):
+            raise ValueError("ZCode adapter requires a compatible 0.16.x CLI")
         extra_env = dict(kwargs.get("extra_env") or {})
         forbidden = sorted(
             name for name in extra_env
@@ -1266,16 +1275,17 @@ class ZCodeBigModel(BaseInstalledAgent):
         return "true"
 
     def install_spec(self) -> AgentInstallSpec:
+        version = self._version or ZCODE_CLI_VERSION
         return AgentInstallSpec(
             agent_name=self.name(),
-            version=ZCODE_CLI_VERSION,
+            version=version,
             steps=[InstallStep(user="root", run=_install_command())],
             verification_command=(
                 f"test \"$(node --version)\" = 'v{NODE_VERSION}' && "
                 "test -x \"$(command -v python3)\""
             ),
             cache_key=(
-                f"dradar-zcode-{ZCODE_CLI_VERSION}-node-{NODE_VERSION}-protocol-v1"
+                f"dradar-zcode-{version}-node-{NODE_VERSION}-protocol-v1"
             ),
         )
 
@@ -1377,7 +1387,9 @@ class ZCodeBigModel(BaseInstalledAgent):
                 await self.exec_as_agent(
                     environment, command=f"chmod 600 {targets}", env=env,
                 )
-            version_pattern = ZCODE_CLI_VERSION.replace(".", r"\.")
+            version_pattern = (self._version or ZCODE_CLI_VERSION).replace(
+                ".", r"\."
+            )
             await self.exec_as_agent(
                 environment,
                 command=(
@@ -1577,7 +1589,7 @@ class ZCodeBigModel(BaseInstalledAgent):
             session_id=payload.get("sessionId") or str(uuid.uuid4()),
             agent=Agent(
                 name=self.name(),
-                version=ZCODE_CLI_VERSION,
+                version=self._version or ZCODE_CLI_VERSION,
                 model_name=self._model_name,
                 extra={"provider": "bigmodel-coding-plan", "protocol": 1},
             ),

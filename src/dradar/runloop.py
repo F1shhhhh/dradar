@@ -66,6 +66,7 @@ from .providers import (
     SUBSCRIPTION_REFILL_AGENTS,
     assignment_codex_provider,
     validate_refill_scope,
+    zcode_cli_version_is_compatible,
 )
 from .runner import (
     CODEX_TRAJECTORY_BUNDLE_SCHEMA, DIAG_ADVICE, BuildFlakeError, RunnerError,
@@ -618,7 +619,12 @@ def _checkpoint_identity_mismatches(
             if getattr(item, name) != value
         )
         requested_version = assignment.get("agent_version")
-        if agent != "codex" and (
+        if agent == ZCODE_AGENT:
+            if not zcode_cli_version_is_compatible(
+                item.agent_version, model=assignment.get("model"),
+            ):
+                mismatched.append("agent_version")
+        elif agent != "codex" and (
             not isinstance(requested_version, str)
             or item.agent_version != requested_version
         ):

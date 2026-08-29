@@ -341,9 +341,11 @@ dradar go --pick TASK_ID:glm-5.3:high
 dradar go --pick TASK_ID:glm-5.3-flash:high
 ```
 
-`provider setup` 会从官方桌面安装的 `Resources/glm/zcode.cjs` 导入 CLI `0.16.5`，并在
-本机和任务容器内分别验证其版本与启动协议；桌面应用正常升级或重新打包不会因文件
-SHA-256 改变而被拒绝。实际 SHA-256 会随结果上报以便异常成绩追溯，但不作为运行门槛。
+`provider setup` 会从官方桌面安装的 `Resources/glm/zcode.cjs` 导入协议 CLI；新任务默认
+使用当前已验证的 `0.16.5`。桌面版本与内嵌协议 CLI 版本分别管理，assignment 中的旧版本
+只作兼容提示，不会阻塞本机最新版。普通 GLM-5.3 接受 `0.16.x >= 0.16.3`，Flash 接受
+`0.16.x >= 0.16.5`。本机和任务容器会记录实际运行版本；桌面应用正常升级或重新打包不会
+因文件 SHA-256 改变而被拒绝。实际 SHA-256 会随结果上报以便异常成绩追溯，但不作为运行门槛。
 高级用户也可以临时设置 `ZCODE_CLI_PATH` 指向该文件。Coding Plan Key
 通过关闭回显的交互式输入保存到 `~/.dradar/secrets`，不会进入命令行、配置 JSON、Git、
 DRadar 服务端或轨迹。容器启动后 Key 会立即转入 ZCode 的内存会话并删除临时文件。
