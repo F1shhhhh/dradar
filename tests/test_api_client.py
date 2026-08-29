@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 from dradar import __version__
-from dradar.api_client import ApiClient, ApiError
+from dradar.api_client import ApiClient, ApiError, normalize_batch_id
 from dradar.providers import DEEPSEEK_CAPABILITY
 from dradar.submission_intent import (
     UPLOAD_INTENT_VERSION,
@@ -268,6 +268,97 @@ def test_selected_benchmark_is_sent_on_reads_claims_and_checkout():
     assert all("benchmark=pompeii-adjacency" in url for _, url, _ in seen[:3])
     assert b"benchmark_id=pompeii-adjacency" in seen[3][2]
     assert b"benchmark_id=pompeii-adjacency" in seen[4][2]
+
+
+def test_exact_batch_is_sent_and_broader_inventory_is_filtered_locally():
+    seen = []
+    selected = "550e8400e29b41d4a716446655440000"
+    other = "123e4567e89b12d3a456426614174000"
+
+    def handler(request):
+        seen.append((request.method, str(request.url), request.read()))
+        if request.url.path.endswith("/assignment"):
+            # This intentionally models an old server that ignores the query.
+            return httpx.Response(200, json={"active": [
+                {"assignment_id": "other", "batch_id": other},
+                {"assignment_id": "selected", "batch_id": selected},
+            ]})
+        if request.url.path.endswith("/claim"):
+            return httpx.Response(200, json={"assignment": {}})
+        return httpx.Response(200, json={"assignment": None})
+
+    client = ApiClient(
+        "https://api.example.com", "drt_test",
+        transport=httpx.MockTransport(handler),
+        benchmark_id="pompeii-adjacency", batch_id=selected,
+    )
+
+    inventory = client.get_assignment()
+    client.claim_assignment("p1", "gpt-5.6-sol", "xhigh")
+    client.checkout(session_id="session-1")
+
+    assert [item["assignment_id"] for item in inventory["active"]] == ["selected"]
+    assert inventory["assignment"]["assignment_id"] == "selected"
+    assert "benchmark=pompeii-adjacency" in seen[0][1]
+    assert f"batch_id={selected}" in seen[0][1]
+    assert f"batch_id={selected}".encode() in seen[1][2]
+    assert f"batch_id={selected}".encode() in seen[2][2]
+
+
+def test_exact_batch_missing_from_inventory_fails_closed_as_404():
+    selected = "550e8400e29b41d4a716446655440000"
+
+    def handler(_request):
+        return httpx.Response(200, json={"active": [{
+            "assignment_id": "other",
+            "batch_id": "123e4567e89b12d3a456426614174000",
+        }]})
+
+    client = ApiClient(
+        "https://api.example.com", "drt_test",
+        transport=httpx.MockTransport(handler), batch_id=selected,
+    )
+    with pytest.raises(ApiError) as exc:
+        client.get_assignment()
+    assert exc.value.status_code == 404
+    assert exc.value.code == "claim_batch_not_found"
+
+
+def test_legacy_unscoped_assignment_requests_remain_unchanged():
+    seen = []
+
+    def handler(request):
+        seen.append((str(request.url), request.read()))
+        if request.url.path.endswith("/assignment"):
+            return httpx.Response(200, json={"active": []})
+        return httpx.Response(200, json={"assignment": None})
+
+    client = ApiClient(
+        "https://api.example.com", "drt_test",
+        transport=httpx.MockTransport(handler),
+    )
+    assert client.get_assignment() == {"active": []}
+    client.checkout()
+    assert all("batch_id" not in url for url, _body in seen)
+    assert all(b"batch_id" not in body for _url, body in seen)
+
+
+@pytest.mark.parametrize("value", (
+    "not-a-uuid",
+    "550e8400e29b41d4a71644665544000",
+    "{550e8400-e29b-41d4-a716-446655440000}",
+    "550e8400-e29b-41d4-a716-446655440000-extra",
+))
+def test_batch_id_validation_rejects_noncanonical_values(value):
+    with pytest.raises(ValueError):
+        normalize_batch_id(value)
+
+
+def test_batch_id_validation_accepts_canonical_forms_and_normalizes_hex():
+    expected = "550e8400e29b41d4a716446655440000"
+    assert normalize_batch_id(expected) == expected
+    assert normalize_batch_id("550E8400-E29B-41D4-A716-446655440000") == expected
+    assert normalize_batch_id(None) is None
 
 
 def test_checkout_sends_failed_cell_exclusions():

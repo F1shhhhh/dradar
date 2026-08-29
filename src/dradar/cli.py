@@ -19,6 +19,7 @@ import argparse
 import sys
 
 from . import __version__
+from .api_client import normalize_batch_id
 from .capacity import cmd_capacity
 from .cells import cmd_cells
 from .doctor import cmd_doctor
@@ -42,6 +43,16 @@ def _workers_value(value: str) -> int | str:
         return int(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("must be an integer or 'auto'") from exc
+
+
+def _batch_id_value(value: str) -> str:
+    try:
+        normalized = normalize_batch_id(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    if normalized is None:
+        raise argparse.ArgumentTypeError("batch id is required")
+    return normalized
 
 
 def _nonnegative_int(value: str) -> int:
@@ -337,6 +348,11 @@ def main(argv: list[str] | None = None) -> int:
             "--workers", type=_workers_value, default=1, metavar="N|auto",
             help="run up to N tasks concurrently, or use 'auto' for a "
                  "conservative Docker-based recommendation (default: 1; maximum: 40)",
+        )
+        p.add_argument(
+            "--batch-id", type=_batch_id_value, metavar="UUID",
+            help="run only this exact active claim batch (normally supplied "
+                 "by the radar page's copied command)",
         )
         p.add_argument(
             "--worker-target-file", metavar="PATH",

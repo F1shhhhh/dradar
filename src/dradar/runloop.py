@@ -27,7 +27,7 @@ from . import (
     __version__, artifact_staging, assignment_boundary, checkpoints, egress,
     failure_circuit, image_cache, pending, refill as refill_plan,
 )
-from .api_client import ApiClient, ApiError
+from .api_client import ApiClient, ApiError, normalize_batch_id
 from .identity import _client
 from .local_config import (
     DEFAULT_BENCHMARK, HOME, _load_config, tasks_root_from_config,
@@ -3532,7 +3532,21 @@ def _disk_allows_refill(cfg: dict) -> bool:
         return True
 
 
+def _scope_client_to_batch(client: ApiClient, batch_id: str | None) -> None:
+    """Apply one validated batch scope without burdening lightweight tests."""
+    if hasattr(client, "set_batch_id"):
+        client.set_batch_id(batch_id)
+    elif batch_id is not None:
+        # Production clients always expose set_batch_id. This compatibility
+        # seam is only for small injected clients used by embedders/tests.
+        setattr(client, "batch_id", batch_id)
+
+
 def cmd_go(args) -> int:
+    try:
+        args.batch_id = normalize_batch_id(getattr(args, "batch_id", None))
+    except ValueError as exc:
+        sys.exit(f"invalid --batch-id: {exc}")
     if getattr(args, "pick", None) and getattr(args, "auto", None):
         sys.exit("--auto and --pick are two different ways to choose cells; pass only one")
     if getattr(args, "auto", None) is not None and args.auto < 1:
@@ -3621,6 +3635,7 @@ def cmd_go(args) -> int:
         or DEFAULT_BENCHMARK
     )
     client = _client(cfg, auto_register=True)
+    _scope_client_to_batch(client, args.batch_id)
     # Pre-default configs may not carry tasks_root at all.  They now get the
     # same hidden checkout as a fresh login, while any explicit legacy path
     # remains authoritative.
@@ -3632,6 +3647,7 @@ def cmd_go(args) -> int:
     if not 1 <= target_workers <= 40:
         target_workers = 1
     telemetry = RunnerTelemetry(client, target_workers=target_workers)
+    telemetry.bind_batch(args.batch_id)
     telemetry.start()
     close_reason = "error"
 
@@ -3752,6 +3768,8 @@ def _worker_command(args) -> list[str]:
         command.extend(("--dev-agent", args.dev_agent))
     if getattr(args, "benchmark", None):
         command.extend(("--benchmark", args.benchmark))
+    if getattr(args, "batch_id", None):
+        command.extend(("--batch-id", args.batch_id))
     if getattr(args, "refill", False):
         command.extend(("--refill", "--max-tasks", str(args.max_tasks)))
         if args.refill_to is not None:
@@ -4055,6 +4073,7 @@ def _run_worker_pool(args) -> int:
             or DEFAULT_BENCHMARK
         )
         client = _client(cfg, auto_register=True)
+        _scope_client_to_batch(client, getattr(args, "batch_id", None))
         requested_options = [
             value for value in (
                 getattr(args, "refill_to", None), getattr(args, "auto", None),
@@ -4109,6 +4128,7 @@ def _run_worker_pool(args) -> int:
             or DEFAULT_BENCHMARK
         )
         client = _client(cfg, auto_register=True)
+        _scope_client_to_batch(client, getattr(args, "batch_id", None))
     tasks_root = _selected_tasks_root(cfg)
     acquire_run_lock(HOME)
     sweep_orphan_compose(HOME, True)

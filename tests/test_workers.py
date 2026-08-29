@@ -32,7 +32,7 @@ def _args(**overrides):
         dev_agent=None, refill=False, refill_to=None, max_tasks=None,
         max_estimated_quota_pct=None, quota_tier="plus", auto=5, pick=None,
         assignment=None, parallel=False, worker_child=False, resume=False,
-        worker_target_file=None, archive_session=False,
+        worker_target_file=None, archive_session=False, batch_id=None,
     )
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -70,6 +70,28 @@ def test_cli_parses_repeatable_expected_assignment_boundary(monkeypatch):
         "--expect-assignment", "a2",
     ]) == 0
     assert seen[0].expect_assignment == ["a1", "a2"]
+
+
+@pytest.mark.parametrize("command", ("go", "resume"))
+def test_cli_parses_and_normalizes_exact_batch_id(monkeypatch, command):
+    seen = []
+    monkeypatch.setattr(cli, "cmd_go", lambda args: seen.append(args) or 0)
+    batch_id = "550E8400-E29B-41D4-A716-446655440000"
+
+    assert cli.main([command, "--batch-id", batch_id, "-y"]) == 0
+    assert seen[0].batch_id == "550e8400e29b41d4a716446655440000"
+
+
+@pytest.mark.parametrize("value", (
+    "not-a-uuid",
+    "550e8400e29b41d4a71644665544000",
+    "{550e8400-e29b-41d4-a716-446655440000}",
+    "550e8400e29b41d4a716446655440000-extra",
+))
+def test_cli_rejects_noncanonical_batch_id(value):
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["resume", "--batch-id", value, "-y"])
+    assert exc.value.code == 2
 
 
 @pytest.mark.parametrize("workers", [0, 41])
@@ -201,6 +223,18 @@ def test_worker_command_forwards_archive_opt_in_only():
         _args(archive_session=True))
 
 
+def test_worker_command_forwards_exact_batch_to_every_child():
+    batch_id = "550e8400e29b41d4a716446655440000"
+    command = runloop._worker_command(_args(batch_id=batch_id))
+
+    assert command.count("--batch-id") == 1
+    assert command[command.index("--batch-id") + 1] == batch_id
+
+
+def test_legacy_worker_command_omits_batch_id():
+    assert "--batch-id" not in runloop._worker_command(_args())
+
+
 class _Telemetry:
     session_id = "session-test"
 
@@ -208,6 +242,9 @@ class _Telemetry:
         self.closed = None
 
     def start(self):
+        pass
+
+    def bind_batch(self, _batch_id):
         pass
 
     def set_phase(self, _phase):
@@ -554,6 +591,65 @@ def test_pool_prepares_once_then_starts_requested_resume_workers(monkeypatch):
     assert len(abort_files) == 1
     assert not runloop.Path(abort_files.pop()).exists()
     assert all("resume" in p.command and "--auto" not in p.command for p in calls)
+
+
+def test_pool_scopes_inventory_and_all_children_to_exact_batch(monkeypatch):
+    _patch_pool_setup(monkeypatch, active_count=2)
+    batch_id = "550e8400e29b41d4a716446655440000"
+    scoped = []
+
+    class Client:
+        def set_batch_id(self, value):
+            scoped.append(value)
+
+        def get_assignment(self):
+            return {"active": []}
+
+    client = Client()
+    monkeypatch.setattr(runloop, "_client", lambda *_a, **_k: client)
+    calls = []
+    monkeypatch.setattr(
+        runloop.subprocess, "Popen",
+        lambda command, env, **kwargs: (
+            calls.append(_Process(command, env, **kwargs)) or calls[-1]
+        ),
+    )
+
+    assert runloop._run_worker_pool(
+        _args(workers=2, batch_id=batch_id),
+    ) == 0
+    assert scoped == [batch_id]
+    assert len(calls) == 2
+    assert all(
+        process.command[process.command.index("--batch-id") + 1] == batch_id
+        for process in calls
+    )
+
+
+def test_pool_ready_count_uses_only_inventory_returned_by_scoped_client(
+        monkeypatch):
+    selected = "550e8400e29b41d4a716446655440000"
+
+    class Client:
+        def get_assignment(self):
+            # The ApiClient contract has already filtered to the selected
+            # batch. A different campaign may have abundant waiting work, but
+            # it must not enter this supervisor's ready/live arithmetic.
+            return {"active": [
+                {"assignment_id": "live", "batch_id": selected,
+                 "started_at": "2026-08-29T00:00:00Z",
+                 "heartbeat_running": True},
+                {"assignment_id": "waiting", "batch_id": selected,
+                 "started_at": None, "heartbeat_running": False},
+            ]}
+
+    monkeypatch.setattr(runloop.checkpoints, "latest_by_assignment", lambda _home: {})
+    assert runloop._pool_ready_work_count(
+        Client(), desired_workers=2,
+    ) == 1
+    assert runloop._pool_ready_work_count(
+        Client(), desired_workers=1,
+    ) == 0
 
 
 def test_pool_live_target_scales_up_without_restarting_existing_workers(

@@ -168,6 +168,21 @@ def test_disk_safety_floor_runs_existing_work_but_does_not_claim_new_menu_cell()
     assert client.claim_calls == []
 
 
+def test_explicit_batch_404_exits_without_claiming_or_running():
+    class MissingBatchClient:
+        def get_assignment(self):
+            raise ApiError(
+                "server returned 404: active claim batch not found",
+                status_code=404, code="claim_batch_not_found",
+            )
+
+        def claim_assignment(self, *_args, **_kwargs):
+            pytest.fail("a missing explicit batch must never claim replacement work")
+
+    with pytest.raises(SystemExit, match="active claim batch not found"):
+        runloop._acquire_batch(MissingBatchClient(), yes=True)
+
+
 # --- --auto / --pick: CLI-side claiming for free-pick instances (volunteer -
 # issue #1, 2026-07-15) so an Agent never has to touch the web UI -----------
 
