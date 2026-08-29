@@ -93,22 +93,61 @@ class SharedOAuthDockerEnvironment(DockerEnvironment):
         self._mounts_json = [*existing, *mounts]
         self._shared_oauth_targets = tuple(mount["target"] for mount in mounts)
 
-    async def _reconcile_antigravity_host_ownership(self) -> None:
-        """Return root-authored AGY state and logs to the invoking host user.
+    def _guard_grok_shared_oauth_command(self, command: str) -> str:
+        """Keep Grok's atomically replaced auth file host-readable mid-run."""
+
+        if self._shared_oauth_targets != ("/tmp/dradar-grok-user/.grok",):
+            return command
+        root = shlex.quote(self._shared_oauth_targets[0])
+        auth = shlex.quote(self._shared_oauth_targets[0] + "/auth.json")
+        guarded = (
+            f"oauth_root={root}; oauth_auth={auth}; "
+            "oauth_owner=$(stat -c '%u:%g' \"$oauth_root\") || exit 1; "
+            "oauth_guard_pid=''; "
+            "oauth_repair() { "
+            "[ -f \"$oauth_auth\" ] && [ ! -L \"$oauth_auth\" ] || return 0; "
+            "oauth_current=$(stat -c '%u:%g' \"$oauth_auth\" 2>/dev/null) "
+            "|| return 0; "
+            "if [ \"$oauth_current\" != \"$oauth_owner\" ]; then "
+            "chown \"$oauth_owner\" \"$oauth_auth\" || return 1; fi; "
+            "chmod 600 \"$oauth_auth\"; "
+            "}; "
+            "oauth_cleanup() { "
+            "oauth_status=$?; "
+            "if [ -n \"$oauth_guard_pid\" ]; then "
+            "kill \"$oauth_guard_pid\" 2>/dev/null || true; "
+            "wait \"$oauth_guard_pid\" 2>/dev/null || true; fi; "
+            "oauth_repair || true; "
+            "exit \"$oauth_status\"; "
+            "}; "
+            "if [ \"$(id -u)\" = 0 ]; then "
+            "(while :; do oauth_repair || true; sleep 0.02; done) & "
+            "oauth_guard_pid=$!; fi; "
+            "trap oauth_cleanup EXIT; "
+            "trap 'exit 130' INT; trap 'exit 143' TERM; "
+            + command
+        )
+        return "bash -o pipefail -c " + shlex.quote(guarded)
+
+    async def _reconcile_shared_oauth_host_ownership(self) -> None:
+        """Return root-authored shared OAuth state to the invoking host user.
 
         Antigravity deliberately runs as root inside the disposable task
         container so its tools and child agents retain the full-permission
-        Honey contract.  Its OAuth directory is a writable host bind mount,
-        however, and ``/logs/agent`` is consumed by host-side Pier code after
-        the turn.  Reconcile those two exact roots after each AGY command;
-        never traverse symlinks or another filesystem.
+        Honey contract. Grok has the same root-authored atomic refresh
+        behaviour for ``auth.json``. Their OAuth directories are writable
+        host bind mounts, while ``/logs/agent`` is consumed by host-side Pier
+        code after the turn. Reconcile only those exact roots after each
+        command; never traverse symlinks or another filesystem.
         """
 
         getuid = getattr(os, "getuid", None)
         getgid = getattr(os, "getgid", None)
         if (
-            self._shared_oauth_targets
-            != ("/tmp/dradar-antigravity-user/.gemini",)
+            self._shared_oauth_targets not in {
+                ("/tmp/dradar-antigravity-user/.gemini",),
+                ("/tmp/dradar-grok-user/.grok",),
+            }
             or not callable(getuid)
             or not callable(getgid)
         ):
@@ -143,7 +182,7 @@ class SharedOAuthDockerEnvironment(DockerEnvironment):
 
         try:
             result = await super().exec(
-                command=command,
+                command=self._guard_grok_shared_oauth_command(command),
                 cwd=cwd,
                 env=env,
                 timeout_sec=timeout_sec,
@@ -151,13 +190,13 @@ class SharedOAuthDockerEnvironment(DockerEnvironment):
             )
         except BaseException:
             try:
-                await self._reconcile_antigravity_host_ownership()
+                await self._reconcile_shared_oauth_host_ownership()
             except BaseException:
                 # Never hide the original provider/container exception.
                 pass
             raise
         try:
-            await self._reconcile_antigravity_host_ownership()
+            await self._reconcile_shared_oauth_host_ownership()
         except BaseException:
             if getattr(result, "return_code", 1) != 0:
                 # Let BaseInstalledAgent report the original provider command
