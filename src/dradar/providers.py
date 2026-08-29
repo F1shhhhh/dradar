@@ -1174,15 +1174,14 @@ def prepare_antigravity_auth(home: Path | None = None) -> str | None:
     cannot strand a valid account before the per-trial context is entered.
     """
 
-    # The official CLI recreates this one convenience symlink during ordinary
-    # commands.  Remove it before the strict tree validation; otherwise the
-    # known-safe cleanup below is unreachable and a valid account is stranded.
-    # No target is followed, and every symlink at every other path still fails
-    # closed in ``antigravity_auth_error``.
+    # The official CLI recreates its convenience log link and may write new
+    # log files with process-default permissions. Normalize those modes and
+    # remove only the reviewed link before strict validation; unsafe links or
+    # special files still fail closed inside ``privatize_antigravity_home``.
     try:
-        _remove_antigravity_cli_log_link(home)
-    except OSError as exc:
-        return f"could not remove Antigravity CLI log link: {exc}"
+        privatize_antigravity_home(home)
+    except (OSError, ValueError) as exc:
+        return f"could not harden Antigravity OAuth state: {exc}"
 
     issue = antigravity_auth_error(home)
     if issue != _ANTIGRAVITY_POLICY_MISMATCH:

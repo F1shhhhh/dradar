@@ -456,6 +456,18 @@ def _antigravity_container_command(
         ),
     ]
     env = provider_subprocess_env()
+    # A loopback proxy that is valid for the host points back at the setup
+    # container itself. Honor DRadar's explicit, user-supplied Docker-side
+    # endpoint when present; otherwise retain the existing host/OS fallback.
+    if proxy := env.get("DRADAR_CONTAINER_HTTP_PROXY", "").strip():
+        for name in (
+            "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+            "http_proxy", "https_proxy", "all_proxy",
+        ):
+            env[name] = proxy
+    if no_proxy := env.get("DRADAR_CONTAINER_NO_PROXY", "").strip():
+        env["NO_PROXY"] = no_proxy
+        env["no_proxy"] = no_proxy
     for name in (
         "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
         "http_proxy", "https_proxy", "all_proxy", "no_proxy",

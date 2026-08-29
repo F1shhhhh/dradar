@@ -353,6 +353,61 @@ def test_antigravity_setup_mounts_a_verified_ca_bundle_readonly(
     ]
 
 
+def test_antigravity_setup_uses_explicit_container_proxy(
+    tmp_path, monkeypatch,
+):
+    executable = tmp_path / "antigravity"
+    executable.write_bytes(b"official-binary")
+    host_proxy = "http://host-loopback.test:18080"
+    container_proxy = "http://docker-proxy.test:19080"
+    monkeypatch.setattr(
+        provider_config,
+        "provider_subprocess_env",
+        lambda: {
+            "DRADAR_HTTP_PROXY": host_proxy,
+            "DRADAR_CONTAINER_HTTP_PROXY": container_proxy,
+            "DRADAR_CONTAINER_NO_PROXY": "localhost,127.0.0.1",
+            "HTTP_PROXY": host_proxy,
+            "HTTPS_PROXY": host_proxy,
+        },
+    )
+
+    command, env = provider_config._antigravity_container_command(
+        "/usr/bin/docker", executable, ["models"], interactive=False,
+    )
+
+    for name in (
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+        "http_proxy", "https_proxy", "all_proxy",
+    ):
+        assert env[name] == container_proxy
+        index = command.index(name)
+        assert command[index - 1:index + 1] == ["--env", name]
+    assert env["NO_PROXY"] == "localhost,127.0.0.1"
+    assert env["no_proxy"] == "localhost,127.0.0.1"
+
+
+def test_antigravity_setup_keeps_host_proxy_without_container_override(
+    tmp_path, monkeypatch,
+):
+    executable = tmp_path / "antigravity"
+    executable.write_bytes(b"official-binary")
+    host_proxy = "http://host-proxy.test:18080"
+    monkeypatch.setattr(
+        provider_config,
+        "provider_subprocess_env",
+        lambda: {"HTTP_PROXY": host_proxy, "HTTPS_PROXY": host_proxy},
+    )
+
+    _command, env = provider_config._antigravity_container_command(
+        "/usr/bin/docker", executable, ["models"], interactive=False,
+    )
+
+    assert env["HTTP_PROXY"] == host_proxy
+    assert env["HTTPS_PROXY"] == host_proxy
+    assert "ALL_PROXY" not in env
+
+
 @pytest.mark.parametrize("kind", ["missing", "directory", "empty", "invalid"])
 def test_antigravity_setup_rejects_an_unusable_ca_bundle(
     kind, tmp_path, monkeypatch,
