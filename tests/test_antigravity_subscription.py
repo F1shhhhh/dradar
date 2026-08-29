@@ -250,6 +250,66 @@ def test_oauth_home_rejects_links_and_broad_secret_files(
     link = auth / "config" / "linked-token"
     link.symlink_to(secret)
     assert "must not be a symlink" in (antigravity_auth_error() or "")
+    assert "must not be a symlink" in (prepare_antigravity_auth() or "")
+    assert link.is_symlink()
+
+
+@pytest.mark.parametrize("target_exists", [True, False])
+def test_preflight_removes_only_official_cli_log_link_before_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target_exists: bool,
+) -> None:
+    auth = _ready_home(tmp_path, monkeypatch)
+    log_dir = auth / "antigravity-cli" / "log"
+    log_dir.mkdir(parents=True)
+    if os.name != "nt":
+        log_dir.chmod(0o700)
+    log_file = log_dir / "cli-20260829_022534.log"
+    if target_exists:
+        log_file.write_text("official log", encoding="utf-8")
+        if os.name != "nt":
+            log_file.chmod(0o600)
+    cli_log = log_dir.parent / "cli.log"
+    cli_log.symlink_to(Path("log") / log_file.name)
+
+    assert "must not be a symlink" in (antigravity_auth_error() or "")
+    assert prepare_antigravity_auth() is None
+    assert not cli_log.exists()
+    assert not cli_log.is_symlink()
+    assert log_file.exists() is target_exists
+
+
+def test_preflight_preserves_regular_cli_log_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = _ready_home(tmp_path, monkeypatch)
+    cli_log = auth / "antigravity-cli" / "cli.log"
+    cli_log.parent.mkdir(parents=True, exist_ok=True)
+    cli_log.write_text("ordinary file", encoding="utf-8")
+    if os.name != "nt":
+        cli_log.chmod(0o600)
+
+    assert prepare_antigravity_auth() is None
+    assert cli_log.read_text(encoding="utf-8") == "ordinary file"
+
+
+def test_preflight_unlinks_known_log_path_without_following_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = _ready_home(tmp_path, monkeypatch)
+    outside = tmp_path / "outside.log"
+    outside.write_text("must remain untouched", encoding="utf-8")
+    cli_log = auth / "antigravity-cli" / "cli.log"
+    cli_log.parent.mkdir(parents=True, exist_ok=True)
+    cli_log.symlink_to(outside)
+
+    assert prepare_antigravity_auth() is None
+    assert not cli_log.exists()
+    assert not cli_log.is_symlink()
+    assert outside.read_text(encoding="utf-8") == "must remain untouched"
 
 
 def test_home_hardening_preserves_only_managed_runtime_executable(
