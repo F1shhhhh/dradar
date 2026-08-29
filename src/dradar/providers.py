@@ -1160,6 +1160,26 @@ def restore_antigravity_settings(home: Path | None = None) -> Path:
     return path
 
 
+def prepare_antigravity_auth(home: Path | None = None) -> str | None:
+    """Migrate versioned DRadar policy, then return the remaining auth issue.
+
+    OAuth credentials and readiness evidence are never repaired here.  Only a
+    private, structurally valid DRadar-owned tree whose settings differ from
+    the current reviewed policy is rewritten.  This must run before doctor,
+    capability advertisement, and provider status so an ordinary CLI upgrade
+    cannot strand a valid account before the per-trial context is entered.
+    """
+
+    issue = antigravity_auth_error(home)
+    if issue != _ANTIGRAVITY_POLICY_MISMATCH:
+        return issue
+    try:
+        restore_antigravity_settings(home)
+    except (OSError, ValueError) as exc:
+        return f"could not migrate Antigravity full-container policy: {exc}"
+    return antigravity_auth_error(home)
+
+
 def parse_antigravity_cli_version(output: str) -> str | None:
     match = _ANTIGRAVITY_VERSION_RE.search(output.strip())
     return match.group(1) if match else None
@@ -1171,13 +1191,7 @@ def antigravity_subscription_session(
 ):
     """Expose only DRadar's validated .gemini tree to one Pier trial."""
 
-    issue = antigravity_auth_error(home)
-    if issue == _ANTIGRAVITY_POLICY_MISMATCH:
-        # Permission policy is versioned DRadar configuration, not account
-        # state. Rewrite only a structurally valid legacy slot so a CLI upgrade
-        # can migrate it without creating a partial tree or repeating login.
-        restore_antigravity_settings(home)
-        issue = antigravity_auth_error(home)
+    issue = prepare_antigravity_auth(home)
     if issue is not None:
         raise ValueError(issue + "; run `dradar provider setup antigravity` first")
     directory.mkdir(parents=True, exist_ok=True)
@@ -1636,7 +1650,7 @@ def advertised_capabilities(
     if kimi_cli_path(environ) and kimi_auth_error() is None:
         capabilities.extend((KIMI_CAPABILITY, KIMI_LEGACY_CAPABILITY))
     if (
-        antigravity_auth_error() is None
+        prepare_antigravity_auth() is None
         and Path(__file__).with_name("pier_antigravity.py").is_file()
     ):
         capabilities.append(ANTIGRAVITY_CAPABILITY)

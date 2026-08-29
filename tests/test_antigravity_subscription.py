@@ -25,8 +25,10 @@ from dradar.providers import (
     antigravity_auth_path,
     antigravity_settings_payload,
     antigravity_subscription_session,
+    advertised_capabilities,
     mark_antigravity_ready,
     privatize_antigravity_home,
+    prepare_antigravity_auth,
     write_antigravity_settings,
 )
 from dradar.runner import RunnerError
@@ -311,6 +313,34 @@ def test_subscription_session_migrates_legacy_policy_without_reauthentication(
         assert json.loads(settings.read_text(encoding="utf-8")) == (
             antigravity_settings_payload()
         )
+
+
+def test_preflight_migrates_legacy_policy_before_capability_advertisement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = _ready_home(tmp_path, monkeypatch)
+    settings = auth / "antigravity-cli" / "settings.json"
+    legacy = json.loads(settings.read_text(encoding="utf-8"))
+    legacy["enableTerminalSandbox"] = True
+    legacy["allowNonWorkspaceAccess"] = False
+    legacy["permissions"] = {"allow": ["command(*)"], "deny": ["unsandboxed(*)"]}
+    settings.write_text(json.dumps(legacy), encoding="utf-8")
+    if os.name != "nt":
+        settings.chmod(0o600)
+
+    assert prepare_antigravity_auth() is None
+    assert ANTIGRAVITY_CAPABILITY in advertised_capabilities({})
+    assert json.loads(settings.read_text(encoding="utf-8")) == (
+        antigravity_settings_payload()
+    )
+
+
+def test_preflight_does_not_repair_invalid_or_missing_oauth_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DRADAR_HOME", str(tmp_path / "missing"))
+    assert "OAuth is not configured" in (prepare_antigravity_auth() or "")
+    assert not antigravity_auth_path().exists()
 
 
 def test_subscription_session_does_not_create_a_missing_oauth_tree(

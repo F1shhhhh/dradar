@@ -407,6 +407,21 @@ def test_antigravity_live_check_restores_the_fail_closed_settings(
     )
 
 
+def test_antigravity_status_prepares_versioned_policy_before_reporting(
+    monkeypatch, capsys,
+):
+    calls = []
+    monkeypatch.setattr(
+        provider_config,
+        "prepare_antigravity_auth",
+        lambda: calls.append("prepare") or None,
+    )
+
+    assert provider_config._status_antigravity_subscription(live=False) == 0
+    assert calls == ["prepare"]
+    assert "provider ready" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize("provider", ["grok", "kimi"])
 def test_interrupted_reauthentication_preserves_previous_credential(
     provider, tmp_path, monkeypatch,
