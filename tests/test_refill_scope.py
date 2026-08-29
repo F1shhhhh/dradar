@@ -96,12 +96,12 @@ class ScopedClient:
 
 
 def _configure(home: Path, *, harness=KIMI_AGENT, model="k3", effort="low",
-               refill_to=3, max_tasks=20, active=None):
+               refill_to=3, max_tasks=20, active=None, order="cost"):
     return refill.configure(
         home, volunteer_id="v1", refill_to=refill_to, max_tasks=max_tasks,
         quota_tier="plus", max_estimated_quota_pct=None,
         active=list(active or []), refill_harness=harness,
-        refill_model=model, refill_effort=effort,
+        refill_model=model, refill_effort=effort, refill_order=order,
     )
 
 
@@ -141,6 +141,27 @@ def test_scoped_refill_claims_cheapest_candidates_first(tmp_path: Path):
     assert result["claimed"] == 4
     assert [task_id for task_id, _model, _effort in client.claimed] == [
         "cheap", "middle", "expensive", "unpriced",
+    ]
+
+
+def test_scoped_refill_can_claim_least_run_candidates_first(tmp_path: Path):
+    board = _table(
+        ("twice", KIMI_AGENT, "k3", "low", "open"),
+        ("never-b", KIMI_AGENT, "k3", "low", "open"),
+        ("unknown", KIMI_AGENT, "k3", "low", "open"),
+        ("never-a", KIMI_AGENT, "k3", "low", "open"),
+    )
+    board["cells"]["twice|k3|low"]["n"] = 2
+    board["cells"]["never-b|k3|low"]["n"] = 0
+    board["cells"]["never-a|k3|low"]["n"] = 0
+    client = ScopedClient(board)
+    _configure(tmp_path, refill_to=4, order="least-run")
+
+    result = refill.refill_once(tmp_path, client)
+
+    assert result["claimed"] == 4
+    assert [task_id for task_id, _model, _effort in client.claimed] == [
+        "never-a", "never-b", "twice", "unknown",
     ]
 
 
@@ -559,11 +580,12 @@ def test_cli_parses_stable_scoped_refill_flags(monkeypatch):
         "resume", "-y", "--workers", "3", "--refill", "--refill-to", "3",
         "--max-tasks", "30", "--refill-harness", "kimi-code",
         "--refill-model", "k3", "--refill-effort", "low",
+        "--refill-order", "least-run",
     ]) == 0
     args = seen[0]
     assert (args.workers, args.max_tasks, args.refill_harness,
-            args.refill_model, args.refill_effort) == (
-                3, 30, "kimi-code", "k3", "low")
+            args.refill_model, args.refill_effort, args.refill_order) == (
+                3, 30, "kimi-code", "k3", "low", "least-run")
 
 
 def test_resume_help_documents_stable_scope_flags(capsys):
@@ -572,7 +594,7 @@ def test_resume_help_documents_stable_scope_flags(capsys):
     assert exc.value.code == 0
     output = capsys.readouterr().out
     for flag in ("--refill-harness", "--refill-model", "--refill-effort",
-                 "--max-tasks"):
+                 "--refill-order", "--max-tasks"):
         assert flag in output
 
 
@@ -582,11 +604,12 @@ def test_worker_command_forwards_complete_scoped_plan():
         dev_agent=None, benchmark=None, refill=True, max_tasks=30,
         refill_to=3, max_estimated_quota_pct=None, quota_tier="plus",
         refill_harness=KIMI_AGENT, refill_model="k3", refill_effort="low",
+        refill_order="least-run",
     )
     command = runloop._worker_command(args)
-    assert command[-6:] == [
+    assert command[-8:] == [
         "--refill-harness", KIMI_AGENT, "--refill-model", "k3",
-        "--refill-effort", "low",
+        "--refill-effort", "low", "--refill-order", "least-run",
     ]
 
 
@@ -598,6 +621,7 @@ def _run_args(**overrides):
         assignment=None, parallel=False, worker_child=False, resume=True,
         worker_target_file=None, archive_session=False,
         refill_harness="kimi-code", refill_model="k3", refill_effort="low",
+        refill_order=None,
     )
     values.update(overrides)
     return argparse.Namespace(**values)
