@@ -36,7 +36,6 @@ from .providers import (
     ZCODE_CLI_VERSION,
     ZCODE_MODELS,
     ZCODE_OFFICIAL_DOWNLOAD_PAGE,
-    antigravity_auth_error,
     antigravity_auth_path,
     antigravity_home,
     antigravity_ready_path,
@@ -62,6 +61,7 @@ from .providers import (
     mark_antigravity_ready,
     privatize_antigravity_home,
     restore_antigravity_settings,
+    prepare_antigravity_auth,
     provider_subprocess_env,
     store_grok_auth,
     store_deepseek_api_key,
@@ -538,7 +538,7 @@ def _setup_antigravity_subscription() -> int:
     executable = _ensure_antigravity_linux_cli(docker)
     if executable is None:
         return 1
-    if antigravity_auth_error() is None:
+    if prepare_antigravity_auth() is None:
         issue = _antigravity_models_live(docker, executable)
         if issue is None:
             print(
@@ -601,7 +601,7 @@ def _setup_antigravity_subscription() -> int:
     except (OSError, ValueError) as exc:
         print(f"could not seal Antigravity readiness state: {exc}")
         return 1
-    issue = antigravity_auth_error()
+    issue = prepare_antigravity_auth()
     if issue is not None:
         print(f"Antigravity provider is not ready: {issue}")
         return 1
@@ -614,7 +614,7 @@ def _setup_antigravity_subscription() -> int:
 
 
 def _status_antigravity_subscription(*, live: bool) -> int:
-    issue = antigravity_auth_error()
+    issue = prepare_antigravity_auth()
     if issue is not None:
         print(f"Antigravity subscription provider not ready: {issue}")
         return 1

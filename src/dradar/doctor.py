@@ -23,7 +23,7 @@ from .providers import (
     KIMI_CLI_VERSION,
     ZCODE_AGENT,
     ZCODE_CLI_VERSION,
-    antigravity_auth_error,
+    prepare_antigravity_auth,
     antigravity_auth_path,
     deepseek_api_key,
     deepseek_catalog_error,
@@ -458,7 +458,7 @@ def cmd_doctor(args) -> int:
         selected_agent is None and antigravity_auth_path().exists()
     )
     antigravity_issue = (
-        antigravity_auth_error() if antigravity_requested else None
+        prepare_antigravity_auth() if antigravity_requested else None
     )
     antigravity_ready = antigravity_requested and antigravity_issue is None
     deepseek_requested = deepseek_opted_in()
