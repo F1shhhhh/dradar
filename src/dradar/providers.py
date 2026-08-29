@@ -21,6 +21,15 @@ from contextlib import contextmanager
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 
+from .codebuddy_provider import (
+    CODEBUDDY_CAPABILITY,
+    CODEBUDDY_CLI_VERSION,
+    codebuddy_executable,
+    codebuddy_runtime_image_error,
+    codebuddy_version,
+    credential_status as codebuddy_credential_status,
+)
+
 DEFAULT_CODEX_PROVIDER = "openai"
 DEEPSEEK_PROVIDER = "deepseek"
 DEEPSEEK_FLASH_MODEL = "deepseek-v4-flash"
@@ -1796,6 +1805,16 @@ def advertised_capabilities(
         and Path(__file__).with_name("pier_zcode.py").is_file()
     ):
         capabilities.append(ZCODE_CAPABILITY)
+    codebuddy_cli = codebuddy_executable(environ)
+    codebuddy_credentials_ready, _ = codebuddy_credential_status()
+    if (
+        codebuddy_cli
+        and codebuddy_version(codebuddy_cli) == CODEBUDDY_CLI_VERSION
+        and codebuddy_credentials_ready
+        and codebuddy_runtime_image_error() is None
+        and Path(__file__).with_name("pier_codebuddy.py").is_file()
+    ):
+        capabilities.append(CODEBUDDY_CAPABILITY)
     return tuple(capabilities)
 
 

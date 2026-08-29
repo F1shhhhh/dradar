@@ -28,6 +28,12 @@ from . import (
     failure_circuit, image_cache, pending, refill as refill_plan,
 )
 from .api_client import ApiClient, ApiError, normalize_batch_id
+from .codebuddy_provider import (
+    CODEBUDDY_AGENT,
+    CODEBUDDY_NATIVE_EFFORTS,
+    CODEBUDDY_RUN_CONFIG_VERSION,
+    CODEBUDDY_RUNTIME_PROFILE,
+)
 from .identity import _client
 from .local_config import (
     DEFAULT_BENCHMARK, HOME, _load_config, tasks_root_from_config,
@@ -1107,6 +1113,7 @@ def _subscription_trial_usage(trial_dir: Path, meta: dict) -> dict | None:
         else "zcode" if meta.get("zcode_cli_version")
         else "kimi-code" if meta.get("kimi_cli_version")
         else "grok" if meta.get("grok_cli_version")
+        else "codebuddy" if meta.get("codebuddy_cli_version")
         else None
     )
     if (
@@ -1130,6 +1137,10 @@ def _subscription_trial_usage(trial_dir: Path, meta: dict) -> dict | None:
         },
         "kimi-code": {
             "turn_completion_ledger_mismatch",
+            "request_ledger_unavailable_or_invalid",
+        },
+        "codebuddy": {
+            "terminal_aggregate_missing_or_inconsistent",
             "request_ledger_unavailable_or_invalid",
         },
     }
@@ -1416,7 +1427,9 @@ def _bundled_completed_outcome(
     assignment: dict, trial_dir: Path, patch: Path, result: Path | None,
 ) -> dict | None:
     """Return independent completion evidence for a Codex-family rc failure."""
-    if assignment.get("agent") in {DSH_AGENT, GROK_AGENT, KIMI_AGENT}:
+    if assignment.get("agent") in {
+        DSH_AGENT, GROK_AGENT, KIMI_AGENT, CODEBUDDY_AGENT,
+    }:
         return None
     try:
         result_value = json.loads(result.read_text(encoding="utf-8")) if result else None
@@ -1619,9 +1632,11 @@ def _upload_trial(
 
     upload_meta = dict(entry.get("meta") or {})
     trial_dir = Path(entry["trial_dir"])
-    trajectory_bundle = build_codex_trajectory_bundle(trial_dir)
-    if trajectory_bundle is None:
-        trajectory_bundle = build_kimi_trajectory_bundle(trial_dir)
+    trajectory_bundle = None
+    if not upload_meta.get("codebuddy_cli_version"):
+        trajectory_bundle = build_codex_trajectory_bundle(trial_dir)
+        if trajectory_bundle is None:
+            trajectory_bundle = build_kimi_trajectory_bundle(trial_dir)
     usage = (
         codex_trajectory_bundle_usage(trajectory_bundle)
         if (
@@ -2577,6 +2592,7 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         "zcode_cli_version": art.zcode_cli_version,
         "zcode_cli_sha256": art.zcode_cli_sha256,
         "dsh_version": art.dsh_version,
+        "codebuddy_cli_version": art.codebuddy_cli_version,
         **stats,
     }
     if failure_kind:
@@ -2684,6 +2700,18 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                 "pier_postrun_warning": True,
                 "pier_failure_phase": "post_agent",
             })
+    if assignment.get("agent") == CODEBUDDY_AGENT:
+        meta.update({
+            "model_config_version": CODEBUDDY_RUN_CONFIG_VERSION,
+            "model_runtime_profile": CODEBUDDY_RUNTIME_PROFILE,
+            "subscription_oauth": True,
+            "subscription_concurrency": 1,
+            "subscription_oauth_coordination": "host-serialized-run-copy-v1",
+            "codebuddy_native_efforts": list(CODEBUDDY_NATIVE_EFFORTS),
+            "codebuddy_credential_mode": "isolated-run-copy-v1",
+            "codebuddy_mcp_mode": "strict-empty-v1",
+            "codebuddy_tools": ["Bash", "Edit", "Read", "Write", "Glob", "Grep"],
+        })
     elif bundled_completion is not None:
         meta.update({
             "bundled_completion_evidence": bundled_completion,
@@ -4261,6 +4289,12 @@ def _run_worker_pool(args) -> int:
     active, _free_pick = _prepare_batch(args, client)
     if not active:
         return 0
+    if any(item.get("agent") == CODEBUDDY_AGENT for item in active):
+        print(
+            "CodeBuddy HY4 canary assignments require the serial runner; "
+            "re-run `dradar resume -y` without --workers"
+        )
+        return 1
     boundary_path = _assignment_boundary_path(args)
     if cfg.get("benchmark"):
         boundary_path = _prepare_assignment_boundary(
@@ -5121,6 +5155,13 @@ def _prompt_positive_int(prompt: str, default: int) -> int:
 def _setup_refill(args, client: ApiClient, active: list[dict], free_pick: bool) -> list[dict]:
     """Configure a plan that drains its initial selected batch before refill."""
     explicit = getattr(args, "refill", False)
+    if any(item.get("agent") == CODEBUDDY_AGENT for item in active):
+        if explicit:
+            raise refill_plan.RefillError(
+                "CodeBuddy HY4 canary assignments cannot use continuous refill; "
+                "run only the explicitly claimed batch"
+            )
+        return active
     if any(item.get("billing_mode") == "api" for item in active):
         if explicit:
             raise refill_plan.RefillError(

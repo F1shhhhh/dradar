@@ -12,10 +12,13 @@ import re
 import sys
 from pathlib import Path
 
-
 _IMAGE_ENV = "DRADAR_EGRESS_PROXY_IMAGE"
-_PATCH_MARKER = "_dradar_prebuilt_egress_v1"
+_CODEBUDDY_SOURCE_IMAGE_ENV = "DRADAR_CODEBUDDY_SOURCE_IMAGE"
+_PATCH_MARKER = "_dradar_prebuilt_egress_codebuddy_v2"
 _LOCAL_IMAGE_ID_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_CODEBUDDY_SOURCE_IMAGE_RE = re.compile(
+    r"dradar-codebuddy:(?P<version>[0-9]+\.[0-9]+\.[0-9]+)\Z"
+)
 _OFFICIAL_DIGEST_PREFIX = (
     "ghcr.io/codex-radar/dradar-egress-proxy@sha256:"
 )
@@ -127,11 +130,74 @@ def _finalize_docker_proxy_compose(
         pass
 
 
+def _rewrite_codebuddy_agent_dockerfile(environment) -> None:
+    """Copy the reviewed CLI and glibc bundle from a validated local image."""
+
+    install = environment.agent_install_spec
+    if install is None or install.agent_name != "codebuddy":
+        return
+    source_image = os.environ.get(_CODEBUDDY_SOURCE_IMAGE_ENV, "")
+    match = _CODEBUDDY_SOURCE_IMAGE_RE.fullmatch(source_image)
+    if match is None or match.group("version") != install.version:
+        raise RuntimeError("CodeBuddy source image is missing or version-mismatched")
+    if len(install.steps) != 1 or install.steps[0].user != "root":
+        raise RuntimeError("CodeBuddy install spec shape changed unexpectedly")
+    build_dir = environment._agent_build_context_dir
+    if build_dir is None:
+        raise RuntimeError("CodeBuddy agent build context was not prepared")
+    dockerfile_path = Path(build_dir) / "Dockerfile"
+    dockerfile = dockerfile_path.read_text(encoding="utf-8")
+    install_run = "RUN " + json.dumps(
+        ["/bin/bash", "-c", install.steps[0].run]
+    )
+    suffix = f"USER root\n{install_run}\n"
+    if not dockerfile.endswith(suffix):
+        raise RuntimeError("CodeBuddy generated Dockerfile shape changed unexpectedly")
+    verify_run = "RUN " + json.dumps(
+        ["/bin/bash", "-c", install.verification_command]
+    )
+    bundle_command = (
+        "set -euo pipefail; runtime=/opt/dradar-codebuddy-runtime; "
+        "mkdir -p \"$runtime/lib\"; "
+        "cp -L /opt/codebuddy/bin/codebuddy \"$runtime/codebuddy\"; "
+        "loader=$(ldd /opt/codebuddy/bin/codebuddy | "
+        "awk '/ld-linux/{print $1; exit}'); "
+        "test -n \"$loader\"; cp -L \"$loader\" \"$runtime/loader\"; "
+        "ldd /opt/codebuddy/bin/codebuddy | "
+        "awk '$2 == \"=>\" && $3 ~ /^\\// {print $3}' | "
+        "while IFS= read -r library; do cp -L \"$library\" \"$runtime/lib/\"; done"
+    )
+    bundle_run = "RUN " + json.dumps(["/bin/bash", "-c", bundle_command])
+    wrapper_command = (
+        "set -euo pipefail; mkdir -p /opt/codebuddy/bin; "
+        "printf '%s\\n' '#!/bin/sh' "
+        "'exec /opt/codebuddy/runtime/loader --library-path "
+        "/opt/codebuddy/runtime/lib /opt/codebuddy/runtime/codebuddy \"$@\"' "
+        "> /opt/codebuddy/bin/codebuddy; chmod 0755 /opt/codebuddy/bin/codebuddy"
+    )
+    wrapper_run = "RUN " + json.dumps(["/bin/bash", "-c", wrapper_command])
+    replacement = (
+        "USER root\n"
+        "COPY --from=dradar_codebuddy_source /opt/dradar-codebuddy-runtime/ "
+        "/opt/codebuddy/runtime/\n"
+        f"{wrapper_run}\n"
+        f"{verify_run}\n"
+    )
+    dockerfile_path.write_text(
+        f"FROM {source_image} AS dradar_codebuddy_source\n"
+        f"{bundle_run}\n"
+        + dockerfile[: -len(suffix)]
+        + replacement,
+        encoding="utf-8",
+    )
+
+
 def _patch_pier() -> None:
     image = os.environ.get(_IMAGE_ENV)
-    if not image:
+    codebuddy_source = os.environ.get(_CODEBUDDY_SOURCE_IMAGE_ENV)
+    if not image and not codebuddy_source:
         return
-    if not _image_is_immutable(image):
+    if image and not _image_is_immutable(image):
         raise RuntimeError("DRadar egress image is not pinned by digest")
 
     from pier.environments import agent_setup
@@ -139,12 +205,23 @@ def _patch_pier() -> None:
 
     if getattr(docker_environment, _PATCH_MARKER, False):
         return
-    agent_setup.write_docker_proxy_compose = _write_docker_proxy_compose
-    docker_environment.write_docker_proxy_compose = _write_docker_proxy_compose
+    original_prepare = None
+    if image:
+        agent_setup.write_docker_proxy_compose = _write_docker_proxy_compose
+        docker_environment.write_docker_proxy_compose = _write_docker_proxy_compose
+        original_prepare = (
+            docker_environment.DockerEnvironment._prepare_egress_proxy_compose
+        )
+    original_agent_prepare = (
+        docker_environment.DockerEnvironment._prepare_agent_build_context
+    )
 
-    original_prepare = docker_environment.DockerEnvironment._prepare_egress_proxy_compose
+    def prepare_agent_with_local_codebuddy(self) -> None:
+        original_agent_prepare(self)
+        _rewrite_codebuddy_agent_dockerfile(self)
 
     def prepare_with_build_proxy(self) -> None:
+        assert original_prepare is not None
         original_prepare(self)
         if self._egress_proxy_compose_path is None:
             return
@@ -162,9 +239,14 @@ def _patch_pier() -> None:
         # `docker compose exec -e HTTP_PROXY=...` process arguments.
         self._egress_proxy_env = {}
 
-    docker_environment.DockerEnvironment._prepare_egress_proxy_compose = (
-        prepare_with_build_proxy
-    )
+    if image:
+        docker_environment.DockerEnvironment._prepare_egress_proxy_compose = (
+            prepare_with_build_proxy
+        )
+    if codebuddy_source:
+        docker_environment.DockerEnvironment._prepare_agent_build_context = (
+            prepare_agent_with_local_codebuddy
+        )
     setattr(docker_environment, _PATCH_MARKER, True)
 
 

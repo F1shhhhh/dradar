@@ -107,6 +107,7 @@ def main(argv: list[str] | None = None) -> int:
     p_doc.add_argument(
         "--agent", choices=(
             "dsh-minimal", "grok-build", "kimi-code", "zcode", "antigravity",
+            "codebuddy",
         ), default=None,
         help="check only the dependencies required by this agent",
     )
@@ -261,6 +262,7 @@ def main(argv: list[str] | None = None) -> int:
     p_provider_setup.add_argument(
         "provider", choices=(
             "deepseek", "grok", "kimi", "zcode", "antigravity", "agy",
+            "codebuddy", "hy4",
         )
     )
     p_provider_setup.set_defaults(func=cmd_provider_setup)
@@ -269,6 +271,7 @@ def main(argv: list[str] | None = None) -> int:
     p_provider_status.add_argument(
         "provider", choices=(
             "deepseek", "grok", "kimi", "zcode", "antigravity", "agy",
+            "codebuddy", "hy4",
         )
     )
     p_provider_status.add_argument(

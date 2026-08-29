@@ -11,6 +11,16 @@ from pathlib import Path
 
 from . import __version__, egress, runner
 from .capacity import docker_resources, worker_resource_warnings
+from .codebuddy_provider import (
+    CODEBUDDY_AGENT,
+    CODEBUDDY_CLI_VERSION,
+    CODEBUDDY_MODEL,
+    codebuddy_executable,
+    codebuddy_runtime_image_error,
+    codebuddy_version,
+    credential_status as codebuddy_credential_status,
+    managed_codebuddy_home,
+)
 from .identity import _client
 from .local_config import _load_config, tasks_root_from_config
 from .providers import (
@@ -281,12 +291,14 @@ def cmd_doctor(args) -> int:
     kimi_only = selected_agent == KIMI_AGENT
     zcode_only = selected_agent == ZCODE_AGENT
     antigravity_only = selected_agent == ANTIGRAVITY_AGENT
+    codebuddy_only = selected_agent == CODEBUDDY_AGENT
     scopes = {
         "dsh-minimal": " — DSH Minimal",
         GROK_AGENT: " — Grok Build",
         KIMI_AGENT: " — Kimi Code",
         ZCODE_AGENT: " — ZCode",
         ANTIGRAVITY_AGENT: " — Google Antigravity",
+        CODEBUDDY_AGENT: " — CodeBuddy HY4",
     }
     scope = scopes.get(selected_agent, "")
     print(f"dradar {__version__} doctor ({plat}{scope})")
@@ -461,6 +473,29 @@ def cmd_doctor(args) -> int:
         prepare_antigravity_auth() if antigravity_requested else None
     )
     antigravity_ready = antigravity_requested and antigravity_issue is None
+    codebuddy_requested = codebuddy_only or (
+        selected_agent is None and managed_codebuddy_home().exists()
+    )
+    codebuddy_cli = codebuddy_executable() if codebuddy_requested else None
+    codebuddy_cli_ready = bool(
+        codebuddy_cli
+        and codebuddy_version(codebuddy_cli) == CODEBUDDY_CLI_VERSION
+    )
+    codebuddy_credentials_ready, codebuddy_credential_detail = (
+        codebuddy_credential_status()
+        if codebuddy_requested else (False, "not configured")
+    )
+    codebuddy_image_issue = (
+        codebuddy_runtime_image_error(docker)
+        if codebuddy_requested and docker and daemon_ready else
+        "Docker daemon is unavailable" if codebuddy_requested else None
+    )
+    codebuddy_ready = bool(
+        codebuddy_requested
+        and codebuddy_cli_ready
+        and codebuddy_credentials_ready
+        and codebuddy_image_issue is None
+    )
     deepseek_requested = deepseek_opted_in()
     deepseek_key_ready = bool(deepseek_api_key())
     if dsh_only:
@@ -472,7 +507,10 @@ def cmd_doctor(args) -> int:
         )
         if deepseek_key_ready:
             _check("DeepSeek V4 Flash / Pro / Vision — DSH Minimal agent ready", True)
-    elif grok_requested or kimi_requested or zcode_requested or antigravity_requested:
+    elif (
+        grok_requested or kimi_requested or zcode_requested
+        or antigravity_requested or codebuddy_requested
+    ):
         if grok_requested:
             all_ok &= _check(
                 f"Grok CLI {GROK_CLI_VERSION} — subscription runner",
@@ -536,6 +574,29 @@ def cmd_doctor(args) -> int:
                     f"{ANTIGRAVITY_CLI_VERSION} provider ready",
                     True,
                 )
+        if codebuddy_requested:
+            all_ok &= _check(
+                f"CodeBuddy CLI {CODEBUDDY_CLI_VERSION} — subscription setup source",
+                codebuddy_cli_ready,
+                "install the reviewed official CLI and run "
+                "`dradar provider setup codebuddy`",
+            )
+            all_ok &= _check(
+                "CodeBuddy subscription login — isolated DRadar copy",
+                codebuddy_credentials_ready,
+                codebuddy_credential_detail,
+            )
+            all_ok &= _check(
+                f"CodeBuddy Linux runtime {CODEBUDDY_CLI_VERSION} — pinned image",
+                codebuddy_image_issue is None,
+                codebuddy_image_issue or "run `dradar provider setup codebuddy`",
+            )
+            if codebuddy_ready:
+                _check(
+                    f"{CODEBUDDY_MODEL}@max — CodeBuddy provider ready "
+                    "(live access not consumed by doctor)",
+                    True,
+                )
     elif deepseek_requested:
         catalog_issue = deepseek_catalog_error()
         catalog_ready = catalog_issue is None
@@ -573,6 +634,7 @@ def cmd_doctor(args) -> int:
         and not kimi_requested
         and not zcode_requested
         and not antigravity_requested
+        and not codebuddy_requested
     ):
         all_ok &= (codex_ready or claude_ready)
 
