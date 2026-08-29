@@ -3961,6 +3961,8 @@ def classify_exception_message(message: str) -> str | None:
         "usage_limit", "usage limit", "quota exhausted", "quota_exhausted",
         "quota exceeded", "weekly limit", "weekly quota",
         "usage limit reached", "quota limit reached",
+        "individual quota reached. please upgrade your subscription to "
+        "increase your limits. resets in",
         "you've hit your usage limit", "you have hit your usage limit",
     )):
         return "quota-limit"

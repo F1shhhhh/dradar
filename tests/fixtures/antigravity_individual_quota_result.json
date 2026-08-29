@@ -1,0 +1,7 @@
+{
+  "exception_info": {
+    "exception_type": "NonZeroAgentExitCodeError",
+    "exception_message": "Command failed (exit 1): antigravity\nIndividual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h4m50s."
+  },
+  "agent_result": {}
+}
