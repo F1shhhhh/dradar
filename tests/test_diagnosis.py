@@ -54,6 +54,10 @@ def _result(tmp_path, message, exc_type="NonZeroAgentExitCodeError"):
     return p
 
 
+def _fixture(name):
+    return Path(__file__).with_name("fixtures") / name
+
+
 def test_diagnose_classifies_stale_agent(tmp_path):
     d = diagnose_exception(_result(tmp_path, STALE_MSG))
     assert d["kind"] == "stale-agent"
@@ -97,6 +101,65 @@ def test_diagnose_classifies_wrapped_codex_usage_limit_as_quota_limit(tmp_path):
         "You've hit your usage limit. Try again after the reset.",
     ))
     assert d["kind"] == "quota-limit"
+
+
+def test_diagnose_classifies_antigravity_individual_quota_as_quota_limit():
+    d = diagnose_exception(_fixture("antigravity_individual_quota_result.json"))
+    assert d["kind"] == "quota-limit"
+
+
+def test_antigravity_quota_limit_opens_pool_circuit(
+        monkeypatch, capsys, tmp_path: Path):
+    monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
+    abort_file = tmp_path / "ACCOUNT_STOP"
+    monkeypatch.setenv("DRADAR_POOL_ABORT_FILE", str(abort_file))
+    result = tmp_path / "result.json"
+    result.write_bytes(
+        _fixture("antigravity_individual_quota_result.json").read_bytes()
+    )
+    art = _fake_art(tmp_path, rc=0)
+    art.result = result
+    monkeypatch.setattr(runloop, "run_trial", lambda *a, **kw: art)
+    client = InvalidAckClient({})
+    assignment = {
+        **ASSIGNMENT,
+        "agent": "antigravity",
+        "provider": "antigravity",
+        "model": "gemini-3.7-flash",
+    }
+
+    outcome = runloop._run_and_submit(
+        client, assignment, tmp_path, _args(), "abc123",
+    )
+
+    assert outcome == "quota-exhausted"
+    assert abort_file.read_text() == "drain:account quota exhausted"
+    assert client.submissions[0]["meta"]["failure_kind"] == "quota-limit"
+    assert "quota window is exhausted" in capsys.readouterr().out
+
+
+def test_transient_429_does_not_open_pool_circuit(
+        monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
+    abort_file = tmp_path / "ACCOUNT_STOP"
+    monkeypatch.setenv("DRADAR_POOL_ABORT_FILE", str(abort_file))
+    art = _fake_art(tmp_path, rc=0, result_data={
+        "exception_info": {
+            "exception_type": "NonZeroAgentExitCodeError",
+            "exception_message": "429 Too Many Requests: burst rate limit",
+        },
+        "agent_result": {},
+    })
+    monkeypatch.setattr(runloop, "run_trial", lambda *a, **kw: art)
+    client = InvalidAckClient({})
+
+    outcome = runloop._run_and_submit(
+        client, ASSIGNMENT, tmp_path, _args(), "abc123",
+    )
+
+    assert outcome == "interrupted"
+    assert not abort_file.exists()
+    assert client.submissions[0]["meta"]["failure_kind"] == "rate-limit"
 
 
 def test_diagnose_classifies_403_as_auth_terminal(tmp_path):
