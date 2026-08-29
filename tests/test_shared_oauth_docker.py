@@ -181,6 +181,51 @@ def test_antigravity_exec_reconciles_only_exact_host_binds(
     assert "/app" not in maintenance
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ownership reconciliation")
+def test_grok_exec_guards_atomic_refresh_and_reconciles_host_ownership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _private_dir(tmp_path / "grok")
+    calls: list[dict[str, object]] = []
+
+    def fake_init(self, *args, **kwargs):  # noqa: ANN001, ANN202, ARG001
+        self._mounts_json = [
+            {"type": "bind", "source": "/host/logs", "target": "/logs/agent"}
+        ]
+
+    async def fake_exec(self, **kwargs):  # noqa: ANN001, ANN202, ARG001
+        calls.append(dict(kwargs))
+        return types.SimpleNamespace(return_code=0, stdout="", stderr="")
+
+    monkeypatch.setattr(
+        "dradar.pier_shared_oauth_docker.DockerEnvironment.__init__", fake_init,
+    )
+    monkeypatch.setattr(
+        "dradar.pier_shared_oauth_docker.DockerEnvironment.exec", fake_exec,
+        raising=False,
+    )
+    environment = SharedOAuthDockerEnvironment(
+        shared_oauth_mounts_json=[{
+            "type": "bind",
+            "source": str(source),
+            "target": "/tmp/dradar-grok-user/.grok",
+        }],
+    )
+
+    asyncio.run(environment.exec("grok --model grok-4.6"))
+
+    guarded = str(calls[0]["command"])
+    assert guarded.startswith("bash -o pipefail -c ")
+    assert "oauth_repair" in guarded
+    assert "/tmp/dradar-grok-user/.grok/auth.json" in guarded
+    assert "grok --model grok-4.6" in guarded
+    maintenance = str(calls[1]["command"])
+    assert calls[1]["user"] == "root"
+    assert "find -P /logs/agent -xdev" in maintenance
+    assert "find -P /tmp/dradar-grok-user/.grok -xdev" in maintenance
+    assert f"chown -h -- {os.getuid()}:{os.getgid()}" in maintenance
+
+
 def test_non_antigravity_shared_oauth_exec_does_not_reconcile(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
