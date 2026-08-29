@@ -28,6 +28,7 @@ CHECKPOINT_FAULT_FAMILIES = frozenset({
     "checkpoint_invalid", "checkpoint_incompatible",
 })
 TIERS = ("plus", "pro-5x", "pro-20x")
+REFILL_ORDERS = ("cost", "least-run")
 
 
 class RefillError(RuntimeError):
@@ -305,6 +306,7 @@ def configure(
     refill_harness: str | None = None,
     refill_model: str | None = None,
     refill_effort: str | None = None,
+    refill_order: str = "cost",
     replace_existing: bool = False,
 ) -> dict:
     if refill_to < 1 or max_tasks < 1:
@@ -313,6 +315,10 @@ def configure(
         raise RefillError(f"unknown quota tier: {quota_tier}")
     if refill_harness is None and (refill_model is not None or refill_effort is not None):
         raise RefillError("refill model/effort filters require a refill harness")
+    if refill_order not in REFILL_ORDERS:
+        raise RefillError(f"unknown refill order: {refill_order}")
+    if refill_harness is None and refill_order != "cost":
+        raise RefillError("non-default refill order requires a refill harness")
     if refill_harness is not None:
         try:
             refill_harness, refill_model, refill_effort = validate_refill_scope(
@@ -329,6 +335,7 @@ def configure(
         "refill_harness": refill_harness,
         "refill_model": refill_model,
         "refill_effort": refill_effort,
+        "refill_order": refill_order,
     }
     # A scoped plan owns only its Harness/model/effort lane.  The account may
     # legitimately hold work for other independent Harness campaigns; treating
@@ -342,6 +349,11 @@ def configure(
         raise RefillError("max tasks must be at least the currently held task count")
     with _locked(home):
         current = _load_unlocked(home)
+        # Plans written before ordering became configurable are exactly the
+        # historical cheapest-first behavior.  Normalize them in memory so a
+        # CLI upgrade does not manufacture a conflicting plan.
+        if current is not None and "refill_order" not in current:
+            current["refill_order"] = "cost"
         replaced_plan_id = None
         if current and isinstance(current.get("circuit"), dict):
             circuit = current["circuit"]
@@ -553,6 +565,27 @@ def _scoped_candidates(table: dict, plan: dict) -> list[dict]:
             str(candidate.get("effort", "")),
         )
 
+    if plan.get("refill_order", "cost") == "least-run":
+        def least_run_key(candidate: dict) -> tuple[int, float, str, str, str]:
+            count = candidate.get("n")
+            if (
+                isinstance(count, (int, float))
+                and not isinstance(count, bool)
+                and math.isfinite(float(count))
+                and float(count) >= 0
+            ):
+                bucket, runs = 0, float(count)
+            else:
+                bucket, runs = 1, 0.0
+            return (
+                bucket,
+                runs,
+                str(candidate.get("task_id", "")),
+                str(candidate.get("model", "")),
+                str(candidate.get("effort", "")),
+            )
+
+        return sorted(candidates, key=least_run_key)
     return sorted(candidates, key=price_key)
 
 

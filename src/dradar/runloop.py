@@ -3580,6 +3580,7 @@ def cmd_go(args) -> int:
         getattr(args, "refill_harness", None),
         getattr(args, "refill_model", None),
         getattr(args, "refill_effort", None),
+        getattr(args, "refill_order", None),
     )
     if any(value is not None for value in refill_options) and not getattr(args, "refill", False):
         sys.exit("refill limits and scope filters require --refill")
@@ -3593,8 +3594,10 @@ def cmd_go(args) -> int:
             sys.exit("continuous refill cannot be combined with --assignment")
         if (getattr(args, "refill_harness", None) is None
                 and (getattr(args, "refill_model", None) is not None
-                     or getattr(args, "refill_effort", None) is not None)):
-            sys.exit("--refill-model/--refill-effort require --refill-harness")
+                     or getattr(args, "refill_effort", None) is not None
+                     or getattr(args, "refill_order", None) is not None)):
+            sys.exit("--refill-model/--refill-effort/--refill-order require "
+                     "--refill-harness")
         if getattr(args, "refill_harness", None) is not None:
             try:
                 (args.refill_harness, args.refill_model,
@@ -3785,6 +3788,8 @@ def _worker_command(args) -> list[str]:
             command.extend(("--refill-model", args.refill_model))
         if getattr(args, "refill_effort", None):
             command.extend(("--refill-effort", args.refill_effort))
+        if getattr(args, "refill_order", None):
+            command.extend(("--refill-order", args.refill_order))
     return command
 
 
@@ -5044,6 +5049,11 @@ def _setup_refill(args, client: ApiClient, active: list[dict], free_pick: bool) 
         if getattr(args, "refill_effort", None):
             scope += f"@{args.refill_effort}"
         print(f"  exact refill scope: {scope} (no cross-harness fallback)")
+        print("  candidate order: " + (
+            "least historical graded runs first"
+            if getattr(args, "refill_order", None) == "least-run"
+            else "estimated cost first"
+        ))
     if args.max_estimated_quota_pct is not None:
         print(f"  estimated quota cap: {args.max_estimated_quota_pct}% {args.quota_tier}")
     print("  order: all initially selected tasks must submit before auto-refill starts")
@@ -5066,6 +5076,7 @@ def _setup_refill(args, client: ApiClient, active: list[dict], free_pick: bool) 
         refill_harness=getattr(args, "refill_harness", None),
         refill_model=getattr(args, "refill_model", None),
         refill_effort=getattr(args, "refill_effort", None),
+        refill_order=getattr(args, "refill_order", None) or "cost",
         # A normal parent owns the exclusive per-machine run lock here, so no
         # live local campaign can be displaced. Manual --parallel sessions do
         # not own that proof and must keep the fail-closed conflict behavior.

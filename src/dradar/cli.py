@@ -384,6 +384,11 @@ def main(argv: list[str] | None = None) -> int:
             help="optionally narrow --refill-harness to one effort level",
         )
         p.add_argument(
+            "--refill-order", choices=("cost", "least-run"),
+            help="order scoped refill candidates by estimated cost (default) "
+                 "or by the exact cell's historical graded-run count",
+        )
+        p.add_argument(
             "--max-tasks", type=int, metavar="N",
             help="total-task cap for this refill plan (required for Kimi Code, "
                  "ZCode, and Grok scoped refill)",
