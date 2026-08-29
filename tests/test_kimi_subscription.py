@@ -414,9 +414,10 @@ def test_kimi_checkpoint_keeps_sessions_stream_and_original_prompt_only() -> Non
 def test_kimi_adapter_source_has_fixed_security_contract() -> None:
     source = Path(providers.__file__).with_name("pier_kimi.py").read_text()
     assert 'return NetworkAllowlist(domains=["auth.kimi.com", "api.kimi.com"])' in source
-    assert 'enabled = ["Read", "ReadMediaFile", "Glob", "Grep", "Write", "Edit", "Bash"]' in source
-    assert '"WebSearch"' not in source
-    assert '"FetchURL"' not in source
+    assert "[tools]" not in source
+    assert '"--auto"' in source
+    assert "KIMI_CODE_AGENT_SWARM_MAX_CONCURRENCY" not in source
+    assert "Agent|AgentSwarm" in source
     assert 'event = "PreToolUse"' in source
     assert '"KIMI_CODE_HOME": remote_home' in source
     assert "run_with_kimi_resume" in source

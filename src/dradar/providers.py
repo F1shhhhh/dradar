@@ -79,8 +79,8 @@ DSH_VISION_TEXT_CAPABILITY = (
 )
 DSH_FLASH_LEGACY_CAPABILITY = "dsh-minimal-deepseek-v4-flash-artifact-v4"
 DSH_PRO_LEGACY_CAPABILITY = "dsh-minimal-deepseek-v4-pro-artifact-v4"
-DSH_RUN_CONFIG_VERSION = "dsh-minimal-native-0.1.1-rc.1-v1"
-DSH_RUNTIME_PROFILE = "public-pier-0.3.0-dsh-minimal-0.1.1-rc.1-v1"
+DSH_RUN_CONFIG_VERSION = "dsh-minimal-native-full-container-0.1.1-rc.1-v2"
+DSH_RUNTIME_PROFILE = "public-pier-0.3.0-dsh-minimal-full-container-v2"
 
 # Grok Build is intentionally subscription/OAuth-only.  In particular, the
 # runner strips XAI_API_KEY from Pier's environment and never accepts a key in
@@ -151,8 +151,8 @@ KIMI_CLI_VERSION = "0.36.1"
 KIMI_SUPPORTED_EFFORTS = frozenset({"low", "high", "max"})
 KIMI_CAPABILITY = "kimi-code-k3-subscription-oauth-node-concurrent-v2"
 KIMI_LEGACY_CAPABILITY = "kimi-code-k3-subscription-oauth-node-v1"
-KIMI_RUN_CONFIG_VERSION = "kimi-code-k3-subscription-oauth-node-concurrent-v2"
-KIMI_RUNTIME_PROFILE = "pier-kimi-code-k3-node-shared-oauth-lock-v2"
+KIMI_RUN_CONFIG_VERSION = "kimi-code-k3-subscription-oauth-full-container-v3"
+KIMI_RUNTIME_PROFILE = "pier-kimi-code-k3-shared-oauth-full-container-v3"
 KIMI_BINARY_BASE_URL = "https://code.kimi.com/kimi-code/binaries/0.36.1"
 KIMI_BINARY_SHA256 = {
     "linux-x64": "78c07b255e0bdc8dfe90d0cbd3204a3d862957394a08ca99c6e31144732451c7",
@@ -217,10 +217,10 @@ ANTIGRAVITY_CAPABILITY = (
     "antigravity-gemini-3.7-flash-subscription-oauth-sandbox-v1"
 )
 ANTIGRAVITY_RUN_CONFIG_VERSION = (
-    "antigravity-gemini-3.7-flash-subscription-oauth-sandbox-v1"
+    "antigravity-gemini-3.7-flash-subscription-oauth-full-container-v2"
 )
 ANTIGRAVITY_RUNTIME_PROFILE = (
-    "pier-antigravity-gemini-3.7-flash-shared-oauth-sandbox-v1"
+    "pier-antigravity-gemini-3.7-flash-shared-oauth-full-container-v2"
 )
 ANTIGRAVITY_ARTIFACT_CAPTURE = "full-worktree-v1"
 ANTIGRAVITY_HOME_RELATIVE_PATH = Path("providers") / "antigravity"
@@ -241,14 +241,30 @@ ZCODE_CLI_VERSION = "0.16.5"
 ZCODE_SUPPORTED_EFFORTS = frozenset({"low", "high", "max"})
 ZCODE_LEGACY_CAPABILITY = "zcode-glm-5.3-bigmodel-coding-plan-v1"
 ZCODE_CAPABILITY = "zcode-glm-5.3-family-bigmodel-coding-plan-v2"
-ZCODE_RUN_CONFIG_VERSION = "zcode-protocol-glm-5.3-family-v2"
-ZCODE_RUNTIME_PROFILE = "pier-zcode-glm-5.3-family-api-key-v2"
+ZCODE_RUN_CONFIG_VERSION = "zcode-protocol-glm-5.3-family-full-container-v3"
+ZCODE_RUNTIME_PROFILE = "pier-zcode-glm-5.3-family-api-key-full-container-v3"
 ZCODE_HOME_RELATIVE_PATH = Path("providers") / "zcode"
 ZCODE_CLI_RELATIVE_PATH = ZCODE_HOME_RELATIVE_PATH / "current" / "zcode.cjs"
 ZCODE_SECRET_RELATIVE_PATH = Path("secrets") / "zcode_coding_plan_api_key"
 ZCODE_API_KEY_ENV = "ZCODE_API_KEY"
 ZCODE_OFFICIAL_DOWNLOAD_PAGE = "https://zcode.z.ai/cn"
 _ZCODE_VERSION_RE = re.compile(r"(?:^|\s)(\d+\.\d+\.\d+)(?:\s|$)")
+
+# Every benchmark Honey uses the disposable Pier container as its trust
+# boundary.  These values are uploaded with each current run so the server can
+# fail closed if a future adapter accidentally restores an inner approval
+# prompt, hides child-agent tools, or weakens the outer isolation contract.
+HONEY_EXECUTION_SECURITY_PROFILE = "full-container-tools-outer-boundary-v1"
+HONEY_INNER_PERMISSION_MODE = "full-auto-approve"
+HONEY_CHILD_AGENT_ACCESS = "native-enabled"
+HONEY_OUTER_ISOLATION = "pier-docker-exact-egress-minimal-credentials-v1"
+HONEY_SECURITY_AGENTS = frozenset({
+    "codex",
+    DSH_AGENT,
+    ZCODE_AGENT,
+    KIMI_AGENT,
+    ANTIGRAVITY_AGENT,
+})
 
 # User-facing continuous-refill names resolve to the same canonical agent
 # wire values used by assignments and the public table.  Keeping this beside
@@ -916,16 +932,18 @@ def store_zcode_cli(
     return target
 
 
-_ANTIGRAVITY_REQUIRED_DENY_RULES = frozenset({
-    "read_file(/tmp/dradar-antigravity-user/.gemini)",
-    "write_file(/tmp/dradar-antigravity-user/.gemini)",
-    "read_file(/logs)",
-    "write_file(/logs)",
-    "read_url(*)",
+_ANTIGRAVITY_FULL_CONTAINER_ALLOW_RULES = (
+    "command(*)",
     "execute_url(*)",
     "mcp(*)",
+    "read_file(*)",
+    "read_url(*)",
     "unsandboxed(*)",
-})
+    "write_file(*)",
+)
+_ANTIGRAVITY_POLICY_MISMATCH = (
+    "Antigravity settings do not match DRadar's full-container policy"
+)
 
 
 def antigravity_home(home: Path | None = None) -> Path:
@@ -949,18 +967,23 @@ def antigravity_ready_path(home: Path | None = None) -> Path:
 
 
 def antigravity_settings_payload() -> dict[str, object]:
-    """Return the fail-closed headless policy used by every paid AGY run."""
+    """Return the full-container policy used by every paid AGY run.
+
+    Benchmark agents execute inside Pier's disposable Docker boundary.  The
+    inner CLI must therefore not add a second approval/sandbox layer that can
+    deny ordinary coding tools or child-agent work and skew the score.  Host
+    files, network egress, and credentials remain constrained by Pier and the
+    provider adapter rather than by Antigravity's interactive permission UI.
+    """
 
     return {
         "enableTelemetry": False,
-        "enableTerminalSandbox": True,
-        "allowNonWorkspaceAccess": False,
+        "enableTerminalSandbox": False,
+        "allowNonWorkspaceAccess": True,
         "trustedWorkspaces": ["/app"],
         "permissions": {
-            # Commands are autonomous only inside AGY's native nsjail ring.
-            # File tools are already auto-allowed in /app by the official CLI.
-            "allow": ["command(*)"],
-            "deny": sorted(_ANTIGRAVITY_REQUIRED_DENY_RULES),
+            "allow": list(_ANTIGRAVITY_FULL_CONTAINER_ALLOW_RULES),
+            "deny": [],
         },
     }
 
@@ -995,7 +1018,7 @@ def _private_tree_error(path: Path) -> str | None:
 
 
 def antigravity_auth_error(home: Path | None = None) -> str | None:
-    """Validate isolated OAuth state plus the mandatory sandbox policy."""
+    """Validate isolated OAuth state plus the full-container policy."""
 
     auth = antigravity_auth_path(home)
     issue = _private_tree_error(auth)
@@ -1005,10 +1028,10 @@ def antigravity_auth_error(home: Path | None = None) -> str | None:
     try:
         payload = json.loads(settings.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        return f"Antigravity sandbox settings are unavailable or invalid: {exc}"
+        return f"Antigravity full-container settings are unavailable or invalid: {exc}"
     expected = antigravity_settings_payload()
     if payload != expected:
-        return "Antigravity sandbox settings do not match DRadar's safe policy"
+        return _ANTIGRAVITY_POLICY_MISMATCH
     ready = antigravity_ready_path(home)
     try:
         ready_payload = json.loads(ready.read_text(encoding="utf-8"))
@@ -1149,6 +1172,12 @@ def antigravity_subscription_session(
     """Expose only DRadar's validated .gemini tree to one Pier trial."""
 
     issue = antigravity_auth_error(home)
+    if issue == _ANTIGRAVITY_POLICY_MISMATCH:
+        # Permission policy is versioned DRadar configuration, not account
+        # state. Rewrite only a structurally valid legacy slot so a CLI upgrade
+        # can migrate it without creating a partial tree or repeating login.
+        restore_antigravity_settings(home)
+        issue = antigravity_auth_error(home)
     if issue is not None:
         raise ValueError(issue + "; run `dradar provider setup antigravity` first")
     directory.mkdir(parents=True, exist_ok=True)

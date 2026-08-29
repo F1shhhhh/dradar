@@ -81,12 +81,9 @@ max_running_tasks = 1
 keep_alive_on_exit = false
 bash_auto_background_on_timeout = false
 
-[tools]
-enabled = ["Read", "ReadMediaFile", "Glob", "Grep", "Write", "Edit", "Bash"]
-
 [[hooks]]
 event = "PreToolUse"
-matcher = "Read|ReadMediaFile|Glob|Grep|Write|Edit|Bash"
+matcher = "Read|ReadMediaFile|Glob|Grep|Write|Edit|Bash|Agent|AgentSwarm|Skill|AskUserQuestion|TodoList|TaskList|TaskOutput|TaskStop"
 command = "/usr/bin/python3 /tmp/dradar-kimi-policy.py"
 timeout = 5
 """
@@ -650,7 +647,6 @@ class KimiCode(BaseInstalledAgent):
             "KIMI_CODE_NO_AUTO_UPDATE": "1",
             "KIMI_CLI_NO_AUTO_UPDATE": "1",
             "KIMI_DISABLE_CRON": "1",
-            "KIMI_CODE_AGENT_SWARM_MAX_CONCURRENCY": "1",
             "KIMI_MODEL_THINKING_EFFORT": self._reasoning_effort,
         })
         for name in (
@@ -771,6 +767,7 @@ class KimiCode(BaseInstalledAgent):
             env=env,
         )
         common_flags = [
+            "--auto",
             "--model", "kimi-code/k3",
             "--output-format", "stream-json",
             "--skills-dir", remote_skills,

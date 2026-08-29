@@ -166,7 +166,7 @@ def _antigravity_usage_facts(
         init is not None
         and init.get("model") == expected_runtime_model
         and init.get("cwd") == "/app"
-        and init.get("permission_mode") != "always-proceed"
+        and init.get("permission_mode") == "always-proceed"
     )
     num_turns = (
         _nonnegative_int(terminal.get("num_turns"))
@@ -370,7 +370,11 @@ class Antigravity(BaseInstalledAgent):
             "--model", self._runtime_model,
             "--effort", self._reasoning_effort,
             "--mode", "accept-edits",
-            "--sandbox",
+            # Pier's disposable Docker environment is the security boundary.
+            # A second interactive approval/sandbox layer can soft-deny tools
+            # in headless mode and produce an invalid empty patch, so every
+            # model and child-agent tool is approved inside the container.
+            "--dangerously-skip-permissions",
             "--disable-slash-commands",
             "--output-format", "stream-json",
             "--print-timeout", "120m",
