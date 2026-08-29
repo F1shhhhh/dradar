@@ -2859,6 +2859,33 @@ def _finish_assignment_boundary(
     return True
 
 
+def _finish_invocation_assignment_boundary(
+    args, client: ApiClient, path: Path | None,
+) -> bool:
+    """Reconcile a boundary only in the process that owns its inventory.
+
+    A worker-pool parent passes one shared boundary to its children so they
+    can atomically record the outcome of the assignment they checked out.
+    Each child can subsequently be scoped by the server to that assignment's
+    provider/batch, however, and therefore does *not* have an authoritative
+    view of the other assignments in the shared campaign. Reconciling from
+    that partial view falsely reports healthy sibling assignments as missing
+    and makes a replacement worker exit before checkout.
+
+    The parent retains responsibility for final reconciliation. A standalone
+    worker child without an inherited boundary remains conservative and
+    reconciles normally.
+    """
+    inherited = os.environ.get(_ASSIGNMENT_BOUNDARY_ENV)
+    if (
+        getattr(args, "worker_child", False)
+        and path is not None
+        and inherited == str(path)
+    ):
+        return True
+    return _finish_assignment_boundary(client, path)
+
+
 def _checkpoint_upload_entry(
     item: checkpoints.Checkpoint, assignment: dict, args, local_commit: str | None,
 ) -> dict:
@@ -3711,10 +3738,12 @@ def cmd_go(args) -> int:
         if getattr(args, "assignment", None):
             close_reason = "completed" if recovery_ok and recovered else "paused"
             rc = 0 if recovery_ok and recovered else 1
-            return rc if _finish_assignment_boundary(client, boundary_path) else 1
+            return rc if _finish_invocation_assignment_boundary(
+                args, client, boundary_path,
+            ) else 1
         if recovered and not recovery_ok:
             close_reason = "paused"
-            _finish_assignment_boundary(client, boundary_path)
+            _finish_invocation_assignment_boundary(args, client, boundary_path)
             return 1
         if found_checkpoints and getattr(args, "resume", False) and not recovered:
             # Every matching checkpoint is already owned by another local
@@ -3729,13 +3758,15 @@ def cmd_go(args) -> int:
                       "checking for a different waiting task")
             else:
                 close_reason = "paused"
-                _finish_assignment_boundary(client, boundary_path)
+                _finish_invocation_assignment_boundary(args, client, boundary_path)
                 return 1
 
         rc = _go_menu(args, cfg, client, tasks_root, telemetry=telemetry)
         if not getattr(args, "parallel", False):
             _maintain_image_cache(client, cfg, phase="after run")
-        if not _finish_assignment_boundary(client, _assignment_boundary_path(args)):
+        if not _finish_invocation_assignment_boundary(
+            args, client, _assignment_boundary_path(args),
+        ):
             rc = 1
         close_reason = "completed" if rc == 0 else "paused"
         return rc
