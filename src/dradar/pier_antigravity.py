@@ -8,6 +8,7 @@ usage to DRadar.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -43,6 +44,12 @@ ANTIGRAVITY_LINUX_SHA512 = {
         "e6d216ef197188fe8b5c46e6f57aee64a3b7c9e23fc855cefee43fe434179d3"
     ),
 }
+ANTIGRAVITY_STREAM_INTERRUPTED_MESSAGE = (
+    "The stream was interrupted. Please continue the task you were working on."
+)
+ANTIGRAVITY_TERMINAL_RECOVERY_SCHEMA = (
+    "dradar-antigravity-terminal-recovery-v1"
+)
 
 
 def _model_line_pattern(model: str) -> str:
@@ -190,7 +197,7 @@ def _antigravity_usage_facts(
     )
     observed = ledger_valid and bool(token_usage_events)
     selected = totals if observed else {name: 0 for name in totals}
-    return {
+    facts: dict[str, object] = {
         "schema": "dradar-subscription-provider-usage-v1",
         "provider": "antigravity",
         "model": ANTIGRAVITY_MODEL,
@@ -217,6 +224,28 @@ def _antigravity_usage_facts(
         ),
         "terminal_status": terminal_status,
     }
+    terminal_response = terminal.get("response") if terminal is not None else None
+    terminal_error = terminal.get("error") if terminal is not None else None
+    if (
+        reconciled
+        and terminal_status == "ERROR"
+        and terminal_error == ANTIGRAVITY_STREAM_INTERRUPTED_MESSAGE
+        and isinstance(terminal_response, str)
+        and terminal_response.strip()
+    ):
+        # Do not reinterpret ERROR as success here.  Preserve the provider's
+        # terminal status and expose only a narrow, content-bound recovery
+        # candidate.  The server independently verifies the response hash
+        # against trajectory.json, plus the non-empty patch and completed Pier
+        # result, before it may accept the run for grading.
+        facts["terminal_recovery"] = {
+            "schema": ANTIGRAVITY_TERMINAL_RECOVERY_SCHEMA,
+            "reason": "stream_interrupted_after_final_response",
+            "response_sha256": hashlib.sha256(
+                terminal_response.strip().encode("utf-8")
+            ).hexdigest(),
+        }
+    return facts
 
 
 def _install_command() -> str:

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import stat
 from pathlib import Path
 from typing import Any
@@ -90,3 +91,77 @@ class SharedOAuthDockerEnvironment(DockerEnvironment):
         if existing_targets & {mount["target"] for mount in mounts}:
             raise ValueError("shared OAuth mount conflicts with an existing mount")
         self._mounts_json = [*existing, *mounts]
+        self._shared_oauth_targets = tuple(mount["target"] for mount in mounts)
+
+    async def _reconcile_antigravity_host_ownership(self) -> None:
+        """Return root-authored AGY state and logs to the invoking host user.
+
+        Antigravity deliberately runs as root inside the disposable task
+        container so its tools and child agents retain the full-permission
+        Honey contract.  Its OAuth directory is a writable host bind mount,
+        however, and ``/logs/agent`` is consumed by host-side Pier code after
+        the turn.  Reconcile those two exact roots after each AGY command;
+        never traverse symlinks or another filesystem.
+        """
+
+        getuid = getattr(os, "getuid", None)
+        getgid = getattr(os, "getgid", None)
+        if (
+            self._shared_oauth_targets
+            != ("/tmp/dradar-antigravity-user/.gemini",)
+            or not callable(getuid)
+            or not callable(getgid)
+        ):
+            return
+        owner = f"{getuid()}:{getgid()}"
+        roots = ("/logs/agent", *self._shared_oauth_targets)
+        operations: list[str] = ["set -eu"]
+        for root in roots:
+            quoted = shlex.quote(root)
+            operations.extend((
+                f"test -d {quoted}",
+                f"test ! -L {quoted}",
+                f"find -P {quoted} -xdev -exec chown -h -- {owner} {{}} +",
+                f"find -P {quoted} -xdev -type d -exec chmod 700 -- {{}} +",
+                f"find -P {quoted} -xdev -type f -exec chmod 600 -- {{}} +",
+            ))
+        result = await super().exec(
+            command="; ".join(operations), user="root", timeout_sec=120,
+        )
+        if getattr(result, "return_code", 1) != 0:
+            raise RuntimeError("failed to reconcile Antigravity host ownership")
+
+    async def exec(
+        self,
+        command: str,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+    ) -> Any:
+        """Preserve root-in-container execution without poisoning host binds."""
+
+        try:
+            result = await super().exec(
+                command=command,
+                cwd=cwd,
+                env=env,
+                timeout_sec=timeout_sec,
+                user=user,
+            )
+        except BaseException:
+            try:
+                await self._reconcile_antigravity_host_ownership()
+            except BaseException:
+                # Never hide the original provider/container exception.
+                pass
+            raise
+        try:
+            await self._reconcile_antigravity_host_ownership()
+        except BaseException:
+            if getattr(result, "return_code", 1) != 0:
+                # Let BaseInstalledAgent report the original provider command
+                # and return code rather than replacing it with cleanup noise.
+                return result
+            raise
+        return result

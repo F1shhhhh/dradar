@@ -1868,12 +1868,18 @@ class DurableCheckpoint:
         ``AgentLogStore`` before :meth:`start` seals ``/logs/agent`` for the
         untrusted model process.  Keep that early write on the exact same
         no-follow, numeric-owner, and private-mode boundary as checkpoint
-        publication.  Ordinary non-checkpoint Pier runs retain their existing
-        compatibility permissions and remain subject to ``AgentLogStore``'s
-        own fail-closed validation.
+        publication.  Disabled checkpoints still use this preflight when an
+        adapter must write through ``AgentLogStore``.  Pier creates the trial
+        tree with compatibility permissions (typically 0775/0777); leaving
+        those modes untouched makes later fail-closed log redaction reject an
+        otherwise successful model run.  Native Windows has no numeric POSIX
+        ownership boundary, so the disabled path remains a no-op there.
         """
 
-        if not self.enabled:
+        if not self.enabled and (
+            not callable(getattr(os, "getuid", None))
+            or not callable(getattr(os, "getgid", None))
+        ):
             return
         self._normalize_host_layout()
         self._validate_host_layout()
