@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 
@@ -250,7 +251,7 @@ def test_oauth_home_rejects_links_and_broad_secret_files(
     link = auth / "config" / "linked-token"
     link.symlink_to(secret)
     assert "must not be a symlink" in (antigravity_auth_error() or "")
-    assert "must not be a symlink" in (prepare_antigravity_auth() or "")
+    assert "contains a symlink" in (prepare_antigravity_auth() or "")
     assert link.is_symlink()
 
 
@@ -278,6 +279,26 @@ def test_preflight_removes_only_official_cli_log_link_before_validation(
     assert not cli_log.exists()
     assert not cli_log.is_symlink()
     assert log_file.exists() is target_exists
+
+
+def test_preflight_hardens_official_cli_log_permissions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = _ready_home(tmp_path, monkeypatch)
+    log_file = auth / "antigravity-cli" / "log" / "cli-new.log"
+    log_file.parent.mkdir(parents=True)
+    log_file.write_text("official log", encoding="utf-8")
+    if os.name != "nt":
+        log_file.parent.chmod(0o755)
+        log_file.chmod(0o644)
+        assert "broadly accessible" in (antigravity_auth_error() or "")
+
+    assert prepare_antigravity_auth() is None
+    assert log_file.read_text(encoding="utf-8") == "official log"
+    if os.name != "nt":
+        assert stat.S_IMODE(log_file.parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE(log_file.stat().st_mode) == 0o600
 
 
 def test_preflight_preserves_regular_cli_log_file(
