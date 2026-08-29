@@ -355,6 +355,10 @@ class _Process:
         self.returncode = returncode
         self.pid = self.next_pid
         _Process.next_pid += 1
+        if returncode == 0 and env.get(runloop._POOL_WORKER_ACTIVITY_ENV):
+            runloop.Path(env[runloop._POOL_WORKER_ACTIVITY_ENV]).write_text(
+                "test-assignment"
+            )
 
     def wait(self):
         return self.returncode
@@ -381,11 +385,14 @@ class _LiveProcess(_Process):
 
 
 class _ScriptedProcess(_Process):
-    def __init__(self, command, env, polls, on_poll=None, **kwargs):
-        super().__init__(command, env, **kwargs)
+    def __init__(
+        self, command, env, polls, on_poll=None, mark_activity=True, **kwargs,
+    ):
+        super().__init__(command, env, returncode=1, **kwargs)
         self.returncode = None
         self.polls = list(polls)
         self.on_poll = on_poll
+        self.mark_activity = mark_activity
 
     def poll(self):
         if self.returncode is not None:
@@ -396,12 +403,23 @@ class _ScriptedProcess(_Process):
         value = self.polls.pop(0)
         if value is not None:
             self.returncode = value
+            if (
+                value == 0 and self.mark_activity
+                and self.env.get(runloop._POOL_WORKER_ACTIVITY_ENV)
+            ):
+                runloop.Path(
+                    self.env[runloop._POOL_WORKER_ACTIVITY_ENV]
+                ).write_text("test-assignment")
         return value
 
 
 def _patch_pool_setup(monkeypatch, active_count=5):
+    class Client:
+        def get_assignment(self):
+            return {"active": []}
+
     monkeypatch.setattr(runloop, "_load_config", lambda: {})
-    monkeypatch.setattr(runloop, "_client", lambda *_a, **_k: object())
+    monkeypatch.setattr(runloop, "_client", lambda *_a, **_k: Client())
     monkeypatch.setattr(runloop, "tasks_root_from_config", lambda _cfg: object())
     monkeypatch.setattr(runloop, "acquire_run_lock", lambda _home: None)
     monkeypatch.setattr(runloop, "sweep_orphan_compose", lambda _home, _yes: None)
@@ -544,8 +562,10 @@ def test_pool_live_target_scales_up_without_restarting_existing_workers(
     target = tmp_path / "workers"
     target.write_text("2")
     monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
+    ready = iter((2, 0))
     monkeypatch.setattr(
-        runloop, "_pool_ready_work_count", lambda _client, **_kwargs: 2,
+        runloop, "_pool_ready_work_count",
+        lambda _client, **_kwargs: next(ready, 0),
     )
     calls = []
 
@@ -572,8 +592,10 @@ def test_pool_live_scale_up_refills_to_new_worker_target(
     target = tmp_path / "workers"
     target.write_text("2")
     monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
+    ready = iter((2, 0))
     monkeypatch.setattr(
-        runloop, "_pool_ready_work_count", lambda _client, **_kwargs: 2,
+        runloop, "_pool_ready_work_count",
+        lambda _client, **_kwargs: next(ready, 0),
     )
     resized = []
     replenished = []
@@ -633,7 +655,7 @@ def test_pool_live_target_scales_down_without_signalling_inflight_workers(
         lambda _processes: pytest.fail("live scale-down must not signal workers"),
     )
     monkeypatch.setattr(
-        runloop, "_pool_ready_work_count", lambda _client, **_kwargs: 4,
+        runloop, "_pool_ready_work_count", lambda _client, **_kwargs: 0,
     )
     calls = []
 
@@ -767,7 +789,12 @@ def test_pool_restores_vacant_slot_when_fresh_held_work_is_waiting(
 
         def get_assignment(self):
             self.calls += 1
-            return {"active": [{"assignment_id": "new", "started_at": None}]}
+            return {
+                "active": (
+                    [{"assignment_id": "new", "started_at": None}]
+                    if self.calls == 1 else []
+                )
+            }
 
     client = Client()
     monkeypatch.setattr(runloop, "_client", lambda *_a, **_k: client)
@@ -784,14 +811,150 @@ def test_pool_restores_vacant_slot_when_fresh_held_work_is_waiting(
 
     assert runloop._run_worker_pool(_args(workers=2)) == 0
     assert [p.env["DRADAR_WORKER_INDEX"] for p in calls] == ["1", "2", "2"]
-    assert client.calls == 1
+    assert client.calls == 2
     assert "restoring worker slot 2/2" in capsys.readouterr().out
+
+
+def test_pool_reconciles_waiting_work_after_last_healthy_worker_exits(
+        monkeypatch, capsys):
+    """A zero-live pool must not retire while its batch still has waiting work."""
+    _patch_pool_setup(monkeypatch, active_count=1)
+    monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
+    ready = iter((1, 0))
+    monkeypatch.setattr(
+        runloop, "_pool_ready_work_count",
+        lambda _client, **_kwargs: next(ready, 0),
+    )
+    calls = []
+
+    def popen(command, env, **kwargs):
+        process = _ScriptedProcess(command, env, [0], **kwargs)
+        calls.append(process)
+        return process
+
+    monkeypatch.setattr(runloop.subprocess, "Popen", popen)
+
+    assert runloop._run_worker_pool(_args(workers=1)) == 0
+    assert len(calls) == 2
+    assert [p.env["DRADAR_WORKER_INDEX"] for p in calls] == ["1", "1"]
+    assert "restoring worker slot 1/1" in capsys.readouterr().out
+
+
+def test_worker_checkout_activity_marker_is_atomic_and_local(
+        tmp_path, monkeypatch):
+    marker = tmp_path / "slot.started"
+    monkeypatch.setenv(runloop._POOL_WORKER_ACTIVITY_ENV, str(marker))
+
+    runloop._record_worker_checkout("assignment-1")
+
+    assert marker.read_text() == "assignment-1"
+    assert list(tmp_path.glob("slot.started.*.tmp")) == []
+
+
+def test_no_waiting_after_pause_or_release_never_spawns_replacement(
+        monkeypatch):
+    _patch_pool_setup(monkeypatch, active_count=1)
+    monkeypatch.setattr(
+        runloop, "_pool_ready_work_count", lambda _client, **_kwargs: 0,
+    )
+    calls = []
+
+    def popen(command, env, **kwargs):
+        process = _ScriptedProcess(
+            command, env, [0], mark_activity=False, **kwargs,
+        )
+        calls.append(process)
+        return process
+
+    monkeypatch.setattr(runloop.subprocess, "Popen", popen)
+
+    assert runloop._run_worker_pool(_args(workers=1)) == 0
+    assert len(calls) == 1
+
+
+def test_precheckout_capability_failure_has_bounded_backfill(
+        monkeypatch, capsys):
+    """A 426-like preflight exit cannot create an unbounded spawn storm."""
+    _patch_pool_setup(monkeypatch, active_count=1)
+    monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(runloop, "_pool_backfill_delay", lambda _attempt: 0)
+    monkeypatch.setattr(
+        runloop, "_pool_ready_work_count", lambda _client, **_kwargs: 1,
+    )
+    calls = []
+
+    def popen(command, env, **kwargs):
+        process = _ScriptedProcess(
+            command, env, [1], mark_activity=False, **kwargs,
+        )
+        calls.append(process)
+        return process
+
+    monkeypatch.setattr(runloop.subprocess, "Popen", popen)
+
+    assert runloop._run_worker_pool(_args(workers=1)) == 1
+    assert len(calls) == runloop._POOL_BACKFILL_MAX_ATTEMPTS
+    output = capsys.readouterr().out
+    assert "exited 1 before checkout" in output
+    assert "bounded replacement is exhausted" in output
+
+
+def test_task_failure_after_checkout_keeps_anti_cascade_cutoff(
+        monkeypatch, capsys):
+    _patch_pool_setup(monkeypatch, active_count=2)
+    monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
+    seen_cutoffs = []
+    monkeypatch.setattr(
+        runloop, "_pool_ready_work_count",
+        lambda _client, **kwargs: seen_cutoffs.append(
+            kwargs.get("claimed_after")
+        ) or 0,
+    )
+    calls = []
+
+    def popen(command, env, **kwargs):
+        process = _ScriptedProcess(
+            command, env, [1] if not calls else [None, 0], **kwargs,
+        )
+        # The nonzero child represents a provider/task failure after checkout.
+        if not calls:
+            runloop.Path(env[runloop._POOL_WORKER_ACTIVITY_ENV]).write_text("a1")
+        calls.append(process)
+        return process
+
+    monkeypatch.setattr(runloop.subprocess, "Popen", popen)
+
+    assert runloop._run_worker_pool(_args(workers=2)) == 1
+    assert len(calls) == 2
+    assert seen_cutoffs and seen_cutoffs[0] is not None
+    assert "existing waiting work is frozen" in capsys.readouterr().out
+
+
+def test_backfill_v2_kill_switch_restores_previous_last_exit_behavior(
+        monkeypatch):
+    _patch_pool_setup(monkeypatch, active_count=1)
+    monkeypatch.setenv("DRADAR_POOL_BACKFILL_V2", "0")
+    monkeypatch.setattr(
+        runloop, "_pool_ready_work_count",
+        lambda *_a, **_k: pytest.fail("disabled reconciler must not inspect"),
+    )
+    calls = []
+    monkeypatch.setattr(
+        runloop.subprocess, "Popen",
+        lambda command, env, **kwargs: (
+            calls.append(_Process(command, env, **kwargs)) or calls[-1]
+        ),
+    )
+
+    assert runloop._run_worker_pool(_args(workers=1)) == 0
+    assert len(calls) == 1
 
 
 def test_pool_child_failure_keeps_sibling_and_backfills_new_held_work(
         monkeypatch, capsys):
     _patch_pool_setup(monkeypatch, active_count=3)
     monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(runloop, "_pool_backfill_delay", lambda _attempt: 0)
     monkeypatch.setattr(
         runloop, "_signal_workers",
         lambda _processes: pytest.fail("failed pool must not signal siblings"),
@@ -821,7 +984,7 @@ def test_pool_child_failure_keeps_sibling_and_backfills_new_held_work(
     assert calls[1].polls == []
     assert calls[2].env["DRADAR_WORKER_INDEX"] == "1"
     output = capsys.readouterr().out
-    assert "watching only for assignments claimed later" in output
+    assert "exited 1 before checkout" in output
     assert "restoring worker slot 1/2" in output
 
 
@@ -830,10 +993,11 @@ def test_pool_quarantines_uncertain_slot_without_freezing_siblings(
     _patch_pool_setup(monkeypatch, active_count=2)
     monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
     ready_after_quarantine = []
+    ready_values = iter((1, 1, 0))
 
     def ready(_client, **kwargs):
         ready_after_quarantine.append(kwargs.get("claimed_after"))
-        return 1
+        return next(ready_values, 0)
 
     monkeypatch.setattr(runloop, "_pool_ready_work_count", ready)
     calls = []
@@ -841,7 +1005,7 @@ def test_pool_quarantines_uncertain_slot_without_freezing_siblings(
     def popen(command, env, **kwargs):
         polls = (
             [runloop._WORKER_SLOT_QUARANTINED_EXIT_CODE]
-            if not calls else [None, 0]
+            if not calls else ([None, 0] if len(calls) == 1 else [0])
         )
         process = _ScriptedProcess(command, env, polls, **kwargs)
         calls.append(process)
@@ -850,13 +1014,14 @@ def test_pool_quarantines_uncertain_slot_without_freezing_siblings(
     monkeypatch.setattr(runloop.subprocess, "Popen", popen)
 
     assert runloop._run_worker_pool(_args(workers=2)) == 1
-    assert len(calls) == 2
-    assert ready_after_quarantine == [None]
+    assert len(calls) == 3
+    assert ready_after_quarantine == [None, None, None]
     output = capsys.readouterr().out
     assert "worker 1 quarantined" in output
     assert "sibling workers will continue" in output
     assert "existing waiting work is frozen" not in output
     assert "restoring worker slot 1/2" not in output
+    assert calls[2].env["DRADAR_WORKER_INDEX"] == "2"
 
 
 def test_explicit_resume_can_start_fresh_pool_after_failure_drain(
@@ -1152,6 +1317,32 @@ def test_backfill_counts_fresh_and_safely_recoverable_work(monkeypatch):
             ]}
 
     assert runloop._pool_ready_work_count(Client()) == 2
+
+
+def test_backfill_never_spawns_when_batch_live_count_meets_target(monkeypatch):
+    class Client:
+        def get_assignment(self):
+            return {"active": [
+                {
+                    "assignment_id": "live-1", "started_at": "earlier",
+                    "heartbeat_running": True,
+                },
+                {
+                    "assignment_id": "live-2", "started_at": "earlier",
+                    "heartbeat_running": True,
+                },
+                {
+                    "assignment_id": "waiting", "started_at": None,
+                    "heartbeat_running": False,
+                },
+            ]}
+
+    assert runloop._pool_ready_work_count(
+        Client(), desired_workers=2,
+    ) == 0
+    assert runloop._pool_ready_work_count(
+        Client(), desired_workers=3,
+    ) == 1
 
 
 def test_disabled_rollout_never_backfills_paused_checkpoint(monkeypatch):
