@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import os
 import re
@@ -184,7 +185,17 @@ def _usage_helper():
         node for node in module.body
         if isinstance(node, ast.FunctionDef) and node.name in names
     ]
-    namespace = {"ANTIGRAVITY_MODEL": ANTIGRAVITY_MODEL}
+    namespace = {
+        "ANTIGRAVITY_MODEL": ANTIGRAVITY_MODEL,
+        "ANTIGRAVITY_STREAM_INTERRUPTED_MESSAGE": (
+            "The stream was interrupted. Please continue the task you were "
+            "working on."
+        ),
+        "ANTIGRAVITY_TERMINAL_RECOVERY_SCHEMA": (
+            "dradar-antigravity-terminal-recovery-v1"
+        ),
+        "hashlib": hashlib,
+    }
     exec(
         compile(ast.Module(body=helpers, type_ignores=[]), "pier_antigravity.py", "exec"),
         namespace,
@@ -591,6 +602,74 @@ def test_official_step_ledger_reconciles_without_double_counting_thinking() -> N
     assert facts["thinking_tokens"] == 15
     assert sum(item["n_input_tokens"] for item in facts["token_usage_events"]) == 170
     assert sum(item["n_output_tokens"] for item in facts["token_usage_events"]) == 22
+
+
+def test_stream_interrupted_after_final_response_emits_bound_recovery_evidence() -> None:
+    helper = _usage_helper()
+    runtime = ANTIGRAVITY_RUNTIME_MODELS["high"]
+    usage = _usage(100, 20, 60, 15)
+    response = "Implemented, validated, and committed."
+    events = [
+        {"event": "init", "init": {
+            "model": runtime, "cwd": "/app", "permission_mode": "always-proceed",
+        }},
+        {"event": "step_update", "step_update": {
+            "step_index": 1, "step_type": "agent_response", "state": "DONE",
+            "usage": usage,
+        }},
+        {"event": "result", "result": {
+            "status": "ERROR", "num_turns": 1, "usage": usage,
+            "response": response,
+            "error": (
+                "The stream was interrupted. Please continue the task you were "
+                "working on."
+            ),
+        }},
+    ]
+
+    facts = helper(events, expected_runtime_model=runtime)
+
+    assert facts["complete"] is True
+    assert facts["terminal_status"] == "ERROR"
+    assert facts["terminal_recovery"] == {
+        "schema": "dradar-antigravity-terminal-recovery-v1",
+        "reason": "stream_interrupted_after_final_response",
+        "response_sha256": hashlib.sha256(response.encode()).hexdigest(),
+    }
+
+
+@pytest.mark.parametrize("mutation", ["different-error", "empty-response"])
+def test_other_antigravity_errors_never_emit_recovery_evidence(mutation: str) -> None:
+    helper = _usage_helper()
+    runtime = ANTIGRAVITY_RUNTIME_MODELS["high"]
+    usage = _usage(100, 20, 60, 15)
+    result = {
+        "status": "ERROR", "num_turns": 1, "usage": usage,
+        "response": "done",
+        "error": (
+            "The stream was interrupted. Please continue the task you were "
+            "working on."
+        ),
+    }
+    if mutation == "different-error":
+        result["error"] = "provider failed"
+    else:
+        result["response"] = "  "
+    events = [
+        {"event": "init", "init": {
+            "model": runtime, "cwd": "/app", "permission_mode": "always-proceed",
+        }},
+        {"event": "step_update", "step_update": {
+            "step_index": 1, "step_type": "agent_response", "state": "DONE",
+            "usage": usage,
+        }},
+        {"event": "result", "result": result},
+    ]
+
+    facts = helper(events, expected_runtime_model=runtime)
+
+    assert facts["complete"] is True
+    assert "terminal_recovery" not in facts
 
 
 def test_official_cache_can_exceed_uncached_input_and_still_reconcile() -> None:

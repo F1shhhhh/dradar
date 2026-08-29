@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import types
@@ -135,3 +136,80 @@ def test_environment_preserves_pier_default_mounts(
         "/logs/agent",
         "/tmp/dradar-grok-user/.grok",
     ]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ownership reconciliation")
+def test_antigravity_exec_reconciles_only_exact_host_binds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _private_dir(tmp_path / "antigravity" / ".gemini")
+    calls: list[dict[str, object]] = []
+
+    def fake_init(self, *args, **kwargs):  # noqa: ANN001, ANN202, ARG001
+        self._mounts_json = [
+            {"type": "bind", "source": "/host/logs", "target": "/logs/agent"}
+        ]
+
+    async def fake_exec(self, **kwargs):  # noqa: ANN001, ANN202, ARG001
+        calls.append(dict(kwargs))
+        return types.SimpleNamespace(return_code=0, stdout="", stderr="")
+
+    monkeypatch.setattr(
+        "dradar.pier_shared_oauth_docker.DockerEnvironment.__init__", fake_init,
+    )
+    monkeypatch.setattr(
+        "dradar.pier_shared_oauth_docker.DockerEnvironment.exec", fake_exec,
+        raising=False,
+    )
+    environment = SharedOAuthDockerEnvironment(
+        shared_oauth_mounts_json=[{
+            "type": "bind",
+            "source": str(source),
+            "target": "/tmp/dradar-antigravity-user/.gemini",
+        }],
+    )
+
+    asyncio.run(environment.exec("antigravity models", env={"HOME": "/tmp"}))
+
+    assert calls[0]["command"] == "antigravity models"
+    assert calls[0]["user"] is None
+    maintenance = str(calls[1]["command"])
+    assert calls[1]["user"] == "root"
+    assert "find -P /logs/agent -xdev" in maintenance
+    assert "find -P /tmp/dradar-antigravity-user/.gemini -xdev" in maintenance
+    assert f"chown -h -- {os.getuid()}:{os.getgid()}" in maintenance
+    assert "/app" not in maintenance
+
+
+def test_non_antigravity_shared_oauth_exec_does_not_reconcile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _private_dir(tmp_path / "kimi" / "oauth")
+    calls: list[dict[str, object]] = []
+
+    def fake_init(self, *args, **kwargs):  # noqa: ANN001, ANN202, ARG001
+        self._mounts_json = []
+
+    async def fake_exec(self, **kwargs):  # noqa: ANN001, ANN202, ARG001
+        calls.append(dict(kwargs))
+        return types.SimpleNamespace(return_code=0, stdout="", stderr="")
+
+    monkeypatch.setattr(
+        "dradar.pier_shared_oauth_docker.DockerEnvironment.__init__", fake_init,
+    )
+    monkeypatch.setattr(
+        "dradar.pier_shared_oauth_docker.DockerEnvironment.exec", fake_exec,
+        raising=False,
+    )
+    environment = SharedOAuthDockerEnvironment(
+        shared_oauth_mounts_json=[{
+            "type": "bind",
+            "source": str(source),
+            "target": "/tmp/dradar-kimi-home/oauth",
+        }],
+    )
+
+    asyncio.run(environment.exec("kimi --auto"))
+
+    assert len(calls) == 1
+    assert calls[0]["command"] == "kimi --auto"

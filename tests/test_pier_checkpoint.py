@@ -651,11 +651,12 @@ def test_checkpoint_prepares_host_layout_before_agent_log_store_write(
     assert stat.S_IMODE(config.stat().st_mode) == 0o600
 
 
-def test_disabled_checkpoint_host_layout_preflight_is_strict_noop(
+@pytest.mark.skipif(os.name == "nt", reason="POSIX no-follow directory semantics")
+def test_disabled_checkpoint_host_layout_preflight_privatises_agent_logs(
     tmp_path: Path,
 ) -> None:
     trial = tmp_path / "world-writable-trial"
-    logs = trial / "not-the-agent-directory"
+    logs = trial / "agent"
     logs.mkdir(parents=True, mode=0o777)
     trial.chmod(0o777)
     logs.chmod(0o777)
@@ -673,9 +674,13 @@ def test_disabled_checkpoint_host_layout_preflight_is_strict_noop(
 
     manager.prepare_host_layout()
 
-    assert stat.S_IMODE(trial.stat().st_mode) == 0o777
-    assert stat.S_IMODE(logs.stat().st_mode) == 0o777
+    assert stat.S_IMODE(trial.stat().st_mode) == 0o700
+    assert stat.S_IMODE(logs.stat().st_mode) == 0o700
     assert not manager.host_dir.exists()
+
+    output = logs / "model-output.jsonl"
+    assert AgentLogStore(logs).replace_text(output, '{"ok":true}\n')
+    assert stat.S_IMODE(output.stat().st_mode) == 0o600
 
 
 def test_disabled_checkpoint_constructs_without_posix_host_identity(

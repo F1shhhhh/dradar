@@ -1640,6 +1640,7 @@ def _upload_trial(
             "cache_creation_tokens", "subscription_reported_cost_usd",
             "subscription_reported_cost_basis", "resume_attempts",
             "thinking_tokens", "provider_runtime_model", "terminal_status",
+            "terminal_recovery",
         ):
             source_key = "sessions" if key == "agent_session_usage" else key
             if source_key in usage:
