@@ -572,6 +572,7 @@ def cmd_doctor(args) -> int:
         and not grok_requested
         and not kimi_requested
         and not zcode_requested
+        and not antigravity_requested
     ):
         all_ok &= (codex_ready or claude_ready)
 

@@ -526,3 +526,53 @@ def test_zcode_scoped_doctor_ignores_other_configured_provider_slots(
     assert "ZCode GLM-5.3 — Coding Plan provider ready" in out
     assert "Grok" not in out
     assert "Kimi" not in out
+
+
+def test_antigravity_scoped_doctor_does_not_require_codex_or_claude(
+    monkeypatch, capsys, tmp_path,
+):
+    tasks_root = tmp_path / "tasks"
+    tasks_root.mkdir()
+    monkeypatch.setattr(doctor, "_platform", lambda: "linux")
+    monkeypatch.setattr(
+        doctor, "_load_config",
+        lambda: {"server": "https://example.test", "token": "hidden"},
+    )
+    monkeypatch.setattr(doctor, "tasks_root_from_config", lambda _cfg: tasks_root)
+    monkeypatch.setattr(doctor, "deepseek_opted_in", lambda: False)
+    monkeypatch.setattr(doctor, "antigravity_auth_path", lambda: tmp_path / "agy")
+    monkeypatch.setattr(doctor, "prepare_antigravity_auth", lambda: None)
+    monkeypatch.setattr(
+        doctor.shutil, "which",
+        lambda name: "/usr/bin/docker" if name == "docker" else None,
+    )
+    monkeypatch.setattr(doctor, "_probe", lambda _cmd: True)
+    monkeypatch.setattr(doctor, "docker_resources", lambda: (8, 16.0, ()))
+    monkeypatch.setattr(doctor.runner, "ensure_pier", lambda: None)
+    monkeypatch.setattr(
+        doctor.runner, "_resolve_user_tool", lambda name: f"/usr/bin/{name}",
+    )
+    monkeypatch.setattr(
+        doctor.runner, "_pier_version", lambda _path: doctor.runner.PIER_VERSION,
+    )
+    monkeypatch.setattr(
+        doctor.runner, "_pier_version_compatible", lambda _version: True,
+    )
+    monkeypatch.setattr(
+        doctor.shutil, "disk_usage",
+        lambda _path: SimpleNamespace(free=100_000_000_000),
+    )
+    monkeypatch.setattr(
+        doctor, "_client",
+        lambda _cfg: SimpleNamespace(whoami=lambda: {"nickname": "tester"}),
+    )
+
+    rc = doctor.cmd_doctor(SimpleNamespace(agent="antigravity"))
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "Antigravity subscription OAuth" in out
+    assert "Gemini 3.7 Flash" in out
+    assert "codex CLI" not in out
+    assert "claude CLI" not in out
+    assert "all checks passed" in out
