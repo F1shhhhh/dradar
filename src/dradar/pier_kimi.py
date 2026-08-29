@@ -767,7 +767,6 @@ class KimiCode(BaseInstalledAgent):
             env=env,
         )
         common_flags = [
-            "--auto",
             "--model", "kimi-code/k3",
             "--output-format", "stream-json",
             "--skills-dir", remote_skills,

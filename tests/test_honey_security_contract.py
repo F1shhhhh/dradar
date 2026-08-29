@@ -51,7 +51,9 @@ def test_all_non_codex_honeys_use_full_container_permissions() -> None:
 
     kimi = _source("pier_kimi.py")
     assert 'default_permission_mode = "auto"' in kimi
-    assert '"--auto"' in kimi
+    # Kimi 0.39.1 prompt mode rejects the redundant CLI ``--auto`` flag.  The
+    # isolated config remains the single source of truth for full permissions.
+    assert '"--auto"' not in kimi
     assert "[tools]" not in kimi
     assert "KIMI_CODE_AGENT_SWARM_MAX_CONCURRENCY" not in kimi
 
