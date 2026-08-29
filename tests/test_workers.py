@@ -4,9 +4,11 @@ import argparse
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from dradar import cli, runloop
+from dradar.api_client import ApiClient
 
 
 @pytest.fixture(autouse=True)
@@ -1536,6 +1538,88 @@ def test_backfill_queue_read_fails_closed(monkeypatch, capsys):
 
     assert runloop._pool_ready_work_count(Client()) is None
     assert "keeping current workers only" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("code", ("claim_batch_not_found", None))
+def test_scoped_backfill_treats_finished_batch_404_as_clean_drain(code):
+    class Client:
+        batch_id = "550e8400e29b41d4a716446655440000"
+
+        def get_assignment(self):
+            raise runloop.ApiError(
+                "server returned 404: active claim batch not found",
+                status_code=404, code=code,
+            )
+
+    assert runloop._pool_ready_work_count(Client()) == 0
+
+
+@pytest.mark.parametrize("batch_id", (None, "550e8400e29b41d4a716446655440000"))
+def test_backfill_does_not_swallow_unrelated_404(batch_id, capsys):
+    class Client:
+        def __init__(self):
+            self.batch_id = batch_id
+
+        def get_assignment(self):
+            raise runloop.ApiError(
+                "server returned 404: unrelated route missing",
+                status_code=404,
+            )
+
+    assert runloop._pool_ready_work_count(Client()) is None
+    assert "keeping current workers only" in capsys.readouterr().out
+
+
+def test_rolling_server_local_batch_filter_empty_is_clean_supervisor_drain():
+    selected = "550e8400e29b41d4a716446655440000"
+
+    def handler(_request):
+        # Models an old server ignoring batch_id and returning only another
+        # campaign. ApiClient synthesizes the exact claim_batch_not_found 404.
+        return httpx.Response(200, json={"active": [{
+            "assignment_id": "other",
+            "batch_id": "123e4567e89b12d3a456426614174000",
+        }]})
+
+    client = ApiClient(
+        "https://api.example.com", "drt_test",
+        transport=httpx.MockTransport(handler), batch_id=selected,
+    )
+    assert runloop._pool_ready_work_count(client) == 0
+
+
+def test_last_worker_completion_followed_by_batch_404_exits_cleanly(
+        monkeypatch):
+    _patch_pool_setup(monkeypatch, active_count=1)
+
+    class Client:
+        batch_id = "550e8400e29b41d4a716446655440000"
+
+        def set_batch_id(self, value):
+            self.batch_id = value
+
+        def get_assignment(self):
+            raise runloop.ApiError(
+                "server returned 404: active claim batch not found",
+                status_code=404,
+            )
+
+    client = Client()
+    monkeypatch.setattr(runloop, "_client", lambda *_a, **_k: client)
+    monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
+    calls = []
+    monkeypatch.setattr(
+        runloop.subprocess, "Popen",
+        lambda command, env, **kwargs: (
+            calls.append(_ScriptedProcess(command, env, [0], **kwargs))
+            or calls[-1]
+        ),
+    )
+
+    assert runloop._run_worker_pool(_args(
+        workers=1, batch_id=client.batch_id,
+    )) == 0
+    assert len(calls) == 1
 
 
 def test_declining_pool_claims_nothing(monkeypatch):

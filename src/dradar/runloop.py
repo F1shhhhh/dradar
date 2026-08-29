@@ -3910,6 +3910,13 @@ def _pool_ready_work_count(
     try:
         data = client.get_assignment()
     except ApiError as exc:
+        if _explicit_batch_finished(client, exc):
+            # An exact active-batch inventory becomes 404 when its last lease
+            # settles. At this point the pool has already existed and is only
+            # reconciling vacant slots, so this is authoritative clean drain,
+            # not a failed inventory read. Initial acquisition still routes
+            # the same 404 through _acquire_batch/_exit_for and fails closed.
+            return 0
         print(f"worker backfill check failed ({exc}); keeping current workers only")
         return None
     active = data.get("active")
@@ -3942,6 +3949,20 @@ def _pool_ready_work_count(
         if assignment
     )
     return min(ready, max(0, desired_workers - live))
+
+
+def _explicit_batch_finished(client: ApiClient, exc: ApiError) -> bool:
+    """Whether one scoped supervisor read proves its batch is now exhausted."""
+    if not getattr(client, "batch_id", None) or exc.status_code != 404:
+        return False
+    if exc.code == "claim_batch_not_found":
+        return True
+    detail = str(exc).lower()
+    return any(message in detail for message in (
+        "active claim batch not found",
+        "active batch not found",
+        "claim batch not found",
+    ))
 
 
 def _pool_failure_cutoff_path() -> Path | None:
