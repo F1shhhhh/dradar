@@ -5,6 +5,7 @@ import os
 import random
 import time
 import urllib.parse
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,26 @@ _DEFAULT_RETRY_AFTER_SEC = 1.0
 _MAX_RETRY_AFTER_SEC = 60.0
 CLIENT_VERSION_HEADER = "X-DRadar-Client-Version"
 CLIENT_CAPABILITIES_HEADER = "X-DRadar-Capabilities"
+
+
+def normalize_batch_id(value: str | None) -> str | None:
+    """Validate a user-facing claim-batch UUID and normalize it to hex."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or len(value) not in {32, 36}:
+        raise ValueError("batch id must be a 32-hex or canonical 36-character UUID")
+    lowered = value.lower()
+    try:
+        parsed = uuid.UUID(lowered)
+    except (ValueError, AttributeError) as exc:
+        raise ValueError("batch id must be a valid UUID") from exc
+    if len(lowered) == 32:
+        canonical = parsed.hex
+    else:
+        canonical = str(parsed)
+    if lowered != canonical:
+        raise ValueError("batch id must use canonical UUID syntax")
+    return parsed.hex
 
 
 def _env_proxies_set() -> bool:
@@ -51,9 +72,11 @@ class ApiClient:
     def __init__(self, server: str, token: str,
                  transport: httpx.BaseTransport | None = None,
                  capabilities: tuple[str, ...] | list[str] | set[str] | None = None,
-                 benchmark_id: str | None = None):
+                 benchmark_id: str | None = None,
+                 batch_id: str | None = None):
         self.server = server.rstrip("/")
         self.benchmark_id = benchmark_id
+        self.batch_id = normalize_batch_id(batch_id)
         # write=None: large uploads over a slow tunnel must not hit a write
         # timeout; keep a bounded connect/read so a dead server fails fast.
         # No header at all when tokenless (pre-registration): an empty
@@ -101,6 +124,16 @@ class ApiClient:
         separator = "&" if "?" in path else "?"
         return (path + separator + "benchmark="
                 + urllib.parse.quote(self.benchmark_id, safe=""))
+
+    @staticmethod
+    def _query_path(path: str, key: str, value: str | None) -> str:
+        if value is None:
+            return path
+        separator = "&" if "?" in path else "?"
+        return path + separator + key + "=" + urllib.parse.quote(value, safe="")
+
+    def set_batch_id(self, batch_id: str | None) -> None:
+        self.batch_id = normalize_batch_id(batch_id)
 
     def _request(self, method: str, path: str, **kw) -> httpx.Response:
         for attempt in range(_RATE_LIMIT_RETRIES + 1):
@@ -203,7 +236,38 @@ class ApiClient:
         """Returns {active: [dict, ...], free_pick: bool, menu: list|None, ...}
         — `active` is the whole held batch to run, in claim order. Also carries
         legacy `assignment`/`resumed` (first active lease) for older clients."""
-        return self._get(self._benchmark_path("/api/v1/assignment"))
+        path = self._benchmark_path("/api/v1/assignment")
+        data = self._get(self._query_path(path, "batch_id", self.batch_id))
+        if self.batch_id is None:
+            return data
+        # Compatibility guard during a rolling server deployment: if an old
+        # server ignores batch_id, filter its broader inventory locally and
+        # fail closed rather than starting another campaign's assignment.
+        active = data.get("active")
+        if active is None:
+            one = data.get("assignment")
+            active = [one] if one else []
+        matching = []
+        for item in active:
+            if not item:
+                continue
+            try:
+                item_batch_id = normalize_batch_id(item.get("batch_id"))
+            except ValueError:
+                continue
+            if item_batch_id == self.batch_id:
+                matching.append(item)
+        if not matching:
+            raise ApiError(
+                "server returned 404: active claim batch not found",
+                status_code=404,
+                code="claim_batch_not_found",
+            )
+        scoped = dict(data)
+        scoped["active"] = matching
+        scoped["assignment"] = matching[0]
+        scoped["resumed"] = True
+        return scoped
 
     def claim_assignment(self, task_id: str, model: str, effort: str) -> dict[str, Any]:
         """Returns {assignment: dict, resumed: False}. Raises ApiError (409) if
@@ -211,6 +275,8 @@ class ApiClient:
         data = {"task_id": task_id, "model": model, "effort": effort}
         if self.benchmark_id:
             data["benchmark_id"] = self.benchmark_id
+        if self.batch_id:
+            data["batch_id"] = self.batch_id
         return self._post("/api/v1/assignment/claim", data=data)
 
     def suggest(self, n: int) -> dict[str, Any]:
@@ -263,6 +329,8 @@ class ApiClient:
                 "session_id": session_id or ""}
         if self.benchmark_id:
             data["benchmark_id"] = self.benchmark_id
+        if self.batch_id:
+            data["batch_id"] = self.batch_id
         return self._post(
             "/api/v1/assignment/checkout",
             data=data,

@@ -27,7 +27,7 @@ from . import (
     __version__, artifact_staging, assignment_boundary, checkpoints, egress,
     failure_circuit, image_cache, pending, refill as refill_plan,
 )
-from .api_client import ApiClient, ApiError
+from .api_client import ApiClient, ApiError, normalize_batch_id
 from .identity import _client
 from .local_config import (
     DEFAULT_BENCHMARK, HOME, _load_config, tasks_root_from_config,
@@ -113,6 +113,8 @@ _ACCOUNT_TERMINAL_OUTCOMES = {
 _POOL_ABORT_ENV = "DRADAR_POOL_ABORT_FILE"
 _POOL_TARGET_FILE_ENV = "DRADAR_POOL_TARGET_FILE"
 _POOL_FAILURE_CUTOFF_ENV = "DRADAR_POOL_FAILURE_CUTOFF_FILE"
+_POOL_WORKER_ACTIVITY_ENV = "DRADAR_POOL_WORKER_ACTIVITY_FILE"
+_POOL_BACKFILL_V2_ENV = "DRADAR_POOL_BACKFILL_V2"
 _REPEAT_FAILURE_STATE_ENV = "DRADAR_REPEAT_FAILURE_STATE_FILE"
 _ASSIGNMENT_BOUNDARY_ENV = "DRADAR_ASSIGNMENT_BOUNDARY_FILE"
 _POOL_DRAIN_PREFIX = "drain:"
@@ -122,6 +124,9 @@ _WORKER_SLOT_QUARANTINED_EXIT_CODE = 75
 _POOL_SUPERVISOR_POLL_SECONDS = 0.2
 _POOL_BACKFILL_REFRESH_SECONDS = 2.0
 _POOL_BACKFILL_ERROR_RETRY_SECONDS = 10.0
+_POOL_BACKFILL_MAX_ATTEMPTS = 3
+_POOL_BACKFILL_RETRY_BASE_SECONDS = 2.0
+_POOL_BACKFILL_RETRY_MAX_SECONDS = 30.0
 _POOL_IMAGE_CACHE_MAINTENANCE_SECONDS = 15 * 60
 _POOL_TARGET_CACHE: dict[Path, int] = {}
 MAX_CHECKPOINT_RESUMES = 5
@@ -3527,7 +3532,21 @@ def _disk_allows_refill(cfg: dict) -> bool:
         return True
 
 
+def _scope_client_to_batch(client: ApiClient, batch_id: str | None) -> None:
+    """Apply one validated batch scope without burdening lightweight tests."""
+    if hasattr(client, "set_batch_id"):
+        client.set_batch_id(batch_id)
+    elif batch_id is not None:
+        # Production clients always expose set_batch_id. This compatibility
+        # seam is only for small injected clients used by embedders/tests.
+        setattr(client, "batch_id", batch_id)
+
+
 def cmd_go(args) -> int:
+    try:
+        args.batch_id = normalize_batch_id(getattr(args, "batch_id", None))
+    except ValueError as exc:
+        sys.exit(f"invalid --batch-id: {exc}")
     if getattr(args, "pick", None) and getattr(args, "auto", None):
         sys.exit("--auto and --pick are two different ways to choose cells; pass only one")
     if getattr(args, "auto", None) is not None and args.auto < 1:
@@ -3616,6 +3635,7 @@ def cmd_go(args) -> int:
         or DEFAULT_BENCHMARK
     )
     client = _client(cfg, auto_register=True)
+    _scope_client_to_batch(client, args.batch_id)
     # Pre-default configs may not carry tasks_root at all.  They now get the
     # same hidden checkout as a fresh login, while any explicit legacy path
     # remains authoritative.
@@ -3627,6 +3647,7 @@ def cmd_go(args) -> int:
     if not 1 <= target_workers <= 40:
         target_workers = 1
     telemetry = RunnerTelemetry(client, target_workers=target_workers)
+    telemetry.bind_batch(args.batch_id)
     telemetry.start()
     close_reason = "error"
 
@@ -3747,6 +3768,8 @@ def _worker_command(args) -> list[str]:
         command.extend(("--dev-agent", args.dev_agent))
     if getattr(args, "benchmark", None):
         command.extend(("--benchmark", args.benchmark))
+    if getattr(args, "batch_id", None):
+        command.extend(("--batch-id", args.batch_id))
     if getattr(args, "refill", False):
         command.extend(("--refill", "--max-tasks", str(args.max_tasks)))
         if args.refill_to is not None:
@@ -3873,15 +3896,27 @@ def _assignment_is_recoverable_checkpoint(
 
 def _pool_ready_work_count(
     client: ApiClient, *, claimed_after: datetime | None = None,
+    desired_workers: int | None = None,
 ) -> int | None:
-    """Read fresh checkout work plus safely recoverable checkpoints.
+    """Read work eligible for a vacant desired-worker slot.
 
     ``None`` means the safety check itself failed. The supervisor then keeps
     current workers but fails closed instead of guessing and overspawning.
+    New servers expose authoritative per-assignment heartbeat state; when a
+    desired target is supplied, never create replacements if the batch already
+    has that many live assignment owners. Atomic checkout still prevents two
+    racing parents from consuming the same waiting assignment.
     """
     try:
         data = client.get_assignment()
     except ApiError as exc:
+        if _explicit_batch_finished(client, exc):
+            # An exact active-batch inventory becomes 404 when its last lease
+            # settles. At this point the pool has already existed and is only
+            # reconciling vacant slots, so this is authoritative clean drain,
+            # not a failed inventory read. Initial acquisition still routes
+            # the same 404 through _acquire_batch/_exit_for and fails closed.
+            return 0
         print(f"worker backfill check failed ({exc}); keeping current workers only")
         return None
     active = data.get("active")
@@ -3905,12 +3940,81 @@ def _pool_ready_work_count(
             if assignment
         )
     )
-    return waiting + recoverable
+    ready = waiting + recoverable
+    if desired_workers is None:
+        return ready
+    live = sum(
+        bool(assignment.get("heartbeat_running"))
+        for assignment in active
+        if assignment
+    )
+    return min(ready, max(0, desired_workers - live))
+
+
+def _explicit_batch_finished(client: ApiClient, exc: ApiError) -> bool:
+    """Whether one scoped supervisor read proves its batch is now exhausted."""
+    if not getattr(client, "batch_id", None) or exc.status_code != 404:
+        return False
+    if exc.code == "claim_batch_not_found":
+        return True
+    detail = str(exc).lower()
+    return any(message in detail for message in (
+        "active claim batch not found",
+        "active batch not found",
+        "claim batch not found",
+    ))
 
 
 def _pool_failure_cutoff_path() -> Path | None:
     raw = os.environ.get(_POOL_FAILURE_CUTOFF_ENV)
     return Path(raw) if raw else None
+
+
+def _pool_backfill_v2_enabled() -> bool:
+    """Whether the bounded desired-worker reconciler is enabled.
+
+    The default is on so ordinary users get the fix. Operators can restore
+    the previous drain-on-last-exit behavior without downgrading the CLI while
+    a rollout is being investigated.
+    """
+    return os.environ.get(_POOL_BACKFILL_V2_ENV, "1").strip().lower() not in {
+        "0", "false", "no", "off",
+    }
+
+
+def _worker_activity_path() -> Path | None:
+    raw = os.environ.get(_POOL_WORKER_ACTIVITY_ENV)
+    return Path(raw) if raw else None
+
+
+def _record_worker_checkout(assignment_id: str) -> bool:
+    """Tell the local supervisor that this child consumed a real assignment.
+
+    This local marker lets the parent distinguish a pre-checkout startup
+    failure from a task/runtime failure. The latter keeps the existing
+    anti-cascade cutoff; the former may receive a bounded replacement.
+    """
+    path = _worker_activity_path()
+    if path is None:
+        return True
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(str(assignment_id), encoding="utf-8")
+        os.replace(temporary, path)
+        return True
+    except OSError:
+        return False
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _pool_backfill_delay(attempt: int) -> float:
+    """Bounded exponential delay for a repeatedly vacant worker slot."""
+    exponent = max(0, attempt - 1)
+    return min(
+        _POOL_BACKFILL_RETRY_MAX_SECONDS,
+        _POOL_BACKFILL_RETRY_BASE_SECONDS * (2 ** exponent),
+    )
 
 
 def _read_pool_failure_cutoff(path: Path | None = None) -> datetime | None:
@@ -3990,6 +4094,7 @@ def _run_worker_pool(args) -> int:
             or DEFAULT_BENCHMARK
         )
         client = _client(cfg, auto_register=True)
+        _scope_client_to_batch(client, getattr(args, "batch_id", None))
         requested_options = [
             value for value in (
                 getattr(args, "refill_to", None), getattr(args, "auto", None),
@@ -4044,6 +4149,7 @@ def _run_worker_pool(args) -> int:
             or DEFAULT_BENCHMARK
         )
         client = _client(cfg, auto_register=True)
+        _scope_client_to_batch(client, getattr(args, "batch_id", None))
     tasks_root = _selected_tasks_root(cfg)
     acquire_run_lock(HOME)
     sweep_orphan_compose(HOME, True)
@@ -4093,6 +4199,10 @@ def _run_worker_pool(args) -> int:
         Path(tempfile.gettempdir())
         / f"dradar-pool-failure-cutoff-{os.getpid()}-{time.time_ns()}"
     )
+    worker_activity_prefix = (
+        Path(tempfile.gettempdir())
+        / f"dradar-pool-worker-{os.getpid()}-{time.time_ns()}"
+    )
     owns_abort_file = configured_abort_file is None
     popen_kwargs = {}
     if os.name == "nt":
@@ -4101,7 +4211,13 @@ def _run_worker_pool(args) -> int:
     active_processes: dict[int, subprocess.Popen] = {}
     returncodes: list[tuple[int, int]] = []
     quarantined_slots: set[int] = set()
+    suppressed_slots: set[int] = set()
+    worker_activity_files: dict[int, Path] = {}
+    vacant_attempts: dict[int, int] = {}
+    retry_not_before: dict[int, float] = {}
+    zero_live_inventory_failures = 0
     backfill_error: str | None = None
+    backfill_exhausted = False
     backfill_disabled = False
     failure_cutoff: datetime | None = None
     abort_reason: str | None = None
@@ -4115,8 +4231,20 @@ def _run_worker_pool(args) -> int:
             f"{repeat_failure_state_file.name}.lock"
         ).unlink(missing_ok=True)
         failure_cutoff_file.unlink(missing_ok=True)
+        for path in worker_activity_files.values():
+            path.unlink(missing_ok=True)
 
     def spawn_worker(slot: int) -> None:
+        activity_file = worker_activity_files.setdefault(
+            slot,
+            worker_activity_prefix.with_name(
+                f"{worker_activity_prefix.name}-slot-{slot}.started"
+            ),
+        )
+        # The parent writes the initial state before spawning. Missing or
+        # unreadable state later is treated fail-closed; only this exact value
+        # proves that the child exited before checkout.
+        activity_file.write_text("preparing", encoding="utf-8")
         env = os.environ.copy()
         env["DRADAR_WORKER_INDEX"] = str(slot)
         env["DRADAR_POOL_SIZE"] = str(target)
@@ -4126,6 +4254,7 @@ def _run_worker_pool(args) -> int:
         env[_POOL_ABORT_ENV] = str(pool_abort_file)
         env[_REPEAT_FAILURE_STATE_ENV] = str(repeat_failure_state_file)
         env[_POOL_FAILURE_CUTOFF_ENV] = str(failure_cutoff_file)
+        env[_POOL_WORKER_ACTIVITY_ENV] = str(activity_file)
         if boundary_path is not None:
             env[_ASSIGNMENT_BOUNDARY_ENV] = str(boundary_path)
         process = subprocess.Popen(command, env=env, **popen_kwargs)
@@ -4138,13 +4267,25 @@ def _run_worker_pool(args) -> int:
             spawn_worker(index)
 
         next_backfill_check = 0.0
-        while active_processes:
+        while True:
             for slot, process in list(active_processes.items()):
                 returncode = process.poll()
                 if returncode is None:
                     continue
                 returncodes.append((slot, returncode))
                 del active_processes[slot]
+                activity_file = worker_activity_files.get(slot)
+                try:
+                    activity_state = (
+                        activity_file.read_text(encoding="utf-8")
+                        if activity_file is not None else None
+                    )
+                except OSError:
+                    activity_state = None
+                precheckout_exit = activity_state == "preparing"
+                # Unknown marker state is safety-significant: never turn a
+                # lost checkout signal into automatic retry of paid work.
+                consumed_assignment = not precheckout_exit
                 if returncode == _WORKER_SLOT_QUARANTINED_EXIT_CODE:
                     quarantined_slots.add(slot)
                     print(
@@ -4152,6 +4293,23 @@ def _run_worker_pool(args) -> int:
                         "confirmed; sibling workers will continue and this slot "
                         "will not be reused"
                     )
+                elif precheckout_exit:
+                    attempt = vacant_attempts.get(slot, 0) + 1
+                    vacant_attempts[slot] = attempt
+                    retry_not_before[slot] = (
+                        time.monotonic() + _pool_backfill_delay(attempt)
+                    )
+                    if returncode == 0:
+                        print(
+                            f"worker {slot} exited without checkout; checking "
+                            "the authoritative waiting queue before replacement"
+                        )
+                    else:
+                        print(
+                            f"worker {slot} exited {returncode} before checkout; "
+                            f"retrying this vacant slot after bounded backoff "
+                            f"({attempt}/{_POOL_BACKFILL_MAX_ATTEMPTS})"
+                        )
                 elif returncode != 0 and not backfill_disabled:
                     # Freeze everything that was already held when this local
                     # failure surfaced. Replacement workers may only consume
@@ -4168,8 +4326,14 @@ def _run_worker_pool(args) -> int:
                         f"worker {slot} exited {returncode}; existing waiting "
                         "work is frozen, watching only for assignments claimed later"
                     )
+                elif consumed_assignment:
+                    # A healthy child may finish while other assignments are
+                    # still waiting. Its slot remains eligible for inventory-
+                    # driven replacement rather than retiring the whole pool.
+                    vacant_attempts.pop(slot, None)
+                    retry_not_before.pop(slot, None)
 
-            if not active_processes:
+            if not active_processes and not _pool_backfill_v2_enabled():
                 break
             new_target = _read_pool_target(
                 target_file, default=target, maximum=maximum,
@@ -4216,8 +4380,16 @@ def _run_worker_pool(args) -> int:
                             "checkout or backfill will start, active workers will finish"
                         )
                 if abort_interrupts_siblings:
+                    if not active_processes:
+                        break
                     time.sleep(_POOL_SUPERVISOR_POLL_SECONDS)
                     continue
+
+            if backfill_disabled and not active_processes:
+                break
+
+            if target == 0 and not active_processes:
+                break
 
             current_time = time.monotonic()
             if (not backfill_disabled
@@ -4225,6 +4397,7 @@ def _run_worker_pool(args) -> int:
                     and current_time >= next_backfill_check):
                 ready = _pool_ready_work_count(
                     client, claimed_after=failure_cutoff,
+                    desired_workers=target,
                 )
                 next_backfill_check = (
                     current_time + (
@@ -4235,9 +4408,30 @@ def _run_worker_pool(args) -> int:
                 if ready:
                     vacant_slots = sorted(
                         set(range(1, target + 1)) - set(active_processes)
-                        - quarantined_slots
+                        - quarantined_slots - suppressed_slots
                     )
-                    for slot in vacant_slots[:ready]:
+                    exhausted_slots = {
+                        slot for slot in vacant_slots
+                        if vacant_attempts.get(slot, 0)
+                        >= _POOL_BACKFILL_MAX_ATTEMPTS
+                    }
+                    if exhausted_slots:
+                        suppressed_slots.update(exhausted_slots)
+                        backfill_exhausted = True
+                        detail = ", ".join(map(str, sorted(exhausted_slots)))
+                        print(
+                            "bounded replacement is exhausted for worker "
+                            f"slot(s) {detail}; held work remains waiting"
+                        )
+                        vacant_slots = [
+                            slot for slot in vacant_slots
+                            if slot not in exhausted_slots
+                        ]
+                    eligible_slots = [
+                        slot for slot in vacant_slots
+                        if current_time >= retry_not_before.get(slot, 0.0)
+                    ]
+                    for slot in eligible_slots[:ready]:
                         print(
                             f"held work is waiting; restoring worker slot "
                             f"{slot}/{target}"
@@ -4255,6 +4449,26 @@ def _run_worker_pool(args) -> int:
                                 f"({exc}); current workers will finish safely"
                             )
                             break
+                    if not active_processes and not eligible_slots:
+                        retryable_slots = (
+                            set(range(1, target + 1))
+                            - quarantined_slots - suppressed_slots
+                        )
+                        if not retryable_slots:
+                            break
+                elif ready == 0 and not active_processes:
+                    break
+                elif ready is None and not active_processes:
+                    zero_live_inventory_failures += 1
+                    if zero_live_inventory_failures >= _POOL_BACKFILL_MAX_ATTEMPTS:
+                        backfill_error = "worker inventory remained unavailable"
+                        print(
+                            "worker inventory remained unavailable after bounded "
+                            "retries; leaving held work untouched"
+                        )
+                        break
+                if ready is not None:
+                    zero_live_inventory_failures = 0
             time.sleep(_POOL_SUPERVISOR_POLL_SECONDS)
     except (KeyboardInterrupt, EOFError):
         print("\nstopping workers safely; each active task is recoverable only after "
@@ -4291,6 +4505,12 @@ def _run_worker_pool(args) -> int:
     if backfill_error:
         print("worker pool finished after a backfill spawn error; completed uploads "
               "are preserved and the next resume can restore the full pool")
+        return 1
+    if backfill_exhausted:
+        print(
+            "worker pool finished after bounded pre-checkout replacement "
+            "failures; held assignments remain waiting for a later resume"
+        )
         return 1
     if failed:
         detail = ", ".join(f"worker {i}=exit {rc}" for i, rc in failed)
@@ -4572,6 +4792,17 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
                 "The checkout stamp was returned and the worker is stopping."
             )
             results.append("assignment-boundary-failed")
+            break
+        if not _record_worker_checkout(assignment["assignment_id"]):
+            _mark_stopped_quietly(
+                client, assignment, defer_seconds=0,
+                failure_kind="runner_failed",
+            )
+            print(
+                "worker checkout could not be recorded for safe supervision; "
+                "the assignment was returned before the model started"
+            )
+            results.append("worker-activity-unrecorded")
             break
         extra = data.get("unstarted")
         if telemetry:
