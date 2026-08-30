@@ -92,13 +92,13 @@ def test_codebuddy_public_contract_is_pinned_to_three_efforts() -> None:
     assert CODEBUDDY_PROVIDER == "codebuddy-subscription"
     assert CODEBUDDY_MODEL == "hy4-preview"
     assert CODEBUDDY_CLI_VERSION == "2.137.1"
-    assert CODEBUDDY_SUPPORTED_EFFORTS == {"medium", "xhigh", "max"}
+    assert CODEBUDDY_SUPPORTED_EFFORTS == {"low", "high", "max"}
     assert CODEBUDDY_NATIVE_EFFORTS == (
         "minimal", "low", "medium", "high", "xhigh", "max",
     )
     assert CODEBUDDY_CAPABILITY == CODEBUDDY_RUN_CONFIG_VERSION
     assert CODEBUDDY_CAPABILITY == (
-        "codebuddy-hy4-preview-subscription-oauth-three-effort-concurrent-v3"
+        "codebuddy-hy4-preview-subscription-oauth-three-effort-low-high-max-concurrent-v4"
     )
     assert CODEBUDDY_RUNTIME_PROFILE == (
         "pier-codebuddy-hy4-preview-isolated-copy-concurrent-v2"
@@ -238,7 +238,7 @@ def test_login_import_recovers_interrupted_previous_snapshot(
     [
         ("provider", "codebuddy-local"),
         ("model", "hy4"),
-        ("effort", "high"),
+        ("effort", "xhigh"),
         ("agent_version", "2.137.0"),
     ],
 )
@@ -248,7 +248,7 @@ def test_assignment_boundary_fails_closed(field: str, value: str) -> None:
         _validate_codebuddy_assignment(_valid_assignment(**{field: value}))
 
 
-@pytest.mark.parametrize("effort", ["max", "xhigh", "medium"])
+@pytest.mark.parametrize("effort", ["max", "high", "low"])
 def test_assignment_boundary_accepts_each_public_codebuddy_effort(effort: str) -> None:
     _validate_codebuddy_assignment(_valid_assignment(effort=effort))
 

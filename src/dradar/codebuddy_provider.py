@@ -30,12 +30,12 @@ CODEBUDDY_NATIVE_EFFORTS = (
 )
 # Keep the public surface narrower than CodeBuddy's native tier list until each
 # tier has been explicitly approved for the distributed runner.
-CODEBUDDY_SUPPORTED_EFFORTS = frozenset({"medium", "xhigh", "max"})
+CODEBUDDY_SUPPORTED_EFFORTS = frozenset({"low", "high", "max"})
 CODEBUDDY_CAPABILITY = (
-    "codebuddy-hy4-preview-subscription-oauth-three-effort-concurrent-v3"
+    "codebuddy-hy4-preview-subscription-oauth-three-effort-low-high-max-concurrent-v4"
 )
 CODEBUDDY_RUN_CONFIG_VERSION = (
-    "codebuddy-hy4-preview-subscription-oauth-three-effort-concurrent-v3"
+    "codebuddy-hy4-preview-subscription-oauth-three-effort-low-high-max-concurrent-v4"
 )
 CODEBUDDY_RUNTIME_PROFILE = (
     "pier-codebuddy-hy4-preview-isolated-copy-concurrent-v2"
