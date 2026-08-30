@@ -282,6 +282,17 @@ def main(argv: list[str] | None = None) -> int:
     p_retry = sub.add_parser(
         "retry-upload",
         help="flush any trials that ran but failed to upload (also runs automatically before `go`)")
+    p_retry.add_argument(
+        "--request-salvage", metavar="ASSIGNMENT_ID",
+        help=(
+            "explicitly request an upload-only owner for one saved "
+            "owner-superseded result; never reruns the model"
+        ),
+    )
+    p_retry.add_argument(
+        "-y", "--yes", action="store_true",
+        help="confirm the explicit upload-salvage request non-interactively",
+    )
     p_retry.set_defaults(func=cmd_retry_upload, lease_hint=True)
 
     p_cleanup = sub.add_parser(

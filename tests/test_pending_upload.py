@@ -234,6 +234,275 @@ def test_superseded_owner_blocks_migrated_ledger_and_future_retries_locally(
     assert "will neither be retried nor run again automatically" in capsys.readouterr().out
 
 
+def test_explicit_salvage_rebinds_upload_only_and_never_runs_model(
+    tmp_path: Path, monkeypatch, capsys,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    entry = _entry(
+        trial_dir,
+        runner_session_id="source-session-0001",
+        owner_epoch=1,
+        ledger_version=3,
+        upload_blocked="owner_superseded",
+    )
+    pending.record(tmp_path, entry)
+
+    class SalvageClient(FakeClient):
+        def __init__(self):
+            super().__init__(
+                lambda _aid: {"submission_id": "s1", "grade_status": "pending"},
+            )
+            self.rebind_calls = []
+
+        def get_assignment(self):
+            return {"active": [{
+                "assignment_id": "a1",
+                "owner_epoch": 3,
+                "started_at": None,
+            }]}
+
+        def rebind_submission_upload_salvage(
+            self, assignment_id, nonce, source_session_id,
+            source_owner_epoch, expected_owner_epoch, salvage_session_id,
+        ):
+            self.rebind_calls.append({
+                "assignment_id": assignment_id,
+                "nonce": nonce,
+                "source_session_id": source_session_id,
+                "source_owner_epoch": source_owner_epoch,
+                "expected_owner_epoch": expected_owner_epoch,
+                "salvage_session_id": salvage_session_id,
+            })
+            return {"owner_epoch": 4, "replayed": False}
+
+    client = SalvageClient()
+    outcome = runloop._upload_trial(client, entry, request_salvage=True)
+
+    assert outcome == "submitted"
+    assert pending.load(tmp_path) == []
+    assert len(client.rebind_calls) == 1
+    call = client.rebind_calls[0]
+    assert call["source_session_id"] == "source-session-0001"
+    assert call["source_owner_epoch"] == 1
+    assert call["expected_owner_epoch"] == 3
+    assert call["salvage_session_id"].startswith("salvage-")
+    assert client.intent_calls[0][1] == call["salvage_session_id"]
+    assert client.intent_calls[0][2] == 4
+    assert client.calls == ["a1"]
+    assert "without rerunning the model" in capsys.readouterr().out
+
+
+def test_explicit_salvage_refusal_keeps_block_and_artifacts(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    entry = _entry(
+        trial_dir,
+        runner_session_id="source-session-0001",
+        owner_epoch=1,
+        ledger_version=3,
+        upload_blocked="owner_superseded",
+    )
+
+    class LiveOwnerClient(FakeClient):
+        def get_assignment(self):
+            return {"active": [{
+                "assignment_id": "a1",
+                "owner_epoch": 3,
+                "started_at": "2026-08-31T00:00:00+00:00",
+            }]}
+
+        def rebind_submission_upload_salvage(self, *_args, **_kwargs):
+            pytest.fail("a live owner must be rejected before rebind")
+
+    client = LiveOwnerClient(lambda _aid: pytest.fail("must not submit"))
+    outcome = runloop._upload_trial(client, entry, request_salvage=True)
+
+    assert outcome == "upload-blocked"
+    saved = pending.load(tmp_path)[0]
+    assert saved["upload_blocked"] == "owner_superseded"
+    assert saved["runner_session_id"] == "source-session-0001"
+    assert (trial_dir / "artifacts" / "model.patch").is_file()
+    assert client.calls == []
+
+
+@pytest.mark.parametrize(
+    "code",
+    ["upload_salvage_owner_changed", "upload_salvage_identity_unavailable"],
+)
+def test_explicit_salvage_unusable_identity_is_cleared_for_fresh_request(
+    tmp_path: Path, monkeypatch, code,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    entry = _entry(
+        trial_dir,
+        runner_session_id="source-session-0001",
+        owner_epoch=1,
+        ledger_version=3,
+        upload_blocked="owner_superseded",
+        salvage_rebind={
+            "source_session_id": "source-session-0001",
+            "source_owner_epoch": 1,
+            "expected_owner_epoch": 3,
+            "salvage_session_id": "salvage-session-stale",
+        },
+    )
+    pending.record(tmp_path, entry)
+
+    class UnusableIdentityClient(FakeClient):
+        def rebind_submission_upload_salvage(self, *_args, **_kwargs):
+            raise ApiError(
+                "server returned 409: salvage identity is unusable",
+                status_code=409,
+                code=code,
+            )
+
+    client = UnusableIdentityClient(lambda _aid: pytest.fail("must not submit"))
+    outcome = runloop._upload_trial(client, entry, request_salvage=True)
+
+    assert outcome == "upload-blocked"
+    saved = pending.load(tmp_path)[0]
+    assert saved["upload_blocked"] == "owner_superseded"
+    assert "salvage_rebind" not in saved
+    assert (trial_dir / "artifacts" / "model.patch").is_file()
+    assert client.calls == []
+
+
+def test_explicit_salvage_transport_failure_preserves_idempotency_identity(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    entry = _entry(
+        trial_dir,
+        runner_session_id="source-session-0001",
+        owner_epoch=1,
+        ledger_version=3,
+        upload_blocked="owner_superseded",
+    )
+
+    class LostResponseClient(FakeClient):
+        def get_assignment(self):
+            return {"active": [{
+                "assignment_id": "a1",
+                "owner_epoch": 3,
+                "started_at": None,
+            }]}
+
+        def rebind_submission_upload_salvage(self, *_args, **_kwargs):
+            raise ApiError("response lost", status_code=None)
+
+    client = LostResponseClient(lambda _aid: pytest.fail("must not submit"))
+    outcome = runloop._upload_trial(client, entry, request_salvage=True)
+
+    assert outcome == "upload-blocked"
+    saved = pending.load(tmp_path)[0]
+    assert saved["upload_blocked"] == "owner_superseded"
+    assert saved["salvage_rebind"]["salvage_session_id"].startswith("salvage-")
+    assert (trial_dir / "artifacts" / "model.patch").is_file()
+    assert client.calls == []
+
+
+def test_salvaged_owner_superseded_during_intent_clears_stale_rebind(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    entry = _entry(
+        trial_dir,
+        runner_session_id="source-session-0001",
+        owner_epoch=1,
+        ledger_version=3,
+        upload_blocked="owner_superseded",
+    )
+
+    class SupersededSalvageClient(FakeClient):
+        def get_assignment(self):
+            return {"active": [{
+                "assignment_id": "a1",
+                "owner_epoch": 3,
+                "started_at": None,
+            }]}
+
+        def rebind_submission_upload_salvage(
+            self, _assignment_id, _nonce, _source_session_id,
+            _source_owner_epoch, _expected_owner_epoch, _salvage_session_id,
+        ):
+            return {"owner_epoch": 4, "replayed": False}
+
+        def register_submission_upload_intent(self, *_args, **_kwargs):
+            raise ApiError(
+                "server returned 409: upload owner superseded",
+                status_code=409,
+                code="upload_owner_superseded",
+            )
+
+    client = SupersededSalvageClient(
+        lambda _aid: pytest.fail("superseded salvage must not submit"),
+    )
+    outcome = runloop._upload_trial(client, entry, request_salvage=True)
+
+    assert outcome == "upload-blocked"
+    saved = pending.load(tmp_path)[0]
+    assert saved["upload_blocked"] == "owner_superseded"
+    assert "salvage_rebind" not in saved
+    assert saved["salvaged_from"] == {
+        "runner_session_id": "source-session-0001",
+        "owner_epoch": 1,
+    }
+    assert saved["runner_session_id"].startswith("salvage-")
+    assert saved["owner_epoch"] == 4
+    assert (trial_dir / "artifacts" / "model.patch").is_file()
+    assert client.calls == []
+
+    class FreshSalvageClient(FakeClient):
+        def __init__(self):
+            super().__init__(
+                lambda _aid: {"submission_id": "s1", "grade_status": "pending"},
+            )
+            self.rebind_calls = []
+
+        def get_assignment(self):
+            return {"active": [{
+                "assignment_id": "a1",
+                "owner_epoch": 5,
+                "started_at": None,
+            }]}
+
+        def rebind_submission_upload_salvage(
+            self, assignment_id, nonce, source_session_id,
+            source_owner_epoch, expected_owner_epoch, salvage_session_id,
+        ):
+            self.rebind_calls.append({
+                "assignment_id": assignment_id,
+                "nonce": nonce,
+                "source_session_id": source_session_id,
+                "source_owner_epoch": source_owner_epoch,
+                "expected_owner_epoch": expected_owner_epoch,
+                "salvage_session_id": salvage_session_id,
+            })
+            return {"owner_epoch": 6, "replayed": False}
+
+    retry = FreshSalvageClient()
+    second_outcome = runloop._upload_trial(
+        retry, saved, request_salvage=True,
+    )
+
+    assert second_outcome == "submitted"
+    assert pending.load(tmp_path) == []
+    assert len(retry.rebind_calls) == 1
+    rebound = retry.rebind_calls[0]
+    assert rebound["source_session_id"] == "source-session-0001"
+    assert rebound["source_owner_epoch"] == 1
+    assert rebound["expected_owner_epoch"] == 5
+    assert rebound["salvage_session_id"].startswith("salvage-")
+    assert rebound["salvage_session_id"] != saved["runner_session_id"]
+    assert retry.calls == ["a1"]
+
+
 def test_expired_intent_registration_is_terminal_for_only_that_run(
     tmp_path: Path, monkeypatch,
 ):

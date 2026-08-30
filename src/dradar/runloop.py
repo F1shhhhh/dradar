@@ -10,6 +10,10 @@ someone else with nothing counted. Split out of cli.py to separate this from
 identity (login/register) and doctor (environment checks) concerns.
 """
 
+from contextlib import nullcontext
+from datetime import datetime, timezone
+from pathlib import Path
+
 import json
 import os
 import re
@@ -19,9 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from contextlib import nullcontext
-from datetime import datetime, timezone
-from pathlib import Path
+import uuid
 
 from . import (
     __version__, artifact_staging, assignment_boundary, assignment_lock, egress,
@@ -1414,6 +1416,7 @@ def _bundled_completed_outcome(
 
 def _upload_trial(
     client: ApiClient, entry: dict, *, ask_cleanup: bool = False,
+    request_salvage: bool = False,
 ) -> str:
     """Scrub + upload one trial's artifacts, described by a pending-ledger
     entry dict (assignment_id/nonce/task_id/trial_dir/meta/outcome/job_dir/
@@ -1436,7 +1439,15 @@ def _upload_trial(
     assignment_id = entry["assignment_id"]
     task_id = entry.get("task_id", "?")
     blocked_reason = entry.get("upload_blocked")
-    if blocked_reason:
+    salvage_requested = request_salvage and blocked_reason == "owner_superseded"
+    if request_salvage and not salvage_requested:
+        pending.record(HOME, entry)
+        print(
+            f"  {task_id}: explicit salvage only applies to an "
+            "owner_superseded completed upload; no state was changed"
+        )
+        return "upload-blocked"
+    if blocked_reason and not salvage_requested:
         # A persisted block is a terminal *automatic* recovery decision, not
         # a transient upload error.  Keep both the ledger row and artifacts so
         # the paid result can be inspected explicitly, but never restage it or
@@ -1717,6 +1728,153 @@ def _upload_trial(
                     "budget; kept for retry without allocating the body"
                 )
                 return "upload-failed"
+
+        if salvage_requested:
+            # A salvage owner may itself be reclaimed before its saved upload
+            # lands.  Always rebind from the original completed runner, not
+            # from that synthetic upload-only session, whose audit event is
+            # intentionally insufficient to prove a model run.
+            original_source = entry.get("salvaged_from")
+            if original_source is None:
+                source_session_id = entry.get("runner_session_id")
+                source_owner_epoch = entry.get("owner_epoch")
+            elif isinstance(original_source, dict):
+                source_session_id = original_source.get("runner_session_id")
+                source_owner_epoch = original_source.get("owner_epoch")
+            else:
+                source_session_id = None
+                source_owner_epoch = None
+            if (
+                not isinstance(source_session_id, str)
+                or not source_session_id
+                or not isinstance(source_owner_epoch, int)
+                or isinstance(source_owner_epoch, bool)
+                or source_owner_epoch < 0
+            ):
+                print(
+                    f"  {task_id}: saved upload lacks a trustworthy source "
+                    "runner identity; explicit salvage refused"
+                )
+                return "upload-blocked"
+
+            salvage = entry.get("salvage_rebind")
+            if salvage is None:
+                assignment_response = client.get_assignment()
+                active = assignment_response.get("active")
+                if active is None:
+                    one = assignment_response.get("assignment")
+                    active = [one] if one else []
+                assignment = next(
+                    (
+                        item for item in active
+                        if item and item.get("assignment_id") == assignment_id
+                    ),
+                    None,
+                )
+                if assignment is None:
+                    print(
+                        f"  {task_id}: assignment is no longer an active lease; "
+                        "explicit salvage refused"
+                    )
+                    return "upload-blocked"
+                expected_owner_epoch = assignment.get("owner_epoch")
+                if (
+                    not isinstance(expected_owner_epoch, int)
+                    or isinstance(expected_owner_epoch, bool)
+                    or expected_owner_epoch <= source_owner_epoch
+                ):
+                    print(
+                        f"  {task_id}: server did not expose a newer idle owner "
+                        "epoch; explicit salvage refused"
+                    )
+                    return "upload-blocked"
+                if assignment.get("started_at") is not None:
+                    print(
+                        f"  {task_id}: another runner currently owns this "
+                        "assignment; explicit salvage refused"
+                    )
+                    return "upload-blocked"
+                salvage = {
+                    "source_session_id": source_session_id,
+                    "source_owner_epoch": source_owner_epoch,
+                    "expected_owner_epoch": expected_owner_epoch,
+                    "salvage_session_id": f"salvage-{uuid.uuid4().hex}",
+                }
+                # Crash safety: persist the exact idempotency identity before
+                # asking the server to issue an upload-only owner.
+                entry["salvage_rebind"] = salvage
+                pending.record(HOME, entry)
+            elif not isinstance(salvage, dict):
+                print(
+                    f"  {task_id}: malformed saved salvage identity; no state "
+                    "was changed"
+                )
+                return "upload-blocked"
+
+            try:
+                rebound = client.rebind_submission_upload_salvage(
+                    assignment_id,
+                    entry["nonce"],
+                    str(salvage["source_session_id"]),
+                    int(salvage["source_owner_epoch"]),
+                    int(salvage["expected_owner_epoch"]),
+                    str(salvage["salvage_session_id"]),
+                )
+                new_owner_epoch = int(rebound["owner_epoch"])
+            except ApiError as exc:
+                if (
+                    exc.status_code == 409
+                    and exc.code in {
+                        "upload_salvage_owner_changed",
+                        "upload_salvage_identity_unavailable",
+                    }
+                ):
+                    # These structured conflicts prove that this exact
+                    # one-shot identity cannot become a usable owner.  Forget
+                    # only the attempted identity so the user can explicitly
+                    # request a fresh one later; keep the paid artifacts and
+                    # the terminal automatic-upload block intact.
+                    entry.pop("salvage_rebind", None)
+                    pending.record(HOME, entry)
+                    print(
+                        f"  {task_id}: the saved salvage request is no longer "
+                        "usable; request salvage explicitly again after "
+                        "checking that the assignment is idle"
+                    )
+                    return "upload-blocked"
+                print(
+                    f"  {task_id}: explicit upload salvage was refused or "
+                    f"could not complete ({exc}); local evidence remains blocked"
+                )
+                return "upload-blocked"
+            except (KeyError, TypeError, ValueError) as exc:
+                print(
+                    f"  {task_id}: explicit upload salvage was refused or "
+                    f"could not complete ({exc}); local evidence remains blocked"
+                )
+                return "upload-blocked"
+
+            entry["salvaged_from"] = {
+                "runner_session_id": source_session_id,
+                "owner_epoch": source_owner_epoch,
+            }
+            entry["runner_session_id"] = str(salvage["salvage_session_id"])
+            entry["owner_epoch"] = new_owner_epoch
+            entry["ledger_version"] = 3
+            entry.pop("upload_blocked", None)
+            entry.pop("upload_intent", None)
+            upload_meta["upload_salvage_recovery"] = {
+                "schema": "dradar-upload-salvage-v1",
+                "source_owner_epoch": source_owner_epoch,
+                "rebound_owner_epoch": new_owner_epoch,
+            }
+            entry["meta"] = upload_meta
+            pending.record(HOME, entry)
+            print(
+                f"  {task_id}: server authorized an upload-only salvage owner; "
+                "submitting the saved result without rerunning the model"
+            )
+
         while True:
             submit_kwargs = {
                 "outcome": outcome,
@@ -1871,6 +2029,11 @@ def _upload_trial(
                         return "expired"
                     if exc.status_code == 409 and exc.code == "upload_owner_superseded":
                         entry["upload_blocked"] = "owner_superseded"
+                        # A previously issued upload-only owner has itself
+                        # been superseded.  Its one-shot identity can no
+                        # longer be replayed, so a later explicit salvage must
+                        # start with a fresh identity and current owner epoch.
+                        entry.pop("salvage_rebind", None)
                         pending.record(HOME, entry)
                         print(
                             f"  {task_id}: completed result belongs to an owner "
@@ -2625,6 +2788,35 @@ def cmd_retry_upload(args) -> int:
     if not entries:
         print("nothing pending — every trial you've run has been uploaded")
         return 0
+    salvage_assignment_id = getattr(args, "request_salvage", None)
+    if salvage_assignment_id:
+        matches = [
+            entry for entry in entries
+            if entry.get("assignment_id") == salvage_assignment_id
+        ]
+        if not matches:
+            print(
+                "no saved pending upload matches that assignment id; "
+                "no state was changed"
+            )
+            return 2
+        entry = matches[0]
+        if entry.get("upload_blocked") != "owner_superseded":
+            print(
+                "that saved result is not blocked by owner_superseded; "
+                "ordinary retry-upload remains the safe path"
+            )
+            return 2
+        if not getattr(args, "yes", False):
+            answer = input(
+                "request a fresh upload-only owner for this exact saved result? "
+                "The model will NOT run. [y/N] "
+            ).strip().lower()
+            if answer not in {"y", "yes"}:
+                print("cancelled — no server or local state was changed")
+                return 1
+        outcome = _upload_trial(client, entry, request_salvage=True)
+        return 0 if outcome in {"submitted", "interrupted"} else 1
     _retry_pending_uploads(client)
     remaining = pending.load(HOME)
     if remaining:
