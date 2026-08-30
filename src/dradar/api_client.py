@@ -13,7 +13,10 @@ import httpx
 
 from . import __version__
 from .providers import advertised_capabilities, normalize_capabilities
-from .submission_intent import UPLOAD_INTENT_VERSION
+from .submission_intent import (
+    LEGACY_UPLOAD_INTENT_VERSION,
+    UPLOAD_INTENT_VERSION,
+)
 
 _RATE_LIMIT_RETRIES = 5
 _DEFAULT_RETRY_AFTER_SEC = 1.0
@@ -370,7 +373,7 @@ class ApiClient:
         )
 
     def runner_heartbeat(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Best-effort lease-observation heartbeat (protocol v2).
+        """Best-effort lease-observation heartbeat (owner protocol v3).
 
         It is deliberately JSON-only and bounded; the server stores current
         state plus five-minute aggregates, never prompts, patches or command
@@ -387,6 +390,8 @@ class ApiClient:
         assignment_id: str,
         *,
         defer_seconds: int = 300,
+        session_id: str | None = None,
+        owner_epoch: int | None = None,
         resume_generation: int | None = None,
         failure_kind: str | None = None,
         failure_diagnostic: dict[str, Any] | None = None,
@@ -396,11 +401,14 @@ class ApiClient:
         server should stop showing the cell as 解题中. Callers use bounded
         best-effort retries and surface a final failure; current servers also
         reopen session-bound, uncheckpointed work after its exact runner is
-        stale."""
+        stale. New clients fence this transition with owner_epoch."""
         data = {
             "assignment_id": assignment_id,
             "defer_seconds": str(defer_seconds),
+            "session_id": session_id or "",
         }
+        if owner_epoch is not None:
+            data["owner_epoch"] = str(owner_epoch)
         if resume_generation is not None:
             data["resume_generation"] = str(resume_generation)
         if failure_kind:
@@ -460,6 +468,8 @@ class ApiClient:
         result: Path | None,
         client_meta: dict[str, Any],
         outcome: str = "completed",
+        session_id: str | None = None,
+        owner_epoch: int | None = None,
         resume_generation: int | None = None,
         trajectory_bundle: Path | None = None,
         upload_intent_id: str | None = None,
@@ -479,7 +489,10 @@ class ApiClient:
             "nonce": nonce,
             "outcome": outcome,
             "client_meta": json.dumps(client_meta),
+            "session_id": session_id or "",
         }
+        if owner_epoch is not None:
+            data["owner_epoch"] = str(owner_epoch)
         if resume_generation is not None:
             data["resume_generation"] = str(resume_generation)
         if upload_intent_id is not None:
@@ -495,19 +508,26 @@ class ApiClient:
         assignment_id: str,
         nonce: str,
         session_id: str,
-        resume_generation: int,
+        owner_epoch: int | None,
         upload_intent_id: str,
+        *,
+        resume_generation: int | None = None,
+        intent_version: str = UPLOAD_INTENT_VERSION,
     ) -> str:
         """Precommit one exact payload before the potentially large POST."""
+        data = {
+            "assignment_id": assignment_id,
+            "nonce": nonce,
+            "session_id": session_id,
+            "upload_intent_id": upload_intent_id,
+            "intent_version": intent_version,
+        }
+        if owner_epoch is not None:
+            data["owner_epoch"] = str(owner_epoch)
+        if resume_generation is not None:
+            data["resume_generation"] = str(resume_generation)
         self._post(
             "/api/v1/submission-upload-intents",
-            data={
-                "assignment_id": assignment_id,
-                "nonce": nonce,
-                "session_id": session_id,
-                "resume_generation": str(resume_generation),
-                "upload_intent_id": upload_intent_id,
-                "intent_version": UPLOAD_INTENT_VERSION,
-            },
+            data=data,
         )
         return upload_intent_id

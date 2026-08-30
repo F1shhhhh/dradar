@@ -82,17 +82,19 @@ class FakeClient:
 
     def submit(self, assignment_id, nonce, patch, trajectory, result, meta,
                outcome="completed", resume_generation=None,
-               upload_intent_id=None):
+               owner_epoch=None, session_id=None, upload_intent_id=None,
+               intent_version=None):
         self.calls.append(assignment_id)
         self.last_upload_intent_id = upload_intent_id
         return self.behavior(assignment_id)
 
     def register_submission_upload_intent(
-        self, assignment_id, nonce, session_id, resume_generation,
-        upload_intent_id,
+        self, assignment_id, nonce, session_id, owner_epoch,
+        upload_intent_id, *, resume_generation=None, intent_version=None,
     ):
+        fence = owner_epoch if owner_epoch is not None else resume_generation
         self.intent_calls.append((
-            assignment_id, session_id, resume_generation, upload_intent_id,
+            assignment_id, session_id, fence, upload_intent_id,
         ))
         return upload_intent_id
 
@@ -198,7 +200,7 @@ def test_expired_intent_registration_is_terminal_for_only_that_run(
     assert pending.load(tmp_path) == []
 
 
-def test_old_server_without_intent_endpoint_keeps_legacy_submit_compatibility(
+def test_old_server_without_intent_endpoint_keeps_completed_work_for_upgrade(
     tmp_path: Path, monkeypatch,
 ):
     monkeypatch.setattr(runloop, "HOME", tmp_path)
@@ -213,8 +215,9 @@ def test_old_server_without_intent_endpoint_keeps_legacy_submit_compatibility(
     )
     assert runloop._upload_trial(
         client, _entry(trial_dir, runner_session_id="session-1234"),
-    ) == "submitted"
-    assert client.last_upload_intent_id is None
+    ) == "upload-failed"
+    assert pending.assignment_ids(tmp_path) == {"a1"}
+    assert client.calls == []
 
 
 def test_opted_in_session_archive_runs_after_ack_before_job_cleanup(
@@ -1080,7 +1083,7 @@ def test_saved_intent_rejects_changed_prepared_meta(tmp_path: Path, monkeypatch)
     changed = pending.load(tmp_path)[0]
     changed["meta"] = {"changed_after_intent": True}
     second = FakeClient(lambda _aid: pytest.fail("must not submit changed body"))
-    assert runloop._upload_trial(second, changed) == "upload-failed"
+    assert runloop._upload_trial(second, changed) == "upload-blocked"
     assert second.intent_calls == []
 
 

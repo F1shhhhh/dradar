@@ -92,6 +92,20 @@ def load(home: Path) -> list[dict]:
     return _load_unlocked(home)
 
 
+def assignment_ids(home: Path) -> set[str]:
+    """Assignments with durable completed work that must never be rerun.
+
+    A blocked/superseded upload is intentionally included: it still represents
+    paid work whose ownership must be resolved explicitly, not a license to
+    start the model again.
+    """
+    return {
+        str(entry["assignment_id"])
+        for entry in load(home)
+        if entry.get("assignment_id")
+    }
+
+
 def _save_unlocked(home: Path, entries: list[dict]) -> None:
     # A safety-net ledger that isn't itself crash-safe defeats the point: a
     # plain write_text() truncates the file before writing, so a kill/OOM/

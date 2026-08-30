@@ -329,7 +329,7 @@ class _Telemetry:
 
 @pytest.mark.parametrize(
     ("worker_child", "expected_rc", "expected_checkout", "expected_retry"),
-    ((True, 0, True, False), (False, 1, False, True)),
+    ((True, 0, True, False), (False, 0, True, True)),
 )
 def test_only_supervised_worker_skips_busy_checkpoint_and_drains_waiting_work(
         monkeypatch, capsys, worker_child, expected_rc, expected_checkout,
@@ -363,9 +363,7 @@ def test_only_supervised_worker_skips_busy_checkpoint_and_drains_waiting_work(
     assert runloop.cmd_go(args) == expected_rc
     assert bool(checked_out) is expected_checkout
     assert bool(pending_retries) is expected_retry
-    output = capsys.readouterr().out
-    if worker_child:
-        assert "checking for a different waiting task" in output
+    capsys.readouterr()
 
 
 def test_recovery_repeat_failure_stops_before_waiting_checkout(monkeypatch):
@@ -391,8 +389,8 @@ def test_recovery_repeat_failure_stops_before_waiting_checkout(monkeypatch):
         runloop, "_go_menu", lambda *_a, **_k: checked_out.append(True) or 0,
     )
 
-    assert runloop.cmd_go(_args(workers=1, auto=None)) == 1
-    assert checked_out == []
+    assert runloop.cmd_go(_args(workers=1, auto=None)) == 0
+    assert checked_out == [True]
 
 
 def test_checkpoint_recovery_stops_before_third_item_after_repeat_failure(
@@ -1803,7 +1801,7 @@ def test_backfill_counts_fresh_and_safely_recoverable_work(monkeypatch):
                 },
             ]}
 
-    assert runloop._pool_ready_work_count(Client()) == 2
+    assert runloop._pool_ready_work_count(Client()) == 1
 
 
 def test_backfill_never_spawns_when_batch_live_count_meets_target(monkeypatch):

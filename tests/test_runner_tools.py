@@ -773,17 +773,16 @@ def _fake_pier(monkeypatch, work_dir, *, patch=True, trajectory=True,
     return captured
 
 
-def test_run_trial_on_started_exception_is_swallowed(tmp_path, monkeypatch):
+def test_run_trial_on_started_exception_prevents_model_start(tmp_path, monkeypatch):
     _fake_pier(monkeypatch, tmp_path)
     calls = []
     def boom():
         calls.append(True)
         raise RuntimeError("network hiccup")
-    # a failed started-ping must never abort a quota-burning trial
-    art = run_trial(_assignment("codex"), tmp_path, tmp_path, on_started=boom)
+    # A paid subprocess may start only after authoritative ownership binding.
+    with pytest.raises(RuntimeError, match="network hiccup"):
+        run_trial(_assignment("codex"), tmp_path, tmp_path, on_started=boom)
     assert calls == [True]
-    assert art.returncode == 0 and art.patch.is_file()
-    assert art.trajectory is not None and art.trajectory.is_file()
 
 
 def test_run_trial_uses_artifact_overlay_for_verifier_collect_pack(

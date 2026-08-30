@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import (
-    __version__, artifact_staging, assignment_boundary, checkpoints, egress,
+    __version__, artifact_staging, assignment_boundary, assignment_lock, checkpoints, egress,
     failure_circuit, image_cache, pending, refill as refill_plan,
 )
 from .api_client import ApiClient, ApiError, normalize_batch_id
@@ -99,7 +99,12 @@ from .scrub import (
     scrub_json_bytes,
 )
 from .session_archive import archive_after_submit
-from .submission_intent import submission_payload_manifest, upload_intent_id
+from .submission_intent import (
+    LEGACY_UPLOAD_INTENT_VERSION,
+    UPLOAD_INTENT_VERSION,
+    submission_payload_manifest,
+    upload_intent_id,
+)
 from .telemetry import RunnerTelemetry
 from .taskpacks import TaskPackError, ensure_benchmark_task_pack
 
@@ -1806,43 +1811,137 @@ def _upload_trial(
         while True:
             submit_kwargs = {
                 "outcome": outcome,
-                "resume_generation": entry.get("resume_generation"),
             }
             if submit_bundle is not None:
                 submit_kwargs["trajectory_bundle"] = submit_bundle
             runner_session_id = entry.get("runner_session_id")
             if runner_session_id:
-                manifest = submission_payload_manifest(
-                    assignment_id=assignment_id,
-                    session_id=runner_session_id,
-                    resume_generation=int(entry.get("resume_generation", 0)),
-                    outcome=outcome,
-                    meta=upload_meta,
-                    patch=upload_patch,
-                    trajectory=traj_scrubbed,
-                    result=result_scrubbed,
-                    trajectory_bundle=submit_bundle,
-                )
-                calculated_intent_id = upload_intent_id(manifest)
+                manifest_kwargs = {
+                    "assignment_id": assignment_id,
+                    "session_id": runner_session_id,
+                    "outcome": outcome,
+                    "meta": upload_meta,
+                    "patch": upload_patch,
+                    "trajectory": traj_scrubbed,
+                    "result": result_scrubbed,
+                    "trajectory_bundle": submit_bundle,
+                }
                 saved_intent = entry.get("upload_intent")
-                if saved_intent is not None and (
-                    not isinstance(saved_intent, dict)
-                    or saved_intent.get("id") != calculated_intent_id
-                    or saved_intent.get("manifest") != manifest
-                ):
-                    print(
-                        f"  {task_id}: prepared upload changed after its "
-                        "content-bound intent was saved; kept for explicit "
-                        "recovery instead of changing the pending result"
+                legacy_entry = "owner_epoch" not in entry
+                intent_already_registered = False
+                legacy_manifest = submission_payload_manifest(
+                    **manifest_kwargs,
+                    resume_generation=int(entry.get("resume_generation", 0)),
+                )
+                legacy_intent_id = upload_intent_id(legacy_manifest)
+                if legacy_entry:
+                    # Existing ledgers are migrated without guessing whether
+                    # the pre-upgrade registration response was lost. Replaying
+                    # the deterministic v2 identity first is authoritative:
+                    # success means it already exists/is current; a structured
+                    # stale-owner response means the server proved it does not
+                    # exist and only then may v3 reconciliation begin.
+                    if saved_intent is not None and (
+                        not isinstance(saved_intent, dict)
+                        or saved_intent.get("id") != legacy_intent_id
+                        or saved_intent.get("manifest") != legacy_manifest
+                    ):
+                        print(
+                            f"  {task_id}: saved legacy upload identity no longer "
+                            "matches its durable artifacts; kept for explicit review"
+                        )
+                        entry["upload_blocked"] = "legacy_content_identity_changed"
+                        pending.record(HOME, entry)
+                        return "upload-blocked"
+                    try:
+                        client.register_submission_upload_intent(
+                            assignment_id,
+                            entry["nonce"],
+                            runner_session_id,
+                            None,
+                            legacy_intent_id,
+                            resume_generation=int(entry.get("resume_generation", 0)),
+                            intent_version=LEGACY_UPLOAD_INTENT_VERSION,
+                        )
+                    except ApiError as legacy_exc:
+                        migratable = (
+                            legacy_exc.status_code == 409
+                            and (
+                                legacy_exc.code == "owner_protocol_upgrade_required"
+                                or "stale recovery generation" in str(legacy_exc).lower()
+                            )
+                        )
+                        if not migratable:
+                            if legacy_exc.status_code == 410:
+                                print(
+                                    f"  {task_id}: lease expired before its saved "
+                                    "upload could be reconciled; local evidence kept"
+                                )
+                                pending.remove(HOME, assignment_id)
+                                cleanup_settled()
+                                return "expired"
+                            print(
+                                f"  {task_id}: legacy upload reconciliation failed "
+                                f"({legacy_exc}); kept for retry"
+                            )
+                            return "upload-failed"
+                        entry["owner_epoch"] = int(
+                            entry.get("resume_generation", 0)
+                        )
+                        entry["ledger_version"] = 3
+                        entry["migrated_from"] = LEGACY_UPLOAD_INTENT_VERSION
+                        entry.pop("upload_intent", None)
+                        pending.record(HOME, entry)
+                        legacy_entry = False
+                    else:
+                        entry["upload_intent"] = {
+                            "id": legacy_intent_id,
+                            "manifest": legacy_manifest,
+                        }
+                        pending.record(HOME, entry)
+                        submit_kwargs.update({
+                            "session_id": runner_session_id,
+                            "resume_generation": int(
+                                entry.get("resume_generation", 0)
+                            ),
+                            "upload_intent_id": legacy_intent_id,
+                        })
+                        calculated_intent_id = legacy_intent_id
+                        manifest = legacy_manifest
+                        owner_epoch = None
+                        intent_already_registered = True
+                if not legacy_entry:
+                    owner_epoch = int(entry["owner_epoch"])
+                    manifest = submission_payload_manifest(
+                        **manifest_kwargs,
+                        owner_epoch=owner_epoch,
                     )
-                    return "upload-failed"
+                    calculated_intent_id = upload_intent_id(manifest)
+                    saved_intent = entry.get("upload_intent")
+                    if saved_intent is not None and (
+                        not isinstance(saved_intent, dict)
+                        or saved_intent.get("id") != calculated_intent_id
+                        or saved_intent.get("manifest") != manifest
+                    ):
+                        print(
+                            f"  {task_id}: prepared upload changed after its "
+                            "content-bound intent was saved; kept for explicit "
+                            "recovery instead of changing the pending result"
+                        )
+                        entry["upload_blocked"] = "content_identity_changed"
+                        pending.record(HOME, entry)
+                        return "upload-blocked"
                 try:
-                    registered_intent_id = client.register_submission_upload_intent(
-                        assignment_id,
-                        entry["nonce"],
-                        runner_session_id,
-                        int(entry.get("resume_generation", 0)),
-                        calculated_intent_id,
+                    registered_intent_id = (
+                        calculated_intent_id
+                        if intent_already_registered
+                        else client.register_submission_upload_intent(
+                            assignment_id,
+                            entry["nonce"],
+                            runner_session_id,
+                            owner_epoch,
+                            calculated_intent_id,
+                        )
                     )
                 except ApiError as exc:
                     if exc.status_code == 410:
@@ -1861,6 +1960,15 @@ def _upload_trial(
                         pending.remove(HOME, assignment_id)
                         cleanup_settled()
                         return "expired"
+                    if exc.status_code == 409 and exc.code == "upload_owner_superseded":
+                        entry["upload_blocked"] = "owner_superseded"
+                        pending.record(HOME, entry)
+                        print(
+                            f"  {task_id}: completed result belongs to an owner "
+                            "that was later replaced; it was kept locally and will "
+                            "not be retried or run again automatically"
+                        )
+                        return "upload-blocked"
                     if exc.status_code != 404:
                         print(
                             f"  {task_id}: could not register the content-bound "
@@ -1880,7 +1988,11 @@ def _upload_trial(
                         "manifest": manifest,
                     }
                     pending.record(HOME, entry)
-                    submit_kwargs["upload_intent_id"] = calculated_intent_id
+                    submit_kwargs.update({
+                        "session_id": runner_session_id,
+                        "owner_epoch": owner_epoch,
+                        "upload_intent_id": calculated_intent_id,
+                    })
             try:
                 ack = client.submit(
                     assignment_id, entry["nonce"], upload_patch, traj_scrubbed,
@@ -2024,11 +2136,21 @@ def _mark_stopped_quietly(
     resume_generation = (
         None if isinstance(assignment, str) else assignment.get("resume_generation")
     )
+    owner_epoch = (
+        None if isinstance(assignment, str) else assignment.get("owner_epoch")
+    )
+    runner_session_id = (
+        None if isinstance(assignment, str)
+        else assignment.get("_runner_session_id")
+    )
     last_error: Exception | None = None
     for attempt in range(3):
         try:
             stop_kwargs = {"defer_seconds": defer_seconds}
-            if resume_generation is not None:
+            if owner_epoch is not None:
+                stop_kwargs["owner_epoch"] = owner_epoch
+                stop_kwargs["session_id"] = runner_session_id
+            elif resume_generation is not None:
                 stop_kwargs["resume_generation"] = resume_generation
             if failure_kind is not None:
                 stop_kwargs["failure_kind"] = failure_kind
@@ -2309,13 +2431,13 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
     # own job/container checks get a chance to reject it.
     if not _assignment_lock_held:
         try:
-            with checkpoints.assignment_lock(HOME, assignment["assignment_id"]):
+            with assignment_lock.lock(HOME, assignment["assignment_id"]):
                 return _run_and_submit(
                     client, assignment, tasks_root, args, local_commit,
                     telemetry=telemetry, resume_checkpoint=resume_checkpoint,
                     _assignment_lock_held=True,
                 )
-        except checkpoints.CheckpointBusy:
+        except assignment_lock.AssignmentBusy:
             print(
                 f"assignment {assignment['assignment_id']} is already running on this "
                 "machine; refusing to start a duplicate model session"
@@ -2340,20 +2462,41 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             ),
         )
         return "task-content-mismatch"
+    if assignment["assignment_id"] in pending.assignment_ids(HOME):
+        print(
+            "refusing to start: this assignment already has a durable completed "
+            "result pending upload; run `dradar retry-upload`"
+        )
+        return "pending-upload"
     work_dir = HOME / "work"
     print("running trial (this can take a while)...")
+
+    def bind_owner() -> None:
+        try:
+            response = client.mark_started(
+                assignment["assignment_id"],
+                session_id=telemetry.session_id if telemetry else None,
+            )
+        except ApiError as exc:
+            raise RunnerError(
+                f"server ownership bind failed before model start: {exc}"
+            ) from exc
+        if response.get("owner_epoch") is not None:
+            assignment["owner_epoch"] = int(response["owner_epoch"])
+        if telemetry is not None:
+            assignment["_runner_session_id"] = telemetry.session_id
+            telemetry.set_phase(
+                "running", assignment["assignment_id"],
+                assignment.get("owner_epoch"),
+            )
+            telemetry.flush()
+
     for attempt in (1, 2):
         try:
             art = run_trial(
                 assignment, tasks_root, work_dir, dev_agent=args.dev_agent,
-                on_started=lambda: (
-                    client.mark_started(
-                        assignment["assignment_id"], session_id=telemetry.session_id)
-                    if telemetry else client.mark_started(assignment["assignment_id"])
-                ),
-                resume_checkpoint=(
-                    resume_checkpoint.checkpoint_dir if resume_checkpoint else None
-                ))
+                on_started=bind_owner,
+                resume_checkpoint=None)
             break
         except BuildFlakeError as exc:
             # The image build died before the agent ran — a free failure
@@ -2369,17 +2512,9 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                   "the build failed twice — check your network/proxy and re-run "
                   "`dradar resume` (still free: the agent never started), or "
                   "use `dradar release` if you do not want to keep the cell")
-            paused = _pause_checkpoint_quietly(client, assignment)
-            if isinstance(paused, _CheckpointPauseFailure):
-                print(
-                    f"checkpoint infrastructure failed ({paused.family}); "
-                    "local evidence was kept and automatic refill was faulted"
-                )
-                return paused.family.replace("_", "-")
-            if paused is None:
-                _mark_stopped_quietly(
-                    client, assignment, failure_kind="environment_build_failed",
-                )
+            _mark_stopped_quietly(
+                client, assignment, failure_kind="environment_build_failed",
+            )
             return "environment-build-failed"
         except RunnerCleanupUnconfirmedError as exc:
             print(
@@ -2407,18 +2542,6 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         except RunnerError as exc:
             failure_kind = classify_exception_message(str(exc))
             terminal_outcome = _terminal_failure_outcome(failure_kind)
-            item = _pause_checkpoint_quietly(client, assignment)
-            if isinstance(item, _CheckpointPauseFailure):
-                print(
-                    f"trial stopped by {item.family}; local evidence was kept "
-                    "and automatic refill was faulted"
-                )
-                return item.family.replace("_", "-")
-            if item is not None:
-                print(f"trial interrupted: {exc}\n"
-                      f"checkpoint {item.checkpoint_id} was kept; `dradar resume` "
-                      "continues the same workspace/session")
-                return terminal_outcome or "paused"
             if attempt == 1 and _retryable_zcode_network_failure(assignment, exc):
                 stopped = _mark_stopped_quietly(
                     client,
@@ -2454,20 +2577,10 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             )
             return terminal_outcome or "failed"
         except (KeyboardInterrupt, EOFError):
-            # A user can interrupt before an agent has produced a resumable
-            # checkpoint (notably DSH minimal mode). In that case there is no
-            # local recovery path, so undo the checkout stamp before bubbling
-            # the interrupt up. Otherwise the UI reports a resumable lease
-            # while every later ``dradar resume`` sees it as already checked
-            # out and has nothing it can start.
-            paused = _pause_checkpoint_quietly(client, assignment)
-            if paused is None:
-                _mark_stopped_quietly(
-                    client,
-                    assignment,
-                    defer_seconds=0,
-                    failure_kind="user_interrupted",
-                )
+            _mark_stopped_quietly(
+                client, assignment, defer_seconds=0,
+                failure_kind="user_interrupted",
+            )
             raise
 
     if assignment.get("agent") == GROK_AGENT:
@@ -2572,24 +2685,12 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         else None
     )
     terminal_outcome = _terminal_failure_outcome(failure_kind)
-    item = checkpoints.find_latest(HOME, assignment["assignment_id"])
-    if interrupted and item is not None and item.phase != "agent_completed":
-        saved = _pause_checkpoint_quietly(client, assignment)
-        if isinstance(saved, _CheckpointPauseFailure):
-            print(
-                f"trial stopped by {saved.family}; local evidence was kept "
-                "and automatic refill was faulted"
-            )
-            return saved.family.replace("_", "-")
-        if saved is not None:
-            print(f"trial interrupted; checkpoint {saved.checkpoint_id} was kept — "
-                  "the next `dradar resume` continues instead of submitting a partial run")
-            return terminal_outcome or "paused"
+    item = None
     outcome = "interrupted" if interrupted else "completed"
     if telemetry:
         telemetry.set_phase(
             "uploading", assignment["assignment_id"],
-            assignment.get("resume_generation"),
+            assignment.get("owner_epoch"),
         )
     display_outcome = "invalid/not-graded" if interrupted else "completed"
     print(f"trial finished in {art.duration_sec/60:.1f} min (pier rc={art.returncode}, "
@@ -2766,6 +2867,8 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         "meta": meta, "outcome": outcome,
         "job_dir": str(art.job_dir) if art.job_dir else None, "keep": args.keep,
         "archive_session": getattr(args, "archive_session", False),
+        "ledger_version": 3,
+        "owner_epoch": assignment.get("owner_epoch", 0),
         "resume_generation": assignment.get("resume_generation", 0),
         "runner_session_id": telemetry.session_id if telemetry is not None else None,
     }, ask_cleanup=(
@@ -3864,38 +3967,9 @@ def cmd_go(args) -> int:
             args, client, cfg["benchmark"],
         )
 
-        recovered, found_checkpoints = _resume_local_checkpoints(
-            client, args, tasks_root, telemetry,
-        )
-        recovery_ok = all(
-            outcome in ("submitted", "interrupted", "discarded", "expired")
-            for outcome in recovered
-        )
-        if getattr(args, "assignment", None):
-            close_reason = "completed" if recovery_ok and recovered else "paused"
-            rc = 0 if recovery_ok and recovered else 1
-            return rc if _finish_invocation_assignment_boundary(
-                args, client, boundary_path,
-            ) else 1
-        if recovered and not recovery_ok:
-            close_reason = "paused"
-            _finish_invocation_assignment_boundary(args, client, boundary_path)
-            return 1
-        if found_checkpoints and getattr(args, "resume", False) and not recovered:
-            # Every matching checkpoint is already owned by another local
-            # worker. A supervised worker child may safely continue to the
-            # server's atomic checkout dispenser: paused/running checkpoint
-            # assignments already have started_at and cannot be dispensed,
-            # while a different waiting assignment can fill this worker slot.
-            # Keep standalone/manual --parallel conservative because it was
-            # not launched as part of one confirmed worker pool.
-            if getattr(args, "worker_child", False):
-                print("checkpoint is already owned by another local worker; "
-                      "checking for a different waiting task")
-            else:
-                close_reason = "paused"
-                _finish_invocation_assignment_boundary(args, client, boundary_path)
-                return 1
+        # Checkpoint recovery has been retired. Completed paid work is
+        # represented only by the durable pending-upload ledger above; old
+        # checkpoint directories are ignored and can never start a model.
 
         rc = _go_menu(args, cfg, client, tasks_root, telemetry=telemetry)
         if not getattr(args, "parallel", False):
@@ -4115,25 +4189,16 @@ def _pool_ready_work_count(
     if active is None:
         one = data.get("assignment")
         active = [one] if one else []
+    pending_ids = pending.assignment_ids(HOME)
     waiting = sum(
         _assignment_is_ready_for_checkout(
             assignment, claimed_after=claimed_after,
             returned_assignment_ids=returned_assignment_ids,
         )
         for assignment in active
-        if assignment
+        if assignment and assignment.get("assignment_id") not in pending_ids
     )
-    local = checkpoints.latest_by_assignment(HOME)
-    recoverable = (
-        0
-        if claimed_after is not None
-        else sum(
-            _assignment_is_recoverable_checkpoint(assignment, local)
-            for assignment in active
-            if assignment
-        )
-    )
-    ready = waiting + recoverable
+    ready = waiting
     if desired_workers is None:
         return ready
     live = sum(
@@ -4964,7 +5029,14 @@ def _acquire_batch(
         except ApiError as exc:
             _exit_for(exc)
         active = [one] if one else []
-    return active, free_pick
+    pending_ids = pending.assignment_ids(HOME)
+    blocked = [a for a in active if a.get("assignment_id") in pending_ids]
+    if blocked:
+        print(
+            f"holding {len(blocked)} completed assignment(s) for upload recovery; "
+            "the model will not be run again"
+        )
+    return [a for a in active if a.get("assignment_id") not in pending_ids], free_pick
 
 
 def _run_batch(args, client: ApiClient, tasks_root: Path, active: list[dict],
@@ -4972,6 +5044,11 @@ def _run_batch(args, client: ApiClient, tasks_root: Path, active: list[dict],
     """Run a non-empty held batch serially: one version-pin check covers the
     whole batch (a single local checkout serves every cell; it sys.exit's on
     a mismatch unless --allow-task-drift), then per-cell confirm/skip/run."""
+    blocked_ids = pending.assignment_ids(HOME)
+    active = [a for a in active if a.get("assignment_id") not in blocked_ids]
+    if not active:
+        print("all held assignments already have durable pending results; refusing to rerun")
+        return 1
     local_commit = _check_version_pin(active[0].get("deep_swe_commit"), tasks_root,
                                       args.allow_task_drift)
 
@@ -5003,8 +5080,8 @@ def _run_batch(args, client: ApiClient, tasks_root: Path, active: list[dict],
                 return 1
         if telemetry:
             telemetry.set_phase(
-                "running", assignment["assignment_id"],
-                assignment.get("resume_generation"),
+                "preparing", assignment["assignment_id"],
+                assignment.get("owner_epoch"),
             )
             # Make the session/assignment relationship visible before the
             # subprocess can start or fail. assignment/started then stamps
@@ -5018,7 +5095,7 @@ def _run_batch(args, client: ApiClient, tasks_root: Path, active: list[dict],
             if outcome == "cleanup-unconfirmed":
                 telemetry.set_phase(
                     "paused", assignment["assignment_id"],
-                    assignment.get("resume_generation"),
+                    assignment.get("owner_epoch"),
                 )
             else:
                 telemetry.set_phase("queued")
@@ -5070,6 +5147,9 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
     local_commit = _check_version_pin(active[0].get("deep_swe_commit"), tasks_root,
                                       args.allow_task_drift)
     results, failed_ids = [], set()
+    batch_assignment_ids = {
+        item["assignment_id"] for item in active if item.get("assignment_id")
+    }
     while True:
         if not _worker_slot_is_enabled():
             print("worker slot retired by the live pool target; leaving after current work")
@@ -5085,7 +5165,10 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
         if degraded_exclusions is None:
             results.append("degraded-pool-inventory-failed")
             break
-        checkout_exclusions = failed_ids | degraded_exclusions
+        checkout_exclusions = (
+            failed_ids | degraded_exclusions
+            | (pending.assignment_ids(HOME) & batch_assignment_ids)
+        )
         try:
             # A failed local cell is marked stopped so it is retryable later,
             # but this session must not immediately take the same cell again.
@@ -5176,8 +5259,8 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
         if telemetry:
             telemetry.bind_batch(assignment.get("batch_id"))
             telemetry.set_phase(
-                "running", assignment["assignment_id"],
-                assignment.get("resume_generation"),
+                "preparing", assignment["assignment_id"],
+                assignment.get("owner_epoch"),
             )
         print(f"\n=== checked out {assignment['task_id']} "
               f"{assignment['model']}@{assignment['effort']}"
@@ -5194,7 +5277,7 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
             if outcome == "cleanup-unconfirmed":
                 telemetry.set_phase(
                     "paused", assignment["assignment_id"],
-                    assignment.get("resume_generation"),
+                    assignment.get("owner_epoch"),
                 )
             else:
                 telemetry.set_phase("queued")

@@ -207,15 +207,13 @@ CODEBUDDY_AGENT_IMPORT_PATH = (
 )
 CODEBUDDY_AGENT_MODULE_FILENAME = "_dradar_pier_codebuddy.py"
 CHECKPOINT_MODULE_FILENAME = "_dradar_pier_checkpoint.py"
-# Emergency public rollout gate. The shared durable runtime remains in the
-# package for diagnosis and controlled tests, but ordinary trials must use the
-# adapters' checkpoint-disabled path until the cross-platform preflight has a
-# complete release matrix. Do not make this an environment override: a stale
-# shell setting must not silently re-enable quota-burning startup failures.
+# Compatibility tombstone for code/tests that import the old symbol. Runtime
+# selection no longer reads this value and no environment can re-enable it.
 DURABLE_CHECKPOINT_ROLLOUT_ENABLED = False
 
 
 def durable_checkpoint_rollout_enabled() -> bool:
+    """Checkpoint was removed; retained for one import-compatible release."""
     return DURABLE_CHECKPOINT_ROLLOUT_ENABLED
 BETA_SUBSCRIPTION_TRIAL_TIMEOUT_FLOOR_SEC = 120 * 60
 BETA_SUBSCRIPTION_AGENTS = frozenset({
@@ -3541,11 +3539,11 @@ def run_trial(
     codebuddy_cli_version = None
     codex_provider = None
     effective_agent = dev_agent or assignment["agent"]
-    checkpoint_enabled = durable_checkpoint_rollout_enabled()
-    if not checkpoint_enabled and resume_checkpoint is not None:
+    checkpoint_enabled = False
+    if resume_checkpoint is not None:
         raise RunnerError(
-            "durable checkpoint resume is temporarily unavailable in this release; "
-            "the saved checkpoint was not started or discarded"
+            "checkpoint recovery has been removed; the saved directory was not "
+            "started or discarded"
         )
     if effective_agent == "codex":
         codex_provider = (
@@ -3821,21 +3819,9 @@ def run_trial(
             ),
         )
         if on_started is not None:
-            # Best-effort by design: this only confirms to the server that a
-            # free-pick claim's short initial lease should be extended (see
-            # app.py's assignment_started endpoint) -- a network hiccup here must
-            # never abort a real trial that's about to burn real quota.
-            try:
-                on_started()
-            except Exception:
-                pass
-        if not checkpoint_enabled and effective_agent in (
-            "codex", DSH_AGENT, KIMI_AGENT, ZCODE_AGENT, CODEBUDDY_AGENT,
-        ):
-            print(
-                "checkpoint safety fallback active: this trial will run without "
-                "durable checkpoint recovery while the shared runtime is repaired"
-            )
+            # This is now the authoritative ownership bind. Never start a paid
+            # model when the server has not fenced this exact session/epoch.
+            on_started()
         started = time.time()
         with log_path.open("w") as log:
             log.write("cmd=" + " ".join(cmd) + "\n")

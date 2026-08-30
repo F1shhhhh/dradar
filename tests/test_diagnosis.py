@@ -443,7 +443,7 @@ def test_interrupted_quota_limit_opens_pool_circuit(
     assert "quota window is exhausted" in capsys.readouterr().out
 
 
-def test_structured_quota_terminal_keeps_existing_checkpoint_and_drains_pool(
+def test_structured_quota_terminal_stops_fresh_retry_and_drains_pool(
         monkeypatch, tmp_path: Path):
     monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
     abort_file = tmp_path / "ACCOUNT_STOP"
@@ -461,21 +461,17 @@ def test_structured_quota_terminal_keeps_existing_checkpoint_and_drains_pool(
             failure_diagnostic=diagnostic,
         )
 
-    checkpoint = type("Checkpoint", (), {"checkpoint_id": "cp-kept"})()
     monkeypatch.setattr(runloop, "run_trial", quota_terminal)
-    monkeypatch.setattr(
-        runloop, "_pause_checkpoint_quietly", lambda *_a, **_k: checkpoint,
-    )
     client = SubmitClient({})
-    client.mark_stopped = lambda *_a, **_k: pytest.fail(
-        "a resumable checkpoint must not be released or reset",
-    )
+    stopped = []
+    client.mark_stopped = lambda *a, **k: stopped.append((a, k)) or {}
 
     outcome = runloop._run_and_submit(
         client, ASSIGNMENT, tmp_path, _args(), "abc123",
     )
 
     assert outcome == "quota-exhausted"
+    assert stopped
     assert abort_file.read_text() == "drain:account quota exhausted"
 
 
@@ -660,16 +656,13 @@ def test_user_interrupt_without_checkpoint_reports_stopped_to_server(
     )]
 
 
-def test_user_interrupt_with_checkpoint_keeps_server_paused(
+def test_user_interrupt_relinquishes_owner_without_checkpoint(
         monkeypatch, tmp_path):
     monkeypatch.setattr(runloop, "HOME", tmp_path / "home")
     monkeypatch.setattr(
         runloop, "run_trial",
         lambda *a, **kw: (_ for _ in ()).throw(KeyboardInterrupt()),
     )
-    checkpoint = object()
-    monkeypatch.setattr(
-        runloop, "_pause_checkpoint_quietly", lambda *a, **kw: checkpoint)
     stopped = []
     client = SubmitClient({})
     client.mark_stopped = lambda aid, **kw: stopped.append((aid, kw))
@@ -677,7 +670,9 @@ def test_user_interrupt_with_checkpoint_keeps_server_paused(
     with pytest.raises(KeyboardInterrupt):
         runloop._run_and_submit(client, ASSIGNMENT, tmp_path, _args(), "abc")
 
-    assert stopped == []
+    assert stopped == [("a1", {
+        "defer_seconds": 0, "failure_kind": "user_interrupted",
+    })]
 
 
 def test_mark_stopped_retries_transient_cleanup_failure(monkeypatch, capsys):
