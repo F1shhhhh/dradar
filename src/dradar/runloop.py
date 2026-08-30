@@ -119,6 +119,7 @@ _ACCOUNT_TERMINAL_OUTCOMES = {
 _POOL_ABORT_ENV = "DRADAR_POOL_ABORT_FILE"
 _POOL_TARGET_FILE_ENV = "DRADAR_POOL_TARGET_FILE"
 _POOL_FAILURE_CUTOFF_ENV = "DRADAR_POOL_FAILURE_CUTOFF_FILE"
+_POOL_RETURNED_ASSIGNMENTS_ENV = "DRADAR_POOL_RETURNED_ASSIGNMENTS_FILE"
 _POOL_WORKER_ACTIVITY_ENV = "DRADAR_POOL_WORKER_ACTIVITY_FILE"
 _POOL_BACKFILL_V2_ENV = "DRADAR_POOL_BACKFILL_V2"
 _REPEAT_FAILURE_STATE_ENV = "DRADAR_REPEAT_FAILURE_STATE_FILE"
@@ -4085,6 +4086,11 @@ def _pool_failure_cutoff_path() -> Path | None:
     return Path(raw) if raw else None
 
 
+def _pool_returned_assignments_path() -> Path | None:
+    raw = os.environ.get(_POOL_RETURNED_ASSIGNMENTS_ENV)
+    return Path(raw) if raw else None
+
+
 def _pool_backfill_v2_enabled() -> bool:
     """Whether the bounded desired-worker reconciler is enabled.
 
@@ -4173,6 +4179,58 @@ def _write_pool_failure_cutoff(path: Path, cutoff: datetime) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _read_pool_returned_assignments(path: Path | None = None) -> set[str]:
+    """Read exact server-acknowledged returns shared by the pool parent.
+
+    Missing, unreadable, or malformed state fails closed to no proofs. The
+    authoritative assignment inventory is still checked separately before a
+    returned ID can bypass the degraded-pool claim cutoff.
+    """
+    path = path or _pool_returned_assignments_path()
+    if path is None or not path.is_file():
+        return set()
+    try:
+        values = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return set()
+    if not isinstance(values, list):
+        return set()
+    returned = set()
+    for value in values:
+        if (
+            not isinstance(value, str)
+            or not 1 <= len(value) <= 128
+            or any(
+                char not in (
+                    "abcdefghijklmnopqrstuvwxyz"
+                    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-"
+                )
+                for char in value
+            )
+        ):
+            return set()
+        returned.add(value)
+    return returned
+
+
+def _write_pool_returned_assignments(
+    path: Path, assignment_ids: set[str],
+) -> bool:
+    """Atomically publish the parent's bounded exact-return proof set."""
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(sorted(assignment_ids), separators=(",", ":")),
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+        return True
+    except OSError:
+        return False
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _pool_degraded_exclusions(client: ApiClient) -> set[str] | None:
     """IDs held before the pool's latest child failure.
 
@@ -4196,11 +4254,13 @@ def _pool_degraded_exclusions(client: ApiClient) -> set[str] | None:
     if active is None:
         one = data.get("assignment")
         active = [one] if one else []
+    returned_assignment_ids = _read_pool_returned_assignments()
     return {
         assignment["assignment_id"]
         for assignment in active
         if assignment and not _assignment_is_ready_for_checkout(
             assignment, claimed_after=cutoff,
+            returned_assignment_ids=returned_assignment_ids,
         )
         and assignment.get("assignment_id")
     }
@@ -4337,6 +4397,10 @@ def _run_worker_pool(args) -> int:
         Path(tempfile.gettempdir())
         / f"dradar-pool-failure-cutoff-{os.getpid()}-{time.time_ns()}"
     )
+    returned_assignments_file = (
+        Path(tempfile.gettempdir())
+        / f"dradar-pool-returned-{os.getpid()}-{time.time_ns()}.json"
+    )
     worker_activity_prefix = (
         Path(tempfile.gettempdir())
         / f"dradar-pool-worker-{os.getpid()}-{time.time_ns()}"
@@ -4370,6 +4434,7 @@ def _run_worker_pool(args) -> int:
             f"{repeat_failure_state_file.name}.lock"
         ).unlink(missing_ok=True)
         failure_cutoff_file.unlink(missing_ok=True)
+        returned_assignments_file.unlink(missing_ok=True)
         for path in worker_activity_files.values():
             path.unlink(missing_ok=True)
 
@@ -4393,6 +4458,7 @@ def _run_worker_pool(args) -> int:
         env[_POOL_ABORT_ENV] = str(pool_abort_file)
         env[_REPEAT_FAILURE_STATE_ENV] = str(repeat_failure_state_file)
         env[_POOL_FAILURE_CUTOFF_ENV] = str(failure_cutoff_file)
+        env[_POOL_RETURNED_ASSIGNMENTS_ENV] = str(returned_assignments_file)
         env[_POOL_WORKER_ACTIVITY_ENV] = str(activity_file)
         if boundary_path is not None:
             env[_ASSIGNMENT_BOUNDARY_ENV] = str(boundary_path)
@@ -4431,7 +4497,17 @@ def _run_worker_pool(args) -> int:
                     else None
                 )
                 if returned_assignment_id:
-                    returned_assignment_ids.add(returned_assignment_id)
+                    updated_returned = returned_assignment_ids | {
+                        returned_assignment_id,
+                    }
+                    if _write_pool_returned_assignments(
+                        returned_assignments_file, updated_returned,
+                    ):
+                        returned_assignment_ids = updated_returned
+                    else:
+                        # Without a proof readable by the replacement child,
+                        # fail closed and leave this old lease out of backfill.
+                        returned_assignment_ids.discard(returned_assignment_id)
                 elif activity_state not in {
                     None, "preparing",
                     "preparing:runner_session_capacity_reached",
@@ -4440,6 +4516,9 @@ def _run_worker_pool(args) -> int:
                     # one-shot safe-return proof. If the child did not return
                     # it again, never let an old marker authorize another run.
                     returned_assignment_ids.discard(activity_state)
+                    _write_pool_returned_assignments(
+                        returned_assignments_file, returned_assignment_ids,
+                    )
                 precheckout_exit = (
                     activity_state == "preparing" or capacity_blocked
                 )
