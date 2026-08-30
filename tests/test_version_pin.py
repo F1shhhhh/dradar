@@ -7,7 +7,7 @@ import subprocess
 
 import pytest
 
-from dradar import runloop
+from dradar import runloop, runner
 from dradar.runner import local_deep_swe_commit
 
 
@@ -42,6 +42,31 @@ def test_local_deep_swe_commit_real_repo(tmp_path):
     sub.mkdir()
     assert local_deep_swe_commit(tmp_path) == head
     assert local_deep_swe_commit(sub) == head
+
+
+def test_sync_fetches_pin_from_dradar_public_task_repo(monkeypatch, tmp_path):
+    pinned = "d" * 40
+    calls = []
+
+    class Completed:
+        returncode = 0
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return Completed()
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(runner, "local_deep_swe_commit", lambda _root: pinned)
+
+    assert runner.sync_deep_swe_commit(tmp_path / "tasks", pinned) is True
+    assert calls == [
+        [
+            "git", "-C", str(tmp_path / "tasks"), "fetch", "--depth", "1",
+            runner.DEEP_SWE_REPO, pinned,
+        ],
+        ["git", "-C", str(tmp_path / "tasks"), "checkout", pinned],
+    ]
+    assert runner.DEEP_SWE_REPO == "https://github.com/SecurityMind/deep-swe"
 
 
 # --- _check_version_pin: drift handling (self-heal / hard-stop / --allow-task-drift)

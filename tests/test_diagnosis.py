@@ -762,6 +762,39 @@ def test_mark_stopped_downgrades_failure_kind_for_old_server(capsys):
     assert capsys.readouterr().out == ""
 
 
+def test_task_mismatch_cleanup_rolls_back_observability_for_old_server(capsys):
+    attempts = []
+
+    class Client:
+        def mark_stopped(self, assignment_id, **kwargs):
+            attempts.append((assignment_id, kwargs))
+            if len(attempts) == 1:
+                raise ApiError(
+                    "server returned 422: unsupported failure_diagnostic schema",
+                    status_code=422,
+                )
+            if len(attempts) == 2:
+                raise ApiError(
+                    "server returned 422: unsupported failure_kind",
+                    status_code=422,
+                )
+            return {"ok": True}
+
+    assert runloop._mark_stopped_quietly(
+        Client(), "assignment-old-task-pack",
+        failure_kind="task_content_mismatch",
+        failure_diagnostic={
+            "schema": "dradar-task-content-mismatch-v1",
+            "failure_code": "task_content_mismatch",
+        },
+    ) is True
+    assert "failure_diagnostic" in attempts[0][1]
+    assert attempts[1][1]["failure_kind"] == "task_content_mismatch"
+    assert "failure_diagnostic" not in attempts[1][1]
+    assert "failure_kind" not in attempts[2][1]
+    assert capsys.readouterr().out == ""
+
+
 def test_mark_stopped_does_not_downgrade_unrelated_422(capsys):
     attempts = []
 

@@ -78,7 +78,8 @@ from .providers import (
     zcode_cli_version_is_compatible,
 )
 from .runner import (
-    CODEX_TRAJECTORY_BUNDLE_SCHEMA, DIAG_ADVICE, BuildFlakeError, RunnerError,
+    CODEX_TRAJECTORY_BUNDLE_SCHEMA, DEEP_SWE_REPO, DIAG_ADVICE,
+    BuildFlakeError, RunnerError,
     RunnerCleanupUnconfirmedError, RunnerTaskRetryableError,
     POMPEII_BENCHMARK_ID,
     POMPEII_FINALIZATION_RESERVE_SEC, POMPEII_SOFT_BUDGET_SEC,
@@ -90,7 +91,8 @@ from .runner import (
     diagnose_exception, ensure_pier, ensure_tasks_root,
     durable_checkpoint_rollout_enabled, local_deep_swe_commit,
     pompeii_agent_timeout_sec, run_trial,
-    summarize_result, sync_deep_swe_commit, trial_artifact_paths,
+    summarize_result, sync_deep_swe_commit, task_content_mismatch_diagnostic,
+    trial_artifact_paths,
 )
 from .scrub import (
     patch_structure_is_valid, redact_patch_secrets, scan_secrets,
@@ -974,7 +976,7 @@ def _check_version_pin(pinned: str | None, tasks_root: Path, allow_drift: bool) 
             print(f"  synced to {pinned[:12]}")
             return pinned
         fix = (
-            f"  git -C {tasks_root} fetch --depth 1 origin {pinned}\n"
+            f"  git -C {tasks_root} fetch --depth 1 {DEEP_SWE_REPO} {pinned}\n"
             f"  git -C {tasks_root} checkout {pinned}"
         )
         if not allow_drift:
@@ -2319,11 +2321,20 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
     if hash_match is False and not getattr(args, "allow_task_drift", False):
         print(
             "refusing to start: the selected benchmark task differs from the "
-            "server copy. Restore local task changes or refresh the task pack, "
-            "then run `dradar resume`; no model quota was consumed. Use "
-            "`--allow-task-drift` only for an intentional non-comparable run."
+            "server's published task package. No model process was started and "
+            "no model quota was consumed. Update the CLI, restore local task "
+            "changes, or refresh the task repo, then run `dradar resume`. Do not "
+            "use `--allow-task-drift` for an ordinary retry; that override is only "
+            "for an intentional non-comparable run."
         )
-        _mark_stopped_quietly(client, assignment)
+        _mark_stopped_quietly(
+            client,
+            assignment,
+            failure_kind="task_content_mismatch",
+            failure_diagnostic=task_content_mismatch_diagnostic(
+                assignment, tasks_root, local_commit,
+            ),
+        )
         return "task-content-mismatch"
     work_dir = HOME / "work"
     print("running trial (this can take a while)...")
