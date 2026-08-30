@@ -98,10 +98,6 @@ class FakeClient:
         ))
         return upload_intent_id
 
-    def checkpoint_discard(self, assignment_id, checkpoint_id,
-                           resume_generation, reason):
-        self.discarded = (assignment_id, checkpoint_id, resume_generation, reason)
-
     def mark_stopped(self, assignment_id, **_kwargs):
         self.stopped.append(assignment_id)
 
