@@ -162,17 +162,11 @@ def test_command_uses_official_catalog_adapter_and_auth_without_secret_env(
     assert "--agent" not in command
     assert f"version={TEST_CODEX_VERSION}" in command
     assert "reasoning_effort=max" in command
-    assert "checkpoint_enabled=true" in command
-    assert "checkpoint_assignment_id=a1" in command
-    assert "checkpoint_task_id=task-1" in command
-    assert "checkpoint_effort=max" in command
-    assert "checkpoint_resume_generation=0" in command
+    assert not any(value.startswith("checkpoint_") for value in command)
     assert "checkpoint_path=" not in joined
     assert DEEPSEEK_API_KEY_ENV not in joined
     assert "CODEX_AUTH_JSON_PATH=" in joined
     assert (home / runner.DEEPSEEK_AGENT_MODULE_FILENAME).is_file()
-    assert (home / runner.CODEX_AGENT_MODULE_FILENAME).is_file()
-    assert (home / runner.CHECKPOINT_MODULE_FILENAME).is_file()
 
     catalog_arg = next(
         item for item in command if item.startswith("model_catalog_json_file=")
@@ -238,12 +232,6 @@ def test_deepseek_shared_inputs_are_reused_and_owner_only(
     expected = {
         home / runner.DEEPSEEK_AGENT_MODULE_FILENAME: (
             Path(runner.__file__).with_name("pier_deepseek.py").read_bytes()
-        ),
-        home / runner.CODEX_AGENT_MODULE_FILENAME: (
-            Path(runner.__file__).with_name("pier_codex.py").read_bytes()
-        ),
-        home / runner.CHECKPOINT_MODULE_FILENAME: (
-            Path(runner.__file__).with_name("pier_checkpoint.py").read_bytes()
         ),
         home / "codex-deepseek-v4.toml": runner.DEEPSEEK_TOML.encode(),
         home / "codex-submission-prompt.j2": (
@@ -410,48 +398,6 @@ def test_missing_runtime_auth_file_is_rejected(tmp_path: Path, monkeypatch):
             _assignment(), tasks, tmp_path / "jobs", "job", home,
         )
 
-
-def test_deepseek_checkpoint_resume_passes_durable_metadata(
-    tmp_path: Path, monkeypatch,
-):
-    monkeypatch.setattr(runner.shutil, "which", lambda name: "/usr/bin/pier")
-    tasks = tmp_path / "tasks"
-    (tasks / "task-1").mkdir(parents=True)
-    auth = tmp_path / "auth.json"
-    auth.write_text("{}")
-    checkpoint = tmp_path / "checkpoint"
-    command = runner.build_pier_command(
-        _assignment(resume_generation=2),
-        tasks,
-        tmp_path / "jobs",
-        "job",
-        tmp_path,
-        resume_checkpoint=checkpoint,
-        provider_auth_path=auth,
-    )
-    assert f"checkpoint_path={checkpoint}" in command
-    assert "checkpoint_resume_generation=2" in command
-
-
-def test_deepseek_checkpoint_identity_is_owned_by_durable_codex() -> None:
-    source = Path(runner.__file__).with_name("pier_deepseek.py").read_text()
-    module = ast.parse(source)
-    adapter = next(
-        node for node in module.body
-        if isinstance(node, ast.ClassDef) and node.name == "DeepSeekCodex"
-    )
-    rendered = ast.unparse(adapter)
-
-    assert any(
-        isinstance(base, ast.Name) and base.id == "DurableCodex"
-        for base in adapter.bases
-    )
-    assert "_CHECKPOINT_PROVIDER = 'deepseek'" in rendered
-    assert "_CHECKPOINT_HARNESS = 'codex'" in rendered
-    assert not any(
-        isinstance(node, ast.AsyncFunctionDef) and node.name == "_start_checkpoint"
-        for node in adapter.body
-    )
 
 
 def test_pier_process_isolates_deepseek_secret_and_adapter_path(

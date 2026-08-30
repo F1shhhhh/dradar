@@ -179,33 +179,6 @@ def test_dsh_assignment_version_is_only_a_hint() -> None:
     runner._validate_dsh_assignment(_assignment(agent_version="9.9.9"))
 
 
-def test_dsh_checkpoint_resume_passes_durable_metadata(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(runner.shutil, "which", lambda _name: "/usr/bin/uvx")
-    assignment = _assignment()
-    tasks = tmp_path / "tasks"
-    (tasks / assignment["task_id"]).mkdir(parents=True)
-    key = _key(tmp_path / "dsh-key")
-
-    checkpoint = tmp_path / "checkpoint"
-    command = runner.build_pier_command(
-        {**assignment, "resume_generation": 3},
-        tasks,
-        tmp_path / "jobs",
-        "job",
-        tmp_path,
-        resume_checkpoint=checkpoint,
-        provider_auth_path=key,
-    )
-    assert f"checkpoint_path={checkpoint}" in command
-    assert "checkpoint_enabled=true" in command
-    assert "checkpoint_assignment_id=a-dsh-1" in command
-    assert "checkpoint_task_id=task-1" in command
-    assert "checkpoint_effort=high" in command
-    assert "checkpoint_resume_generation=3" in command
-
 
 def test_dsh_process_env_strips_secret_and_isolates_adapter(
     tmp_path: Path,

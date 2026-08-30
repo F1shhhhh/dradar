@@ -62,7 +62,7 @@ def validated_session_id(value: str | None) -> str | None:
 
     Kimi Code 0.39.x stores sessions in directories named
     ``session_<UUID>`` and its ``--session`` flag requires that full basename.
-    Accepting a bare UUID keeps older DRadar checkpoints recoverable, but all
+    Accepting a bare UUID keeps older same-turn retry logs readable, but all
     callers receive the current CLI-owned spelling.
     """
 

@@ -94,7 +94,7 @@ def test_checkout_flushes_and_passes_session_id_before_server_stamps_cell(
         _args(), {}, client, tmp_path, telemetry=telemetry) == 0
     assert client.checkout_sessions == ["session-test", "session-test"]
     assert telemetry.flushes >= 2
-    assert ("running", "a1", None) in telemetry.phases
+    assert ("preparing", "a1", None) in telemetry.phases
 
 
 def test_checkout_surfaces_heartbeat_capacity_error_without_calling_checkout(

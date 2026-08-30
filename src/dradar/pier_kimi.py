@@ -25,18 +25,14 @@ from pier.models.agent.network import NetworkAllowlist
 from pier.models.trajectories import Agent, FinalMetrics, Step, Trajectory
 from pier.utils.trajectory_metrics import populate_context_from_final_metrics
 
-from _dradar_pier_checkpoint import (
+from _dradar_pier_runtime_safety import (
     AgentLogStore,
-    CheckpointError,
-    CheckpointIncompatibleError,
-    DurableCheckpoint,
-    StatePath,
+    RuntimeSafety,
     UnsafeAgentLog,
 )
 from _dradar_kimi_recovery import (
     KIMI_PROVIDER_CONNECTION_EXIT_CODE,
     kimi_provider_connection_stderr_is_retryable,
-    native_session_probe_command,
     pier_exit_code,
     run_with_kimi_resume,
     unique_session_probe_command,
@@ -593,12 +589,6 @@ class KimiCode(BaseInstalledAgent):
         kimi_cli_file: str,
         reasoning_effort: str,
         shared_oauth: bool = False,
-        checkpoint_enabled: str | bool = False,
-        checkpoint_assignment_id: str | None = None,
-        checkpoint_task_id: str | None = None,
-        checkpoint_effort: str | None = None,
-        checkpoint_resume_generation: str | int = 0,
-        checkpoint_path: str | None = None,
         **kwargs: Any,
     ):
         auth = Path(auth_json_file)
@@ -609,8 +599,6 @@ class KimiCode(BaseInstalledAgent):
             raise ValueError("Verified host Kimi CLI executable is missing")
         if reasoning_effort not in {"low", "high", "max"}:
             raise ValueError("Kimi reasoning_effort must be low, high, or max")
-        if checkpoint_effort is not None and checkpoint_effort != reasoning_effort:
-            raise ValueError("Kimi checkpoint effort must match reasoning_effort")
         if not isinstance(shared_oauth, bool):
             raise ValueError("Kimi shared_oauth must be a boolean")
         try:
@@ -632,31 +620,7 @@ class KimiCode(BaseInstalledAgent):
         self._resume_attempts = 0
         self._session_id: str | None = None
         super().__init__(*args, **kwargs)
-        self._checkpoint = DurableCheckpoint(
-            logs_dir=self.logs_dir,
-            enabled=checkpoint_enabled,
-            assignment_id=checkpoint_assignment_id,
-            task_id=checkpoint_task_id,
-            model=self.model_name,
-            effort=checkpoint_effort or reasoning_effort,
-            resume_generation=checkpoint_resume_generation,
-            checkpoint_path=checkpoint_path,
-            harness=self.name(),
-            provider="kimi-subscription",
-            agent_version=self._version or KIMI_CLI_VERSION,
-            state_paths=(
-                StatePath("sessions", (self._REMOTE_HOME / "sessions").as_posix()),
-                StatePath(
-                    "session-index",
-                    (self._REMOTE_HOME / "session_index.jsonl").as_posix(),
-                ),
-                StatePath("stream", f"/logs/agent/{self._STREAM_FILE}"),
-            ),
-            sensitive_values=self._credential_values,
-            session_probe=unique_session_probe_command(
-                (self._REMOTE_HOME / "sessions").as_posix(),
-            ),
-        )
+        self._runtime_safety = RuntimeSafety(self.logs_dir)
 
     def get_version_command(self) -> str:
         return f"{self._REMOTE_CLI.as_posix()} --version"
@@ -715,42 +679,6 @@ class KimiCode(BaseInstalledAgent):
             "KIMI_CODE_PASSWORD",
         ):
             env.pop(name, None)
-        if self._checkpoint.enabled:
-            await self._checkpoint.prepare_agent_environment(
-                self, environment, env,
-            )
-        if self._checkpoint.enabled and self._shared_oauth:
-            identity = self._checkpoint.agent_identity
-            if identity is None:
-                raise CheckpointError("Kimi checkpoint agent identity is unavailable")
-            numeric_user = f"{identity.uid}:{identity.gid}"
-            quoted_home = shlex.quote(remote_home)
-            quoted_user_home = shlex.quote(remote_user_home)
-            quoted_skills = shlex.quote(remote_skills)
-            quoted_credentials = shlex.quote(remote_home + "/credentials")
-            quoted_oauth = shlex.quote(remote_home + "/oauth")
-            await self._checkpoint.exec_root_maintenance(
-                environment,
-                command=(
-                    "set -eu; "
-                    f"test -d {quoted_home}; test ! -L {quoted_home}; "
-                    f"test -d {quoted_credentials}; "
-                    f"test ! -L {quoted_credentials}; "
-                    f"test -d {quoted_oauth}; test ! -L {quoted_oauth}; "
-                    f"mkdir -p {quoted_user_home} {quoted_skills}; "
-                    f"chown {numeric_user} {quoted_home} {quoted_user_home} "
-                    f"{quoted_skills}; "
-                    f"test \"$(stat -c %u {quoted_credentials})\" = "
-                    f"'{identity.uid}'; "
-                    f"test \"$(stat -c %g {quoted_credentials})\" = "
-                    f"'{identity.gid}'; "
-                    f"test \"$(stat -c %u {quoted_oauth})\" = "
-                    f"'{identity.uid}'; "
-                    f"test \"$(stat -c %g {quoted_oauth})\" = "
-                    f"'{identity.gid}'; "
-                    f"chmod 700 {quoted_home} {quoted_user_home} {quoted_skills}"
-                ),
-            )
         await self.exec_as_agent(
             environment,
             command=(
@@ -775,7 +703,7 @@ class KimiCode(BaseInstalledAgent):
         )
         local_config = self.logs_dir / "kimi-config.toml"
         local_policy = self.logs_dir / "kimi-policy.py"
-        self._checkpoint.prepare_host_layout()
+        self._runtime_safety.prepare_host_layout()
         log_store = AgentLogStore(self.logs_dir)
         log_store.replace_text(local_config, KIMI_CONFIG)
         log_store.replace_text(local_policy, KIMI_POLICY)
@@ -799,12 +727,7 @@ class KimiCode(BaseInstalledAgent):
                 f"{shlex.quote(remote_lock)} {shlex.quote(remote_config)} "
                 f"&& chmod 500 {shlex.quote(remote_policy)}"
             )
-            if self._checkpoint.enabled:
-                await self._checkpoint.exec_root_maintenance(
-                    environment, command=command,
-                )
-            else:
-                await self.exec_as_root(environment, command=command, env=env)
+            await self.exec_as_root(environment, command=command, env=env)
         elif not self._shared_oauth:
             await self.exec_as_agent(
                 environment,
@@ -830,7 +753,6 @@ class KimiCode(BaseInstalledAgent):
             "--output-format", "stream-json",
             "--skills-dir", remote_skills,
         ]
-        checkpoint_session: str | None = None
 
         def shared_oauth_guarded_command(command: str) -> str:
             """Keep container-created refresh files owned by the host user.
@@ -900,17 +822,11 @@ class KimiCode(BaseInstalledAgent):
             return validated_session_id(result.stdout)
 
         async def run_initial() -> None:
-            if checkpoint_session is not None:
-                await run_resume(checkpoint_session, instruction)
-            else:
-                await self.exec_as_agent(
-                    environment,
-                    command=command_for(
-                        ["--prompt", instruction],
-                        append=self._checkpoint.previous is not None,
-                    ),
-                    env=env,
-                )
+            await self.exec_as_agent(
+                environment,
+                command=command_for(["--prompt", instruction], append=False),
+                env=env,
+            )
 
         async def run_resume(session_id: str, _prompt: str) -> None:
             await self.exec_as_agent(
@@ -943,35 +859,7 @@ class KimiCode(BaseInstalledAgent):
                 attempt,
             )
 
-        completed = False
-        failure: BaseException | None = None
         try:
-            checkpoint_session = await self._checkpoint.start(
-                self, environment, env,
-            )
-            restoring_checkpoint = self._checkpoint.previous is not None
-            if checkpoint_session is not None:
-                checkpoint_session = validated_session_id(checkpoint_session)
-                self._checkpoint.session_id = checkpoint_session
-            if restoring_checkpoint and checkpoint_session is None:
-                raise CheckpointIncompatibleError(
-                    "Kimi checkpoint has no canonical native session id"
-                )
-            if checkpoint_session is not None:
-                native = await self.exec_as_agent(
-                    environment,
-                    command=native_session_probe_command(
-                        remote_home + "/sessions",
-                        remote_home + "/session_index.jsonl",
-                        checkpoint_session,
-                    ),
-                    env=env,
-                )
-                if validated_session_id(native.stdout) != checkpoint_session:
-                    raise CheckpointIncompatibleError(
-                        "Kimi checkpoint native session state is unavailable"
-                    )
-            self._session_id = checkpoint_session
             resume_attempts, runtime_session = await run_with_kimi_resume(
                 run_initial=run_initial,
                 find_session_id=remote_session_id,
@@ -980,11 +868,7 @@ class KimiCode(BaseInstalledAgent):
                 classify_retryable_error=classify_retryable_error,
             )
             self._resume_attempts = resume_attempts
-            self._session_id = runtime_session or checkpoint_session
-            completed = True
-        except BaseException as exc:
-            failure = exc
-            raise
+            self._session_id = runtime_session
         finally:
             probe_cancellation: asyncio.CancelledError | None = None
             try:
@@ -997,23 +881,11 @@ class KimiCode(BaseInstalledAgent):
             except asyncio.CancelledError as exc:
                 probe_cancellation = exc
                 self.logger.warning(
-                    "Kimi session recovery was cancelled; finalizing the "
-                    "checkpoint before propagating cancellation"
+                    "Kimi session recovery was cancelled; preserving OAuth "
+                    "state before propagating cancellation"
                 )
             except Exception as exc:
                 self.logger.warning("Could not recover Kimi session log: %s", exc)
-            try:
-                await self._checkpoint.finish_durably(
-                    self,
-                    environment,
-                    env,
-                    completed=completed,
-                    failure=failure,
-                    session_id=self._session_id,
-                )
-            except asyncio.CancelledError as exc:
-                if probe_cancellation is None:
-                    probe_cancellation = exc
             if not self._shared_oauth:
                 try:
                     await environment.download_file(remote_auth, self._auth_json_file)

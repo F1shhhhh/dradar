@@ -2,8 +2,8 @@
 
 The adapter runs a version-checked ZCode Protocol server imported from the
 desktop bundle. The Coding Plan key is uploaded as an owner-only run file,
-moved into ZCode's in-memory session-secret store during ``session/create`` or
-``session/resume``, and then unlinked before the model may execute a tool.
+moved into ZCode's in-memory session-secret store during ``session/create``,
+and then unlinked before the model may execute a tool.
 """
 
 from __future__ import annotations
@@ -27,17 +27,15 @@ from pier.models.trajectories import Agent, FinalMetrics, Step, Trajectory
 from pier.utils.trajectory_metrics import populate_context_from_final_metrics
 
 try:
-    from _dradar_pier_checkpoint import (
+    from _dradar_pier_runtime_safety import (
         AgentLogStore,
-        DurableCheckpoint,
-        StatePath,
+        RuntimeSafety,
         UnsafeAgentLog,
     )
 except ModuleNotFoundError:  # Local source-tree tests import the packaged module.
-    from dradar.pier_checkpoint import (
+    from dradar.pier_runtime_safety import (
         AgentLogStore,
-        DurableCheckpoint,
-        StatePath,
+        RuntimeSafety,
         UnsafeAgentLog,
     )
 
@@ -52,33 +50,6 @@ SUPPORTED_EFFORTS = frozenset({"low", "high", "max"})
 SUPPORTED_MODELS = frozenset({"glm-5.3", "glm-5.3-flash"})
 _ARTIFACT_ID_RE = re.compile(r"[0-9a-f]{32}")
 _SESSION_ID_RE = re.compile(r"sess_[A-Za-z0-9._:-]{1,155}")
-
-
-def _read_local_session_id(path: Path) -> str | None:
-    """Read the model-writable session sidecar without links or blocking."""
-
-    try:
-        snapshot = AgentLogStore(path.parent).read_text(path, max_bytes=512)
-    except UnsafeAgentLog:
-        try:
-            AgentLogStore(path.parent).replace_text(
-                path, AgentLogStore.REJECTED,
-            )
-        except UnsafeAgentLog:
-            pass
-        return None
-    if snapshot is None:
-        return None
-    text, identity = snapshot
-    try:
-        if not AgentLogStore(path.parent).replace_text(
-            path, text, expected=identity,
-        ):
-            return None
-    except UnsafeAgentLog:
-        return None
-    candidate = text.strip()
-    return candidate if _SESSION_ID_RE.fullmatch(candidate) else None
 
 
 def _install_command() -> str:
@@ -135,7 +106,7 @@ class ProtocolError(RuntimeError):
 (
     node, cli, key_path, instruction_path, model_name, effort, session_timeout_raw,
     outcome_path, events_path, stderr_path, diagnostic_path, compact_usage_path,
-    resume_session_id, session_id_path,
+    session_id_path,
 ) = sys.argv[1:]
 if model_name not in {"glm-5.3", "glm-5.3-flash"}:
     raise ProtocolError("ZCode model is unsupported")
@@ -152,10 +123,6 @@ if not key or any(character.isspace() for character in key):
 instruction = Path(instruction_path).read_text(encoding="utf-8")
 if not instruction.strip():
     raise ProtocolError("instruction is empty")
-if resume_session_id and not resume_session_id.startswith("sess_"):
-    raise ProtocolError("checkpoint session id is invalid")
-
-
 workspace = {"workspacePath": "/app", "workspaceKey": "dradar-zcode"}
 runtime_model = {
     "revision": f"dradar-zcode-{model_name}-v2",
@@ -671,46 +638,28 @@ def optional_call(method, params, *, timeout=30.0):
 session_id = None
 outcome = None
 compact_collector = None
-resumed_from_checkpoint = bool(resume_session_id)
 try:
-    if resumed_from_checkpoint:
-        created = call(
-            "session/resume",
-            {
-                "sessionId": resume_session_id,
-                "workspace": workspace,
-                "runtimeModel": runtime_model,
-                "thoughtLevel": effort,
-                "mcpServers": [],
-            },
-            timeout=120.0,
-        )
-    else:
-        created = call(
-            "session/create",
-            {
-                "workspace": workspace,
-                "runtimeModel": runtime_model,
-                "thoughtLevel": effort,
-                "mode": "yolo",
-                "persistence": "deferred",
-                "titleGenerationEnabled": False,
-                "mcpServers": [],
-                # Omit both tool lists: in ZCode Protocol an absent allowlist
-                # means the complete built-in tool catalog, including Agent
-                # delegation.  Pier's Docker mounts and egress allowlist—not
-                # an inner tool filter—enforce the benchmark security boundary.
-            },
-            timeout=120.0,
-        )
-    session = created.get("session") if isinstance(created, dict) else None
-    session_id = session.get("sessionId") if isinstance(session, dict) else (
-        resume_session_id if resumed_from_checkpoint else None
+    created = call(
+        "session/create",
+        {
+            "workspace": workspace,
+            "runtimeModel": runtime_model,
+            "thoughtLevel": effort,
+            "mode": "yolo",
+            "persistence": "deferred",
+            "titleGenerationEnabled": False,
+            "mcpServers": [],
+            # Omit both tool lists: in ZCode Protocol an absent allowlist
+            # means the complete built-in tool catalog, including Agent
+            # delegation. Pier's Docker mounts and egress allowlist enforce
+            # the benchmark security boundary.
+        },
+        timeout=120.0,
     )
+    session = created.get("session") if isinstance(created, dict) else None
+    session_id = session.get("sessionId") if isinstance(session, dict) else None
     if not isinstance(session_id, str) or not session_id.startswith("sess_"):
         raise ProtocolError("ZCode returned no valid session id")
-    if resumed_from_checkpoint and session_id != resume_session_id:
-        raise ProtocolError("session/resume returned a different session id")
     session_path = Path(session_id_path)
     session_path.parent.mkdir(parents=True, exist_ok=True)
     session_tmp = session_path.with_suffix(session_path.suffix + ".tmp")
@@ -726,37 +675,18 @@ try:
         item.get("value") for item in thought.get("available", [])
         if isinstance(item, dict)
     } if isinstance(thought, dict) else set()
-    if (not resumed_from_checkpoint
-            and (thought.get("current") != effort
-                 or available != {"low", "high", "max"})):
+    if (thought.get("current") != effort
+            or available != {"low", "high", "max"}):
         raise ProtocolError("ZCode did not apply the requested GLM-5.3 thought level")
     projection = created.get("projection") if isinstance(created, dict) else None
-    if (not resumed_from_checkpoint
-            and (not isinstance(projection, dict)
-                 or projection.get("contextWindow") != 1000000)):
+    if (not isinstance(projection, dict)
+            or projection.get("contextWindow") != 1000000):
         raise ProtocolError("ZCode did not materialize the pinned GLM-5.3 model")
     starting_turn_count = 0
-    if resumed_from_checkpoint:
-        restored_state = call(
-            "session/read", {"sessionId": session_id}, timeout=60.0,
-        )
-        restored_projection = (
-            restored_state.get("projection")
-            if isinstance(restored_state, dict) else None
-        )
-        restored_turns = (
-            restored_projection.get("turnCount", 0)
-            if isinstance(restored_projection, dict) else 0
-        )
-        if not isinstance(restored_turns, int) or isinstance(restored_turns, bool):
-            raise ProtocolError("resumed ZCode session has an invalid turn count")
-        starting_turn_count = max(0, restored_turns)
 
     # ZCode has replaced the inline value with an in-memory session-secret ref.
     # Remove the only filesystem copy before any model-controlled tool can run.
     key_file.unlink()
-    # A resumed session is continued with the byte-for-byte original benchmark
-    # instruction.  No recovery hint or harness-specific wording is appended.
     call("session/send", {"sessionId": session_id, "content": instruction}, timeout=120.0)
 
     deadline = time.monotonic() + session_timeout_sec
@@ -818,7 +748,6 @@ try:
         "sessionId": session_id,
         "model": model_name,
         "reasoningEffort": effort,
-        "resumedFromCheckpoint": resumed_from_checkpoint,
         "seenRunning": seen_running,
         "state": final_state,
         "messages": messages,
@@ -1166,12 +1095,6 @@ class ZCodeBigModel(BaseInstalledAgent):
         zcode_cli_file: str,
         reasoning_effort: str,
         session_timeout_sec: str | int,
-        checkpoint_enabled: str | bool = False,
-        checkpoint_assignment_id: str | None = None,
-        checkpoint_task_id: str | None = None,
-        checkpoint_effort: str | None = None,
-        checkpoint_resume_generation: str | int = 0,
-        checkpoint_path: str | None = None,
         model_name: str | None = None,
         version: str | None = ZCODE_CLI_VERSION,
         **kwargs: Any,
@@ -1202,8 +1125,6 @@ class ZCodeBigModel(BaseInstalledAgent):
             )
         if reasoning_effort not in SUPPORTED_EFFORTS:
             raise ValueError("ZCode reasoning_effort must be low, high, or max")
-        if checkpoint_effort is not None and checkpoint_effort != reasoning_effort:
-            raise ValueError("ZCode checkpoint effort must match reasoning_effort")
         try:
             resolved_session_timeout = int(session_timeout_sec)
         except (TypeError, ValueError) as exc:
@@ -1244,32 +1165,7 @@ class ZCodeBigModel(BaseInstalledAgent):
         self._remote_secret_dir = run_secret_dir
         self._remote_api_key = run_secret_dir / "coding-plan-key"
         super().__init__(*args, model_name=resolved_model, version=resolved_version, **kwargs)
-        self._checkpoint = DurableCheckpoint(
-            logs_dir=self.logs_dir,
-            enabled=checkpoint_enabled,
-            assignment_id=checkpoint_assignment_id,
-            task_id=checkpoint_task_id,
-            model=resolved_model,
-            effort=checkpoint_effort or reasoning_effort,
-            resume_generation=checkpoint_resume_generation,
-            checkpoint_path=checkpoint_path,
-            harness=self.name(),
-            provider="bigmodel-coding-plan",
-            agent_version=resolved_version,
-            state_paths=(
-                StatePath("xdg-data", (self._REMOTE_HOME / "data").as_posix()),
-                StatePath(
-                    "zcode-rollout",
-                    (
-                        self._REMOTE_USER_HOME / ".zcode" / "cli" / "rollout"
-                    ).as_posix(),
-                ),
-            ),
-            sensitive_values=(key_value,),
-            session_probe=(
-                f"cat /logs/agent/{self._SESSION_ID_FILE}"
-            ),
-        )
+        self._runtime_safety = RuntimeSafety(self.logs_dir)
 
     def get_version_command(self) -> str:
         return "true"
@@ -1336,32 +1232,18 @@ class ZCodeBigModel(BaseInstalledAgent):
             "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
         ):
             env.pop(name, None)
-        if self._checkpoint.enabled:
-            await self._checkpoint.prepare_agent_environment(
-                self, environment, env,
-            )
         directories = (remote_home, remote_user_home, remote_bin, remote_secret)
         setup = "mkdir -p " + " ".join(shlex.quote(item) for item in directories)
         setup += " && chmod 700 " + " ".join(shlex.quote(item) for item in directories)
         await self.exec_as_agent(environment, command=setup, env=env)
 
-        failure: BaseException | None = None
-        completed = False
-        resume_session_id: str | None = None
         local_runner = self.logs_dir / "zcode-protocol-runner.py"
         local_instruction = self.logs_dir / "zcode-instruction.txt"
         try:
-            # DurableCheckpoint.start() seals /logs/agent as a root-owned
-            # sticky directory before the untrusted model process begins.
-            # Publish host-authored inputs first while AgentLogStore can still
-            # require the ordinary Pier host-owned layout without weakening
-            # its directory-ownership invariant.
-            self._checkpoint.prepare_host_layout()
+            self._runtime_safety.prepare_host_layout()
             log_store = AgentLogStore(self.logs_dir)
             log_store.replace_text(local_runner, _PROTOCOL_RUNNER)
             log_store.replace_text(local_instruction, instruction)
-            resume_session_id = await self._checkpoint.start(self, environment, env)
-
             await environment.upload_file(self._zcode_cli_file, remote_cli)
             await environment.upload_file(local_runner, remote_runner)
             await environment.upload_file(local_instruction, instruction_path)
@@ -1375,14 +1257,9 @@ class ZCodeBigModel(BaseInstalledAgent):
                     f"chown {shlex.quote(str(environment.default_user))} {targets} "
                     f"&& chmod 600 {targets}"
                 )
-                if self._checkpoint.enabled:
-                    await self._checkpoint.exec_root_maintenance(
-                        environment, command=command,
-                    )
-                else:
-                    await self.exec_as_root(
-                        environment, command=command, env=env,
-                    )
+                await self.exec_as_root(
+                    environment, command=command, env=env,
+                )
             else:
                 await self.exec_as_agent(
                     environment, command=f"chmod 600 {targets}", env=env,
@@ -1405,7 +1282,7 @@ class ZCodeBigModel(BaseInstalledAgent):
                     self._model_name,
                     self._reasoning_effort, str(self._session_timeout_sec),
                     outcome, events, stderr, diagnostic, compact_usage,
-                    resume_session_id or "", session_id_path,
+                    session_id_path,
                 )
             )
             command = (
@@ -1417,21 +1294,8 @@ class ZCodeBigModel(BaseInstalledAgent):
             await self.exec_as_agent(
                 environment, command=command, env=env, cwd="/app",
             )
-            completed = True
-        except BaseException as exc:
-            failure = exc
-            raise
         finally:
-            local_session_id = self.logs_dir / self._SESSION_ID_FILE
-            checkpoint_session_id = _read_local_session_id(local_session_id)
-            await self._checkpoint.finish_durably(
-                self,
-                environment,
-                env,
-                completed=completed,
-                failure=failure,
-                session_id=checkpoint_session_id,
-            )
+            pass
 
     def _redact_or_reject_credential_output(
         self, paths: list[Path],

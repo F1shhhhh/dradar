@@ -464,7 +464,7 @@ def effective_policy(home: Path, cfg: dict) -> CachePolicy:
 
 def _protected_projects(home: Path, protected_assignment_ids: set[str],
                         include_kept: bool) -> set[str]:
-    from . import checkpoints, pending
+    from . import local_jobs, pending
 
     projects: set[str] = set()
     pending_entries = pending.load(home)
@@ -474,15 +474,15 @@ def _protected_projects(home: Path, protected_assignment_ids: set[str],
         trial_dir = entry.get("trial_dir")
         if trial_dir:
             projects.add(_sanitize_project(Path(trial_dir).name))
-    for item in checkpoints.scan(home):
+    for item in local_jobs.scan(home):
         protected = (
             item.assignment_id in protected_assignment_ids
             or item.assignment_id in pending_ids
-            or (checkpoints.is_kept(home, item) and not include_kept)
+            or (local_jobs.is_kept(home, item.job_dir) and not include_kept)
         )
-        if protected:
+        if protected and item.trial_dir is not None:
             projects.add(_sanitize_project(item.trial_dir.name))
-    # Legacy jobs may predate checkpoint manifests or the image ledger. Their
+    # Legacy jobs may predate the image ledger. Their
     # directory still carries the assignment ID (a<32 hex>) and trial/project
     # name, so preserve that final recovery signal as well.
     jobs_root = home / "work" / "jobs"

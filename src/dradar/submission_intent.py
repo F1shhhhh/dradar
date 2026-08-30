@@ -7,7 +7,8 @@ import json
 from pathlib import Path
 
 
-UPLOAD_INTENT_VERSION = "dradar-submission-upload-v2"
+UPLOAD_INTENT_VERSION = "dradar-submission-upload-v3"
+LEGACY_UPLOAD_INTENT_VERSION = "dradar-submission-upload-v2"
 _HASH_CHUNK_BYTES = 1024 * 1024
 
 
@@ -43,7 +44,8 @@ def submission_payload_manifest(
     *,
     assignment_id: str,
     session_id: str,
-    resume_generation: int,
+    owner_epoch: int | None = None,
+    resume_generation: int | None = None,
     outcome: str,
     meta: dict,
     patch: Path,
@@ -52,11 +54,21 @@ def submission_payload_manifest(
     trajectory_bundle: Path | None,
 ) -> dict:
     """Describe every digest component without loading artifacts into RAM."""
+    version = (
+        UPLOAD_INTENT_VERSION
+        if owner_epoch is not None
+        else LEGACY_UPLOAD_INTENT_VERSION
+    )
+    identity = (
+        {"owner_epoch": owner_epoch}
+        if owner_epoch is not None
+        else {"resume_generation": int(resume_generation or 0)}
+    )
     return {
-        "version": UPLOAD_INTENT_VERSION,
+        "version": version,
         "assignment_id": assignment_id,
         "session_id": session_id,
-        "resume_generation": resume_generation,
+        **identity,
         "outcome": outcome,
         "components": {
             "client_meta": _bytes_fact(canonical_meta_bytes(meta)),

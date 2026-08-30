@@ -58,7 +58,7 @@ class RunnerTelemetry:
         self._thread: threading.Thread | None = None
         self._phase = "preparing"
         self._active_assignment_id: str | None = None
-        self._resume_generation: int | None = None
+        self._owner_epoch: int | None = None
         self._batch_id: str | None = None
         self._seq = 0
         self._progress_counter = 0
@@ -115,21 +115,21 @@ class RunnerTelemetry:
         self,
         phase: str,
         assignment_id: str | None = None,
-        resume_generation: int | None = None,
+        owner_epoch: int | None = None,
     ) -> None:
         if phase not in {"preparing", "queued", "running", "uploading", "paused"}:
             raise ValueError(f"unknown runner phase {phase!r}")
-        if resume_generation is not None and resume_generation < 0:
-            raise ValueError("resume_generation must be non-negative")
+        if owner_epoch is not None and owner_epoch < 0:
+            raise ValueError("owner_epoch must be non-negative")
         if assignment_id is None:
-            resume_generation = None
+            owner_epoch = None
         with self._lock:
             changed = (
-                self._phase, self._active_assignment_id, self._resume_generation,
-            ) != (phase, assignment_id, resume_generation)
+                self._phase, self._active_assignment_id, self._owner_epoch,
+            ) != (phase, assignment_id, owner_epoch)
             self._phase = phase
             self._active_assignment_id = assignment_id
-            self._resume_generation = resume_generation
+            self._owner_epoch = owner_epoch
             if changed:
                 self._progress_counter += 1
         if changed:
@@ -139,14 +139,14 @@ class RunnerTelemetry:
         with self._lock:
             self._seq += 1
             return {
-                "protocol_version": 2,
+                "protocol_version": 3,
                 "client_version": __version__,
                 "session_id": self.session_id,
                 "batch_id": self._batch_id,
                 "seq": self._seq,
                 "phase": self._phase,
                 "active_assignment_id": self._active_assignment_id,
-                "resume_generation": self._resume_generation,
+                "owner_epoch": self._owner_epoch,
                 "client_monotonic_ms": int(time.monotonic() * 1000),
                 "progress_counter": self._progress_counter,
                 "platform": platform_family(),

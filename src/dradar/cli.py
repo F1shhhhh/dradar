@@ -28,8 +28,7 @@ from .image_cache import cmd_config_set, cmd_config_show
 from .leases import cmd_leases, cmd_release
 from .provider_config import cmd_provider_setup, cmd_provider_status
 from .runloop import (
-    cmd_checkpoint_discard, cmd_checkpoints, cmd_cleanup, cmd_go,
-    cmd_refill_status, cmd_refill_stop, cmd_retry_upload,
+    cmd_cleanup, cmd_go, cmd_refill_status, cmd_refill_stop, cmd_retry_upload,
 )
 from .session_archive import cmd_sessions_prune
 
@@ -287,17 +286,6 @@ def main(argv: list[str] | None = None) -> int:
     p_refill_stop = refill_sub.add_parser("stop", help="stop claiming new refill tasks")
     p_refill_stop.set_defaults(func=cmd_refill_stop)
 
-    p_cp_list = sub.add_parser(
-        "checkpoints", help="list resumable local checkpoints and their disk usage")
-    p_cp_list.set_defaults(func=cmd_checkpoints)
-
-    p_checkpoint = sub.add_parser("checkpoint", help="manage a local checkpoint")
-    checkpoint_sub = p_checkpoint.add_subparsers(dest="checkpoint_command", required=True)
-    p_cp_discard = checkpoint_sub.add_parser(
-        "discard", help="delete a checkpoint and reopen its assignment cell")
-    p_cp_discard.add_argument("checkpoint_id", metavar="ID")
-    p_cp_discard.set_defaults(func=cmd_checkpoint_discard, lease_hint=True)
-
     p_sessions = sub.add_parser(
         "sessions", help="manage opt-in local Codex session archives")
     sessions_sub = p_sessions.add_subparsers(
@@ -419,11 +407,6 @@ def main(argv: list[str] | None = None) -> int:
                 help="nothing held? claim this exact cell instead of auto-picking "
                      "(repeatable), then run — e.g. "
                      "--pick abs-module-cache-flags:gpt-5.6-sol:low",
-            )
-        else:
-            p.add_argument(
-                "--assignment", metavar="ID",
-                help="resume only this assignment's local checkpoint",
             )
         p.set_defaults(func=cmd_go, resume=is_resume, lease_hint=True)
 

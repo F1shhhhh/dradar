@@ -12,12 +12,7 @@ from dradar.api_client import ApiClient
 
 
 @pytest.fixture(autouse=True)
-def _enable_checkpoint_runtime_for_worker_mechanics(monkeypatch):
-    """Keep legacy recovery mechanics covered behind the disabled rollout."""
-
-    monkeypatch.setattr(
-        runloop, "durable_checkpoint_rollout_enabled", lambda: True,
-    )
+def _isolate_worker_boundary_mechanics(monkeypatch):
     # Pool mechanics tests use clients intentionally stripped of API methods.
     # Boundary integration has its own state/reconciliation coverage.
     monkeypatch.setattr(
@@ -329,12 +324,11 @@ class _Telemetry:
 
 @pytest.mark.parametrize(
     ("worker_child", "expected_rc", "expected_checkout", "expected_retry"),
-    ((True, 0, True, False), (False, 1, False, True)),
+    ((True, 0, True, False), (False, 0, True, True)),
 )
-def test_only_supervised_worker_skips_busy_checkpoint_and_drains_waiting_work(
+def test_only_parent_retries_pending_uploads_before_draining_waiting_work(
         monkeypatch, capsys, worker_child, expected_rc, expected_checkout,
         expected_retry):
-    """One checkpoint owner must not leave another confirmed pool slot idle."""
     checked_out = []
     pending_retries = []
     monkeypatch.setattr(runloop, "_load_config", lambda: {})
@@ -348,10 +342,6 @@ def test_only_supervised_worker_skips_busy_checkpoint_and_drains_waiting_work(
         lambda _client: pending_retries.append(True),
     )
     monkeypatch.setattr(
-        runloop, "_resume_local_checkpoints",
-        lambda *_a, **_k: ([], True),  # every checkpoint lock was busy
-    )
-    monkeypatch.setattr(
         runloop, "_go_menu",
         lambda *_a, **_k: checked_out.append(True) or 0,
     )
@@ -363,9 +353,7 @@ def test_only_supervised_worker_skips_busy_checkpoint_and_drains_waiting_work(
     assert runloop.cmd_go(args) == expected_rc
     assert bool(checked_out) is expected_checkout
     assert bool(pending_retries) is expected_retry
-    output = capsys.readouterr().out
-    if worker_child:
-        assert "checking for a different waiting task" in output
+    capsys.readouterr()
 
 
 def test_recovery_repeat_failure_stops_before_waiting_checkout(monkeypatch):
@@ -384,46 +372,11 @@ def test_recovery_repeat_failure_stops_before_waiting_checkout(monkeypatch):
     monkeypatch.setattr(runloop, "_ensure_egress_runtime", lambda **_k: None)
     monkeypatch.setattr(runloop, "_retry_pending_uploads", lambda _client: None)
     monkeypatch.setattr(
-        runloop, "_resume_local_checkpoints",
-        lambda *_a, **_k: (["repeat-agent-failure"], True),
-    )
-    monkeypatch.setattr(
         runloop, "_go_menu", lambda *_a, **_k: checked_out.append(True) or 0,
     )
 
-    assert runloop.cmd_go(_args(workers=1, auto=None)) == 1
-    assert checked_out == []
-
-
-def test_checkpoint_recovery_stops_before_third_item_after_repeat_failure(
-        monkeypatch, tmp_path):
-    items = {
-        name: SimpleNamespace(assignment_id=name)
-        for name in ("first", "second", "must-not-resume")
-    }
-    monkeypatch.setattr(
-        runloop.checkpoints, "latest_by_assignment", lambda _home: items,
-    )
-    monkeypatch.setattr(
-        runloop, "_active_by_id", lambda _client: {name: {} for name in items},
-    )
-    attempted = []
-    outcomes = iter(("interrupted", "repeat-agent-failure"))
-
-    def resume(_client, item, *_args, **_kwargs):
-        attempted.append(item.assignment_id)
-        return next(outcomes)
-
-    monkeypatch.setattr(runloop, "_resume_one_checkpoint", resume)
-    args = _args(workers=1, auto=None)
-
-    results, found = runloop._resume_local_checkpoints(
-        object(), args, tmp_path, None,
-    )
-
-    assert found is True
-    assert results == ["interrupted", "repeat-agent-failure"]
-    assert attempted == ["first", "second"]
+    assert runloop.cmd_go(_args(workers=1, auto=None)) == 0
+    assert checked_out == [True]
 
 
 def test_egress_preflight_failure_happens_before_checkout(monkeypatch):
@@ -716,7 +669,6 @@ def test_pool_ready_count_uses_only_inventory_returned_by_scoped_client(
                  "started_at": None, "heartbeat_running": False},
             ]}
 
-    monkeypatch.setattr(runloop.checkpoints, "latest_by_assignment", lambda _home: {})
     assert runloop._pool_ready_work_count(
         Client(), desired_workers=2,
     ) == 1
@@ -1254,9 +1206,6 @@ def test_server_confirmed_stopped_assignment_backfills_after_retry_time(
     _patch_pool_setup(monkeypatch, active_count=2)
     monkeypatch.setattr(runloop, "_client", lambda *_a, **_k: client)
     monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(
-        runloop.checkpoints, "latest_by_assignment", lambda _home: {},
-    )
     calls = []
 
     def popen(command, env, **kwargs):
@@ -1778,20 +1727,7 @@ def test_malformed_parent_proof_snapshot_fails_closed(monkeypatch):
     assert runloop._read_pool_returned_assignments() == set()
 
 
-def test_backfill_counts_fresh_and_safely_recoverable_work(monkeypatch):
-    checkpoint = SimpleNamespace(
-        valid=True, checkpoint_id="cp-1", resume_generation=2,
-    )
-    monkeypatch.setattr(
-        runloop.checkpoints, "latest_by_assignment", lambda _home: {"a-2": checkpoint},
-    )
-    monkeypatch.setattr(runloop.checkpoints, "is_expired", lambda _item: False)
-    monkeypatch.setattr(runloop.checkpoints, "is_terminal", lambda _home, _item: False)
-    monkeypatch.setattr(
-        runloop, "_checkpoint_backoff_seconds",
-        lambda _item, *, generation=None: 0,
-    )
-
+def test_backfill_counts_only_fresh_waiting_work():
     class Client:
         def get_assignment(self):
             return {"active": [
@@ -1803,7 +1739,7 @@ def test_backfill_counts_fresh_and_safely_recoverable_work(monkeypatch):
                 },
             ]}
 
-    assert runloop._pool_ready_work_count(Client()) == 2
+    assert runloop._pool_ready_work_count(Client()) == 1
 
 
 def test_backfill_never_spawns_when_batch_live_count_meets_target(monkeypatch):
@@ -1830,94 +1766,6 @@ def test_backfill_never_spawns_when_batch_live_count_meets_target(monkeypatch):
     assert runloop._pool_ready_work_count(
         Client(), desired_workers=3,
     ) == 1
-
-
-def test_disabled_rollout_never_backfills_paused_checkpoint(monkeypatch):
-    checkpoint = SimpleNamespace(
-        valid=True, checkpoint_id="cp-1", resume_generation=2,
-    )
-    assignment = {
-        "assignment_id": "a-1", "started_at": "earlier",
-        "execution_state": "paused", "runner_state": "resumable",
-        "checkpoint_id": "cp-1", "resume_generation": 2,
-    }
-    monkeypatch.setattr(
-        runloop, "durable_checkpoint_rollout_enabled", lambda: False,
-    )
-    monkeypatch.setattr(
-        runloop.checkpoints, "latest_by_assignment",
-        lambda _home: {"a-1": checkpoint},
-    )
-
-    class Client:
-        def get_assignment(self):
-            return {"active": [assignment]}
-
-    assert not runloop._assignment_is_recoverable_checkpoint(
-        assignment, {"a-1": checkpoint},
-    )
-    assert runloop._pool_ready_work_count(Client()) == 0
-
-
-def test_backfill_retries_compensated_checkpoint_when_server_is_one_generation_ahead(
-    monkeypatch,
-):
-    checkpoint = SimpleNamespace(
-        valid=True, checkpoint_id="cp-1", resume_generation=2,
-    )
-    assignment = {
-        "assignment_id": "a-1", "started_at": "earlier",
-        "execution_state": "paused", "runner_state": "paused",
-        "checkpoint_id": "cp-1", "resume_generation": 3,
-    }
-    monkeypatch.setattr(runloop.checkpoints, "is_expired", lambda _item: False)
-    monkeypatch.setattr(runloop.checkpoints, "is_terminal", lambda _home, _item: False)
-    seen = []
-    monkeypatch.setattr(
-        runloop,
-        "_checkpoint_backoff_seconds",
-        lambda _item, *, generation=None: seen.append(generation) or 0,
-    )
-
-    assert runloop._assignment_is_recoverable_checkpoint(
-        assignment, {"a-1": checkpoint},
-    )
-    assert seen == [3]
-
-
-@pytest.mark.parametrize(
-    ("override", "local_override"),
-    [
-        ({"execution_state": "running"}, {}),
-        ({"runner_state": "running"}, {}),
-        ({"checkpoint_id": "different"}, {}),
-        ({"resume_generation": 1}, {}),
-        ({"resume_generation": runloop.MAX_CHECKPOINT_RESUMES}, {}),
-        ({"resume_generation": "2"}, {}),
-        ({}, {"valid": False}),
-    ],
-)
-def test_backfill_rejects_unsafe_checkpoint_candidates(
-    monkeypatch, override, local_override,
-):
-    assignment = {
-        "assignment_id": "a-1", "started_at": "earlier",
-        "execution_state": "paused", "runner_state": "paused",
-        "checkpoint_id": "cp-1", "resume_generation": 2,
-    }
-    assignment.update(override)
-    checkpoint_values = {
-        "valid": True, "checkpoint_id": "cp-1", "resume_generation": 2,
-    }
-    checkpoint_values.update(local_override)
-    checkpoint = SimpleNamespace(**checkpoint_values)
-    monkeypatch.setattr(runloop.checkpoints, "is_expired", lambda _item: False)
-    monkeypatch.setattr(runloop.checkpoints, "is_terminal", lambda _home, _item: False)
-    monkeypatch.setattr(runloop, "_checkpoint_backoff_seconds", lambda _item: 0)
-
-    assert not runloop._assignment_is_recoverable_checkpoint(
-        assignment, {"a-1": checkpoint},
-    )
 
 
 def test_backfill_queue_read_fails_closed(monkeypatch, capsys):

@@ -200,21 +200,6 @@ def test_grok_assignment_version_is_only_a_hint() -> None:
     runner._validate_grok_assignment(_assignment(agent_version="9.9.9"))
 
 
-def test_grok_checkpoint_resume_is_rejected(tmp_path: Path, monkeypatch):
-    monkeypatch.setattr(runner.shutil, "which", lambda _name: "/usr/bin/pier")
-    tasks = tmp_path / "tasks"
-    (tasks / "task-1").mkdir(parents=True)
-    auth = _write_auth(tmp_path / "auth.json")
-    cli = tmp_path / "grok"
-    cli.write_text("binary", encoding="utf-8")
-    with pytest.raises(RunnerError, match="checkpoints are not supported"):
-        runner.build_pier_command(
-            _assignment(), tasks, tmp_path / "jobs", "job", tmp_path,
-            resume_checkpoint=tmp_path / "checkpoint",
-            provider_auth_path=auth,
-            provider_cli_path=cli,
-        )
-
 
 def test_grok_adapter_primes_dynamic_46_model_catalog() -> None:
     source = Path(providers.__file__).with_name("pier_grok.py").read_text()

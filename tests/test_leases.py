@@ -110,7 +110,28 @@ def test_started_history_without_healthy_runner_is_resumable_not_running(
     out = capsys.readouterr().out
     assert "1 running, 1 paused, 1 stale" in out
     assert "a1" in out and "stale" in out
-    assert "not actually resumable" in out
+    assert "not automatically resumable" in out
+
+
+@pytest.mark.parametrize("server_state", ("resumable", "checkpoint_retired"))
+def test_legacy_checkpoint_tombstone_is_stale_not_resumable(
+    monkeypatch, capsys, server_state,
+):
+    legacy = _cell("legacy-checkpoint", started=True)
+    legacy.update({
+        "heartbeat_running": False,
+        "execution_state": "running",
+        "runner_state": server_state,
+        "checkpoint_id": "retired-checkpoint-tombstone",
+    })
+    client = FakeClient([legacy])
+    _wire(monkeypatch, client)
+
+    assert leases.cmd_leases(Namespace()) == 0
+
+    out = capsys.readouterr().out
+    assert "1 stale" in out
+    assert "resumable" not in out.splitlines()[0]
 
 
 def test_leases_lists_and_labels_assignments_across_benchmarks(

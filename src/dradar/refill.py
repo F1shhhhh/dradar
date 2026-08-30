@@ -146,7 +146,7 @@ def open_circuit(
     assignment: dict,
     failure_family: str,
 ) -> dict | None:
-    """Latch a scoped refill plan after a provider or checkpoint fault.
+    """Latch a scoped refill plan after a provider or historical runner fault.
 
     The DRADAR_HOME is already the account boundary.  Persist the remaining
     key dimensions so a restart, CLI upgrade, task change, or effort change

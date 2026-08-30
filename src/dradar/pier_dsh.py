@@ -25,11 +25,11 @@ from pier.models.agent.install import AgentInstallSpec, InstallStep
 from pier.models.agent.network import NetworkAllowlist
 
 try:
-    from _dradar_pier_checkpoint import DurableCheckpoint, StatePath
+    from _dradar_pier_runtime_safety import RuntimeSafety
 except ModuleNotFoundError as exc:  # Local source/test import before materialization.
-    if exc.name != "_dradar_pier_checkpoint":
+    if exc.name != "_dradar_pier_runtime_safety":
         raise
-    from dradar.pier_checkpoint import DurableCheckpoint, StatePath
+    from dradar.pier_runtime_safety import RuntimeSafety
 
 DSH_VERSION = "0.1.1-rc.2"
 NODE_VERSION = "22.23.2"
@@ -241,7 +241,6 @@ async function run(ctx, task, io) {
     });
   }
   const preset = await presets.resolve("minimal");
-  const resumeSessionId = process.env.DSH_RESUME_SESSION_ID?.trim() || null;
   const agentOptions = {
     provider: selection.provider,
     model: selection.model,
@@ -253,15 +252,9 @@ async function run(ctx, task, io) {
     });
     await presets.mount(agentCtx, preset.id);
   };
-  const { agent } = resumeSessionId === null
-    ? await agents.create({
+  const { agent } = await agents.create({
       sessionId: SessionId(`session-${randomUUID()}`),
       meta: { cwd: process.cwd(), agentPreset: preset.id },
-      agentOptions,
-      setup,
-    })
-    : await agents.resume({
-      resumeSessionId: SessionId(resumeSessionId),
       agentOptions,
       setup,
     });
@@ -271,8 +264,7 @@ async function run(ctx, task, io) {
   });
 
   await agent.whenIdle();
-  // Resumed runs send exactly the benchmark instruction again.  No recovery
-  // wording is appended, which keeps prompts identical across harnesses.
+  // Every run is a fresh session and receives the benchmark instruction once.
   agent.followup(createUserMessage({
     content: [
       { type: "text", text: task },
@@ -282,8 +274,7 @@ async function run(ctx, task, io) {
   }));
   await agent.whenIdle();
   await sessions.flush(agent.session);
-  // The restored transcript is the usage ledger.  Re-fold the whole session
-  // so every generation is billed exactly once in the final result.
+  // Fold this fresh session's full event stream into the usage ledger.
   const outcome = summarize(agent.session.events, 0);
   const terminalKind = outcome.reason?.kind;
   writeFileSync(process.env.DSH_OUTCOME_FILE, JSON.stringify({
@@ -293,7 +284,7 @@ async function run(ctx, task, io) {
     taskId: process.env.DRADAR_TASK_ID ?? null,
     assignmentModel: process.env.DRADAR_ASSIGNMENT_MODEL ?? null,
     reasoningEffort: process.env.DSH_REASONING_EFFORT ?? null,
-    resumed: resumeSessionId !== null,
+    resumed: false,
     visionInputAttached: imageRef !== null,
     visionInput: imageRef === null ? null : {
       attachmentId: String(imageRef.attachmentId),
@@ -409,12 +400,6 @@ class DshMinimal(BaseInstalledAgent):
         artifact_assignment_id: str | None = None,
         artifact_run_id: str | None = None,
         artifact_task_id: str | None = None,
-        checkpoint_enabled: str | bool = False,
-        checkpoint_assignment_id: str | None = None,
-        checkpoint_task_id: str | None = None,
-        checkpoint_effort: str | None = None,
-        checkpoint_resume_generation: str | int = 0,
-        checkpoint_path: str | None = None,
         extra_env: dict[str, str] | None = None,
         **kwargs: Any,
     ):
@@ -443,11 +428,6 @@ class DshMinimal(BaseInstalledAgent):
         runtime_model = RUNTIME_MODELS[assignment_model]
         if reasoning_effort not in SUPPORTED_REASONING_EFFORTS:
             raise ValueError("DSH reasoning_effort must be off, high, or max")
-        if (
-            checkpoint_effort is not None
-            and checkpoint_effort != reasoning_effort
-        ):
-            raise ValueError("DSH checkpoint effort must match reasoning_effort")
         for label, value in (
             ("assignment", artifact_assignment_id),
             ("artifact run", artifact_run_id),
@@ -497,13 +477,6 @@ class DshMinimal(BaseInstalledAgent):
         self._artifact_assignment_id = artifact_assignment_id
         self._artifact_run_id = artifact_run_id
         self._artifact_task_id = artifact_task_id
-        self._checkpoint_enabled = checkpoint_enabled
-        self._checkpoint_assignment_id = checkpoint_assignment_id
-        self._checkpoint_task_id = checkpoint_task_id
-        self._checkpoint_effort = checkpoint_effort or reasoning_effort
-        self._checkpoint_resume_generation = checkpoint_resume_generation
-        self._checkpoint_path = checkpoint_path
-        self._checkpoint_sensitive_values = (key_bytes.strip(),)
         run_secret_dir = self._REMOTE_SECRET_ROOT / uuid.uuid4().hex
         self._remote_secret_dir = run_secret_dir
         self._remote_api_key = run_secret_dir / "deepseek-api-key"
@@ -584,39 +557,12 @@ class DshMinimal(BaseInstalledAgent):
                 "NODE_USE_ENV_PROXY": "1",
             }
         )
-        checkpoint = DurableCheckpoint(
-            logs_dir=self.logs_dir,
-            enabled=self._checkpoint_enabled,
-            assignment_id=(
-                self._checkpoint_assignment_id or self._artifact_assignment_id
-            ),
-            task_id=self._checkpoint_task_id or self._artifact_task_id,
-            model=self._assignment_model,
-            effort=self._checkpoint_effort,
-            resume_generation=self._checkpoint_resume_generation,
-            checkpoint_path=self._checkpoint_path,
-            harness=self.name(),
-            provider="deepseek",
-            agent_version=DSH_VERSION,
-            state_paths=(
-                StatePath("dsh-sessions", f"{remote_home}/sessions"),
-                StatePath("dsh-attachments", f"{remote_home}/attachments"),
-            ),
-            session_probe=f"cat {shlex.quote(session_id_file)}",
-            sensitive_values=self._checkpoint_sensitive_values,
-        )
-        if checkpoint.enabled:
-            await checkpoint.prepare_agent_environment(self, environment, env)
+        runtime_safety = RuntimeSafety(self.logs_dir)
 
         async def root_maintenance(command: str) -> None:
-            if checkpoint.enabled:
-                await checkpoint.exec_root_maintenance(
-                    environment, command=command,
-                )
-            else:
-                await self.exec_as_root(
-                    environment, command=command, env=env,
-                )
+            await self.exec_as_root(
+                environment, command=command, env=env,
+            )
 
         runtime_dirs = (remote_home, remote_config_dir, remote_secret_dir)
         setup_command = "mkdir -p " + " ".join(
@@ -636,14 +582,7 @@ class DshMinimal(BaseInstalledAgent):
         # Pier bind-mounts /logs at runtime, so Dockerfile ownership does not
         # survive. Create and hand off all runtime directories after mounts.
         await root_maintenance(setup_command)
-        resume_session_id = await checkpoint.start(self, environment, env)
-        failure: BaseException | None = None
         try:
-            if resume_session_id is not None:
-                env = dict(env)
-                env["DSH_RESUME_SESSION_ID"] = resume_session_id
-            # Restored archives may be uploaded as root by an environment
-            # backend. Re-assert ownership before DSH opens the session store.
             if environment.default_user is not None:
                 await root_maintenance(
                     f"chown -R {owner} {shlex.quote(remote_home)} "
@@ -706,28 +645,13 @@ class DshMinimal(BaseInstalledAgent):
                 env=env,
                 cwd="/app",
             )
-        except BaseException as exc:
-            failure = exc
-            raise
         finally:
-            try:
-                await checkpoint.finish_durably(
-                    self,
-                    environment,
-                    env,
-                    completed=failure is None,
-                    failure=failure,
-                )
-            finally:
-                # Preserve the post-run ownership guarantee introduced after
-                # root-run DSH sessions made Pier's host traversal fail.  The
-                # handoff uses the host identity captured before the sticky
-                # logs directory is installed, rather than stat'ing that now
-                # root-owned bind mount.
-                await checkpoint.return_runtime_tree_to_host_owner(
-                    environment,
-                    remote_home,
-                )
+            # Preserve the post-run ownership guarantee introduced after
+            # root-run DSH sessions made Pier's host traversal fail.
+            await runtime_safety.return_runtime_tree_to_host_owner(
+                environment,
+                remote_home,
+            )
 
     def populate_context_post_run(self, context: AgentContext) -> None:
         # DSH rc.6 does not expose a stable ATIF event stream. Keep this false
