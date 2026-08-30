@@ -157,6 +157,12 @@ def _kimi_usage_facts(
     * an exact ordered retry-event group for every preceding failed attempt;
     * a completed turn after all logical requests have settled.
 
+    The durable wire order is authoritative for flat-priced K3 accounting.
+    Wall-clock timestamps are retained when valid, but missing or skewed host
+    clocks only make ``timed_usage_complete`` false; they do not erase an
+    otherwise exact token ledger.  Managed OAuth catalog refreshes may also
+    change the raw provider model id, so identity is pinned by ``modelAlias``.
+
     Retry counts alone are never sufficient. Unknown errors, malformed retry
     groups, missing or extra events, duplicate steps, and unfinished turns all
     fail closed.
@@ -167,6 +173,7 @@ def _kimi_usage_facts(
     )}
     events: list[dict[str, Any]] = []
     usage_valid = True
+    timed_usage_valid = True
     session_identity_valid = True
     request_ledger_valid = True
     turn_ledger_valid = True
@@ -178,9 +185,11 @@ def _kimi_usage_facts(
     unexpected_usage = False
     turn_open = False
     pending_attempts: list[tuple[str, datetime | None]] = []
+    pending_compaction_attempts: list[datetime | None] = []
     settled_request_steps: set[str] = set()
     request_attempt_count = 0
     request_retry_count = 0
+    compaction_request_count = 0
     seen_turn_ids: set[int] = set()
     last_usage_instant: datetime | None = None
     last_request_instant: datetime | None = None
@@ -270,12 +279,31 @@ def _kimi_usage_facts(
             continue
         if record_type == "llm.request":
             request_attempt_count += 1
-            # The request event uses the provider model id while the usage
-            # event uses Kimi's configured alias.
-            if not turn_open or record.get("model") != "k3":
+            # Managed OAuth can resolve one stable configured alias to an
+            # account-specific provider model id.  The alias is the durable
+            # identity DRadar pinned in KIMI_CONFIG; do not reject otherwise
+            # valid K3 usage merely because the catalog returned a different
+            # raw provider id.  Older wire versions did not persist modelAlias,
+            # so retain their exact ``model == k3`` contract.
+            model_alias = record.get("modelAlias")
+            provider_model = record.get("model")
+            if model_alias is None:
+                model_valid = provider_model == "k3"
+            else:
+                model_valid = (
+                    model_alias == "kimi-code/k3"
+                    and isinstance(provider_model, str)
+                    and bool(provider_model.strip())
+                )
+            if not turn_open or not model_valid:
                 session_identity_valid = False
+            request_kind = record.get("kind", "loop")
+            if request_kind not in {"loop", "compaction"}:
+                request_ledger_valid = False
             request_step = record.get("turnStep")
-            if not isinstance(request_step, str) or not request_step:
+            if request_kind == "compaction":
+                parsed_step = None
+            elif not isinstance(request_step, str) or not request_step:
                 request_ledger_valid = False
                 parsed_step = None
             else:
@@ -288,7 +316,7 @@ def _kimi_usage_facts(
                     parsed_step = (int(parts[0]), int(parts[1]))
             request_instant = instant(record.get("time"))
             if request_instant is None:
-                request_ledger_valid = False
+                timed_usage_valid = False
                 parsed_request_instant = None
             else:
                 parsed_request_instant = request_instant[1]
@@ -296,8 +324,11 @@ def _kimi_usage_facts(
                      and parsed_request_instant < last_request_instant)
                         or (last_usage_instant is not None
                             and parsed_request_instant < last_usage_instant)):
-                    request_ledger_valid = False
+                    timed_usage_valid = False
                 last_request_instant = parsed_request_instant
+            if request_kind == "compaction":
+                pending_compaction_attempts.append(parsed_request_instant)
+                continue
             if isinstance(request_step, str) and request_step:
                 if (request_step in settled_request_steps
                         or any(step == request_step for step, _ in pending_attempts)):
@@ -309,7 +340,8 @@ def _kimi_usage_facts(
             continue
         if record_type == "turn.ended":
             ended_turns += 1
-            if not turn_open or pending_attempts:
+            if (not turn_open or pending_attempts
+                    or pending_compaction_attempts):
                 turn_ledger_valid = False
             turn_id = record.get("turnId")
             if (not isinstance(turn_id, int) or isinstance(turn_id, bool)
@@ -328,13 +360,16 @@ def _kimi_usage_facts(
             terminal_instant = instant(record.get("time"))
             if (terminal_instant is None
                     or (last_usage_instant is not None
-                        and terminal_instant[1] < last_usage_instant)
-                    or record.get("reason") != "completed"):
+                        and terminal_instant[1] < last_usage_instant)):
+                timed_usage_valid = False
+            if record.get("reason") != "completed":
                 turn_ledger_valid = False
             turn_open = False
             continue
-        if (record_type != "usage.record"
-                or record.get("usageScope") != "turn"):
+        if record_type != "usage.record":
+            continue
+        usage_scope = record.get("usageScope")
+        if usage_scope not in {"turn", "session"}:
             continue
         if not turn_open or record.get("model") != "kimi-code/k3":
             session_identity_valid = False
@@ -358,16 +393,32 @@ def _kimi_usage_facts(
             or record.get("occurred_at")
         )
         if occurred is None:
-            usage_valid = False
+            timed_usage_valid = False
             occurred_at = None
             occurred_instant = None
         else:
             occurred_at, occurred_instant = occurred
             if (last_usage_instant is not None
                     and occurred_instant < last_usage_instant):
-                usage_valid = False
+                timed_usage_valid = False
             last_usage_instant = occurred_instant
-        if not pending_attempts:
+        request_instant: datetime | None = None
+        if usage_scope == "session":
+            if not pending_compaction_attempts:
+                request_ledger_valid = False
+                unexpected_usage = True
+                duplicate_count += 1
+            else:
+                if len(pending_compaction_attempts) != 1:
+                    # Kimi persists every outbound compaction attempt but only
+                    # the successful response has usage.  Without a separate
+                    # retry ledger, multiple attempts cannot be reconciled.
+                    request_ledger_valid = False
+                request_instant = pending_compaction_attempts[-1]
+                pending_compaction_attempts = []
+                model_request_count += 1
+                compaction_request_count += 1
+        elif not pending_attempts:
             request_ledger_valid = False
             unexpected_usage = True
             duplicate_count += 1
@@ -384,10 +435,10 @@ def _kimi_usage_facts(
             model_request_count += 1
             request_step, request_instant = pending_attempts[-1]
             settled_request_steps.update(step for step, _ in pending_attempts)
-            if (request_instant is None or occurred_instant is None
-                    or occurred_instant < request_instant):
-                request_ledger_valid = False
             pending_attempts = []
+        if (request_instant is None or occurred_instant is None
+                or occurred_instant < request_instant):
+            timed_usage_valid = False
         events.append({
             "occurred_at": occurred_at,
             "n_input_tokens": (
@@ -410,6 +461,7 @@ def _kimi_usage_facts(
         and retry_ledger_valid
         and retry_group_index == len(retry_groups)
         and not pending_attempts
+        and not pending_compaction_attempts
         and model_request_count == len(events)
     )
     turn_ledger_valid = (
@@ -435,7 +487,7 @@ def _kimi_usage_facts(
         and bool(events)
         and prompt_tokens + totals["output"] > 0
     )
-    timed_complete = complete
+    timed_complete = complete and timed_usage_valid
     return {
         "schema": "dradar-subscription-provider-usage-v1",
         "provider": "kimi-code",
@@ -445,6 +497,7 @@ def _kimi_usage_facts(
         "session_usage_model_request_count": model_request_count,
         "session_usage_request_attempt_count": request_attempt_count,
         "session_usage_request_retry_count": request_retry_count,
+        "session_usage_compaction_request_count": compaction_request_count,
         "completed_turn_count": ended_turns,
         "turn_prompt_count": turn_prompt_count,
         "n_input_tokens": prompt_tokens,
@@ -456,7 +509,13 @@ def _kimi_usage_facts(
         "request_usage_observed": complete or observed,
         "timed_usage_complete": timed_complete,
         "request_ledger_duplicate_count": duplicate_count,
-        "request_ledger_source": "kimi-code-0.39.1-main-wire-retry-v3",
+        "request_ledger_source": "kimi-code-0.39.1-main-wire-retry-v4",
+        "usage_counters_valid": usage_valid,
+        "session_identity_valid": session_identity_valid,
+        "request_ledger_valid": request_ledger_valid,
+        "turn_ledger_valid": turn_ledger_valid,
+        "timed_usage_valid": timed_usage_valid,
+        "wire_metadata_count": metadata_count,
         "provider_actual_cost_observed": False,
         "cost_semantics": (
             "api_equivalent_from_complete_tokens" if complete
