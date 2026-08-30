@@ -120,8 +120,10 @@ def acquire_run_lock(home: Path) -> None:
             "Running two at once makes them race each other over the same "
             "claimed cells — the duplicate runs are rejected on upload and "
             "their quota is simply wasted. Wait for it to finish (or stop it), "
-            "then re-run. To run safely in parallel from one command, use "
-            "`dradar go --workers N`.")
+            "then re-run. To run one batch safely in parallel, use "
+            "`dradar resume --batch-id ID --workers N`. To run several exact "
+            "Honeypot batches on this machine, add each one through "
+            "`dradar fleet add --batch-id ID --workers N|auto`.")
     fh.seek(0)
     fh.truncate()
     fh.write(f"PID {os.getpid()}")

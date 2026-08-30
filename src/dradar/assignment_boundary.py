@@ -57,10 +57,17 @@ def _safe_assignment_id(value: object) -> str | None:
     return value
 
 
-def state_path(home: Path, benchmark_id: str) -> Path:
+def state_path(
+    home: Path, benchmark_id: str, batch_id: str | None = None,
+) -> Path:
     if not isinstance(benchmark_id, str) or not benchmark_id:
         raise BoundaryError("assignment boundary requires a benchmark ID")
-    digest = hashlib.sha256(benchmark_id.encode("utf-8")).hexdigest()[:20]
+    if batch_id is not None and (
+        not isinstance(batch_id, str) or not batch_id
+    ):
+        raise BoundaryError("assignment boundary batch ID must be non-empty")
+    scope = benchmark_id if batch_id is None else f"{benchmark_id}\0batch:{batch_id}"
+    digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:20]
     return home / STATE_DIR / f"{digest}.json"
 
 
@@ -208,11 +215,12 @@ def prepare(
     benchmark_id: str,
     active_assignments: list[dict],
     *,
+    batch_id: str | None = None,
     expected_ids: list[str] | None = None,
     forget_existing: bool = False,
 ) -> Path | None:
     """Open or create a campaign boundary and reject any unresolved loss."""
-    path = state_path(home, benchmark_id)
+    path = state_path(home, benchmark_id, batch_id)
     active = _active_entries(active_assignments)
     explicit = None
     if expected_ids is not None:
@@ -234,6 +242,8 @@ def prepare(
                 )
             if state is not None and state.get("benchmark_id") != benchmark_id:
                 raise BoundaryError("saved assignment boundary has a benchmark mismatch")
+            if state is not None and state.get("batch_id") != batch_id:
+                raise BoundaryError("saved assignment boundary has a batch mismatch")
             if state is not None:
                 report = _report(state, set(active))
                 if report.complete:
@@ -275,6 +285,7 @@ def prepare(
             state = {
                 "schema_version": SCHEMA_VERSION,
                 "benchmark_id": benchmark_id,
+                "batch_id": batch_id,
                 "created_at": now,
                 "updated_at": now,
                 "strict": explicit is not None,

@@ -23,6 +23,10 @@ from .api_client import normalize_batch_id
 from .capacity import cmd_capacity
 from .cells import cmd_cells
 from .doctor import cmd_doctor
+from .fleet import (
+    cmd_fleet_add, cmd_fleet_serve, cmd_fleet_status, cmd_fleet_stop,
+    cmd_fleet_watch,
+)
 from .identity import cmd_link_github, cmd_login, cmd_rename, cmd_status
 from .image_cache import cmd_config_set, cmd_config_show
 from .leases import cmd_leases, cmd_release
@@ -115,6 +119,66 @@ def main(argv: list[str] | None = None) -> int:
     p_capacity = sub.add_parser(
         "capacity", help="recommend a safe local worker count from Docker resources")
     p_capacity.set_defaults(func=cmd_capacity)
+
+    p_fleet = sub.add_parser(
+        "fleet",
+        help="run several exact Honeypot batches through one safe local coordinator",
+    )
+    fleet_sub = p_fleet.add_subparsers(
+        dest="fleet_command", required=True,
+        metavar="{add,status,watch,stop}",
+    )
+    p_fleet_add = fleet_sub.add_parser(
+        "add", help="idempotently add one exact claimed batch to this machine")
+    p_fleet_add.add_argument("--batch-id", required=True, type=_batch_id_value)
+    p_fleet_add.add_argument(
+        "--workers", type=_workers_value, default="auto", metavar="N|auto",
+        help="workers reserved for this batch (default: auto, accounting for the whole Fleet)",
+    )
+    p_fleet_add.add_argument(
+        "--retry", action="store_true",
+        help="restart a locally completed/failed Fleet entry after reviewing its status",
+    )
+    p_fleet_add.add_argument(
+        "--refill", action="store_true",
+        help="after every seed assignment submits, keep this exact campaign filled",
+    )
+    p_fleet_add.add_argument(
+        "--max-tasks", type=int, metavar="N",
+        help="campaign total-task cap including the website-selected seed batch",
+    )
+    p_fleet_add.add_argument(
+        "--refill-harness", metavar="HARNESS",
+        help="exact Harness for post-seed refill",
+    )
+    p_fleet_add.add_argument("--refill-model", metavar="MODEL")
+    p_fleet_add.add_argument("--refill-effort", metavar="EFFORT")
+    p_fleet_add.set_defaults(func=cmd_fleet_add, lease_hint=True)
+    p_fleet_status = fleet_sub.add_parser(
+        "status", help="show local Fleet batches and aggregate worker reservations")
+    p_fleet_status.add_argument(
+        "--json", action="store_true", help="emit machine-readable JSON")
+    p_fleet_status.set_defaults(func=cmd_fleet_status)
+    p_fleet_watch = fleet_sub.add_parser(
+        "watch", help="follow one Fleet batch until its local pool exits")
+    p_fleet_watch.add_argument("--batch-id", required=True, type=_batch_id_value)
+    p_fleet_watch.set_defaults(func=cmd_fleet_watch, lease_hint=True)
+    p_fleet_stop = fleet_sub.add_parser(
+        "stop", help="safely interrupt one or every local Fleet batch")
+    fleet_stop_target = p_fleet_stop.add_mutually_exclusive_group(required=True)
+    fleet_stop_target.add_argument("--batch-id", type=_batch_id_value)
+    fleet_stop_target.add_argument("--all", action="store_true")
+    p_fleet_stop.set_defaults(func=cmd_fleet_stop, lease_hint=True)
+    p_fleet_serve = fleet_sub.add_parser("serve", help=argparse.SUPPRESS)
+    p_fleet_serve.add_argument("--internal", action="store_true", help=argparse.SUPPRESS)
+    p_fleet_serve.set_defaults(func=cmd_fleet_serve)
+    # argparse otherwise renders a literal ``==SUPPRESS==`` entry for hidden
+    # subcommands. Keep the internal parser reachable without advertising it
+    # to users or copied Agent runbooks.
+    fleet_sub._choices_actions = [
+        action for action in fleet_sub._choices_actions
+        if action.dest != "serve"
+    ]
 
     p_cells = sub.add_parser(
         "cells", help="browse and filter the full public cell table (read-only)")
@@ -352,6 +416,7 @@ def main(argv: list[str] | None = None) -> int:
                  "and scale-down lets in-flight tasks finish",
         )
         p.add_argument("--worker-child", action="store_true", help=argparse.SUPPRESS)
+        p.add_argument("--fleet-pool", action="store_true", help=argparse.SUPPRESS)
         p.add_argument(
             "--refill", action="store_true",
             help="keep replenishing the held queue (requires a quota or task limit)",

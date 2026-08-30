@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -2689,6 +2690,14 @@ def _prepare_assignment_boundary(
             HOME,
             benchmark_id,
             active,
+            # Preserve the pre-Fleet boundary path for legacy invocations so
+            # an upgrade cannot silently bypass unresolved local state. Fleet
+            # parents need a per-batch path because several exact batches are
+            # intentionally live under one machine coordinator.
+            batch_id=(
+                getattr(client, "batch_id", None)
+                if getattr(args, "fleet_pool", False) else None
+            ),
             expected_ids=getattr(args, "expect_assignment", None),
             forget_existing=getattr(args, "forget_assignment_boundary", False),
         )
@@ -3091,6 +3100,7 @@ def cmd_go(args) -> int:
         sys.exit("--auto N requires N >= 1")
     workers = getattr(args, "workers", 1)
     auto_workers = workers == "auto"
+    fleet_pool = bool(getattr(args, "fleet_pool", False))
     if not auto_workers and (workers < 1 or workers > 40):
         sys.exit("--workers N requires 1 <= N <= 40")
     if getattr(args, "worker_child", False) and (
@@ -3101,6 +3111,45 @@ def cmd_go(args) -> int:
         or getattr(args, "forget_assignment_boundary", False)
     ):
         sys.exit("invalid internal worker invocation")
+    if fleet_pool:
+        controller_id = os.environ.get("DRADAR_FLEET_CONTROLLER_ID")
+        env_batch_id = os.environ.get("DRADAR_FLEET_BATCH_ID")
+        if (
+            not controller_id
+            or not getattr(args, "resume", False)
+            or getattr(args, "worker_child", False)
+            or not getattr(args, "batch_id", None)
+            or env_batch_id != getattr(args, "batch_id", None)
+            or auto_workers
+            or getattr(args, "parallel", False)
+        ):
+            sys.exit("invalid internal Fleet pool invocation")
+        from . import fleet
+
+        if not fleet.controller_matches(controller_id, HOME):
+            sys.exit("invalid internal Fleet pool invocation")
+        try:
+            fleet.acquire_pool_lock(HOME, args.batch_id, controller_id)
+        except fleet.FleetError as exc:
+            sys.exit(str(exc))
+        fleet.start_pool_watchdog(HOME, controller_id)
+        args.yes = True
+    elif (
+        getattr(args, "parallel", False)
+        and not getattr(args, "worker_child", False)
+    ):
+        from . import fleet
+
+        if fleet.controller_is_active(HOME):
+            suffix = (
+                f" --batch-id {args.batch_id}" if getattr(args, "batch_id", None)
+                else " --batch-id <BATCH_ID>"
+            )
+            sys.exit(
+                "a machine-local DRadar Fleet is already active. Do not start an "
+                "unmanaged parallel session; add the exact Honeypot batch with "
+                f"`dradar fleet add{suffix} --workers auto`"
+            )
     if (auto_workers or workers > 1) and getattr(args, "parallel", False):
         sys.exit("--workers already manages parallel sessions; do not combine it with --parallel")
     if getattr(args, "refill_to", None) is not None:
@@ -3195,7 +3244,22 @@ def cmd_go(args) -> int:
         # One runner per machine by default, THEN sweep containers stranded by
         # dead runs — the lock is what makes "a pier-shaped compose project
         # exists right now" mean "nobody alive owns it" (see machine.py).
-        if getattr(args, "parallel", False):
+        if fleet_pool:
+            args.yes = True
+            # Fixed Fleet entries never claim. A refill entry may claim only
+            # through its exact server-authoritative campaign after the seed
+            # barrier; it still cannot use go/auto/pick or cross batch scope.
+            args.allow_new_claims = bool(getattr(args, "refill", False))
+            print(
+                f"Fleet batch {args.batch_id}: running under the machine-local "
+                "coordinator; "
+                + (
+                    "refill is limited to this server-budgeted campaign."
+                    if getattr(args, "refill", False)
+                    else "no new assignments or refill will be requested."
+                )
+            )
+        elif getattr(args, "parallel", False):
             args.yes = True  # a dispenser that stamps at checkout can't prompt
             print("--parallel: running alongside other dradar sessions on this "
                   "machine. Cells are split safely server-side, but the sessions "
@@ -3210,18 +3274,22 @@ def cmd_go(args) -> int:
         # Preparing is a real phase: cloning the task repo and installing pier
         # can take minutes on a fresh machine. The heartbeat lets operators
         # distinguish that from an abandoned claim without inspecting the host.
+        preparation = (
+            fleet.preparation_lock(HOME) if fleet_pool else nullcontext()
+        )
         try:
-            if cfg["benchmark"] != DEFAULT_BENCHMARK:
-                try:
-                    ensure_benchmark_task_pack(
-                        client, cfg["benchmark"], tasks_root)
-                except TaskPackError as exc:
-                    raise RunnerError(str(exc)) from exc
-            _ensure_selected_tasks_root(tasks_root, cfg["benchmark"])
-            ensure_pier()
-            _ensure_egress_runtime(
-                probe_connectivity=not getattr(args, "worker_child", False),
-            )
+            with preparation:
+                if cfg["benchmark"] != DEFAULT_BENCHMARK:
+                    try:
+                        ensure_benchmark_task_pack(
+                            client, cfg["benchmark"], tasks_root)
+                    except TaskPackError as exc:
+                        raise RunnerError(str(exc)) from exc
+                _ensure_selected_tasks_root(tasks_root, cfg["benchmark"])
+                ensure_pier()
+                _ensure_egress_runtime(
+                    probe_connectivity=not getattr(args, "worker_child", False),
+                )
         except RunnerError as exc:
             sys.exit(str(exc))
 
@@ -3231,7 +3299,7 @@ def cmd_go(args) -> int:
         # pool parent already drains this shared ledger before spawning its
         # children; letting every child replay the same entries creates a
         # duplicate-upload herd precisely when the server asks us to slow down.
-        if not getattr(args, "worker_child", False):
+        if not getattr(args, "worker_child", False) and not fleet_pool:
             _retry_pending_uploads(client)
 
         boundary_path = _prepare_assignment_boundary(
@@ -3242,7 +3310,7 @@ def cmd_go(args) -> int:
         # ledger above; old retired state directories can never start a model.
 
         rc = _go_menu(args, cfg, client, tasks_root, telemetry=telemetry)
-        if not getattr(args, "parallel", False):
+        if not getattr(args, "parallel", False) and not fleet_pool:
             _maintain_image_cache(client, cfg, phase="after run")
         if not _finish_invocation_assignment_boundary(
             args, client, _assignment_boundary_path(args),
@@ -3670,6 +3738,9 @@ def _run_worker_pool(args) -> int:
         )
         return 0
     cfg = client = None
+    fleet_pool = bool(getattr(args, "fleet_pool", False))
+    if fleet_pool:
+        from . import fleet
     if args.workers == "auto":
         from .capacity import AUTO_WORKER_CAP, inspect_capacity, print_report
 
@@ -3697,7 +3768,7 @@ def _run_worker_pool(args) -> int:
         print_report(report)
         args.workers = report.recommended_workers
         _align_refill_target_with_workers(args)
-    else:
+    elif not fleet_pool:
         from .capacity import docker_resources, worker_resource_warnings
 
         cpus, memory_gib, probe_warnings = docker_resources()
@@ -3737,23 +3808,31 @@ def _run_worker_pool(args) -> int:
         client = _client(cfg, auto_register=True)
         _scope_client_to_batch(client, getattr(args, "batch_id", None))
     tasks_root = _selected_tasks_root(cfg)
-    acquire_run_lock(HOME)
-    sweep_orphan_compose(HOME, True)
-    args.allow_new_claims = _maintain_image_cache(
-        client, cfg, phase="before worker pool",
+    if fleet_pool:
+        args.allow_new_claims = bool(getattr(args, "refill", False))
+    else:
+        acquire_run_lock(HOME)
+        sweep_orphan_compose(HOME, True)
+        args.allow_new_claims = _maintain_image_cache(
+            client, cfg, phase="before worker pool",
+        )
+    preparation = (
+        fleet.preparation_lock(HOME) if fleet_pool else nullcontext()
     )
     try:
-        if cfg["benchmark"] != DEFAULT_BENCHMARK:
-            try:
-                ensure_benchmark_task_pack(client, cfg["benchmark"], tasks_root)
-            except TaskPackError as exc:
-                raise RunnerError(str(exc)) from exc
-        _ensure_selected_tasks_root(tasks_root, cfg["benchmark"])
-        ensure_pier()
-        _ensure_egress_runtime()
+        with preparation:
+            if cfg["benchmark"] != DEFAULT_BENCHMARK:
+                try:
+                    ensure_benchmark_task_pack(client, cfg["benchmark"], tasks_root)
+                except TaskPackError as exc:
+                    raise RunnerError(str(exc)) from exc
+            _ensure_selected_tasks_root(tasks_root, cfg["benchmark"])
+            ensure_pier()
+            _ensure_egress_runtime()
     except RunnerError as exc:
         sys.exit(str(exc))
-    _retry_pending_uploads(client)
+    if not fleet_pool:
+        _retry_pending_uploads(client)
 
     active, _free_pick = _prepare_batch(args, client)
     if not active:
@@ -4136,7 +4215,8 @@ def _run_worker_pool(args) -> int:
         print("\nstopping workers safely; each active task is recoverable only after "
               "the server confirms checkout cleanup or its completed upload is durable...")
         _signal_workers(processes)
-        _maintain_image_cache(client, cfg, phase="after interrupted worker pool")
+        if not fleet_pool:
+            _maintain_image_cache(client, cfg, phase="after interrupted worker pool")
         cleanup_abort_file()
         raise
     except OSError as exc:
@@ -4146,7 +4226,8 @@ def _run_worker_pool(args) -> int:
         # model quota even though the command appears to have failed.
         print(f"couldn't start every worker ({exc}); stopping those already started")
         _signal_workers(processes)
-        _maintain_image_cache(client, cfg, phase="after failed worker pool")
+        if not fleet_pool:
+            _maintain_image_cache(client, cfg, phase="after failed worker pool")
         cleanup_abort_file()
         return 1
     cleanup_abort_file()
@@ -4154,7 +4235,8 @@ def _run_worker_pool(args) -> int:
         (slot, rc) for slot, rc in returncodes
         if rc not in (0, _WORKER_SLOT_QUARANTINED_EXIT_CODE)
     ]
-    _maintain_image_cache(client, cfg, phase="after worker pool")
+    if not fleet_pool:
+        _maintain_image_cache(client, cfg, phase="after worker pool")
     boundary_safe = _finish_assignment_boundary(client, boundary_path)
     if not boundary_safe:
         return 1
@@ -4743,6 +4825,39 @@ def _setup_refill(args, client: ApiClient, active: list[dict], free_pick: bool) 
             args.refill = False
             return active
 
+    server_campaign_id = None
+    if getattr(args, "fleet_pool", False):
+        if not getattr(args, "batch_id", None):
+            raise refill_plan.RefillError(
+                "Fleet refill requires an exact seed batch ID"
+            )
+        if not all(
+            getattr(args, name, None)
+            for name in ("refill_harness", "refill_model", "refill_effort")
+        ):
+            raise refill_plan.RefillError(
+                "Fleet refill requires exact Harness, model, and effort scope"
+            )
+        try:
+            configured = client.configure_refill_campaign(
+                batch_id=args.batch_id,
+                harness=args.refill_harness,
+                model=args.refill_model,
+                effort=args.refill_effort,
+                refill_to=target,
+                max_tasks=args.max_tasks,
+            )
+        except ApiError as exc:
+            raise refill_plan.RefillError(
+                f"server refused the exact Fleet refill campaign: {exc}"
+            ) from exc
+        campaign = configured.get("campaign") or {}
+        if campaign.get("batch_id") != args.batch_id:
+            raise refill_plan.RefillError(
+                "server returned a mismatched Fleet refill campaign"
+            )
+        server_campaign_id = args.batch_id
+
     plan = refill_plan.configure(
         HOME,
         volunteer_id=me.get("volunteer_id", "unknown"),
@@ -4755,6 +4870,7 @@ def _setup_refill(args, client: ApiClient, active: list[dict], free_pick: bool) 
         refill_model=getattr(args, "refill_model", None),
         refill_effort=getattr(args, "refill_effort", None),
         refill_order=getattr(args, "refill_order", None) or "cost",
+        server_campaign_id=server_campaign_id,
         # A normal parent owns the exclusive per-machine run lock here, so no
         # live local campaign can be displaced. Manual --parallel sessions do
         # not own that proof and must keep the fail-closed conflict behavior.
@@ -4847,6 +4963,10 @@ def _prepare_batch(args, client: ApiClient) -> tuple[list[dict], bool]:
         except refill_plan.RefillError as exc:
             # Setup validation belongs to this invocation. It must never mutate
             # an already-active shared plan owned by other parallel workers.
+            if getattr(args, "fleet_pool", False):
+                raise SystemExit(
+                    f"exact Fleet refill campaign was not started: {exc}"
+                ) from exc
             print(f"continuous refill not started: {exc}")
             args.refill = False
     if not active:

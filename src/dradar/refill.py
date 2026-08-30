@@ -22,6 +22,8 @@ from .providers import REFILL_HARNESS_PROVIDERS, validate_refill_scope
 SCHEMA_VERSION = 1
 PLAN_FILE = "refill-plan.json"
 LOCK_FILE = "refill-plan.lock"
+PLAN_SCOPE_ENV = "DRADAR_REFILL_PLAN_SCOPE"
+SCOPED_PLAN_DIR = "refill-plans"
 RUNNING_STATES = {"active", "draining"}
 FAULTED_STATE = "faulted"
 REFILL_FAULT_FAMILIES = frozenset({
@@ -44,13 +46,29 @@ def _now() -> str:
 
 
 def _path(home: Path) -> Path:
+    scope = os.environ.get(PLAN_SCOPE_ENV, "").strip().lower()
+    if scope:
+        if not all(character in "0123456789abcdef" for character in scope):
+            raise RefillError("invalid scoped refill plan identifier")
+        return home / SCOPED_PLAN_DIR / f"{scope}.json"
     return home / PLAN_FILE
+
+
+def _lock_path(home: Path) -> Path:
+    scope = os.environ.get(PLAN_SCOPE_ENV, "").strip().lower()
+    if scope:
+        if not all(character in "0123456789abcdef" for character in scope):
+            raise RefillError("invalid scoped refill plan identifier")
+        return home / SCOPED_PLAN_DIR / f"{scope}.lock"
+    return home / LOCK_FILE
 
 
 @contextmanager
 def _locked(home: Path) -> Iterator[None]:
     home.mkdir(parents=True, exist_ok=True)
-    fd = os.open(home / LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+    lock_path = _lock_path(home)
+    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
     if os.fstat(fd).st_size == 0:
         os.write(fd, b"\0")
     os.lseek(fd, 0, os.SEEK_SET)
@@ -309,6 +327,7 @@ def configure(
     refill_model: str | None = None,
     refill_effort: str | None = None,
     refill_order: str = "cost",
+    server_campaign_id: str | None = None,
     replace_existing: bool = False,
 ) -> dict:
     if refill_to < 1 or max_tasks < 1:
@@ -339,6 +358,8 @@ def configure(
         "refill_effort": refill_effort,
         "refill_order": refill_order,
     }
+    if server_campaign_id is not None:
+        desired["server_campaign_id"] = server_campaign_id
     # A scoped plan owns only its Harness/model/effort lane.  The account may
     # legitimately hold work for other independent Harness campaigns; treating
     # those assignments as seeds would block this plan until the entire account
@@ -673,7 +694,17 @@ def refill_once(home: Path, client) -> dict:
             return {"status": "draining", "claimed": 0,
                     "planned": len(plan.get("assignments", {})),
                     "reason": plan.get("stop_reason")}
-        data = client.get_assignment()
+        try:
+            data = client.get_assignment()
+        except ApiError as exc:
+            # An exact seed batch is momentarily empty after its last selected
+            # task submits and before the first server-budgeted refill claim.
+            # Treat only that authenticated campaign gap as an empty queue;
+            # every other 404 remains a real boundary failure.
+            if plan.get("server_campaign_id") and exc.status_code == 404:
+                data = {"active": []}
+            else:
+                raise
         active = data.get("active")
         if active is None:
             one = data.get("assignment")
@@ -744,6 +775,7 @@ def refill_once(home: Path, client) -> dict:
             suggestions = client.suggest(max(wanted, wanted * 3)).get("cells") or []
         quota_blocked = False
         missing_quota_estimate = False
+        server_target_satisfied = False
         for cell in suggestions:
             if claimed >= wanted:
                 break
@@ -757,9 +789,34 @@ def refill_once(home: Path, client) -> dict:
                     quota_blocked = True
                     continue
             try:
-                ack = client.claim_assignment(
-                    cell["task_id"], cell["model"], cell["effort"])
+                campaign_id = plan.get("server_campaign_id")
+                if campaign_id:
+                    ack = client.claim_assignment(
+                        cell["task_id"], cell["model"], cell["effort"],
+                        refill_campaign_id=campaign_id,
+                    )
+                else:
+                    ack = client.claim_assignment(
+                        cell["task_id"], cell["model"], cell["effort"],
+                    )
             except ApiError as exc:
+                if exc.code in {
+                    "refill_limit_reached", "refill_campaign_not_active",
+                    "refill_campaign_faulted",
+                }:
+                    plan["status"] = (
+                        "draining"
+                        if exc.code == "refill_limit_reached" else "stopped"
+                    )
+                    plan["stop_reason"] = str(exc)
+                    break
+                if exc.code in {
+                    "refill_seed_pending", "refill_target_satisfied",
+                }:
+                    server_target_satisfied = (
+                        exc.code == "refill_target_satisfied"
+                    )
+                    break
                 if exc.status_code == 409:
                     continue
                 raise
@@ -797,9 +854,12 @@ def refill_once(home: Path, client) -> dict:
                 "planned": len(plan["assignments"]),
                 "reserved_quota_pct": _reserved_quota(plan),
                 "reason": plan.get("stop_reason")}
+        if server_target_satisfied:
+            result["target_satisfied"] = True
         if (claimed == 0 and plan.get("refill_harness")
                 and plan.get("status") == "active"
-                and not missing_quota_estimate and not quota_blocked):
+                and not missing_quota_estimate and not quota_blocked
+                and not server_target_satisfied):
             result["waiting_for_inventory"] = True
             result["reason"] = (
                 "no currently claimable open cells match the configured refill scope"

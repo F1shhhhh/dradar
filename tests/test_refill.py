@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from dradar import refill, runloop
+from dradar.api_client import ApiError
 
 
 WINDOWS = {"plus": 10.0, "pro-5x": 50.0, "pro-20x": 200.0}
@@ -98,6 +99,62 @@ def test_plan_persists_only_bounded_public_metadata(tmp_path: Path):
     assert plan["submitted_seed_assignment_ids"] == []
     for secret in ("token", "nonce", "password", "auth.json"):
         assert secret not in raw
+
+
+def test_fleet_batches_keep_independent_local_refill_ledgers(
+    tmp_path: Path, monkeypatch,
+):
+    batch_a = "550e8400e29b41d4a716446655440000"
+    batch_b = "6ba7b8109dad11d180b400c04fd430c8"
+    monkeypatch.setenv(refill.PLAN_SCOPE_ENV, batch_a)
+    first = _configure(
+        tmp_path, [_assignment("a1")], server_campaign_id=batch_a,
+    )
+    monkeypatch.setenv(refill.PLAN_SCOPE_ENV, batch_b)
+    second = _configure(
+        tmp_path, [_assignment("b1")], server_campaign_id=batch_b,
+    )
+
+    assert first["plan_id"] != second["plan_id"]
+    assert refill.load(tmp_path)["server_campaign_id"] == batch_b
+    monkeypatch.setenv(refill.PLAN_SCOPE_ENV, batch_a)
+    assert refill.load(tmp_path)["server_campaign_id"] == batch_a
+    assert {
+        path.name for path in (tmp_path / refill.SCOPED_PLAN_DIR).glob("*.json")
+    } == {f"{batch_a}.json", f"{batch_b}.json"}
+
+
+def test_server_fault_stops_scoped_local_refill_plan(tmp_path: Path):
+    batch_id = "550e8400e29b41d4a716446655440000"
+
+    class FaultClient(RefillClient):
+        def table(self):
+            return {
+                "combos": [{"model": "m", "effort": "e"}],
+                "cells": {"new-0|m|e": {"st": "open", "cost": 1.0}},
+                "tier_windows_usd": WINDOWS,
+            }
+
+        def claim_assignment(
+            self, task_id, model, effort, *, refill_campaign_id=None,
+        ):
+            raise ApiError(
+                "campaign assignment failed", status_code=409,
+                code="refill_campaign_faulted",
+            )
+
+    client = FaultClient([])
+    _configure(
+        tmp_path, [], refill_harness="codex", refill_model="m",
+        refill_effort="e", server_campaign_id=batch_id,
+    )
+
+    result = refill.refill_once(tmp_path, client)
+
+    assert result["status"] == "stopped"
+    assert result["claimed"] == 0
+    assert "campaign assignment failed" in result["reason"]
+    assert refill.load(tmp_path)["status"] == "stopped"
 
 
 def test_live_resize_updates_refill_target_without_resetting_budget(
@@ -307,6 +364,52 @@ def test_setup_clamps_target_to_server_claim_limit(tmp_path: Path, monkeypatch, 
     plan = refill.load(tmp_path)
     assert plan["refill_to"] == 3
     assert "using 3" in capsys.readouterr().out
+
+
+def test_fleet_setup_registers_server_authoritative_seed_campaign(
+    tmp_path: Path, monkeypatch,
+):
+    batch_id = "550e8400e29b41d4a716446655440000"
+    selected = {
+        **_assignment("seed"),
+        "batch_id": batch_id,
+        "agent": "kimi-code",
+        "model": "k3",
+        "effort": "high",
+    }
+
+    class Client(RefillClient):
+        def __init__(self):
+            super().__init__([selected])
+            self.configured = []
+
+        def configure_refill_campaign(self, **values):
+            self.configured.append(values)
+            return {"campaign": {"batch_id": values["batch_id"]}}
+
+    client = Client()
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    monkeypatch.setenv(refill.PLAN_SCOPE_ENV, batch_id)
+    args = argparse.Namespace(
+        refill=True, refill_to=1, auto=None, yes=True, max_tasks=3,
+        quota_tier="plus", max_estimated_quota_pct=None,
+        refill_harness="kimi-code", refill_model="k3", refill_effort="high",
+        refill_order="cost", parallel=False, fleet_pool=True,
+        batch_id=batch_id,
+    )
+
+    active = runloop._setup_refill(args, client, [selected], True)
+
+    assert active == [selected]
+    assert client.configured == [{
+        "batch_id": batch_id,
+        "harness": "kimi-code",
+        "model": "k3",
+        "effort": "high",
+        "refill_to": 1,
+        "max_tasks": 3,
+    }]
+    assert refill.load(tmp_path)["server_campaign_id"] == batch_id
 
 
 def test_normal_setup_replaces_stale_plan_before_refilling(
