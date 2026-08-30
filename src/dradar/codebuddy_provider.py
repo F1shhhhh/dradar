@@ -121,7 +121,9 @@ def codebuddy_executable(
     env = os.environ if environ is None else environ
     if explicit := env.get("CODEBUDDY_CLI_PATH"):
         return explicit
-    path = env.get("PATH") if environ is not None else None
+    if environ is None:
+        return shutil.which("codebuddy") or shutil.which("cbc")
+    path = env.get("PATH")
     return shutil.which("codebuddy", path=path) or shutil.which("cbc", path=path)
 
 

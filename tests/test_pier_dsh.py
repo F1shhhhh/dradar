@@ -177,7 +177,7 @@ def test_install_spec_is_fully_pinned(tmp_path: Path) -> None:
     assert f"v{NODE_VERSION}" in spec.verification_command
     assert DSH_VERSION in spec.verification_command
     assert spec.cache_key == (
-        f"dradar-dsh-minimal-{DSH_VERSION}-node-{NODE_VERSION}-patch-v4"
+        f"dradar-dsh-minimal-{DSH_VERSION}-node-{NODE_VERSION}-patch-v5"
     )
     bash = shutil.which("bash")
     if bash is not None:

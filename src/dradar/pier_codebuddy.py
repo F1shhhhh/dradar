@@ -51,10 +51,14 @@ def _usage_values(value: object) -> dict[str, int] | None:
 def _codebuddy_usage_facts(events: list[dict]) -> dict[str, object]:
     """Reconcile CodeBuddy's per-response ledger with its terminal aggregate.
 
-    CodeBuddy's headless wire follows the Claude stream-json token shape:
-    uncached input, cache reads, cache creation and output are disjoint.  DRadar
-    bills total prompt tokens and keeps cache reads as a discounted subset.
-    Missing or inconsistent evidence stays explicitly incomplete.
+    CodeBuddy emits zero-usage stream fragments before the token-bearing
+    response for a message, and ``num_turns`` counts stream turns rather than
+    provider requests.  Its ``input_tokens`` already includes cache reads and
+    cache creation; those cache fields are subsets, not additional prompt
+    tokens.  DRadar therefore deduplicates by message id, reconciles the
+    positive request ledger with the terminal aggregate, and bills
+    ``input_tokens`` directly while retaining cache reads as the discounted
+    subset.  Missing or inconsistent evidence stays explicitly incomplete.
     """
 
     terminals = [
@@ -72,8 +76,7 @@ def _codebuddy_usage_facts(events: list[dict]) -> dict[str, object]:
         "cache_creation_input_tokens", "output_tokens",
     )
     totals = {name: 0 for name in names}
-    token_usage_events: list[dict[str, int]] = []
-    seen_message_ids: set[str] = set()
+    usage_by_message_id: dict[str, dict[str, int]] = {}
     ledger_valid = True
     for event in events:
         if not isinstance(event, dict) or event.get("type") != "assistant":
@@ -83,10 +86,6 @@ def _codebuddy_usage_facts(events: list[dict]) -> dict[str, object]:
             ledger_valid = False
             continue
         message_id = message.get("id")
-        if isinstance(message_id, str) and message_id:
-            if message_id in seen_message_ids:
-                continue
-            seen_message_ids.add(message_id)
         runtime_model = message.get("model")
         if (
             isinstance(runtime_model, str)
@@ -94,27 +93,43 @@ def _codebuddy_usage_facts(events: list[dict]) -> dict[str, object]:
             and runtime_model != SUPPORTED_MODEL
         ):
             ledger_valid = False
-        usage = _usage_values(message.get("usage"))
+        raw_usage = message.get("usage")
+        usage = _usage_values(raw_usage)
         if usage is None:
+            # Thinking/text stream fragments have an all-zero placeholder in
+            # current CodeBuddy releases, with nullable cache counters.  They
+            # are not provider responses.  A malformed record that already
+            # carries a positive counter is real evidence loss and must fail
+            # closed instead of being silently skipped.
+            if isinstance(raw_usage, dict) and any(
+                (_nonnegative_int(raw_usage.get(name)) or 0) > 0
+                for name in names
+            ):
+                ledger_valid = False
+            continue
+        if sum(usage.values()) == 0:
+            continue
+        if not isinstance(message_id, str) or not message_id:
             ledger_valid = False
             continue
+        previous = usage_by_message_id.get(message_id)
+        if previous is not None:
+            if previous != usage:
+                ledger_valid = False
+            continue
+        usage_by_message_id[message_id] = usage
+
+    token_usage_events: list[dict[str, int]] = []
+    for usage in usage_by_message_id.values():
         for name in names:
             totals[name] += usage[name]
         token_usage_events.append({
-            "n_input_tokens": (
-                usage["input_tokens"]
-                + usage["cache_read_input_tokens"]
-                + usage["cache_creation_input_tokens"]
-            ),
+            "n_input_tokens": usage["input_tokens"],
             "n_cache_tokens": usage["cache_read_input_tokens"],
             "n_output_tokens": usage["output_tokens"],
             "cache_creation_tokens": usage["cache_creation_input_tokens"],
         })
 
-    request_count = (
-        _nonnegative_int(terminal.get("num_turns"))
-        if terminal is not None else None
-    )
     terminal_success = bool(
         terminal is not None
         and terminal.get("is_error") is not True
@@ -124,7 +139,10 @@ def _codebuddy_usage_facts(events: list[dict]) -> dict[str, object]:
     if terminal_usage is not None:
         reported_total = terminal.get("total_tokens")
         if reported_total is not None:
-            expected_total = sum(terminal_usage.values())
+            expected_total = (
+                terminal_usage["input_tokens"]
+                + terminal_usage["output_tokens"]
+            )
             if _nonnegative_int(reported_total) != expected_total:
                 terminal_success = False
     complete = bool(
@@ -132,16 +150,11 @@ def _codebuddy_usage_facts(events: list[dict]) -> dict[str, object]:
         and ledger_valid
         and terminal_usage is not None
         and token_usage_events
-        and request_count == len(token_usage_events)
         and terminal_usage == totals
         and sum(totals.values()) > 0
     )
     selected = totals if complete else {name: 0 for name in names}
-    prompt = (
-        selected["input_tokens"]
-        + selected["cache_read_input_tokens"]
-        + selected["cache_creation_input_tokens"]
-    )
+    prompt = selected["input_tokens"]
     return {
         "schema": "dradar-subscription-provider-usage-v1",
         "provider": "codebuddy",

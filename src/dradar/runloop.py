@@ -2869,8 +2869,23 @@ def _finish_assignment_boundary(
         return True
     try:
         active = list(_active_by_id(client).values())
+    except ApiError as exc:
+        if _explicit_batch_finished(client, exc):
+            # Exact-batch reads intentionally become 404 after the final
+            # assignment settles.  The boundary ledger already records that
+            # submitted/terminal outcome, so an empty active inventory is the
+            # authoritative clean-drain state rather than a reconciliation
+            # failure.
+            active = []
+        else:
+            print(
+                f"could not verify the assignment boundary after the run ({exc}); "
+                "the boundary was kept and the next resume will re-check it"
+            )
+            return False
+    try:
         report = assignment_boundary.reconcile(path, active)
-    except (ApiError, assignment_boundary.BoundaryError, OSError) as exc:
+    except (assignment_boundary.BoundaryError, OSError) as exc:
         print(
             f"could not verify the assignment boundary after the run ({exc}); "
             "the boundary was kept and the next resume will re-check it"

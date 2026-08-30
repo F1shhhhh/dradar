@@ -13,11 +13,14 @@ _REAL_DOCKER_HUB_PREFLIGHT = doctor._docker_hub_preflight
 
 
 @pytest.fixture(autouse=True)
-def _stub_docker_hub_preflight(monkeypatch):
-    """Unit tests must never depend on the caller's live Docker registry."""
+def _stub_external_provider_state(monkeypatch, tmp_path):
+    """Unit tests must not depend on live registry or provider state."""
 
     monkeypatch.setattr(
         doctor, "_docker_hub_preflight", lambda _docker, _platform: (True, ""),
+    )
+    monkeypatch.setattr(
+        doctor, "managed_codebuddy_home", lambda: tmp_path / "no-codebuddy",
     )
 
 

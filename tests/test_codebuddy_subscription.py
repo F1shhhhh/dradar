@@ -280,7 +280,7 @@ def test_usage_reconciles_request_ledger_and_terminal_aggregate() -> None:
             "message": {
                 "id": "m1", "model": CODEBUDDY_MODEL,
                 "usage": {
-                    "input_tokens": 100,
+                    "input_tokens": 125,
                     "cache_read_input_tokens": 20,
                     "cache_creation_input_tokens": 5,
                     "output_tokens": 30,
@@ -291,7 +291,7 @@ def test_usage_reconciles_request_ledger_and_terminal_aggregate() -> None:
             "type": "result", "subtype": "success", "is_error": False,
             "num_turns": 1, "total_tokens": 155,
             "usage": {
-                "input_tokens": 100,
+                "input_tokens": 125,
                 "cache_read_input_tokens": 20,
                 "cache_creation_input_tokens": 5,
                 "output_tokens": 30,
@@ -305,6 +305,62 @@ def test_usage_reconciles_request_ledger_and_terminal_aggregate() -> None:
     assert facts["n_output_tokens"] == 30
     assert facts["provider_actual_cost_observed"] is False
     assert facts["cost_semantics"] == "server-priced-api-equivalent"
+
+
+def test_usage_accepts_real_stream_fragments_and_ignores_num_turns() -> None:
+    zero = {
+        "input_tokens": 0, "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0, "output_tokens": 0,
+    }
+    nullable_zero = {
+        "input_tokens": 0, "cache_read_input_tokens": None,
+        "cache_creation_input_tokens": None, "output_tokens": 0,
+    }
+    request = {
+        "input_tokens": 8152, "cache_read_input_tokens": 768,
+        "cache_creation_input_tokens": 7384, "output_tokens": 70,
+    }
+    facts = _usage_function()([
+        {"type": "assistant", "message": {
+            "id": "m1", "model": CODEBUDDY_MODEL, "usage": zero,
+        }},
+        {"type": "assistant", "message": {
+            "id": "m1", "model": CODEBUDDY_MODEL, "usage": zero,
+        }},
+        {"type": "assistant", "message": {
+            "id": "m1", "model": CODEBUDDY_MODEL, "usage": request,
+        }},
+        {"type": "assistant", "message": {
+            "id": "thinking", "model": CODEBUDDY_MODEL,
+            "usage": nullable_zero,
+        }},
+        {"type": "result", "subtype": "success", "is_error": False,
+         "num_turns": 4, "usage": request},
+    ])
+    assert facts["complete"] is True
+    assert facts["request_count"] == 1
+    assert facts["n_input_tokens"] == 8152
+    assert facts["n_cache_tokens"] == 768
+    assert facts["n_output_tokens"] == 70
+
+
+def test_usage_fails_closed_on_conflicting_positive_duplicate() -> None:
+    request = {
+        "input_tokens": 10, "cache_read_input_tokens": 2,
+        "cache_creation_input_tokens": 3, "output_tokens": 1,
+    }
+    facts = _usage_function()([
+        {"type": "assistant", "message": {
+            "id": "m1", "model": CODEBUDDY_MODEL, "usage": request,
+        }},
+        {"type": "assistant", "message": {
+            "id": "m1", "model": CODEBUDDY_MODEL,
+            "usage": {**request, "output_tokens": 2},
+        }},
+        {"type": "result", "subtype": "success", "usage": request},
+    ])
+    assert facts["complete"] is False
+    assert facts["n_input_tokens"] == 0
 
 
 def test_usage_fails_closed_on_mismatch_or_wrong_model() -> None:
@@ -337,7 +393,7 @@ def test_normalized_usage_preserves_codebuddy_attestation_fields(
             "message": {
                 "id": "m1", "model": CODEBUDDY_MODEL,
                 "usage": {
-                    "input_tokens": 100,
+                    "input_tokens": 125,
                     "cache_read_input_tokens": 20,
                     "cache_creation_input_tokens": 5,
                     "output_tokens": 30,
@@ -348,7 +404,7 @@ def test_normalized_usage_preserves_codebuddy_attestation_fields(
             "type": "result", "subtype": "success", "is_error": False,
             "num_turns": 1, "total_tokens": 155,
             "usage": {
-                "input_tokens": 100,
+                "input_tokens": 125,
                 "cache_read_input_tokens": 20,
                 "cache_creation_input_tokens": 5,
                 "output_tokens": 30,
