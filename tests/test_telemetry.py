@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from dradar.api_client import ApiError
 from dradar.telemetry import RunnerTelemetry
 
@@ -117,6 +119,32 @@ def test_old_server_404_disables_future_traffic_silently(capsys):
     telemetry._send_once()
     assert len(client.heartbeats) == 1
     assert capsys.readouterr().err == ""
+
+
+def test_precheckout_flush_propagates_session_registration_error():
+    expected = ApiError(
+        "server returned 409: runner session capacity reached",
+        status_code=409,
+        code="runner_session_capacity_reached",
+    )
+    client = FakeClient([expected])
+    telemetry = RunnerTelemetry(client, jitter=False)
+
+    with pytest.raises(ApiError) as raised:
+        telemetry.flush_for_checkout()
+
+    assert raised.value is expected
+    assert len(client.heartbeats) == 1
+
+
+def test_precheckout_flush_keeps_legacy_heartbeat_404_compatibility():
+    client = FakeClient([ApiError("not found", status_code=404)])
+    telemetry = RunnerTelemetry(client, jitter=False)
+
+    telemetry.flush_for_checkout()
+    telemetry.flush_for_checkout()
+
+    assert len(client.heartbeats) == 1
 
 
 def test_close_carries_only_session_batch_seq_and_reason():

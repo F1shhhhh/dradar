@@ -919,6 +919,8 @@ def _exit_for(exc: ApiError) -> None:
         sys.exit(f"{exc}\nthe server rate limit persisted after bounded retries; "
                  "the supervised pool will stop new checkout/backfill while "
                  "already-running siblings finish")
+    if exc.code == "runner_session_capacity_reached":
+        sys.exit(f"{exc}\nserver error code: {exc.code}")
     if exc.status_code is None:
         sys.exit(f"{exc}\ncheck your connection — held leases stay active, and "
                  "`dradar resume` continues where you left off")
@@ -4762,7 +4764,7 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
             # The server applies this exclusion before stamping started_at,
             # allowing the loop to keep draining other waiting cells.
             if telemetry:
-                telemetry.flush()  # register queued state before atomic checkout
+                telemetry.flush_for_checkout()
                 data = client.checkout(
                     exclude_assignment_ids=checkout_exclusions,
                     session_id=telemetry.session_id,
@@ -4773,12 +4775,14 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
                 )
         except ApiError as exc:
             if (telemetry and exc.status_code == 409
-                    and "runner session" in str(exc)):
+                    and exc.code != "runner_session_capacity_reached"
+                    and "runner session is not registered or already closed"
+                    in str(exc)):
                 # A first heartbeat and checkout can cross on a very fast
                 # machine. Serialize one fresh heartbeat and retry checkout
                 # exactly once; no assignment was stamped by the rejected
                 # transaction, so this retry cannot duplicate work.
-                telemetry.flush()
+                telemetry.flush_for_checkout()
                 try:
                     data = client.checkout(
                         exclude_assignment_ids=checkout_exclusions,

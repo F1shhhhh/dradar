@@ -45,16 +45,22 @@ class CheckoutClient(FakeClient):
 class StubTelemetry:
     session_id = "session-test"
 
-    def __init__(self):
+    def __init__(self, checkout_error=None):
         self.bound = []
         self.flushes = 0
         self.phases = []
+        self.checkout_error = checkout_error
 
     def bind_batch(self, batch_id):
         self.bound.append(batch_id)
 
     def flush(self):
         self.flushes += 1
+
+    def flush_for_checkout(self):
+        self.flushes += 1
+        if self.checkout_error is not None:
+            raise self.checkout_error
 
     def set_phase(self, phase, assignment_id=None, resume_generation=None):
         self.phases.append((phase, assignment_id, resume_generation))
@@ -89,6 +95,29 @@ def test_checkout_flushes_and_passes_session_id_before_server_stamps_cell(
     assert client.checkout_sessions == ["session-test", "session-test"]
     assert telemetry.flushes >= 2
     assert ("running", "a1", None) in telemetry.phases
+
+
+def test_checkout_surfaces_heartbeat_capacity_error_without_calling_checkout(
+        monkeypatch, tmp_path):
+    _patch_run(monkeypatch)
+    telemetry = StubTelemetry(ApiError(
+        "server returned 409: session capacity reached",
+        status_code=409,
+        code="runner_session_capacity_reached",
+    ))
+    client = CheckoutClient(
+        {"active": [_cell("a1")], "free_pick": True},
+        [{"assignment": _cell("a1"), "held": 1, "unstarted": 0}],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        runloop._go_menu(
+            _args(), {}, client, tmp_path, telemetry=telemetry,
+        )
+
+    assert "runner_session_capacity_reached" in str(exc.value)
+    assert client.checkout_sessions == []
+    assert telemetry.flushes == 1
 
 
 def test_checkout_404_falls_back_to_legacy_batch(monkeypatch, tmp_path):
