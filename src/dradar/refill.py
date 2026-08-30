@@ -24,8 +24,8 @@ PLAN_FILE = "refill-plan.json"
 LOCK_FILE = "refill-plan.lock"
 RUNNING_STATES = {"active", "draining"}
 FAULTED_STATE = "faulted"
-CHECKPOINT_FAULT_FAMILIES = frozenset({
-    "checkpoint_invalid", "checkpoint_incompatible",
+REFILL_FAULT_FAMILIES = frozenset({
+    "checkpoint_invalid", "checkpoint_incompatible", "provider_not_ready",
 })
 TIERS = ("plus", "pro-5x", "pro-20x")
 REFILL_ORDERS = ("cost", "least-run")
@@ -146,7 +146,7 @@ def open_circuit(
     assignment: dict,
     failure_family: str,
 ) -> dict | None:
-    """Latch a scoped refill plan after a checkpoint infrastructure fault.
+    """Latch a scoped refill plan after a provider or checkpoint fault.
 
     The DRADAR_HOME is already the account boundary.  Persist the remaining
     key dimensions so a restart, CLI upgrade, task change, or effort change
@@ -155,7 +155,7 @@ def open_circuit(
     saved plan and rearms a later campaign.
     """
 
-    if failure_family not in CHECKPOINT_FAULT_FAMILIES:
+    if failure_family not in REFILL_FAULT_FAMILIES:
         raise RefillError(f"unsupported refill circuit family: {failure_family}")
     harness = assignment.get("agent") or "codex"
     provider = assignment.get("provider")
@@ -182,6 +182,7 @@ def open_circuit(
             and current.get("volunteer_id") == plan.get("volunteer_id")
             and current.get("harness") == harness
             and current.get("provider") == provider
+            and current.get("batch_id") == assignment.get("batch_id")
             and current.get("failure_family") == failure_family
         )
         if same_fault:
@@ -197,6 +198,7 @@ def open_circuit(
                 "volunteer_id": plan.get("volunteer_id"),
                 "harness": harness,
                 "provider": provider,
+                "batch_id": assignment.get("batch_id"),
                 "failure_family": failure_family,
                 "opened_at": now,
                 "last_observed_at": now,
@@ -207,7 +209,7 @@ def open_circuit(
         plan["stop_reason"] = (
             f"{failure_family} circuit open for {harness}/"
             f"{provider or 'default'}; run `dradar refill stop` after the "
-            "checkpoint fault is fixed to explicitly rearm"
+            "underlying fault is fixed to explicitly rearm"
         )
         _save_unlocked(home, plan)
         return plan
@@ -365,8 +367,8 @@ def configure(
                 ) or "saved scope"
                 raise RefillCircuitOpen(
                     f"refill circuit is open for {fault_scope} after "
-                    f"{circuit.get('failure_family') or 'a checkpoint fault'}; "
-                    "fix the checkpoint path, then run `dradar refill stop` "
+                    f"{circuit.get('failure_family') or 'a runtime fault'}; "
+                    "fix the reported problem, then run `dradar refill stop` "
                     "to explicitly rearm a new campaign"
                 )
         if (current and not current.get("refill_harness")

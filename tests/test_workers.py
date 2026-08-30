@@ -109,6 +109,77 @@ def test_worker_count_accepts_40(monkeypatch):
     assert seen == [40]
 
 
+def test_antigravity_refill_preflight_fails_before_pool_or_server(
+        tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    monkeypatch.setattr(
+        runloop, "prepare_antigravity_auth",
+        lambda: f"cannot inspect {tmp_path}/providers/antigravity/.gemini/token",
+    )
+    started = []
+    monkeypatch.setattr(
+        runloop, "_run_worker_pool", lambda _args: started.append(True) or 0,
+    )
+    runloop.refill_plan.configure(
+        tmp_path,
+        volunteer_id="vol-1", refill_to=1, max_tasks=2,
+        quota_tier="plus", max_estimated_quota_pct=None, active=[],
+        refill_harness="antigravity", refill_model="gemini-3.7-flash",
+        refill_effort="medium",
+    )
+    args = _args(
+        workers=2, refill=True, refill_to=1, max_tasks=2, auto=None,
+        refill_harness="antigravity", refill_model="gemini-3.7-flash",
+        refill_effort="medium", refill_order="cost",
+        batch_id="550e8400e29b41d4a716446655440000",
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        runloop.cmd_go(args)
+
+    assert started == []
+    message = str(exc.value)
+    assert "$DRADAR_HOME/providers/antigravity" in message
+    assert str(tmp_path) not in message
+    assert "dradar provider setup antigravity" in message
+    plan = runloop.refill_plan.load(tmp_path)
+    assert plan["status"] == runloop.refill_plan.FAULTED_STATE
+    assert plan["circuit"] == {
+        "state": "open",
+        "volunteer_id": "vol-1",
+        "harness": "antigravity",
+        "provider": "google-antigravity-subscription",
+        "batch_id": "550e8400e29b41d4a716446655440000",
+        "failure_family": "provider_not_ready",
+        "opened_at": plan["circuit"]["opened_at"],
+        "last_observed_at": plan["circuit"]["last_observed_at"],
+        "observation_count": 1,
+        "assignment_id": None,
+    }
+
+
+def test_antigravity_capability_426_aborts_pool_with_setup_guidance(
+        tmp_path, monkeypatch,
+):
+    abort = tmp_path / "abort"
+    activity = tmp_path / "activity"
+    activity.write_text("preparing", encoding="utf-8")
+    monkeypatch.setenv(runloop._POOL_ABORT_ENV, str(abort))
+    monkeypatch.setenv(runloop._POOL_WORKER_ACTIVITY_ENV, str(activity))
+
+    with pytest.raises(SystemExit, match="provider setup antigravity"):
+        runloop._exit_for(runloop.ApiError(
+            "server returned 426: provider is not ready",
+            status_code=426,
+            code="provider_capability_required",
+            required_capability=runloop.ANTIGRAVITY_CAPABILITY,
+        ))
+
+    assert "Antigravity provider is not ready" in abort.read_text()
+    assert activity.read_text() == "preparing:provider_capability_required"
+
+
 def test_dynamic_target_requires_a_fixed_multi_worker_pool():
     with pytest.raises(SystemExit, match="fixed --workers N greater than 1"):
         runloop.cmd_go(_args(workers=1, worker_target_file="target"))
