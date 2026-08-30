@@ -219,6 +219,35 @@ def test_submission_upload_intent_and_submit_share_exact_content_hash(tmp_path):
     assert json.dumps(meta).encode() in requests[1][1]
 
 
+def test_submission_upload_salvage_rebind_wire_contract():
+    seen = {}
+
+    def handler(request):
+        seen["path"] = request.url.path
+        seen["form"] = urllib.parse.parse_qs(request.read().decode())
+        return httpx.Response(200, json={
+            "ok": True,
+            "owner_epoch": 8,
+            "salvage_session_id": "salvage-session-0001",
+        })
+
+    response = _client(handler).rebind_submission_upload_salvage(
+        "a1", "nonce", "source-session-0001", 3, 7,
+        "salvage-session-0001",
+    )
+
+    assert response["owner_epoch"] == 8
+    assert seen["path"] == "/api/v1/submission-upload-salvage/rebind"
+    assert seen["form"] == {
+        "assignment_id": ["a1"],
+        "nonce": ["nonce"],
+        "source_session_id": ["source-session-0001"],
+        "source_owner_epoch": ["3"],
+        "expected_owner_epoch": ["7"],
+        "salvage_session_id": ["salvage-session-0001"],
+    }
+
+
 def test_suggest_passes_n_and_returns_cells():
     seen = {}
 

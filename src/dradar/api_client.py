@@ -544,3 +544,30 @@ class ApiClient:
             data=data,
         )
         return upload_intent_id
+
+    def rebind_submission_upload_salvage(
+        self,
+        assignment_id: str,
+        nonce: str,
+        source_session_id: str,
+        source_owner_epoch: int,
+        expected_owner_epoch: int,
+        salvage_session_id: str,
+    ) -> dict[str, Any]:
+        """Explicitly bind one saved completed result to an upload-only owner.
+
+        This endpoint never starts the model.  It only succeeds after the
+        server proves the source runner owned this assignment and the current
+        assignment has no live runner.
+        """
+        return self._post(
+            "/api/v1/submission-upload-salvage/rebind",
+            data={
+                "assignment_id": assignment_id,
+                "nonce": nonce,
+                "source_session_id": source_session_id,
+                "source_owner_epoch": str(source_owner_epoch),
+                "expected_owner_epoch": str(expected_owner_epoch),
+                "salvage_session_id": salvage_session_id,
+            },
+        )
