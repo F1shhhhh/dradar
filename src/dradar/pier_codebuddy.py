@@ -18,7 +18,7 @@ from pier.models.agent.network import NetworkAllowlist
 
 CODEBUDDY_CLI_VERSION = "2.137.1"
 SUPPORTED_MODEL = "hy4-preview"
-SUPPORTED_EFFORTS = {"medium", "xhigh", "max"}
+SUPPORTED_EFFORTS = {"low", "high", "max"}
 _BASE_URL = (
     "https://acc-1258344699.cos.ap-guangzhou.myqcloud.com/"
     "@tencent-ai/codebuddy-code/releases/download"

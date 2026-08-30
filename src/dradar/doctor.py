@@ -593,7 +593,7 @@ def cmd_doctor(args) -> int:
             )
             if codebuddy_ready:
                 _check(
-                    f"{CODEBUDDY_MODEL}@max/xhigh/medium — concurrent CodeBuddy "
+                    f"{CODEBUDDY_MODEL}@max/high/low — concurrent CodeBuddy "
                     "provider ready "
                     "(live access not consumed by doctor)",
                     True,
