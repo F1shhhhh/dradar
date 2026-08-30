@@ -33,9 +33,10 @@ def platform_family() -> str:
 class RunnerTelemetry:
     """A daemon heartbeat with adaptive 60/120-second cadence.
 
-    Telemetry is best effort and can never abort a trial.  Three consecutive
-    failures produce one warning so a user knows the server can no longer see
-    their runner; recovery produces one matching notice.
+    Background telemetry is best effort and can never abort a running trial.
+    The synchronous pre-checkout registration path is strict because checkout
+    cannot safely bind a session the server rejected. Three consecutive
+    background failures produce one warning; recovery produces one notice.
     """
 
     def __init__(
@@ -152,7 +153,7 @@ class RunnerTelemetry:
                 "target_workers": self.target_workers,
             }
 
-    def _send_once(self) -> int:
+    def _send_once(self, *, propagate_errors: bool = False) -> int:
         """Send once and return the server-selected next interval."""
         with self._send_lock:
             if self._disabled:
@@ -171,6 +172,8 @@ class RunnerTelemetry:
                           "work continues and your leases are not auto-released",
                           file=sys.stderr)
                     self._warned = True
+                if propagate_errors:
+                    raise
                 return self._interval
             except Exception:
                 self._failures += 1
@@ -178,6 +181,8 @@ class RunnerTelemetry:
                     print("warning: runner heartbeat is unavailable; work continues and "
                           "your leases are not auto-released", file=sys.stderr)
                     self._warned = True
+                if propagate_errors:
+                    raise
                 return self._interval
 
             if self._warned:
@@ -196,8 +201,18 @@ class RunnerTelemetry:
             return self._interval
 
     def flush(self) -> None:
-        """Synchronously register the latest state before an atomic checkout."""
+        """Best-effort synchronous update while work is already recoverable."""
         self._send_once()
+
+    def flush_for_checkout(self) -> None:
+        """Register synchronously or expose the error before session checkout.
+
+        A 404 keeps the legacy compatibility path: old servers did not require
+        session registration. Every other failure must stop checkout instead
+        of converting the real heartbeat error into a misleading downstream
+        ``runner session is not registered`` response.
+        """
+        self._send_once(propagate_errors=True)
 
     def _loop(self) -> None:
         while not self._stop.is_set():
