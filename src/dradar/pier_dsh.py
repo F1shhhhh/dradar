@@ -264,8 +264,7 @@ async function run(ctx, task, io) {
   });
 
   await agent.whenIdle();
-  // Resumed runs send exactly the benchmark instruction again.  No recovery
-  // wording is appended, which keeps prompts identical across harnesses.
+  // Every run is a fresh session and receives the benchmark instruction once.
   agent.followup(createUserMessage({
     content: [
       { type: "text", text: task },
@@ -275,8 +274,7 @@ async function run(ctx, task, io) {
   }));
   await agent.whenIdle();
   await sessions.flush(agent.session);
-  // The restored transcript is the usage ledger.  Re-fold the whole session
-  // so every generation is billed exactly once in the final result.
+  // Fold this fresh session's full event stream into the usage ledger.
   const outcome = summarize(agent.session.events, 0);
   const terminalKind = outcome.reason?.kind;
   writeFileSync(process.env.DSH_OUTCOME_FILE, JSON.stringify({
@@ -286,7 +284,7 @@ async function run(ctx, task, io) {
     taskId: process.env.DRADAR_TASK_ID ?? null,
     assignmentModel: process.env.DRADAR_ASSIGNMENT_MODEL ?? null,
     reasoningEffort: process.env.DSH_REASONING_EFFORT ?? null,
-    resumed: resumeSessionId !== null,
+    resumed: false,
     visionInputAttached: imageRef !== null,
     visionInput: imageRef === null ? null : {
       attachmentId: String(imageRef.attachmentId),

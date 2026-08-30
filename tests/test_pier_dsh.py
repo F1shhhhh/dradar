@@ -147,7 +147,16 @@ def test_rejects_unsupported_model_or_version(tmp_path: Path) -> None:
         make_agent(tmp_path, version="0.1.0-rc.5")
 
 
-
+@pytest.mark.parametrize(
+    "extra_env",
+    [
+        {"DEEPSEEK_API_KEY": "wrong-channel"},
+        {"DSH_MODEL": "unexpected"},
+        {"DEEPSEEK_BASE_URL": "https://unexpected.invalid"},
+        {"NODE_OPTIONS": "--require=/tmp/untrusted.js"},
+        {"NODE_USE_ENV_PROXY": "0"},
+    ],
+)
 def test_rejects_reserved_extra_env(tmp_path: Path, extra_env: dict[str, str]) -> None:
     with pytest.raises(ValueError, match="api_key_file"):
         make_agent(tmp_path, extra_env=extra_env)
