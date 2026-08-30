@@ -100,7 +100,7 @@ dradar status                          # 查看自己的提交和判分
 | `dradar status` | 否 | 查看自己的积分、最近提交、判分、异常标记和占用摘要 |
 | `dradar leases` | 否 | 查看当前持有的 assignment，区分 running 与 waiting |
 | `dradar release` | 是 | 释放不再准备运行的租约；运行中任务默认受保护 |
-| `dradar retry-upload` | 是 | 重试已经运行完成但因网络等原因没有上传的结果 |
+| `dradar retry-upload` | 是 | 重试已经运行完成但因网络等原因没有上传的结果；可显式抢救被旧 owner fence 拦下的本地结果 |
 | `dradar cleanup` | 本地删除 | 安全清理已结算的本地任务文件及 DRadar/Pier 镜像缓存 |
 | `dradar config show/set` | 本地配置 | 查看或调整镜像缓存模式与容量上限，不显示账号凭据 |
 | `dradar refill status` | 否 | 查看本机持续补题计划和额度预留 |
@@ -698,7 +698,9 @@ CLI 不再生成、扫描或恢复任务 checkpoint，也不再提供 `checkpoin
 释放或重新运行该 assignment。任务已经完成但上传失败时，durable `model.patch`、内容摘要、
 content-bound intent 和 `pending_uploads.json` 构成唯一恢复路径；`retry-upload` 只上传精确
 已完成结果，不会再次调用模型。若 assignment 已被新 owner 接管，旧结果会本地失败关闭并
-保留供审计，不能绕过 ownership fence。
+保留供审计；普通自动重试始终不能绕过 ownership fence。只有该 assignment 后来重新空闲、
+本地仍保有精确结果和旧 runner 证据，并且用户明确发出一次抢救请求时，服务端才会在重新
+核验账号、nonce、owner epoch 与无活跃 runner 后签发一个仅用于上传的临时 owner。
 
 ## 上传补救：`dradar retry-upload`
 
@@ -707,10 +709,17 @@ content-bound intent 和 `pending_uploads.json` 构成唯一恢复路径；`retr
 
 ```bash
 dradar retry-upload
+dradar retry-upload --request-salvage <ASSIGNMENT_ID>
+dradar retry-upload --request-salvage <ASSIGNMENT_ID> -y
 ```
 
 它只补传已有结果，不领取或运行新任务。每次 `go` / `resume` 启动时也会先自动执行同样
-的补传。服务端按 assignment 幂等接收，已经提交的结果不会重复计分。
+的普通补传。服务端按 assignment 幂等接收，已经提交的结果不会重复计分。
+
+`--request-salvage` 只接受本地账本中已被标记为 `owner_superseded` 的指定 assignment，
+默认需要交互确认；它不会运行模型，也不会自动处理其他记录。服务端若发现 replacement
+runner 正在运行或准备、租约已过期、旧 session 证据不成立，或 owner epoch 已再次变化，
+会保持远端状态不变并拒绝请求，本地结果继续保留供再次检查。
 
 ## 本地清理：`dradar cleanup`
 
