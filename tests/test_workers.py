@@ -997,6 +997,131 @@ def test_precheckout_capability_failure_has_bounded_backfill(
     assert "bounded replacement is exhausted" in output
 
 
+def test_transient_session_capacity_failure_keeps_short_backoff(
+        monkeypatch, capsys):
+    """One admission race recovers quickly while a healthy sibling runs."""
+    _patch_pool_setup(monkeypatch, active_count=2)
+    monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
+    delays = []
+    monkeypatch.setattr(
+        runloop, "_pool_backfill_delay",
+        lambda attempt: delays.append(attempt) or 0,
+    )
+    ready = iter((1, 0))
+    monkeypatch.setattr(
+        runloop, "_pool_ready_work_count",
+        lambda _client, **_kwargs: next(ready, 0),
+    )
+    calls = []
+
+    def popen(command, env, **kwargs):
+        if not calls:
+            process = _ScriptedProcess(command, env, [None, 0], **kwargs)
+        elif len(calls) == 1:
+            process = _ScriptedProcess(
+                command, env, [1], mark_activity=False, **kwargs,
+            )
+            runloop.Path(
+                env[runloop._POOL_WORKER_ACTIVITY_ENV]
+            ).write_text("preparing:runner_session_capacity_reached")
+        else:
+            process = _ScriptedProcess(command, env, [0], **kwargs)
+        calls.append(process)
+        return process
+
+    monkeypatch.setattr(runloop.subprocess, "Popen", popen)
+
+    assert runloop._run_worker_pool(_args(workers=2)) == 1
+    assert [p.env["DRADAR_WORKER_INDEX"] for p in calls] == ["1", "2", "2"]
+    assert delays == [1]
+    output = capsys.readouterr().out
+    assert "runner session capacity" in output
+    assert "bounded backoff (1/3)" in output
+    assert "server freshness window" not in output
+    assert "bounded replacement is exhausted" not in output
+
+
+def test_repeated_session_capacity_failure_cools_down_then_recovers(
+        monkeypatch, capsys):
+    """Three capacity conflicts cool down without permanently suppressing."""
+    _patch_pool_setup(monkeypatch, active_count=1)
+    now = [0.0]
+    monkeypatch.setattr(runloop.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(
+        runloop.time, "sleep",
+        lambda seconds: now.__setitem__(0, now[0] + seconds),
+    )
+    monkeypatch.setattr(runloop, "_POOL_SESSION_CAPACITY_RETRY_SECONDS", 5)
+    calls = []
+    spawn_times = []
+    monkeypatch.setattr(
+        runloop, "_pool_ready_work_count",
+        lambda _client, **_kwargs: 1 if len(calls) < 4 else 0,
+    )
+
+    def popen(command, env, **kwargs):
+        spawn_times.append(now[0])
+        if len(calls) < 3:
+            process = _ScriptedProcess(
+                command, env, [1], mark_activity=False, **kwargs,
+            )
+            runloop.Path(
+                env[runloop._POOL_WORKER_ACTIVITY_ENV]
+            ).write_text("preparing:runner_session_capacity_reached")
+        else:
+            process = _ScriptedProcess(command, env, [0], **kwargs)
+        calls.append(process)
+        return process
+
+    monkeypatch.setattr(runloop.subprocess, "Popen", popen)
+
+    assert runloop._run_worker_pool(_args(workers=1)) == 1
+    assert len(calls) == 4
+    assert spawn_times[1] - spawn_times[0] >= 2
+    assert spawn_times[2] - spawn_times[1] >= 4
+    assert spawn_times[3] - spawn_times[2] >= 5
+    output = capsys.readouterr().out
+    assert "bounded backoff (1/3)" in output
+    assert "bounded backoff (2/3)" in output
+    assert "server freshness window" in output
+    assert "bounded replacement is exhausted" not in output
+
+
+def test_session_capacity_exit_marks_worker_as_safe_precheckout_failure(
+        tmp_path, monkeypatch):
+    marker = tmp_path / "worker.started"
+    marker.write_text("preparing")
+    monkeypatch.setenv(runloop._POOL_WORKER_ACTIVITY_ENV, str(marker))
+
+    with pytest.raises(SystemExit, match="runner_session_capacity_reached"):
+        runloop._exit_for(runloop.ApiError(
+            "server returned 409: runner session capacity reached",
+            status_code=409,
+            code="runner_session_capacity_reached",
+        ))
+
+    assert marker.read_text() == "preparing:runner_session_capacity_reached"
+    assert list(tmp_path.glob("worker.started.*.tmp")) == []
+
+
+def test_successful_mark_stopped_records_exact_returned_assignment(
+        tmp_path, monkeypatch):
+    marker = tmp_path / "worker.started"
+    marker.write_text("assignment-1")
+    monkeypatch.setenv(runloop._POOL_WORKER_ACTIVITY_ENV, str(marker))
+
+    class Client:
+        def mark_stopped(self, assignment_id, **kwargs):
+            assert assignment_id == "assignment-1"
+            assert kwargs["defer_seconds"] == 300
+            return {"ok": True}
+
+    assert runloop._mark_stopped_quietly(
+        Client(), {"assignment_id": "assignment-1"},
+    )
+    assert marker.read_text() == "waiting:assignment-1"
+
+
 def test_task_failure_after_checkout_keeps_anti_cascade_cutoff(
         monkeypatch, capsys):
     _patch_pool_setup(monkeypatch, active_count=2)
@@ -1026,6 +1151,65 @@ def test_task_failure_after_checkout_keeps_anti_cascade_cutoff(
     assert len(calls) == 2
     assert seen_cutoffs and seen_cutoffs[0] is not None
     assert "existing waiting work is frozen" in capsys.readouterr().out
+
+
+def test_server_confirmed_stopped_assignment_backfills_after_retry_time(
+        monkeypatch, capsys):
+    """A stopped child may refill only its exact authoritative waiting row."""
+    old_lease = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    returned = {
+        "assignment_id": "returned",
+        "leased_at": old_lease,
+        "started_at": None,
+        "execution_state": "waiting",
+        "checkpoint_id": None,
+        "retry_after": (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+        "heartbeat_running": False,
+        "runner_state": "waiting",
+        "runner_phase": None,
+    }
+
+    class Client:
+        def __init__(self):
+            self.calls = 0
+
+        def get_assignment(self):
+            self.calls += 1
+            if self.calls == 1:
+                return {"active": [returned], "free_pick": True}
+            return {"active": [], "free_pick": True}
+
+    client = Client()
+    _patch_pool_setup(monkeypatch, active_count=2)
+    monkeypatch.setattr(runloop, "_client", lambda *_a, **_k: client)
+    monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        runloop.checkpoints, "latest_by_assignment", lambda _home: {},
+    )
+    calls = []
+
+    def popen(command, env, **kwargs):
+        if not calls:
+            process = _ScriptedProcess(command, env, [None, 0], **kwargs)
+        elif len(calls) == 1:
+            process = _ScriptedProcess(
+                command, env, [1], mark_activity=False, **kwargs,
+            )
+            runloop.Path(
+                env[runloop._POOL_WORKER_ACTIVITY_ENV]
+            ).write_text("waiting:returned")
+        else:
+            process = _ScriptedProcess(command, env, [0], **kwargs)
+        calls.append(process)
+        return process
+
+    monkeypatch.setattr(runloop.subprocess, "Popen", popen)
+
+    assert runloop._run_worker_pool(_args(workers=2)) == 1
+    assert [p.env["DRADAR_WORKER_INDEX"] for p in calls] == ["1", "2", "2"]
+    output = capsys.readouterr().out
+    assert "existing waiting work is frozen" in output
+    assert "restoring worker slot 2/2" in output
 
 
 def test_backfill_v2_kill_switch_restores_previous_last_exit_behavior(
@@ -1342,6 +1526,49 @@ def test_ready_assignment_filter_excludes_running_paused_and_bad_retry_time():
     )
     assert not runloop._assignment_is_ready_for_checkout(
         {"started_at": None, "retry_after": "not-a-time"}, now=now,
+    )
+
+
+def test_returned_assignment_bypasses_old_lease_only_with_complete_safe_state():
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(minutes=1)
+    assignment = {
+        "assignment_id": "returned",
+        "leased_at": (cutoff - timedelta(minutes=1)).isoformat(),
+        "started_at": None,
+        "execution_state": "waiting",
+        "checkpoint_id": None,
+        "retry_after": (now - timedelta(seconds=1)).isoformat(),
+        "heartbeat_running": False,
+        "runner_state": "waiting",
+        "runner_phase": None,
+    }
+
+    assert runloop._assignment_is_ready_for_checkout(
+        assignment, now=now, claimed_after=cutoff,
+        returned_assignment_ids={"returned"},
+    )
+    for field, unsafe in (
+        ("started_at", now.isoformat()),
+        ("execution_state", "running"),
+        ("checkpoint_id", "checkpoint"),
+        ("heartbeat_running", True),
+        ("runner_state", "stale"),
+        ("runner_phase", "running"),
+    ):
+        candidate = {**assignment, field: unsafe}
+        assert not runloop._assignment_is_ready_for_checkout(
+            candidate, now=now, claimed_after=cutoff,
+            returned_assignment_ids={"returned"},
+        ), field
+    assert not runloop._assignment_is_ready_for_checkout(
+        {**assignment, "retry_after": (now + timedelta(seconds=1)).isoformat()},
+        now=now, claimed_after=cutoff,
+        returned_assignment_ids={"returned"},
+    )
+    assert not runloop._assignment_is_ready_for_checkout(
+        assignment, now=now, claimed_after=cutoff,
+        returned_assignment_ids=set(),
     )
 
 

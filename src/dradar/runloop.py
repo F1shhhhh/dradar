@@ -127,6 +127,12 @@ _POOL_BACKFILL_ERROR_RETRY_SECONDS = 10.0
 _POOL_BACKFILL_MAX_ATTEMPTS = 3
 _POOL_BACKFILL_RETRY_BASE_SECONDS = 2.0
 _POOL_BACKFILL_RETRY_MAX_SECONDS = 30.0
+# A runner-session admission conflict is different from a broken executable or
+# provider preflight: another fresh/stale session may temporarily occupy the
+# batch's observation capacity while the held assignment is still safe and
+# waiting. Recheck after the server freshness window instead of exhausting the
+# generic three-attempt startup budget and permanently serializing the pool.
+_POOL_SESSION_CAPACITY_RETRY_SECONDS = 10 * 60
 _POOL_IMAGE_CACHE_MAINTENANCE_SECONDS = 15 * 60
 _POOL_TARGET_CACHE: dict[Path, int] = {}
 MAX_CHECKPOINT_RESUMES = 5
@@ -920,6 +926,7 @@ def _exit_for(exc: ApiError) -> None:
                  "the supervised pool will stop new checkout/backfill while "
                  "already-running siblings finish")
     if exc.code == "runner_session_capacity_reached":
+        _record_worker_precheckout_failure(exc.code)
         sys.exit(f"{exc}\nserver error code: {exc.code}")
     if exc.status_code is None:
         sys.exit(f"{exc}\ncheck your connection — held leases stay active, and "
@@ -1986,6 +1993,12 @@ def _mark_stopped_quietly(
             if failure_diagnostic is not None:
                 stop_kwargs["failure_diagnostic"] = failure_diagnostic
             client.mark_stopped(assignment_id, **stop_kwargs)
+            # A supervised child may have checked out paid work before this
+            # failure. Publish the server-acknowledged return only after the
+            # endpoint confirms the lease is still active and its running
+            # stamp/checkpoint were cleared. The parent combines this local
+            # process-exit proof with a fresh authoritative inventory read.
+            _record_worker_returned_assignment(assignment_id)
             return True
         except ApiError as exc:
             last_error = exc
@@ -3855,6 +3868,7 @@ def _signal_workers(processes: list[subprocess.Popen]) -> None:
 def _assignment_is_ready_for_checkout(
     assignment: dict, *, now: datetime | None = None,
     claimed_after: datetime | None = None,
+    returned_assignment_ids: set[str] | None = None,
 ) -> bool:
     """Whether a held cell is genuinely waiting for a worker right now.
 
@@ -3863,25 +3877,43 @@ def _assignment_is_ready_for_checkout(
     an incident. Fresh controller claims have no ``started_at`` value and are
     safe for the server's atomic checkout endpoint to assign.
     """
+    assignment_id = assignment.get("assignment_id")
+    confirmed_return = bool(
+        assignment_id
+        and returned_assignment_ids
+        and assignment_id in returned_assignment_ids
+        and assignment.get("execution_state") == "waiting"
+        and assignment.get("runner_state") == "waiting"
+        and assignment.get("heartbeat_running") is False
+        and assignment.get("runner_phase") is None
+    )
     if (assignment.get("started_at")
             or assignment.get("execution_state") == "paused"
             or assignment.get("checkpoint_id")):
         return False
     if claimed_after is not None:
-        leased_at = assignment.get("leased_at")
-        try:
-            claimed_at = datetime.fromisoformat(
-                str(leased_at).replace("Z", "+00:00")
-            )
-        except (TypeError, ValueError):
-            # Old servers do not expose leased_at. A degraded pool must fail
-            # closed rather than rotate a local fault through an assignment
-            # it cannot prove was claimed after the failure.
-            return False
-        if claimed_at.tzinfo is None:
-            claimed_at = claimed_at.replace(tzinfo=timezone.utc)
-        if claimed_at <= claimed_after:
-            return False
+        if confirmed_return:
+            # This exact child checked the assignment out, received a
+            # successful assignment/stopped acknowledgement, and has now
+            # exited. The server independently confirms that the still-leased
+            # row is waiting, unowned and has no checkpoint. It is therefore
+            # safe to bypass only the older leased_at cutoff for this ID.
+            pass
+        else:
+            leased_at = assignment.get("leased_at")
+            try:
+                claimed_at = datetime.fromisoformat(
+                    str(leased_at).replace("Z", "+00:00")
+                )
+            except (TypeError, ValueError):
+                # Old servers do not expose leased_at. A degraded pool must
+                # fail closed rather than rotate a local fault through an
+                # assignment it cannot prove was claimed after the failure.
+                return False
+            if claimed_at.tzinfo is None:
+                claimed_at = claimed_at.replace(tzinfo=timezone.utc)
+            if claimed_at <= claimed_after:
+                return False
     retry_after = assignment.get("retry_after")
     if not retry_after:
         return True
@@ -3935,6 +3967,7 @@ def _assignment_is_recoverable_checkpoint(
 def _pool_ready_work_count(
     client: ApiClient, *, claimed_after: datetime | None = None,
     desired_workers: int | None = None,
+    returned_assignment_ids: set[str] | None = None,
 ) -> int | None:
     """Read work eligible for a vacant desired-worker slot.
 
@@ -3964,6 +3997,7 @@ def _pool_ready_work_count(
     waiting = sum(
         _assignment_is_ready_for_checkout(
             assignment, claimed_after=claimed_after,
+            returned_assignment_ids=returned_assignment_ids,
         )
         for assignment in active
         if assignment
@@ -4025,6 +4059,34 @@ def _worker_activity_path() -> Path | None:
     return Path(raw) if raw else None
 
 
+def _write_worker_activity_state(value: str) -> bool:
+    """Atomically publish one bounded child state to its local supervisor."""
+    path = _worker_activity_path()
+    if path is None:
+        return True
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(value, encoding="utf-8")
+        os.replace(temporary, path)
+        return True
+    except OSError:
+        return False
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _record_worker_precheckout_failure(code: str) -> bool:
+    """Classify a known safe pre-checkout gate without claiming paid work."""
+    if code != "runner_session_capacity_reached":
+        return False
+    return _write_worker_activity_state(f"preparing:{code}")
+
+
+def _record_worker_returned_assignment(assignment_id: str) -> bool:
+    """Record a server-confirmed return to waiting before this child exits."""
+    return _write_worker_activity_state(f"waiting:{assignment_id}")
+
+
 def _record_worker_checkout(assignment_id: str) -> bool:
     """Tell the local supervisor that this child consumed a real assignment.
 
@@ -4032,18 +4094,7 @@ def _record_worker_checkout(assignment_id: str) -> bool:
     failure from a task/runtime failure. The latter keeps the existing
     anti-cascade cutoff; the former may receive a bounded replacement.
     """
-    path = _worker_activity_path()
-    if path is None:
-        return True
-    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    try:
-        temporary.write_text(str(assignment_id), encoding="utf-8")
-        os.replace(temporary, path)
-        return True
-    except OSError:
-        return False
-    finally:
-        temporary.unlink(missing_ok=True)
+    return _write_worker_activity_state(str(assignment_id))
 
 
 def _pool_backfill_delay(attempt: int) -> float:
@@ -4250,6 +4301,7 @@ def _run_worker_pool(args) -> int:
     returncodes: list[tuple[int, int]] = []
     quarantined_slots: set[int] = set()
     suppressed_slots: set[int] = set()
+    returned_assignment_ids: set[str] = set()
     worker_activity_files: dict[int, Path] = {}
     vacant_attempts: dict[int, int] = {}
     retry_not_before: dict[int, float] = {}
@@ -4320,7 +4372,28 @@ def _run_worker_pool(args) -> int:
                     )
                 except OSError:
                     activity_state = None
-                precheckout_exit = activity_state == "preparing"
+                capacity_blocked = (
+                    activity_state
+                    == "preparing:runner_session_capacity_reached"
+                )
+                returned_assignment_id = (
+                    activity_state.removeprefix("waiting:")
+                    if activity_state and activity_state.startswith("waiting:")
+                    else None
+                )
+                if returned_assignment_id:
+                    returned_assignment_ids.add(returned_assignment_id)
+                elif activity_state not in {
+                    None, "preparing",
+                    "preparing:runner_session_capacity_reached",
+                }:
+                    # A later checkout consumed this exact assignment's
+                    # one-shot safe-return proof. If the child did not return
+                    # it again, never let an old marker authorize another run.
+                    returned_assignment_ids.discard(activity_state)
+                precheckout_exit = (
+                    activity_state == "preparing" or capacity_blocked
+                )
                 # Unknown marker state is safety-significant: never turn a
                 # lost checkout signal into automatic retry of paid work.
                 consumed_assignment = not precheckout_exit
@@ -4331,6 +4404,37 @@ def _run_worker_pool(args) -> int:
                         "confirmed; sibling workers will continue and this slot "
                         "will not be reused"
                     )
+                elif capacity_blocked:
+                    attempt = vacant_attempts.get(slot, 0) + 1
+                    if attempt < _POOL_BACKFILL_MAX_ATTEMPTS:
+                        vacant_attempts[slot] = attempt
+                        retry_not_before[slot] = (
+                            time.monotonic() + _pool_backfill_delay(attempt)
+                        )
+                        print(
+                            f"worker {slot} was deferred by runner session "
+                            "capacity; retrying this vacant slot after bounded "
+                            f"backoff ({attempt}/{_POOL_BACKFILL_MAX_ATTEMPTS})"
+                        )
+                    else:
+                        # A genuine concurrent session usually clears in one
+                        # of the short attempts above. At the normal retry
+                        # ceiling, preserve the waiting assignment but reset
+                        # the attempt budget before the generic suppression
+                        # pass can permanently retire this slot. The longer
+                        # delay lets an unclosed session cross the server's
+                        # freshness boundary without creating a spawn storm.
+                        vacant_attempts[slot] = 0
+                        retry_not_before[slot] = (
+                            time.monotonic()
+                            + _POOL_SESSION_CAPACITY_RETRY_SECONDS
+                        )
+                        print(
+                            f"worker {slot} remained blocked by runner session "
+                            "capacity after bounded retries; the assignment "
+                            "remains waiting and this slot will be retried after "
+                            "the server freshness window"
+                        )
                 elif precheckout_exit:
                     attempt = vacant_attempts.get(slot, 0) + 1
                     vacant_attempts[slot] = attempt
@@ -4436,6 +4540,7 @@ def _run_worker_pool(args) -> int:
                 ready = _pool_ready_work_count(
                     client, claimed_after=failure_cutoff,
                     desired_workers=target,
+                    returned_assignment_ids=returned_assignment_ids,
                 )
                 next_backfill_check = (
                     current_time + (
