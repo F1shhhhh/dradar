@@ -1207,6 +1207,9 @@ def test_server_confirmed_stopped_assignment_backfills_after_retry_time(
 
     assert runloop._run_worker_pool(_args(workers=2)) == 1
     assert [p.env["DRADAR_WORKER_INDEX"] for p in calls] == ["1", "2", "2"]
+    assert calls[2].env[
+        runloop._POOL_RETURNED_ASSIGNMENTS_SNAPSHOT_ENV
+    ] == '["returned"]'
     output = capsys.readouterr().out
     assert "existing waiting work is frozen" in output
     assert "restoring worker slot 2/2" in output
@@ -1672,6 +1675,33 @@ def test_malformed_returned_assignment_proof_fails_closed(tmp_path, monkeypatch)
     returned_file.write_text('["safe", "../unsafe"]')
     monkeypatch.setenv(
         runloop._POOL_RETURNED_ASSIGNMENTS_ENV, str(returned_file),
+    )
+
+    assert runloop._read_pool_returned_assignments() == set()
+
+
+def test_replacement_uses_parent_proof_snapshot_when_windows_file_probe_fails(
+        tmp_path, monkeypatch,
+):
+    returned_file = tmp_path / "returned.json"
+    monkeypatch.setenv(
+        runloop._POOL_RETURNED_ASSIGNMENTS_ENV, str(returned_file),
+    )
+    monkeypatch.setenv(
+        runloop._POOL_RETURNED_ASSIGNMENTS_SNAPSHOT_ENV, '["returned"]',
+    )
+    monkeypatch.setattr(
+        runloop.Path, "is_file",
+        lambda _self: (_ for _ in ()).throw(PermissionError("sharing violation")),
+    )
+
+    assert runloop._read_pool_returned_assignments() == {"returned"}
+
+
+def test_malformed_parent_proof_snapshot_fails_closed(monkeypatch):
+    monkeypatch.setenv(
+        runloop._POOL_RETURNED_ASSIGNMENTS_SNAPSHOT_ENV,
+        '["returned", "../unsafe"]',
     )
 
     assert runloop._read_pool_returned_assignments() == set()

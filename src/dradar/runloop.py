@@ -120,6 +120,9 @@ _POOL_ABORT_ENV = "DRADAR_POOL_ABORT_FILE"
 _POOL_TARGET_FILE_ENV = "DRADAR_POOL_TARGET_FILE"
 _POOL_FAILURE_CUTOFF_ENV = "DRADAR_POOL_FAILURE_CUTOFF_FILE"
 _POOL_RETURNED_ASSIGNMENTS_ENV = "DRADAR_POOL_RETURNED_ASSIGNMENTS_FILE"
+_POOL_RETURNED_ASSIGNMENTS_SNAPSHOT_ENV = (
+    "DRADAR_POOL_RETURNED_ASSIGNMENTS_SNAPSHOT"
+)
 _POOL_WORKER_ACTIVITY_ENV = "DRADAR_POOL_WORKER_ACTIVITY_FILE"
 _POOL_BACKFILL_V2_ENV = "DRADAR_POOL_BACKFILL_V2"
 _REPEAT_FAILURE_STATE_ENV = "DRADAR_REPEAT_FAILURE_STATE_FILE"
@@ -4179,19 +4182,12 @@ def _write_pool_failure_cutoff(path: Path, cutoff: datetime) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _read_pool_returned_assignments(path: Path | None = None) -> set[str]:
-    """Read exact server-acknowledged returns shared by the pool parent.
-
-    Missing, unreadable, or malformed state fails closed to no proofs. The
-    authoritative assignment inventory is still checked separately before a
-    returned ID can bypass the degraded-pool claim cutoff.
-    """
-    path = path or _pool_returned_assignments_path()
-    if path is None or not path.is_file():
+def _decode_pool_returned_assignments(raw: str | None) -> set[str]:
+    if not raw:
         return set()
     try:
-        values = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        values = json.loads(raw)
+    except json.JSONDecodeError:
         return set()
     if not isinstance(values, list):
         return set()
@@ -4211,6 +4207,32 @@ def _read_pool_returned_assignments(path: Path | None = None) -> set[str]:
             return set()
         returned.add(value)
     return returned
+
+
+def _read_pool_returned_assignments(path: Path | None = None) -> set[str]:
+    """Read exact server-acknowledged returns shared by the pool parent.
+
+    Missing, unreadable, or malformed state fails closed to no proofs. The
+    authoritative assignment inventory is still checked separately before a
+    returned ID can bypass the degraded-pool claim cutoff.
+    """
+    # A freshly spawned replacement receives the parent's exact proof set in
+    # its environment. This avoids depending on Windows sharing/AV semantics
+    # merely to reach its first checkout. The file remains the update channel
+    # for siblings that were already alive when another child returned work.
+    snapshot = _decode_pool_returned_assignments(
+        os.environ.pop(_POOL_RETURNED_ASSIGNMENTS_SNAPSHOT_ENV, None)
+    )
+    path = path or _pool_returned_assignments_path()
+    try:
+        if path is None or not path.is_file():
+            return snapshot
+        file_proofs = _decode_pool_returned_assignments(
+            path.read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeDecodeError):
+        return snapshot
+    return snapshot | file_proofs
 
 
 def _write_pool_returned_assignments(
@@ -4459,6 +4481,9 @@ def _run_worker_pool(args) -> int:
         env[_REPEAT_FAILURE_STATE_ENV] = str(repeat_failure_state_file)
         env[_POOL_FAILURE_CUTOFF_ENV] = str(failure_cutoff_file)
         env[_POOL_RETURNED_ASSIGNMENTS_ENV] = str(returned_assignments_file)
+        env[_POOL_RETURNED_ASSIGNMENTS_SNAPSHOT_ENV] = json.dumps(
+            sorted(returned_assignment_ids), separators=(",", ":"),
+        )
         env[_POOL_WORKER_ACTIVITY_ENV] = str(activity_file)
         if boundary_path is not None:
             env[_ASSIGNMENT_BOUNDARY_ENV] = str(boundary_path)
