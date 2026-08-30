@@ -456,6 +456,13 @@ def test_upload_uses_reconciled_kimi_provider_usage_with_audit_bundle(
         "timed_usage_complete": True,
         "request_ledger_duplicate_count": 0,
         "request_ledger_source": "kimi-code-0.36.1-main-wire-retry-v2",
+        "session_usage_compaction_request_count": 0,
+        "usage_counters_valid": True,
+        "session_identity_valid": True,
+        "request_ledger_valid": True,
+        "turn_ledger_valid": True,
+        "timed_usage_valid": True,
+        "wire_metadata_count": 1,
         "token_usage_events": [{
             "occurred_at": "2026-08-20T00:00:00Z",
             "n_input_tokens": 300,
@@ -477,6 +484,13 @@ def test_upload_uses_reconciled_kimi_provider_usage_with_audit_bundle(
             assert meta["request_ledger_source"] == (
                 "kimi-code-0.36.1-main-wire-retry-v2"
             )
+            assert meta["session_usage_compaction_request_count"] == 0
+            assert meta["usage_counters_valid"] is True
+            assert meta["session_identity_valid"] is True
+            assert meta["request_ledger_valid"] is True
+            assert meta["turn_ledger_valid"] is True
+            assert meta["timed_usage_valid"] is True
+            assert meta["wire_metadata_count"] == 1
             assert trajectory_bundle is not None
             uploaded = json.loads(trajectory_bundle.read_text())
             assert uploaded["schema_version"] == bundle["schema_version"]

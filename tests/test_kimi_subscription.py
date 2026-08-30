@@ -1033,8 +1033,165 @@ def test_kimi_replays_real_cliffy_429_retry_fixture() -> None:
     assert facts["n_cache_tokens"] == expected["n_cache_tokens"]
     assert facts["n_output_tokens"] == expected["n_output_tokens"]
     assert facts["request_ledger_source"] == (
-        "kimi-code-0.39.1-main-wire-retry-v3"
+        "kimi-code-0.39.1-main-wire-retry-v4"
     )
+
+
+def test_kimi_oauth_wire_uses_alias_identity_and_keeps_untimed_tokens() -> None:
+    source = Path(providers.__file__).with_name("pier_kimi.py").read_text()
+    module = ast.parse(source)
+    helpers = [
+        node for node in module.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"_usage_instant", "_kimi_usage_facts"}
+    ]
+    namespace = {
+        "Any": Any, "datetime": datetime, "timezone": timezone,
+        "deque": deque,
+    }
+    exec(compile(ast.Module(body=helpers, type_ignores=[]), "pier_kimi.py", "exec"),
+         namespace)
+    wire = [
+        {"type": "metadata", "protocol_version": "1.5"},
+        {"type": "turn.prompt", "time": "host-clock-unavailable"},
+        {
+            "type": "llm.request",
+            "provider": "openai",
+            "model": "account-resolved-k3-variant",
+            "modelAlias": "kimi-code/k3",
+            "kind": "loop",
+            "turnStep": "0.1",
+            "time": "host-clock-unavailable",
+        },
+        {
+            "type": "usage.record",
+            "usageScope": "turn",
+            "model": "kimi-code/k3",
+            "time": "host-clock-unavailable",
+            "usage": {
+                "inputOther": 10,
+                "inputCacheCreation": 2,
+                "inputCacheRead": 20,
+                "output": 3,
+            },
+        },
+        {
+            "type": "turn.ended",
+            "turnId": 0,
+            "reason": "completed",
+            "time": "host-clock-unavailable",
+        },
+    ]
+
+    facts = namespace["_kimi_usage_facts"](wire)
+
+    assert facts["complete"] is True
+    assert facts["request_usage_complete"] is True
+    assert facts["timed_usage_complete"] is False
+    assert facts["timed_usage_valid"] is False
+    assert facts["session_identity_valid"] is True
+    assert facts["request_ledger_valid"] is True
+    assert facts["turn_ledger_valid"] is True
+    assert facts["n_input_tokens"] == 32
+    assert facts["n_cache_tokens"] == 20
+    assert facts["n_output_tokens"] == 3
+    assert facts["token_usage_events"] == [{
+        "occurred_at": None,
+        "n_input_tokens": 32,
+        "n_cache_tokens": 20,
+        "n_output_tokens": 3,
+    }]
+
+    wrong_alias = json.loads(json.dumps(wire))
+    wrong_alias[2]["modelAlias"] = "kimi-code/not-k3"
+    rejected = namespace["_kimi_usage_facts"](wrong_alias)
+    assert rejected["complete"] is False
+    assert rejected["session_identity_valid"] is False
+    assert rejected["token_usage_events"] == []
+
+
+def test_kimi_oauth_wire_reconciles_session_scoped_compaction_usage() -> None:
+    source = Path(providers.__file__).with_name("pier_kimi.py").read_text()
+    module = ast.parse(source)
+    helpers = [
+        node for node in module.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"_usage_instant", "_kimi_usage_facts"}
+    ]
+    namespace = {
+        "Any": Any, "datetime": datetime, "timezone": timezone,
+        "deque": deque,
+    }
+    exec(compile(ast.Module(body=helpers, type_ignores=[]), "pier_kimi.py", "exec"),
+         namespace)
+
+    def record(
+        record_type: str, seconds: int, **payload: Any,
+    ) -> dict[str, Any]:
+        return {
+            "type": record_type,
+            "time": f"2026-08-30T00:00:{seconds:02d}Z",
+            **payload,
+        }
+
+    wire = [
+        {"type": "metadata", "protocol_version": "1.5"},
+        record("turn.prompt", 0),
+        record(
+            "llm.request", 1, provider="openai", model="oauth-k3",
+            modelAlias="kimi-code/k3", kind="loop", turnStep="0.1",
+        ),
+        record(
+            "usage.record", 2, usageScope="turn", model="kimi-code/k3",
+            usage={
+                "inputOther": 10, "inputCacheRead": 20,
+                "inputCacheCreation": 2, "output": 3,
+            },
+        ),
+        record(
+            "llm.request", 3, provider="openai", model="oauth-k3",
+            modelAlias="kimi-code/k3", kind="compaction",
+        ),
+        record(
+            "usage.record", 4, usageScope="session", model="kimi-code/k3",
+            usage={
+                "inputOther": 30, "inputCacheRead": 40,
+                "inputCacheCreation": 4, "output": 5,
+            },
+        ),
+        record(
+            "llm.request", 5, provider="openai", model="oauth-k3",
+            modelAlias="kimi-code/k3", kind="loop", turnStep="0.2",
+        ),
+        record(
+            "usage.record", 6, usageScope="turn", model="kimi-code/k3",
+            usage={
+                "inputOther": 50, "inputCacheRead": 60,
+                "inputCacheCreation": 6, "output": 7,
+            },
+        ),
+        record("turn.ended", 7, turnId=0, reason="completed"),
+    ]
+
+    facts = namespace["_kimi_usage_facts"](wire)
+
+    assert facts["complete"] is True
+    assert facts["request_count"] == 3
+    assert facts["session_usage_model_request_count"] == 3
+    assert facts["session_usage_request_attempt_count"] == 3
+    assert facts["session_usage_compaction_request_count"] == 1
+    assert facts["n_input_tokens"] == 222
+    assert facts["n_cache_tokens"] == 120
+    assert facts["n_output_tokens"] == 15
+    assert len(facts["token_usage_events"]) == 3
+
+    ambiguous_retry = json.loads(json.dumps(wire))
+    ambiguous_retry.insert(5, json.loads(json.dumps(ambiguous_retry[4])))
+    rejected = namespace["_kimi_usage_facts"](ambiguous_retry)
+    assert rejected["complete"] is False
+    assert rejected["request_usage_observed"] is True
+    assert rejected["request_ledger_valid"] is False
+    assert len(rejected["token_usage_events"]) == 3
 
 
 def test_kimi_retry_reconciliation_whitelists_connection_errors() -> None:
