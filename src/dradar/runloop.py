@@ -43,6 +43,8 @@ from .patch_guard import check_pompeii_patch, format_patch_guard_report
 from .providers import (
     ANTIGRAVITY_AGENT,
     ANTIGRAVITY_ARTIFACT_CAPTURE,
+    ANTIGRAVITY_CAPABILITY,
+    ANTIGRAVITY_PROVIDER,
     ANTIGRAVITY_RUN_CONFIG_VERSION,
     ANTIGRAVITY_RUNTIME_PROFILE,
     DEEPSEEK_CATALOG_SHA256,
@@ -71,6 +73,7 @@ from .providers import (
     PAID_API_REFILL_AGENTS,
     SUBSCRIPTION_REFILL_AGENTS,
     assignment_codex_provider,
+    prepare_antigravity_auth,
     validate_refill_scope,
     zcode_cli_version_is_compatible,
 )
@@ -938,6 +941,20 @@ def _exit_for(exc: ApiError) -> None:
     if exc.code == "runner_session_capacity_reached":
         _record_worker_precheckout_failure(exc.code)
         sys.exit(f"{exc}\nserver error code: {exc.code}")
+    if (
+        exc.status_code == 426
+        and exc.required_capability == ANTIGRAVITY_CAPABILITY
+    ):
+        _signal_pool_abort(
+            "Antigravity provider is not ready for this batch",
+            interrupt_siblings=False,
+        )
+        _record_worker_precheckout_failure("provider_capability_required")
+        sys.exit(
+            f"{exc}\nAntigravity is not ready in this DRadar home; run "
+            "`dradar provider setup antigravity`, then explicitly rearm any "
+            "saved campaign with `dradar refill stop`"
+        )
     if exc.status_code is None:
         sys.exit(f"{exc}\ncheck your connection — held leases stay active, and "
                  "`dradar resume` continues where you left off")
@@ -3631,6 +3648,45 @@ def _scope_client_to_batch(client: ApiClient, batch_id: str | None) -> None:
         setattr(client, "batch_id", batch_id)
 
 
+def _redact_provider_preflight_issue(issue: str) -> str:
+    """Keep setup diagnostics useful without printing account-local paths."""
+
+    value = " ".join(str(issue).split())
+    for path, replacement in (
+        (str(HOME), "$DRADAR_HOME"),
+        (str(Path.home()), "~"),
+    ):
+        if path:
+            value = value.replace(path, replacement)
+    return value[:500]
+
+
+def _preflight_scoped_provider(args) -> None:
+    """Fail before telemetry/session creation when a paid lane is unusable."""
+
+    if getattr(args, "refill_harness", None) != ANTIGRAVITY_AGENT:
+        return
+    issue = prepare_antigravity_auth()
+    if issue is None:
+        return
+    safe_issue = _redact_provider_preflight_issue(issue)
+    refill_plan.open_circuit(
+        HOME,
+        {
+            "agent": ANTIGRAVITY_AGENT,
+            "provider": ANTIGRAVITY_PROVIDER,
+            "batch_id": getattr(args, "batch_id", None),
+        },
+        "provider_not_ready",
+    )
+    sys.exit(
+        "Antigravity provider preflight failed before any runner session or "
+        f"assignment checkout: {safe_issue}\n"
+        "Run `dradar provider setup antigravity` to repair/login, then run "
+        "`dradar refill stop` to explicitly rearm this saved campaign."
+    )
+
+
 def cmd_go(args) -> int:
     try:
         args.batch_id = normalize_batch_id(getattr(args, "batch_id", None))
@@ -3718,6 +3774,7 @@ def cmd_go(args) -> int:
             sys.exit("--max-estimated-quota-pct must be greater than 0")
     if not auto_workers:
         _align_refill_target_with_workers(args)
+    _preflight_scoped_provider(args)
     if (auto_workers or workers > 1) and not getattr(args, "worker_child", False):
         return _run_worker_pool(args)
     cfg = _load_config()
@@ -4129,7 +4186,9 @@ def _write_worker_activity_state(value: str) -> bool:
 
 def _record_worker_precheckout_failure(code: str) -> bool:
     """Classify a known safe pre-checkout gate without claiming paid work."""
-    if code != "runner_session_capacity_reached":
+    if code not in {
+        "runner_session_capacity_reached", "provider_capability_required",
+    }:
         return False
     return _write_worker_activity_state(f"preparing:{code}")
 

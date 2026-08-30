@@ -57,6 +57,21 @@ def test_http_error_attaches_status_code_and_detail():
     assert "cell went stale" in str(ei.value)
 
 
+def test_http_error_preserves_required_capability():
+    def handler(request):
+        return httpx.Response(426, json={
+            "detail": "provider is not ready",
+            "code": "provider_capability_required",
+            "required_capability": "antigravity-ready-v1",
+        })
+
+    with pytest.raises(ApiError) as ei:
+        _client(handler).get_assignment()
+    assert ei.value.status_code == 426
+    assert ei.value.code == "provider_capability_required"
+    assert ei.value.required_capability == "antigravity-ready-v1"
+
+
 def test_legacy_http_error_without_code_remains_compatible():
     def handler(request):
         return httpx.Response(409, json={"detail": "legacy conflict"})

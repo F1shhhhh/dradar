@@ -53,7 +53,8 @@ def _env_proxies_set() -> bool:
 
 class ApiError(RuntimeError):
     def __init__(self, message: str, status_code: int | None = None,
-                 code: str | None = None, retry_after: float | None = None):
+                 code: str | None = None, retry_after: float | None = None,
+                 required_capability: str | None = None):
         # None means "never got a real HTTP response" (DNS/connect/timeout) —
         # callers that need to branch on a specific status (e.g. 409 vs 410)
         # must check this instead of grepping the message, which can contain
@@ -66,6 +67,10 @@ class ApiError(RuntimeError):
         # retain a conservative compatibility fallback for those responses.
         self.code = code
         self.retry_after = retry_after
+        # A 426 can mean either that the binary is too old or that one local
+        # provider is not ready. Preserve the server's exact requirement so
+        # run supervision never has to infer the provider from prose.
+        self.required_capability = required_capability
 
 
 class ApiClient:
@@ -162,6 +167,7 @@ class ApiClient:
         if resp.status_code >= 400:
             detail: Any = resp.text
             code = None
+            required_capability = None
             try:
                 body = resp.json()
                 if isinstance(body, dict):
@@ -169,6 +175,9 @@ class ApiClient:
                     raw_code = body.get("code")
                     if isinstance(raw_code, str):
                         code = raw_code
+                    raw_capability = body.get("required_capability")
+                    if isinstance(raw_capability, str):
+                        required_capability = raw_capability
             except (json.JSONDecodeError, ValueError):
                 pass
             raise ApiError(
@@ -178,6 +187,7 @@ class ApiClient:
                 retry_after=(
                     self._retry_after(resp) if resp.status_code == 429 else None
                 ),
+                required_capability=required_capability,
             )
         return resp.json()
 
