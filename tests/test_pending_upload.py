@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from dradar import checkpoints, pending, runloop
+from dradar import local_jobs, pending, runloop
 from dradar.api_client import ApiError
 
 
@@ -1453,9 +1453,8 @@ def test_definitive_rejection_preserves_checkpoint_job(tmp_path: Path, monkeypat
     )
     assert outcome == "rejected"
     assert job.is_dir()
-    assert (job / checkpoints.KEEP_MARKER).is_file()
-    assert (job / checkpoints.TERMINAL_MARKER).is_file()
-    assert checkpoints.find_latest(tmp_path, aid) is None
+    assert (job / local_jobs.KEEP_MARKER).is_file()
+    assert (job / local_jobs.TERMINAL_MARKER).is_file()
     assert client.stopped == [aid]
 
 

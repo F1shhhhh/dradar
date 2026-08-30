@@ -28,7 +28,7 @@ from pathlib import Path
 
 import httpx
 
-from . import checkpoints, egress
+from . import egress
 from .codebuddy_provider import (
     CODEBUDDY_AGENT,
     CODEBUDDY_API_KEY_ENVS,
@@ -160,7 +160,7 @@ def _resolve_user_tool(name: str, *, home: Path | None = None) -> str | None:
                 return str(candidate)
     return None
 
-# Public-safe DeepSeek configuration for the pinned checkpoint-capable Codex agent.
+# Public-safe DeepSeek configuration for Pier's stock Codex agent.
 # The official catalog is uploaded to this container-local path before Codex
 # starts; do not add manual context/compaction/reasoning-summary overrides here,
 # because DeepSeek's official setup script explicitly removes them when the
@@ -184,8 +184,6 @@ DEEPSEEK_TOML = (
 )
 DEEPSEEK_AGENT_IMPORT_PATH = "_dradar_pier_deepseek:DeepSeekCodex"
 DEEPSEEK_AGENT_MODULE_FILENAME = "_dradar_pier_deepseek.py"
-CODEX_AGENT_IMPORT_PATH = "_dradar_pier_codex:DurableCodex"
-CODEX_AGENT_MODULE_FILENAME = "_dradar_pier_codex.py"
 GROK_AGENT_IMPORT_PATH = "_dradar_pier_grok:GrokBuild"
 GROK_AGENT_MODULE_FILENAME = "_dradar_pier_grok.py"
 GROK_RECOVERY_MODULE_FILENAME = "_dradar_grok_recovery.py"
@@ -202,19 +200,11 @@ ZCODE_AGENT_IMPORT_PATH = "_dradar_pier_zcode:ZCodeBigModel"
 ZCODE_AGENT_MODULE_FILENAME = "_dradar_pier_zcode.py"
 DSH_AGENT_IMPORT_PATH = "_dradar_pier_dsh:DshMinimal"
 DSH_AGENT_MODULE_FILENAME = "_dradar_pier_dsh.py"
+RUNTIME_SAFETY_MODULE_FILENAME = "_dradar_pier_runtime_safety.py"
 CODEBUDDY_AGENT_IMPORT_PATH = (
     "_dradar_pier_codebuddy:CodeBuddySubscription"
 )
 CODEBUDDY_AGENT_MODULE_FILENAME = "_dradar_pier_codebuddy.py"
-CHECKPOINT_MODULE_FILENAME = "_dradar_pier_checkpoint.py"
-# Compatibility tombstone for code/tests that import the old symbol. Runtime
-# selection no longer reads this value and no environment can re-enable it.
-DURABLE_CHECKPOINT_ROLLOUT_ENABLED = False
-
-
-def durable_checkpoint_rollout_enabled() -> bool:
-    """Checkpoint was removed; retained for one import-compatible release."""
-    return DURABLE_CHECKPOINT_ROLLOUT_ENABLED
 BETA_SUBSCRIPTION_TRIAL_TIMEOUT_FLOOR_SEC = 120 * 60
 BETA_SUBSCRIPTION_AGENTS = frozenset({
     GROK_AGENT, KIMI_AGENT, ZCODE_AGENT, ANTIGRAVITY_AGENT,
@@ -585,36 +575,18 @@ def _ensure_deepseek_agent_module(home: Path) -> Path:
             "DeepSeek Pier adapter is missing; reinstall or upgrade dradar "
             "before running a paid task"
         )
-    _ensure_codex_agent_module(home)
     target = home / DEEPSEEK_AGENT_MODULE_FILENAME
     return _materialize_shared_file(target, source.read_bytes())
 
 
-def _ensure_checkpoint_module(home: Path) -> Path:
-    """Expose the credential-free checkpoint helper to custom Pier agents."""
-
-    source = Path(__file__).with_name("pier_checkpoint.py")
+def _ensure_runtime_safety_module(home: Path) -> Path:
+    source = Path(__file__).with_name("pier_runtime_safety.py")
     if not source.is_file():
         raise RunnerError(
-            "Pier checkpoint helper is missing; reinstall or upgrade dradar"
+            "Pier runtime safety helper is missing; reinstall or upgrade dradar"
         )
     return _materialize_shared_file(
-        home / CHECKPOINT_MODULE_FILENAME, source.read_bytes()
-    )
-
-
-def _ensure_codex_agent_module(home: Path) -> Path:
-    """Expose the stock-compatible host-private Codex adapter to Pier."""
-
-    source = Path(__file__).with_name("pier_codex.py")
-    if not source.is_file():
-        raise RunnerError(
-            "Codex Pier checkpoint adapter is missing; reinstall or upgrade "
-            "dradar before running a paid task"
-        )
-    _ensure_checkpoint_module(home)
-    return _materialize_shared_file(
-        home / CODEX_AGENT_MODULE_FILENAME, source.read_bytes()
+        home / RUNTIME_SAFETY_MODULE_FILENAME, source.read_bytes(),
     )
 
 
@@ -640,7 +612,7 @@ def _ensure_kimi_agent_module(home: Path) -> Path:
         raise RunnerError(
             "Kimi Code Pier adapter is missing; reinstall or upgrade dradar"
         )
-    _ensure_checkpoint_module(home)
+    _ensure_runtime_safety_module(home)
     _materialize_shared_file(
         home / KIMI_RECOVERY_MODULE_FILENAME, recovery_source.read_bytes()
     )
@@ -756,7 +728,7 @@ def _ensure_zcode_agent_module(home: Path) -> Path:
         raise RunnerError(
             "ZCode Pier adapter is missing; reinstall or upgrade dradar"
         )
-    _ensure_checkpoint_module(home)
+    _ensure_runtime_safety_module(home)
     return _materialize_shared_file(
         home / ZCODE_AGENT_MODULE_FILENAME, source.read_bytes()
     )
@@ -770,7 +742,7 @@ def _ensure_dsh_agent_module(home: Path) -> Path:
         raise RunnerError(
             "DSH Minimal Pier adapter is missing; reinstall or upgrade dradar"
         )
-    _ensure_checkpoint_module(home)
+    _ensure_runtime_safety_module(home)
     return _materialize_shared_file(
         home / DSH_AGENT_MODULE_FILENAME, source.read_bytes()
     )
@@ -1083,34 +1055,6 @@ def _agent_timeout_multiplier(assignment: dict, task_path: Path) -> float:
     return math.ceil(raw * 1000) / 1000
 
 
-def _checkpoint_agent_kwargs(
-    assignment: dict,
-    resume_checkpoint: Path | None,
-    *,
-    enabled: bool = True,
-) -> list[str]:
-    if not enabled:
-        if resume_checkpoint is not None:
-            raise RunnerError(
-                "durable checkpoint resume is temporarily unavailable in "
-                "this release; the saved checkpoint was not started or discarded"
-            )
-        return []
-    values = [
-        "--ak", "checkpoint_enabled=true",
-        "--ak", f"checkpoint_assignment_id={assignment['assignment_id']}",
-        "--ak", f"checkpoint_task_id={assignment['task_id']}",
-        "--ak", f"checkpoint_effort={assignment['effort']}",
-        "--ak", (
-            "checkpoint_resume_generation="
-            f"{assignment.get('resume_generation', 0)}"
-        ),
-    ]
-    if resume_checkpoint is not None:
-        values += ["--ak", f"checkpoint_path={resume_checkpoint}"]
-    return values
-
-
 def build_pier_command(
     assignment: dict,
     tasks_root: Path,
@@ -1118,7 +1062,6 @@ def build_pier_command(
     job_name: str,
     home: Path,
     dev_agent: str | None = None,
-    resume_checkpoint: Path | None = None,
     provider_auth_path: Path | None = None,
     provider_cli_path: Path | None = None,
 ) -> list[str]:
@@ -1151,8 +1094,7 @@ def build_pier_command(
         # support and must retain the original OpenAI behavior.
         provider = DEFAULT_CODEX_PROVIDER
     if agent == DSH_AGENT:
-        # DSH is a standalone adapter for stock Pier. Its own provider-native
-        # checkpoint implementation does not depend on Pier's Codex support.
+        # DSH is a standalone adapter for stock Pier.
         public_pier = "datacurve-pier==0.3.0"
         uvx = _resolve_user_tool("uvx")
         uv = _resolve_user_tool("uv")
@@ -1183,25 +1125,11 @@ def build_pier_command(
         _ensure_deepseek_agent_module(home)
         agent_args = ["--agent-import-path", DEEPSEEK_AGENT_IMPORT_PATH]
     elif agent == "codex" and provider == DEFAULT_CODEX_PROVIDER:
-        if bool(assignment.get("_durable_checkpoint_enabled", True)):
-            _ensure_codex_agent_module(home)
-            agent_args = ["--agent-import-path", CODEX_AGENT_IMPORT_PATH]
-        else:
-            # The private adapter exists solely to add durable checkpoints to
-            # Pier's stock Codex agent.  Keeping it in the disabled rollout
-            # made native Windows import POSIX-only checkpoint machinery even
-            # though no checkpoint could be created.  Use the known-good
-            # upstream path until the cross-platform rollout is re-enabled.
-            agent_args = ["--agent", "codex"]
+        agent_args = ["--agent", "codex"]
     elif agent == GROK_AGENT:
         _validate_grok_assignment(assignment)
         _ensure_grok_agent_module(home)
         _ensure_shared_oauth_environment_module(home)
-        if resume_checkpoint is not None:
-            raise RunnerError(
-                "Grok subscription checkpoints are not supported yet; start a "
-                "fresh explicit run"
-            )
         agent_args = ["--agent-import-path", GROK_AGENT_IMPORT_PATH]
     elif agent == KIMI_AGENT:
         _validate_kimi_assignment(assignment)
@@ -1212,10 +1140,6 @@ def build_pier_command(
         _validate_antigravity_assignment(assignment)
         _ensure_antigravity_agent_module(home)
         _ensure_shared_oauth_environment_module(home)
-        if resume_checkpoint is not None:
-            raise RunnerError(
-                "Antigravity checkpoints are not supported yet; start a fresh run"
-            )
         agent_args = ["--agent-import-path", ANTIGRAVITY_AGENT_IMPORT_PATH]
     elif agent == ZCODE_AGENT:
         _validate_zcode_assignment(assignment)
@@ -1228,10 +1152,6 @@ def build_pier_command(
     elif agent == CODEBUDDY_AGENT:
         _validate_codebuddy_assignment(assignment)
         _ensure_codebuddy_agent_module(home)
-        if resume_checkpoint is not None:
-            raise RunnerError(
-                "CodeBuddy checkpoints are not supported yet; start a fresh run"
-            )
         agent_args = ["--agent-import-path", CODEBUDDY_AGENT_IMPORT_PATH]
     else:
         agent_args = ["--agent", agent]
@@ -1279,10 +1199,6 @@ def build_pier_command(
             "--ak", f"reasoning_effort={assignment['effort']}",
             "--ak", f"config_toml_file={allowlist}",
             "--ak", f"prompt_template_path={submission_prompt}",
-            *_checkpoint_agent_kwargs(
-                assignment, resume_checkpoint,
-                enabled=bool(assignment.get("_durable_checkpoint_enabled", True)),
-            ),
             "--ae", f"CODEX_AUTH_JSON_PATH={auth}",
         ]
         # The caller must resolve npm's stable tag to an exact version before
@@ -1318,10 +1234,6 @@ def build_pier_command(
             "--ak", f"config_toml_file={config_path}",
             "--ak", f"model_catalog_json_file={deepseek_catalog}",
             "--ak", f"prompt_template_path={submission_prompt}",
-            *_checkpoint_agent_kwargs(
-                assignment, resume_checkpoint,
-                enabled=bool(assignment.get("_durable_checkpoint_enabled", True)),
-            ),
             "--ae", f"CODEX_AUTH_JSON_PATH={provider_auth_path}",
             "--ak", f"version={_deepseek_codex_version(assignment)}",
         ]
@@ -1365,10 +1277,6 @@ def build_pier_command(
             "--ak", f"artifact_assignment_id={assignment['assignment_id']}",
             "--ak", f"artifact_run_id={assignment.get('_artifact_run_id') or uuid.uuid4().hex}",
             "--ak", f"artifact_task_id={assignment['task_id']}",
-            *_checkpoint_agent_kwargs(
-                assignment, resume_checkpoint,
-                enabled=bool(assignment.get("_durable_checkpoint_enabled", True)),
-            ),
         ]
     elif agent == GROK_AGENT:
         if provider_auth_path is None or not provider_auth_path.is_file():
@@ -1415,10 +1323,6 @@ def build_pier_command(
             "--ak", f"kimi_cli_file={provider_cli_path}",
             "--ak", f"prompt_template_path={submission_prompt}",
             "--ak", f"version={KIMI_CLI_VERSION}",
-            *_checkpoint_agent_kwargs(
-                assignment, resume_checkpoint,
-                enabled=bool(assignment.get("_durable_checkpoint_enabled", True)),
-            ),
         ]
     elif agent == ANTIGRAVITY_AGENT:
         if provider_auth_path is None or not provider_auth_path.is_dir():
@@ -1467,10 +1371,6 @@ def build_pier_command(
             "--ak", f"session_timeout_sec={_zcode_session_timeout_sec(assignment)}",
             "--ak", f"prompt_template_path={submission_prompt}",
             "--ak", f"version={zcode_version}",
-            *_checkpoint_agent_kwargs(
-                assignment, resume_checkpoint,
-                enabled=bool(assignment.get("_durable_checkpoint_enabled", True)),
-            ),
         ]
     elif agent == CODEBUDDY_AGENT:
         if provider_auth_path is None or not provider_auth_path.is_dir():
@@ -1720,134 +1620,6 @@ def _plain_file(path: Path) -> bool:
         return stat.S_ISREG(path.lstat().st_mode)
     except OSError:
         return False
-
-
-def _recover_completed_checkpoint_patch(
-    trial_dir: Path,
-    assignment: dict,
-) -> tuple[bool, str | None]:
-    """Recover Pier's downloaded patch from a completed Codex checkpoint.
-
-    Older visual-task bundles omitted ``pre_artifacts.sh``. The Codex agent
-    still committed a valid answer and the checkpoint provider preserved its
-    workspace patch, but Pier had no ``artifacts/model.patch`` to download.
-    Recover only from an identity-matched, completed checkpoint and never
-    follow symlinks or accept arbitrary bytes as a submission patch.
-    """
-    new_checkpoint_dir = trial_dir / "checkpoint"
-    legacy_checkpoint_dir = trial_dir / "agent" / "checkpoint"
-    if checkpoints._lexists(new_checkpoint_dir):
-        checkpoint_dir = new_checkpoint_dir
-    elif checkpoints._lexists(legacy_checkpoint_dir):
-        return False, "legacy completed checkpoint is not host-private"
-    else:
-        return False, None
-    if checkpoint_dir.is_symlink() or not checkpoint_dir.is_dir():
-        return False, "completed checkpoint root is unsafe"
-    layout_error = checkpoints._host_private_layout_error(
-        trial_dir, checkpoint_dir,
-    )
-    if layout_error:
-        return False, layout_error
-    snapshot_lock = checkpoint_dir / "snapshot.lock"
-    if checkpoints._lexists(snapshot_lock):
-        return False, "completed checkpoint snapshot is incomplete"
-
-    metadata_path = checkpoint_dir / "checkpoint.json"
-    try:
-        metadata_bytes, metadata_identity = checkpoints._read_regular_file_snapshot(
-            metadata_path, max_bytes=checkpoints.MAX_MANIFEST_BYTES,
-        )
-        metadata = json.loads(metadata_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
-        return False, "completed checkpoint metadata is unreadable"
-    if not isinstance(metadata, dict) or metadata.get("phase") != "agent_completed":
-        return False, None
-
-    payload_dir, pointer_error, pointer_before = checkpoints._snapshot_payload_dir(
-        checkpoint_dir,
-    )
-    if pointer_error:
-        return False, pointer_error
-    if checkpoints._lexists(checkpoint_dir / "invalid-snapshot"):
-        return False, "checkpoint snapshot did not finish safely"
-    if (
-        checkpoints._lexists(checkpoint_dir / "invalid-secret")
-        or checkpoints._lexists(payload_dir / "invalid-secret")
-    ):
-        return False, "checkpoint contains rejected credential data"
-
-    expected = {
-        "assignment_id": assignment.get("assignment_id"),
-        "task_id": assignment.get("task_id"),
-        "model": assignment.get("model"),
-        "effort": assignment.get("effort"),
-    }
-    mismatched = [
-        key for key, value in expected.items()
-        if not isinstance(value, str) or metadata.get(key) != value
-    ]
-    if mismatched:
-        return False, (
-            "completed checkpoint identity mismatch: " + ", ".join(mismatched)
-        )
-
-    workspace_name = metadata.get("workspace_patch")
-    if workspace_name != "workspace.patch":
-        return False, "completed checkpoint has an unsafe workspace_patch path"
-    workspace_patch = payload_dir / workspace_name
-    if not _plain_file(workspace_patch):
-        return False, "completed checkpoint is missing its workspace patch"
-    tree_error = checkpoints._host_private_layout_error(
-        trial_dir, checkpoint_dir,
-    )
-    if tree_error:
-        return False, tree_error
-    try:
-        data = checkpoints._read_regular_file(
-            workspace_patch, max_bytes=64 * 1024 * 1024,
-        )
-    except ValueError:
-        return False, "completed checkpoint workspace patch is unreadable"
-    try:
-        metadata_after = checkpoints._read_regular_file_snapshot(
-            metadata_path, max_bytes=checkpoints.MAX_MANIFEST_BYTES,
-        )
-    except ValueError:
-        return False, "completed checkpoint metadata changed while it was read"
-    _payload_after, pointer_error_after, pointer_after = (
-        checkpoints._snapshot_payload_dir(checkpoint_dir)
-    )
-    if (
-        checkpoints._lexists(snapshot_lock)
-        or checkpoints._lexists(checkpoint_dir / "invalid-secret")
-        or checkpoints._lexists(payload_dir / "invalid-secret")
-        or checkpoints._lexists(checkpoint_dir / "invalid-snapshot")
-        or metadata_after != (metadata_bytes, metadata_identity)
-        or pointer_error_after is not None
-        or pointer_after != pointer_before
-    ):
-        return False, "completed checkpoint changed while it was read"
-    if b"\x00" in data or (data and not data.startswith(b"diff --git ")):
-        return False, "completed checkpoint workspace patch is not a Git diff"
-
-    artifact_dir = trial_dir / "artifacts"
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    patch_path = artifact_dir / "model.patch"
-    fd, temp_name = tempfile.mkstemp(prefix=".model.patch.", dir=artifact_dir)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_name, patch_path)
-    except BaseException:
-        try:
-            os.unlink(temp_name)
-        except OSError:
-            pass
-        raise
-    return True, None
 
 
 CODEX_TRAJECTORY_BUNDLE_SCHEMA = "dradar-codex-trajectory-bundle-v1"
@@ -2409,9 +2181,9 @@ def local_deep_swe_commit(tasks_root: Path) -> str | None:
 # able to self-heal to a DRadar-published task commit.
 DEEP_SWE_REPO = "https://github.com/SecurityMind/deep-swe"
 
-# Temporary SecurityMind Pier build containing datacurve-ai/pier#23 plus
-# persistent workspace/Codex-session checkpoints. Keep the immutable commit
-# pin until both fixes are released upstream, then follow the official tag.
+# Temporary SecurityMind Pier build containing datacurve-ai/pier#23 and other
+# reviewed compatibility fixes. Keep the immutable commit pin until those
+# fixes are released upstream, then follow the official tag.
 PIER_VERSION = "0.3.0.post4"
 PIER_COMMIT = "fd5d8f18149844cbe255d7b98d655c7f7bbff030"
 PIER_SPEC = (
@@ -2525,7 +2297,7 @@ def _pier_version(pier: str) -> str | None:
 
 
 def _pier_version_compatible(installed_version: str | None) -> bool:
-    """Accept the pinned checkpoint build and compatible later post releases."""
+    """Accept the pinned compatibility build and later post releases."""
     if installed_version == PIER_VERSION:
         return True
     required = re.fullmatch(r"(.+)\.post(\d+)", PIER_VERSION)
@@ -3527,7 +3299,6 @@ def run_trial(
     work_dir: Path,
     dev_agent: str | None = None,
     on_started: Callable[[], None] | None = None,
-    resume_checkpoint: Path | None = None,
 ) -> TrialArtifacts:
     effective_assignment = assignment
     codex_cli_version = None
@@ -3539,12 +3310,6 @@ def run_trial(
     codebuddy_cli_version = None
     codex_provider = None
     effective_agent = dev_agent or assignment["agent"]
-    checkpoint_enabled = False
-    if resume_checkpoint is not None:
-        raise RunnerError(
-            "checkpoint recovery has been removed; the saved directory was not "
-            "started or discarded"
-        )
     if effective_agent == "codex":
         codex_provider = (
             assignment_codex_provider(assignment) or DEFAULT_CODEX_PROVIDER
@@ -3635,11 +3400,6 @@ def run_trial(
             "agent_version": codebuddy_cli_version,
         }
         print(f"verified pinned CodeBuddy CLI: {codebuddy_cli_version}")
-
-    effective_assignment = {
-        **effective_assignment,
-        "_durable_checkpoint_enabled": checkpoint_enabled,
-    }
 
     work_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -3782,28 +3542,15 @@ def run_trial(
                     job_name,
                 )
             )
-        if resume_checkpoint is None:
-            cmd = build_pier_command(
-                effective_assignment, pier_tasks_root, jobs_dir, job_name, work_dir,
-                dev_agent, **provider_kwargs,
-            )
-        else:
-            cmd = build_pier_command(
-                effective_assignment, pier_tasks_root, jobs_dir, job_name, work_dir,
-                dev_agent, resume_checkpoint=resume_checkpoint,
-                **provider_kwargs,
-            )
+        cmd = build_pier_command(
+            effective_assignment, pier_tasks_root, jobs_dir, job_name, work_dir,
+            dev_agent, **provider_kwargs,
+        )
         env = _pier_process_env(
             effective_assignment,
             pier_bootstrap_dir=(work_dir if egress_environment else None),
             egress_environment=egress_environment,
-            codex_module_dir=(
-                work_dir
-                if effective_agent == "codex"
-                and codex_provider == DEFAULT_CODEX_PROVIDER
-                and checkpoint_enabled
-                else None
-            ),
+            codex_module_dir=None,
             deepseek_module_dir=(
                 work_dir if codex_provider == DEEPSEEK_PROVIDER else None
             ),
@@ -3962,8 +3709,8 @@ def run_trial(
             raise RunnerError(str(exc)) from exc
     duration = time.time() - started
     if isinstance(terminal_error, LiveAccountTerminalError):
-        # Let the existing runloop checkpoint/pause path classify this
-        # normalized failure and open the supervised pool's graceful drain.
+        # Let the runloop classify this normalized failure and open the
+        # supervised pool's graceful drain.
         # Do not upload a partial patch from a terminal account failure.
         raise terminal_error
 
@@ -4010,20 +3757,6 @@ def run_trial(
     if not patch.is_file():
         if terminal_error is not None:
             raise terminal_error
-        recovered, checkpoint_error = _recover_completed_checkpoint_patch(
-            trial_dir, effective_assignment,
-        )
-        if recovered:
-            print(
-                "  recovered model.patch from the completed, identity-matched "
-                "checkpoint (the task artifact hook did not run)"
-            )
-        elif checkpoint_error is not None:
-            raise RunnerError(
-                "agent completed, but model.patch collection failed and the "
-                f"checkpoint could not be recovered: {checkpoint_error}; "
-                f"see {log_path} and {trial_dir}"
-            )
     if (
         effective_agent == DSH_AGENT
         and patch.is_file()
@@ -4304,13 +4037,13 @@ DIAG_ADVICE = {
         "image automatically. If this repeats on the latest dradar, tell the "
         "radar operators — the server-side pin may need a bump."),
     "rate-limit": (
-        "the provider is rate-limiting requests — checkpoint recovery uses "
-        "bounded exponential backoff and will stop after its retry budget."),
+        "the provider is rate-limiting requests. The current task stops after "
+        "its bounded retry budget; run it again after the provider recovers."),
     "quota-limit": (
         "the account quota window is exhausted. This worker stops and the pool "
         "will not start new work, while already-running siblings are allowed to "
-        "finish. After the quota resets, start it again to resume the preserved "
-        "checkpoints."),
+        "finish. After the quota resets, start it again; any completed result "
+        "waiting to upload remains protected by the local pending ledger."),
     "insufficient-balance": (
         "the paid API account has insufficient balance. This worker stops and "
         "the pool will not start another task, while already-running siblings "

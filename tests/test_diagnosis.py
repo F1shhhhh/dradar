@@ -417,7 +417,7 @@ def test_interrupted_rate_limit_advice_mentions_quota(monkeypatch, capsys, tmp_p
     client = InvalidAckClient({})
     runloop._run_and_submit(client, ASSIGNMENT, tmp_path, _args(), "abc123")
     out = capsys.readouterr().out
-    assert "bounded exponential backoff" in out
+    assert "bounded retry budget" in out
 
 
 def test_interrupted_quota_limit_opens_pool_circuit(

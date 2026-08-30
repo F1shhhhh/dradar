@@ -29,11 +29,8 @@ def test_codex_disables_server_side_network_tools(tmp_path, monkeypatch):
     cmd = build_pier_command(
         _assignment("codex"), tmp_path, tmp_path / "jobs", "j", home,
     )
-    assert cmd[cmd.index("--agent-import-path") + 1] == (
-        runner_mod.CODEX_AGENT_IMPORT_PATH
-    )
-    assert (home / runner_mod.CODEX_AGENT_MODULE_FILENAME).is_file()
-    assert (home / runner_mod.CHECKPOINT_MODULE_FILENAME).is_file()
+    assert cmd[cmd.index("--agent") + 1] == "codex"
+    assert "--agent-import-path" not in cmd
     allowlist = (home / "codex-chatgpt-allowlist.toml").read_text()
     # web_search must be a top-level string key BEFORE any [table] header, or
     # TOML nests it and codex ignores it (verified: bool/nested = no effect).
@@ -133,7 +130,7 @@ def test_zcode_pompeii_prompt_enforces_single_declared_deliverable(
     assert "Do not reuse another model's answer" in text
 
 
-def test_dev_agent_codex_uses_durable_openai_provider_default(tmp_path, monkeypatch):
+def test_dev_agent_codex_uses_stock_openai_provider_default(tmp_path, monkeypatch):
     _stub_pier(monkeypatch)
     task = tmp_path / "abs-module-cache-flags"
     task.mkdir()
@@ -148,10 +145,8 @@ def test_dev_agent_codex_uses_durable_openai_provider_default(tmp_path, monkeypa
         dev_agent="codex",
     )
 
-    assert cmd[cmd.index("--agent-import-path") + 1] == (
-        runner_mod.CODEX_AGENT_IMPORT_PATH
-    )
-    assert "--agent" not in cmd
+    assert cmd[cmd.index("--agent") + 1] == "codex"
+    assert "--agent-import-path" not in cmd
 
 
 def test_codex_adapter_dir_is_the_only_added_python_path(tmp_path, monkeypatch):
@@ -353,34 +348,6 @@ def test_build_pier_command_stretches_90_minute_pompeii_pack(tmp_path, monkeypat
     index = cmd.index("--agent-timeout-multiplier")
     assert cmd[index + 1] == "1.333333"
 
-
-def test_codex_command_enables_credential_free_checkpoint_metadata(tmp_path, monkeypatch):
-    _stub_pier(monkeypatch)
-    task = tmp_path / "task"
-    task.mkdir()
-    auth = tmp_path / "auth.json"
-    auth.write_text("{}")
-    (tmp_path / "home").mkdir()
-    monkeypatch.setenv("CODEX_AUTH_JSON_PATH", str(auth))
-    resume = tmp_path / "previous" / "checkpoint"
-    a = _assignment("codex") | {
-        "assignment_id": "a123", "task_id": "task",
-        "resume_generation": 3,
-    }
-    cmd = build_pier_command(
-        a, tmp_path, tmp_path / "jobs", "j", tmp_path / "home",
-        resume_checkpoint=resume,
-    )
-    agent_values = [cmd[i + 1] for i, value in enumerate(cmd[:-1]) if value == "--ak"]
-    assert "checkpoint_enabled=true" in agent_values
-    assert "checkpoint_assignment_id=a123" in agent_values
-    assert "checkpoint_task_id=task" in agent_values
-    assert "checkpoint_resume_generation=3" in agent_values
-    assert f"checkpoint_path={resume}" in agent_values
-    # Auth is injected separately into the ephemeral container, never encoded
-    # in the persistent checkpoint metadata.
-    assert not any("auth" in value.lower() or "token" in value.lower()
-                   for value in agent_values if value.startswith("checkpoint_"))
 
 
 # --- self-bootstrap (ensure_pier / ensure_tasks_root) ------------------------
@@ -1947,228 +1914,6 @@ def _fake_completed_checkpoint_pier(
     monkeypatch.setattr(runner_mod, "build_pier_command", fake_build)
     monkeypatch.setattr(runner_mod.subprocess, "Popen", FakePopen)
 
-
-def test_run_trial_recovers_patch_from_matching_completed_checkpoint(
-        tmp_path, monkeypatch, capsys):
-    assignment = _assignment("codex")
-    patch = b"diff --git a/model_answer.json b/model_answer.json\n"
-    _fake_completed_checkpoint_pier(
-        monkeypatch, tmp_path, assignment, patch_bytes=patch,
-    )
-
-    artifacts = run_trial(assignment, tmp_path, tmp_path)
-
-    assert artifacts.patch.read_bytes() == patch
-    assert "recovered model.patch" in capsys.readouterr().out
-
-
-@pytest.mark.skipif(os.name == "nt", reason="POSIX ownership boundary")
-def test_completed_checkpoint_recovery_rejects_world_writable_sibling(
-        tmp_path, monkeypatch):
-    assignment = _assignment("codex")
-    patch = b"diff --git a/model_answer.json b/model_answer.json\n"
-    _fake_completed_checkpoint_pier(
-        monkeypatch, tmp_path, assignment, patch_bytes=patch,
-    )
-    checkpoint = tmp_path / "jobs" / "aa1" / "task__t0" / "checkpoint"
-    original = runner_mod.subprocess.Popen
-
-    class WritableCheckpointPopen:
-        def __init__(self, cmd, **kwargs):
-            self.inner = original(cmd, **kwargs)
-            checkpoint.chmod(0o777)
-            self.returncode = self.inner.returncode
-
-        def wait(self, timeout=None):
-            return self.returncode
-
-        def kill(self):
-            pass
-
-    monkeypatch.setattr(
-        runner_mod.subprocess, "Popen", WritableCheckpointPopen,
-    )
-    with pytest.raises(RunnerError, match="checkpoint tree is not host-private"):
-        run_trial(assignment, tmp_path, tmp_path)
-
-
-def test_run_trial_recovers_generation_patch_from_new_checkpoint_layout(
-        tmp_path, monkeypatch, capsys):
-    assignment = _assignment("codex")
-    patch = b"diff --git a/model_answer.json b/model_answer.json\n+new\n"
-    _fake_completed_checkpoint_pier(
-        monkeypatch, tmp_path, assignment, patch_bytes=patch,
-        layout="new", generation="1" * 32,
-    )
-
-    artifacts = run_trial(assignment, tmp_path, tmp_path)
-
-    assert artifacts.patch.read_bytes() == patch
-    assert "recovered model.patch" in capsys.readouterr().out
-
-
-def test_run_trial_recovers_generation_patch_from_legacy_checkpoint_layout(
-        tmp_path, monkeypatch):
-    assignment = _assignment("codex")
-    patch = b"diff --git a/model_answer.json b/model_answer.json\n+legacy\n"
-    _fake_completed_checkpoint_pier(
-        monkeypatch, tmp_path, assignment, patch_bytes=patch,
-        layout="legacy", generation="2" * 32,
-    )
-
-    with pytest.raises(
-        RunnerError, match="legacy completed checkpoint is not host-private",
-    ):
-        run_trial(assignment, tmp_path, tmp_path)
-
-
-def test_completed_checkpoint_recovery_does_not_fall_back_from_new_layout(
-        tmp_path):
-    assignment = _assignment("codex")
-    trial = tmp_path / "task__t0"
-    legacy = trial / "agent" / "checkpoint"
-    legacy.mkdir(parents=True)
-    metadata = {
-        "phase": "agent_completed",
-        "assignment_id": assignment["assignment_id"],
-        "task_id": assignment["task_id"],
-        "model": assignment["model"],
-        "effort": assignment["effort"],
-        "workspace_patch": "workspace.patch",
-    }
-    (legacy / "checkpoint.json").write_text(json.dumps(metadata))
-    (legacy / "workspace.patch").write_bytes(b"diff --git a/x b/x\n")
-    current = trial / "checkpoint"
-    current.mkdir()
-    (current / "snapshot.lock").mkdir()
-    if os.name != "nt":
-        trial.chmod(0o700)
-        current.chmod(0o700)
-        (current / "snapshot.lock").chmod(0o700)
-
-    recovered, error = runner_mod._recover_completed_checkpoint_patch(
-        trial, assignment,
-    )
-
-    assert not recovered
-    assert error == "completed checkpoint snapshot is incomplete"
-    assert not (trial / "artifacts" / "model.patch").exists()
-
-
-@pytest.mark.parametrize("location", ["root", "payload"])
-def test_completed_checkpoint_recovery_rejects_invalid_secret_race(
-    tmp_path, monkeypatch, location,
-):
-    assignment = _assignment("codex")
-    trial = tmp_path / "task__t0"
-    checkpoint = trial / "checkpoint"
-    generation = "c" * 32
-    payload = checkpoint / "snapshots" / generation
-    payload.mkdir(parents=True)
-    metadata = {
-        "phase": "agent_completed",
-        "assignment_id": assignment["assignment_id"],
-        "task_id": assignment["task_id"],
-        "model": assignment["model"],
-        "effort": assignment["effort"],
-        "workspace_patch": "workspace.patch",
-    }
-    (checkpoint / "checkpoint.json").write_text(json.dumps(metadata))
-    (checkpoint / "current-generation").write_text(
-        generation + "\n", encoding="ascii",
-    )
-    patch = payload / "workspace.patch"
-    patch.write_bytes(b"diff --git a/x b/x\n")
-    if os.name != "nt":
-        trial.chmod(0o700)
-        checkpoint.chmod(0o700)
-        (checkpoint / "snapshots").chmod(0o700)
-        payload.chmod(0o700)
-        for candidate in (
-            checkpoint / "checkpoint.json",
-            checkpoint / "current-generation",
-            patch,
-        ):
-            candidate.chmod(0o600)
-    real_read = runner_mod.checkpoints._read_regular_file
-
-    def add_marker_after_patch_read(path, *, max_bytes):
-        data = real_read(path, max_bytes=max_bytes)
-        if Path(path) == patch:
-            marker_root = checkpoint if location == "root" else payload
-            (marker_root / "invalid-secret").write_text(
-                "rejected\n", encoding="utf-8",
-            )
-        return data
-
-    monkeypatch.setattr(
-        runner_mod.checkpoints, "_read_regular_file", add_marker_after_patch_read,
-    )
-
-    recovered, error = runner_mod._recover_completed_checkpoint_patch(
-        trial, assignment,
-    )
-
-    assert not recovered
-    assert error == "completed checkpoint changed while it was read"
-    assert not (trial / "artifacts" / "model.patch").exists()
-
-
-def test_run_trial_does_not_recover_mismatched_completed_checkpoint(
-        tmp_path, monkeypatch):
-    assignment = _assignment("codex")
-    _fake_completed_checkpoint_pier(
-        monkeypatch, tmp_path, assignment,
-        patch_bytes=b"diff --git a/x b/x\n",
-        metadata_overrides={"assignment_id": "another-lease"},
-    )
-
-    with pytest.raises(RunnerError, match="identity mismatch: assignment_id"):
-        run_trial(assignment, tmp_path, tmp_path)
-
-
-def test_run_trial_reports_completed_checkpoint_collection_failure(
-        tmp_path, monkeypatch):
-    assignment = _assignment("codex")
-    _fake_completed_checkpoint_pier(
-        monkeypatch, tmp_path, assignment, patch_bytes=None,
-    )
-
-    with pytest.raises(RunnerError) as exc:
-        run_trial(assignment, tmp_path, tmp_path)
-    message = str(exc.value)
-    assert "agent completed" in message
-    assert "missing its workspace patch" in message
-    assert "agent likely failed" not in message
-
-
-def test_completed_checkpoint_recovery_rejects_workspace_patch_symlink(
-        tmp_path, monkeypatch):
-    assignment = _assignment("codex")
-    _fake_completed_checkpoint_pier(
-        monkeypatch, tmp_path, assignment, patch_bytes=None,
-    )
-    checkpoint = tmp_path / "jobs" / "aa1" / "task__t0" / "checkpoint"
-    # Create the symlink during Popen construction by wrapping the fake.
-    original = runner_mod.subprocess.Popen
-
-    class SymlinkPopen:
-        def __init__(self, cmd, **kwargs):
-            self.inner = original(cmd, **kwargs)
-            target = tmp_path / "outside.patch"
-            target.write_bytes(b"diff --git a/x b/x\n")
-            (checkpoint / "workspace.patch").symlink_to(target)
-            self.returncode = self.inner.returncode
-
-        def wait(self, timeout=None):
-            return self.returncode
-
-        def kill(self):
-            pass
-
-    monkeypatch.setattr(runner_mod.subprocess, "Popen", SymlinkPopen)
-    with pytest.raises(RunnerError, match="checkpoint contains a special file"):
-        run_trial(assignment, tmp_path, tmp_path)
 
 
 def test_run_trial_classifies_build_failure_from_nested_result(tmp_path, monkeypatch):

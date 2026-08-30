@@ -23,8 +23,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import (
-    __version__, artifact_staging, assignment_boundary, assignment_lock, checkpoints, egress,
-    failure_circuit, image_cache, pending, refill as refill_plan,
+    __version__, artifact_staging, assignment_boundary, assignment_lock, egress,
+    failure_circuit, image_cache, local_jobs, pending, refill as refill_plan,
 )
 from .api_client import ApiClient, ApiError, normalize_batch_id
 from .codebuddy_provider import (
@@ -1462,22 +1462,23 @@ def _upload_trial(
 
     def cleanup_settled() -> None:
         # During an interactive completed run, keep the current directory
-        # just long enough to ask the volunteer. Superseded checkpoint copies
-        # are still removed immediately.
+        # just long enough to ask the volunteer. Older duplicate job trees
+        # are removed immediately.
         keep_dir = job_dir if (entry.get("keep", False) or ask_cleanup) else None
-        checkpoints.cleanup_assignment(
-            HOME, assignment_id, keep_job_dir=keep_dir,
-        )
+        try:
+            local_jobs.cleanup_assignment(
+                HOME, assignment_id, keep_job_dir=keep_dir,
+            )
+        except ValueError:
+            # External developer/test job roots are never cleanup authority.
+            pass
 
     def settle_terminal_local_failure() -> None:
         """Keep evidence but make a non-retryable local result runnable again."""
         _mark_stopped_quietly(client, entry)
-        item = checkpoints.find_latest(HOME, assignment_id)
-        if item is not None:
-            checkpoints.mark_terminal(HOME, item)
-        elif job_dir and job_dir.is_dir():
+        if job_dir and job_dir.is_dir():
             try:
-                checkpoints.mark_terminal_job(HOME, job_dir)
+                local_jobs.mark_kept(HOME, job_dir, terminal=True)
             except ValueError:
                 pass
 
@@ -1994,9 +1995,10 @@ def _upload_trial(
     else:
         print(f"submitted: {ack['submission_id']} (grading happens server-side)")
     if job_dir and entry.get("keep", False):
-        item = checkpoints.find_latest(HOME, assignment_id)
-        if item is not None and item.job_dir.resolve() == job_dir.resolve():
-            checkpoints.mark_kept(HOME, item)
+        try:
+            local_jobs.mark_kept(HOME, job_dir)
+        except ValueError:
+            pass
         print(f"  local artifacts kept by --keep: {job_dir}")
     elif job_dir:
         if outcome == "interrupted":
@@ -2012,9 +2014,10 @@ def _upload_trial(
                 shutil.rmtree(job_dir, ignore_errors=True)
                 print("  local task files cleaned")
             else:
-                item = checkpoints.find_latest(HOME, assignment_id)
-                if item is not None and item.job_dir.resolve() == job_dir.resolve():
-                    checkpoints.mark_kept(HOME, item)
+                try:
+                    local_jobs.mark_kept(HOME, job_dir)
+                except ValueError:
+                    pass
                 print(f"  local artifacts kept: {job_dir}  "
                       "(`dradar cleanup --include-kept` removes them later)")
         else:
@@ -2035,7 +2038,7 @@ def _mark_stopped_quietly(
     The endpoint is idempotent, so retrying transport/5xx failures is safe.
     Client errors are not retried because they need a refresh or upgrade, but
     they are still surfaced: silently losing this transition can strand a
-    lease as apparently resumable with no checkpoint behind it.
+    lease as apparently resumable after its runner disappeared.
     """
     assignment_id = (
         assignment if isinstance(assignment, str) else assignment["assignment_id"]
@@ -2067,7 +2070,7 @@ def _mark_stopped_quietly(
             # A supervised child may have checked out paid work before this
             # failure. Publish the server-acknowledged return only after the
             # endpoint confirms the lease is still active and its running
-            # stamp/checkpoint were cleared. The parent combines this local
+            # ownership stamp was cleared. The parent combines this local
             # process-exit proof with a fresh authoritative inventory read.
             _record_worker_returned_assignment(assignment_id)
             return True
@@ -2189,8 +2192,7 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         try:
             art = run_trial(
                 assignment, tasks_root, work_dir, dev_agent=args.dev_agent,
-                on_started=bind_owner,
-                resume_checkpoint=None)
+                on_started=bind_owner)
             break
         except BuildFlakeError as exc:
             # The image build died before the agent ran — a free failure
@@ -2379,7 +2381,6 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         else None
     )
     terminal_outcome = _terminal_failure_outcome(failure_kind)
-    item = None
     outcome = "interrupted" if interrupted else "completed"
     if telemetry:
         telemetry.set_phase(
@@ -2552,8 +2553,15 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             "pier_failure_phase": "post_agent",
         })
 
-    if item is not None and item.job_dir == art.job_dir:
-        checkpoints.prune_superseded(HOME, assignment["assignment_id"], item)
+    if art.job_dir is not None:
+        try:
+            local_jobs.cleanup_assignment(
+                HOME, assignment["assignment_id"], keep_job_dir=art.job_dir,
+            )
+        except ValueError:
+            # Test/developer adapters may return a job outside the managed
+            # jobs root. Never widen cleanup authority to accommodate it.
+            pass
 
     upload_outcome = _upload_trial(client, {
         "assignment_id": assignment["assignment_id"], "nonce": assignment["nonce"],
@@ -2864,8 +2872,8 @@ def cmd_cleanup(args) -> int:
     """Remove only local jobs/images proven safe by current server state.
 
     A network failure aborts the whole sweep: without an authoritative active
-    lease list, an ``agent_completed`` checkpoint may be a finished trial that
-    crashed immediately before its upload ledger was recorded.
+    lease list, a local job may be a finished trial that crashed immediately
+    before its upload ledger was recorded.
     """
     docker_requested = bool(
         getattr(args, "docker", False) or getattr(args, "all_task_images", False)
@@ -2886,10 +2894,10 @@ def cmd_cleanup(args) -> int:
         entry.get("assignment_id") for entry in pending.load(HOME)
         if entry.get("assignment_id")
     }
-    candidates: list[checkpoints.Checkpoint] = []
+    candidates: list[local_jobs.LocalJob] = []
     protected_active = protected_pending = protected_kept = 0
     seen_jobs: set[Path] = set()
-    for item in checkpoints.scan(HOME):
+    for item in local_jobs.scan(HOME):
         job = item.job_dir.resolve()
         if job in seen_jobs:
             continue
@@ -2900,7 +2908,7 @@ def cmd_cleanup(args) -> int:
         if item.assignment_id in active_ids:
             protected_active += 1
             continue
-        if checkpoints.is_kept(HOME, item) and not args.include_kept:
+        if local_jobs.is_kept(HOME, item.job_dir) and not args.include_kept:
             protected_kept += 1
             continue
         candidates.append(item)
@@ -2915,7 +2923,7 @@ def cmd_cleanup(args) -> int:
         action = "would remove" if args.dry_run else "ready to remove"
         print(f"{action} {len(candidates)} settled local task(s), {_format_size(total)}")
         for item in candidates:
-            kept = " [kept]" if checkpoints.is_kept(HOME, item) else ""
+            kept = " [kept]" if local_jobs.is_kept(HOME, item.job_dir) else ""
             print(f"  {item.task_id or '?'}  assignment={item.assignment_id or '?'}  "
                   f"{_format_size(item.size_bytes)}{kept}")
 
@@ -2948,7 +2956,7 @@ def cmd_cleanup(args) -> int:
                 print(f"    {image.reference}  {_format_size(image.unique_size)}  [{ownership}]")
         if image_plan.protected:
             print(f"  protected {image_plan.protected} image tag(s) used by a "
-                  "container, active/pending task, checkpoint, or kept job")
+                  "container, active/pending task, or kept job")
 
     has_images = bool(
         image_plan and image_plan.docker_available and image_plan.candidates
@@ -2962,7 +2970,7 @@ def cmd_cleanup(args) -> int:
             print("nothing was deleted")
             return 0
     for item in candidates:
-        checkpoints.remove(HOME, item)
+        local_jobs.remove(HOME, item)
     if candidates:
         print(f"cleaned {len(candidates)} task(s); freed {_format_size(total)}")
     image_failed = bool(image_plan and not image_plan.docker_available)
@@ -2981,7 +2989,7 @@ def _maintain_image_cache(client: ApiClient, cfg: dict, *, phase: str) -> bool:
 
     A server read failure makes cleanup a no-op: without the active lease set
     we cannot prove an image is disposable.  The return value controls only
-    NEW claims; existing leases/checkpoints are still allowed to run. During
+    NEW claims; existing leases are still allowed to run. During
     a worker pool, active assignments and Docker container references remain
     protected and every removal revalidates the exact image ID and labels.
     """
@@ -3230,9 +3238,8 @@ def cmd_go(args) -> int:
             args, client, cfg["benchmark"],
         )
 
-        # Checkpoint recovery has been retired. Completed paid work is
-        # represented only by the durable pending-upload ledger above; old
-        # checkpoint directories are ignored and can never start a model.
+        # Completed paid work is represented only by the durable pending-upload
+        # ledger above; old retired state directories can never start a model.
 
         rc = _go_menu(args, cfg, client, tasks_root, telemetry=telemetry)
         if not getattr(args, "parallel", False):
@@ -3330,10 +3337,9 @@ def _assignment_is_ready_for_checkout(
 ) -> bool:
     """Whether a held cell is genuinely waiting for a worker right now.
 
-    Paused/checkpointed work deliberately stays out of automatic pool
-    backfill: repeatedly reviving a broken checkpoint can burn quota and hide
-    an incident. Fresh controller claims have no ``started_at`` value and are
-    safe for the server's atomic checkout endpoint to assign.
+    Historical paused rows deliberately stay out of automatic pool backfill.
+    Fresh controller claims have no ``started_at`` value and are safe for the
+    server's atomic checkout endpoint to assign.
     """
     assignment_id = assignment.get("assignment_id")
     confirmed_return = bool(
@@ -3354,7 +3360,7 @@ def _assignment_is_ready_for_checkout(
             # This exact child checked the assignment out, received a
             # successful assignment/stopped acknowledgement, and has now
             # exited. The server independently confirms that the still-leased
-            # row is waiting, unowned and has no checkpoint. It is therefore
+            # row is waiting, unowned and has no retired state marker. It is therefore
             # safe to bypass only the older leased_at cutoff for this ID.
             pass
         else:
@@ -4540,7 +4546,7 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
             if outcome not in _NON_FAULT_RUNNER_OUTCOMES:
                 refill_plan.stop(HOME, f"task outcome={outcome}")
                 print(f"continuous refill stopped after outcome={outcome}; no new tasks "
-                      "will be claimed, and existing leases/checkpoints stay untouched")
+                      "will be claimed, and existing leases stay untouched")
                 results.append(outcome)
                 break
             if outcome in ("submitted", "interrupted"):

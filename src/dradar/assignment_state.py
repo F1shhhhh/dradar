@@ -6,14 +6,10 @@ _STATES = {"running", "paused", "resumable", "stale", "waiting"}
 
 def assignment_state(assignment: dict) -> str:
     state = assignment.get("runner_state")
-    if (
-        state == "resumable"
-        and assignment.get("execution_state") == "running"
-        and assignment.get("started_at")
-        and not assignment.get("checkpoint_id")
-    ):
-        # This server response has no path accepted by either fresh checkout
-        # or checkpoint recovery. Never promise that it is resumable.
+    if state in {"resumable", "checkpoint_retired"}:
+        # ``resumable`` is a legacy server value from the retired checkpoint
+        # feature.  A checkpoint_id is now only a database/protocol tombstone;
+        # it must never make the CLI promise that work can be resumed.
         return "stale"
     if state in _STATES:
         return state
@@ -23,7 +19,9 @@ def assignment_state(assignment: dict) -> str:
         if assignment.get("execution_state") == "paused":
             return "paused"
         if assignment.get("started_at"):
-            return "resumable" if assignment.get("checkpoint_id") else "stale"
+            # Historical checkpoint metadata is fail-closed.  It prevents a
+            # duplicate run elsewhere, but is not an executable recovery path.
+            return "stale"
         return "waiting"
     # Compatibility with servers predating runner health in /assignment.
     return "running" if assignment.get("started_at") else "waiting"

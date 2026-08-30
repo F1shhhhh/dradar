@@ -16,7 +16,7 @@ import dradar.providers as providers
 import dradar.provider_config as provider_config
 import dradar.runloop as runloop
 import dradar.runner as runner
-from dradar.pier_checkpoint import AgentLogStore, UnsafeAgentLog
+from dradar.pier_runtime_safety import AgentLogStore, UnsafeAgentLog
 from dradar.providers import (
     ZCODE_AGENT,
     ZCODE_API_KEY_ENV,
@@ -328,8 +328,8 @@ def test_pier_command_uses_private_zcode_adapter_without_secret(
     assert (home / runner.ZCODE_AGENT_MODULE_FILENAME).read_bytes() == (
         Path(runner.__file__).with_name("pier_zcode.py").read_bytes()
     )
-    assert (home / runner.CHECKPOINT_MODULE_FILENAME).read_bytes() == (
-        Path(runner.__file__).with_name("pier_checkpoint.py").read_bytes()
+    assert (home / runner.RUNTIME_SAFETY_MODULE_FILENAME).read_bytes() == (
+        Path(runner.__file__).with_name("pier_runtime_safety.py").read_bytes()
     )
     env = runner._pier_process_env(_assignment(), zcode_module_dir=home)
     assert ZCODE_API_KEY_ENV not in env
@@ -367,32 +367,6 @@ def test_zcode_assignment_version_is_only_a_hint() -> None:
     runner._validate_zcode_assignment(_assignment(agent_version="9.9.9"))
 
 
-def test_zcode_checkpoint_resume_is_forwarded_with_exact_runtime_identity(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(runner.shutil, "which", lambda _name: "/usr/bin/pier")
-    tasks = tmp_path / "tasks"
-    (tasks / "task-1").mkdir(parents=True)
-    cli = tmp_path / "zcode.cjs"
-    cli.write_text("pinned")
-    checkpoint = tmp_path / "checkpoint"
-    command = runner.build_pier_command(
-        _assignment(resume_generation=3), tasks, tmp_path / "jobs", "job", tmp_path,
-        resume_checkpoint=checkpoint,
-        provider_auth_path=_private(tmp_path / "key"),
-        provider_cli_path=cli,
-    )
-    values = [
-        command[index + 1]
-        for index, value in enumerate(command[:-1]) if value == "--ak"
-    ]
-    assert "checkpoint_enabled=true" in values
-    assert "checkpoint_assignment_id=a-zcode-1" in values
-    assert "checkpoint_task_id=task-1" in values
-    assert "checkpoint_effort=high" in values
-    assert "checkpoint_resume_generation=3" in values
-    assert f"checkpoint_path={checkpoint}" in values
-
 
 def test_zcode_adapter_source_has_fixed_security_contract() -> None:
     source = Path(providers.__file__).with_name("pier_zcode.py").read_text()
@@ -416,91 +390,21 @@ def test_zcode_adapter_source_has_fixed_security_contract() -> None:
     assert "deadline = time.monotonic() + session_timeout_sec" in source
     assert "90 * 60" not in source
     assert "dradar-zcode-runtime-v1" in source
-    assert "from _dradar_pier_checkpoint import (" in source
+    assert "from _dradar_pier_runtime_safety import (" in source
     assert "AgentLogStore" in source
-    assert "DurableCheckpoint" in source
-    assert "StatePath" in source
+    assert "DurableCheckpoint" not in source
+    assert "StatePath" not in source
     assert "UnsafeAgentLog" in source
-    assert 'StatePath("xdg-data", (self._REMOTE_HOME / "data").as_posix())' in source
-    assert 'self._REMOTE_USER_HOME / ".zcode" / "cli" / "rollout"' in source
     assert 'self._REMOTE_HOME / "config"' not in source
-    assert "sensitive_values=(key_value,)" in source
-    assert "await self._checkpoint.start(self, environment, env)" in source
-    assert "await self._checkpoint.finish_durably(" in source
-    # start() deliberately seals /logs/agent as root-owned. The shared host
-    # layout preflight must run before every host-side AgentLogStore write
-    # needed to launch ZCode, and those writes must precede that transition.
+    assert "self._checkpoint" not in source
     prepare_host_layout = source.index(
-        "self._checkpoint.prepare_host_layout()"
+        "self._runtime_safety.prepare_host_layout()"
     )
     runner_write = source.index("log_store.replace_text(local_runner")
     instruction_write = source.index("log_store.replace_text(local_instruction")
-    checkpoint_start = source.index(
-        "resume_session_id = await self._checkpoint.start(self, environment, env)"
-    )
-    assert prepare_host_layout < runner_write < checkpoint_start
-    assert prepare_host_layout < instruction_write < checkpoint_start
+    assert prepare_host_layout < runner_write
+    assert prepare_host_layout < instruction_write
 
-
-@pytest.mark.skipif(os.name == "nt", reason="POSIX no-follow file semantics")
-def test_zcode_session_sidecar_reader_rejects_symlink_fifo_and_oversize(
-    tmp_path: Path,
-) -> None:
-    source = Path(providers.__file__).with_name("pier_zcode.py").read_text()
-    module = ast.parse(source)
-    helper = next(
-        node for node in module.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "_read_local_session_id"
-    )
-    namespace = {
-        "AgentLogStore": AgentLogStore,
-        "Path": Path,
-        "_SESSION_ID_RE": re.compile(r"sess_[A-Za-z0-9._:-]{1,155}"),
-        "UnsafeAgentLog": UnsafeAgentLog,
-    }
-    exec(
-        compile(ast.Module(body=[helper], type_ignores=[]), "pier_zcode.py", "exec"),
-        namespace,
-    )
-    read_session = namespace["_read_local_session_id"]
-
-    regular = tmp_path / "session-id"
-    regular.write_text("sess_0123456789\n", encoding="utf-8")
-    assert read_session(regular) == "sess_0123456789"
-
-    link = tmp_path / "session-link"
-    link.symlink_to(regular)
-    assert read_session(link) is None
-
-    fifo = tmp_path / "session-fifo"
-    os.mkfifo(fifo)
-    assert read_session(fifo) is None
-
-    oversized = tmp_path / "session-large"
-    oversized.write_bytes(b"s" * 513)
-    assert read_session(oversized) is None
-
-
-def test_zcode_protocol_uses_native_resume_without_changing_instruction() -> None:
-    source = Path(providers.__file__).with_name("pier_zcode.py").read_text()
-    module = ast.parse(source)
-    runner_assignment = next(
-        node for node in module.body
-        if isinstance(node, ast.Assign)
-        and any(isinstance(target, ast.Name) and target.id == "_PROTOCOL_RUNNER"
-                for target in node.targets)
-    )
-    runner_source = ast.literal_eval(runner_assignment.value)
-    ast.parse(runner_source)
-    assert '"session/resume"' in runner_source
-    assert '"sessionId": resume_session_id' in runner_source
-    assert '"runtimeModel": runtime_model' in runner_source
-    assert '"content": instruction' in runner_source
-    assert "continue from" not in runner_source.lower()
-    assert "continue working" not in runner_source.lower()
-    assert "starting_turn_count" in runner_source
-    assert "turns > starting_turn_count" in runner_source
 
 
 def test_zcode_session_id_is_durable_before_the_paid_turn() -> None:

@@ -669,7 +669,6 @@ def test_pool_ready_count_uses_only_inventory_returned_by_scoped_client(
                  "started_at": None, "heartbeat_running": False},
             ]}
 
-    monkeypatch.setattr(runloop.checkpoints, "latest_by_assignment", lambda _home: {})
     assert runloop._pool_ready_work_count(
         Client(), desired_workers=2,
     ) == 1
@@ -1207,9 +1206,6 @@ def test_server_confirmed_stopped_assignment_backfills_after_retry_time(
     _patch_pool_setup(monkeypatch, active_count=2)
     monkeypatch.setattr(runloop, "_client", lambda *_a, **_k: client)
     monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(
-        runloop.checkpoints, "latest_by_assignment", lambda _home: {},
-    )
     calls = []
 
     def popen(command, env, **kwargs):

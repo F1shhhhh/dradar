@@ -167,7 +167,7 @@ def cmd_leases(args) -> int:
             print("a running cell is protected; only use `--force` after its local "
                   "runner has definitely stopped")
         if stale:
-            print("a stale cell has no usable checkpoint and is not actually resumable; "
+            print("a stale cell has no live owner and is not automatically resumable; "
                   "do not start a duplicate local model process. Retry after the server "
                   "refreshes it, or use `dradar release --force` only after confirming "
                   "the original runner/container is gone")

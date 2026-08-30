@@ -13,7 +13,6 @@ import pytest
 pytest.importorskip("pier")
 
 from dradar import pier_dsh
-from dradar.pier_checkpoint import CheckpointError, CheckpointIncompatibleError
 from dradar.pier_dsh import (
     DSH_VERSION,
     NODE_SHA256,
@@ -53,83 +52,13 @@ class FakeEnvironment:
         self.uploads.append((source, target_path, source.read_bytes()))
 
 
-class RecordingCheckpoint:
-    instances: list["RecordingCheckpoint"] = []
-    resume_session_id: str | None = None
-    start_error: BaseException | None = None
-
-    def __init__(self, **kwargs: object) -> None:
-        self.kwargs = kwargs
-        self.enabled = bool(kwargs["enabled"])
-        self.started = False
-        self.finished: tuple[bool, BaseException | None] | None = None
-        self.runtime_handoffs: list[str] = []
-        type(self).instances.append(self)
-
-    async def prepare_agent_environment(self, agent, environment, env):
-        del agent, environment, env
-        return None
-
-    async def exec_root_maintenance(
-        self, environment, command, *, timeout_sec=120,
-    ):
-        return await environment.exec(
-            command=command,
-            user="root",
-            env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "BASH_ENV": "/dev/null"},
-            cwd="/",
-            timeout_sec=timeout_sec,
-        )
-
-    async def start(self, agent, environment, env):
-        del agent, environment, env
-        self.started = True
-        if type(self).start_error is not None:
-            raise type(self).start_error
-        return type(self).resume_session_id
-
-    async def finish(
-        self, agent, environment, env, *, completed, failure, session_id=None,
-    ):
-        del agent, environment, env, session_id
-        self.finished = (completed, failure)
-
-    async def finish_durably(
-        self, agent, environment, env, *, completed, failure, session_id=None,
-    ):
-        await self.finish(
-            agent,
-            environment,
-            env,
-            completed=completed,
-            failure=failure,
-            session_id=session_id,
-        )
-
-    async def return_runtime_tree_to_host_owner(self, environment, remote_path):
-        del environment
-        self.runtime_handoffs.append(remote_path)
-
-
-@pytest.fixture
-def recording_checkpoint(monkeypatch: pytest.MonkeyPatch):
-    RecordingCheckpoint.instances = []
-    RecordingCheckpoint.resume_session_id = None
-    RecordingCheckpoint.start_error = None
-    monkeypatch.setattr(pier_dsh, "DurableCheckpoint", RecordingCheckpoint)
-    yield RecordingCheckpoint
-    RecordingCheckpoint.instances = []
-    RecordingCheckpoint.resume_session_id = None
-    RecordingCheckpoint.start_error = None
-
-
 def test_standalone_adapter_matches_main_flow_contract() -> None:
     assert DSH_VERSION == MAIN_FLOW_VERSION
     assert SUPPORTED_MODELS == frozenset(MAIN_FLOW_MODELS)
     assert SUPPORTED_REASONING_EFFORTS == MAIN_FLOW_EFFORTS
     source = Path(pier_dsh.__file__).read_text(encoding="utf-8")
-    assert "await checkpoint.finish_durably(" in source
-    assert "await checkpoint.finish(" not in source
+    assert "checkpoint" not in source.lower()
+    assert "return_runtime_tree_to_host_owner" in source
 
 
 def make_key(tmp_path: Path, value: str = "test-secret-never-log") -> Path:
@@ -218,25 +147,7 @@ def test_rejects_unsupported_model_or_version(tmp_path: Path) -> None:
         make_agent(tmp_path, version="0.1.0-rc.5")
 
 
-def test_rejects_checkpoint_effort_identity_mismatch(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="checkpoint effort"):
-        make_agent(
-            tmp_path,
-            reasoning_effort="high",
-            checkpoint_effort="max",
-        )
 
-
-@pytest.mark.parametrize(
-    "extra_env",
-    [
-        {"DEEPSEEK_API_KEY": "wrong-channel"},
-        {"DSH_MODEL": "unexpected"},
-        {"DEEPSEEK_BASE_URL": "https://unexpected.invalid"},
-        {"NODE_OPTIONS": "--require=/tmp/untrusted.js"},
-        {"NODE_USE_ENV_PROXY": "0"},
-    ],
-)
 def test_rejects_reserved_extra_env(tmp_path: Path, extra_env: dict[str, str]) -> None:
     with pytest.raises(ValueError, match="api_key_file"):
         make_agent(tmp_path, extra_env=extra_env)
@@ -311,8 +222,8 @@ def test_run_supports_model_effort_matrix_without_logging_secret(
     assert "watch: false" in patch
     assert 'presets.resolve("minimal")' in runner
     assert "await presets.mount(agentCtx, preset.id)" in runner
-    assert "await agents.resume({" in runner
-    assert "resumeSessionId: SessionId(resumeSessionId)" in runner
+    assert "await agents.resume({" not in runner
+    assert "resumeSessionId" not in runner
     assert 'writeFileSync(process.env.DSH_SESSION_ID_FILE' in runner
     assert 'String(agent.session.id) + "\\n"' in runner
     assert "const outcome = summarize(agent.session.events, 0)" in runner
@@ -374,133 +285,3 @@ def test_run_supports_model_effort_matrix_without_logging_secret(
     )
     assert (dsh_call.get("env") or {})["NODE_USE_ENV_PROXY"] == "1"
     assert agent.SUPPORTS_ATIF is False
-
-
-def test_checkpoint_resume_uses_native_session_and_exact_same_instruction(
-    tmp_path: Path,
-    recording_checkpoint,
-) -> None:
-    recording_checkpoint.resume_session_id = "session-resume-12345678"
-    instruction = "Fix the quoted 'edge' and do not expand $HOME"
-    agent = make_agent(
-        tmp_path,
-        checkpoint_enabled="true",
-        checkpoint_assignment_id="assignment-checkpoint-1",
-        checkpoint_task_id="httpx-streaming-json-iteration",
-        checkpoint_effort="max",
-        checkpoint_resume_generation="2",
-        checkpoint_path=str(tmp_path / "previous"),
-        model_name="dsh-deepseek-v4-pro",
-        reasoning_effort="max",
-        **artifact_binding(),
-    )
-    environment = FakeEnvironment()
-
-    asyncio.run(
-        agent.run(
-            instruction,
-            environment,  # type: ignore[arg-type]
-            object(),  # type: ignore[arg-type]
-        )
-    )
-
-    checkpoint = recording_checkpoint.instances[-1]
-    assert checkpoint.started is True
-    assert checkpoint.finished == (True, None)
-    assert checkpoint.kwargs["assignment_id"] == "assignment-checkpoint-1"
-    assert checkpoint.kwargs["task_id"] == "httpx-streaming-json-iteration"
-    assert checkpoint.kwargs["model"] == "dsh-deepseek-v4-pro"
-    assert checkpoint.kwargs["effort"] == "max"
-    assert checkpoint.kwargs["resume_generation"] == "2"
-    assert checkpoint.kwargs["harness"] == "dsh-minimal"
-    assert checkpoint.kwargs["provider"] == "deepseek"
-    paths = {
-        (item.name, item.remote_path)
-        for item in checkpoint.kwargs["state_paths"]
-    }
-    assert paths == {
-        ("dsh-sessions", "/logs/agent/dsh-home/sessions"),
-        ("dsh-attachments", "/logs/agent/dsh-home/attachments"),
-    }
-    assert all("credential" not in path for _, path in paths)
-
-    dsh_call = next(
-        call
-        for call in environment.calls
-        if "dsh --profile headless" in str(call["command"])
-    )
-    assert (dsh_call.get("env") or {})["DSH_RESUME_SESSION_ID"] == (
-        "session-resume-12345678"
-    )
-    command = str(dsh_call["command"])
-    assert shlex.quote(instruction) in command
-    assert "continue the previous" not in command.lower()
-
-
-def test_checkpoint_marks_failed_paid_run_paused(
-    tmp_path: Path,
-    recording_checkpoint,
-) -> None:
-    agent = make_agent(
-        tmp_path,
-        checkpoint_enabled=True,
-        checkpoint_assignment_id="assignment-checkpoint-2",
-        checkpoint_task_id="task-checkpoint-2",
-    )
-    environment = FakeEnvironment(fail_dsh=True)
-
-    with pytest.raises(Exception, match="exit 7"):
-        asyncio.run(
-            agent.run(
-                "Fix it",
-                environment,  # type: ignore[arg-type]
-                object(),  # type: ignore[arg-type]
-            )
-        )
-
-    checkpoint = recording_checkpoint.instances[-1]
-    assert checkpoint.finished is not None
-    completed, failure = checkpoint.finished
-    assert completed is False
-    assert failure is not None
-    assert checkpoint.runtime_handoffs == ["/logs/agent/dsh-home"]
-
-
-@pytest.mark.parametrize(
-    "start_error",
-    [
-        CheckpointError("checkpoint manifest is unreadable"),
-        CheckpointIncompatibleError("checkpoint runtime identity mismatch"),
-    ],
-)
-def test_checkpoint_rejects_corrupt_or_mismatched_state_before_paid_run(
-    tmp_path: Path,
-    recording_checkpoint,
-    start_error: BaseException,
-) -> None:
-    recording_checkpoint.start_error = start_error
-    agent = make_agent(
-        tmp_path,
-        checkpoint_enabled=True,
-        checkpoint_assignment_id="assignment-checkpoint-3",
-        checkpoint_task_id="task-checkpoint-3",
-    )
-    environment = FakeEnvironment()
-
-    with pytest.raises(type(start_error), match=str(start_error)):
-        asyncio.run(
-            agent.run(
-                "Fix it",
-                environment,  # type: ignore[arg-type]
-                object(),  # type: ignore[arg-type]
-            )
-        )
-
-    assert not any(
-        "dsh --profile headless" in str(call["command"])
-        for call in environment.calls
-    )
-    assert not any(
-        target.endswith("/deepseek-api-key")
-        for _, target, _ in environment.uploads
-    )

@@ -1,11 +1,11 @@
 # dradar — 分布式雷达客户端 CLI
 
 `dradar` 是分布式雷达的开源客户端，运行在参与者自己的电脑上。它负责连接雷达服务、
-查看和领取 benchmark 任务、在隔离环境中调用本机已经登录的模型工具、保存中断恢复点、
-上传结果，并查看服务端的独立判分。调度、判分和榜单由服务端完成，不在本仓库中。
+查看和领取 benchmark 任务、在隔离环境中调用本机已经登录的模型工具、持久保存已完成的
+待上传结果，并查看服务端的独立判分。调度、判分和榜单由服务端完成，不在本仓库中。
 
-CLI 的核心能力围绕通用的 benchmark 运行流程设计，包括格子、租约、worker、checkpoint、
-artifact 和判分结果，不把产品定位绑定到某一个题库。当前主站首先接入 DeepSWE，并使用
+CLI 的核心能力围绕通用的 benchmark 运行流程设计，包括格子、租约、worker、artifact、
+待上传账本和判分结果，不把产品定位绑定到某一个题库。当前主站首先接入 DeepSWE，并使用
 Pier + Docker 作为现阶段的任务执行方案；未来可以继续接入其他 benchmark 和对应 runner。
 
 - 官网与任务大表：[deng.codexradar.com](https://deng.codexradar.com)
@@ -20,7 +20,7 @@ Pier + Docker 作为现阶段的任务执行方案；未来可以继续接入其
 │ dradar cells / go / resume     │──查询/领题▶│ 推荐、原子领取、租约与心跳    │
 │  └─ 当前 runner：Pier + Docker  │           │                            │
 │      └─ 本机模型工具             │           │ 独立 verifier 重新判分       │
-│  └─ checkpoint / 脱敏 / 上传    │──提交结果▶│ 积分、榜单与公开大表          │
+│  └─ durable artifact / 脱敏 / 上传│──提交结果▶│ 积分、榜单与公开大表          │
 └────────────────────────────────┘           └────────────────────────────┘
 ```
 
@@ -31,11 +31,11 @@ Pier + Docker 作为现阶段的任务执行方案；未来可以继续接入其
   始终留在本机；无法安全脱敏的补丁会被拒绝。trajectory 等展示数据也会先脱敏。
 - **领取由服务端原子裁决**：查询到的 `open` 只是快照；真正领取时服务端会再次检查，
   避免同一空位被并发重复发放。
-- **Codex 容器始终使用最新稳定版**：每道 Codex 任务启动或恢复前，CLI 都会从 npm
+- **Codex 容器始终使用最新稳定版**：每道 Codex 任务启动前，CLI 都会从 npm
   确认当前 `latest` 对应的精确版本号，再交给 Pier 构建。精确版本变化会使 Docker
   安装层缓存失效；本机 npm 不可达时，只接受服务端最近确认仍新鲜的精确版本。两边
   都无法确认最新版时不会启动模型，也不会消耗额度。已经运行中的任务不会被中途升级，
-  下一道任务或下次恢复时再更新。
+  下一道任务再更新。
 - **Honey 权限在容器内完整、边界在容器外**：Codex、DSH、ZCode、Kimi Code、
   Antigravity 和 Grok 统一使用无人值守的完整编码/子代理权限，由 Docker 挂载、网络出口和凭证
   生命周期防作弊。新增 Honey 必须逐项通过
@@ -95,17 +95,15 @@ dradar status                          # 查看自己的提交和判分
 | `dradar capacity` | 否 | 根据 Docker 资源、磁盘和账号上限推荐安全 worker 数 |
 | `dradar cells` | 否 | 查看、筛选和排序完整格子表，不领取任务 |
 | `dradar go` | 是 | 使用网页已领任务，或从 CLI 精确/自动领题并运行、上传 |
-| `dradar resume` | 是 | 优先恢复 checkpoint，再继续当前仍持有的任务 |
+| `dradar resume` | 是 | 补传已完成结果，再继续当前仍持有的 waiting 任务 |
 | `dradar status` | 否 | 查看自己的积分、最近提交、判分、异常标记和占用摘要 |
 | `dradar leases` | 否 | 查看当前持有的 assignment，区分 running 与 waiting |
 | `dradar release` | 是 | 释放不再准备运行的租约；运行中任务默认受保护 |
-| `dradar checkpoints` | 否 | 查看本地恢复点、阶段、更新时间和磁盘占用 |
-| `dradar checkpoint discard` | 是 | 删除指定恢复点，并安全重新开放对应格子 |
 | `dradar retry-upload` | 是 | 重试已经运行完成但因网络等原因没有上传的结果 |
 | `dradar cleanup` | 本地删除 | 安全清理已结算的本地任务文件及 DRadar/Pier 镜像缓存 |
 | `dradar config show/set` | 本地配置 | 查看或调整镜像缓存模式与容量上限，不显示账号凭据 |
 | `dradar refill status` | 否 | 查看本机持续补题计划和额度预留 |
-| `dradar refill stop` | 是 | 停止继续领取新题，保留已有任务和 checkpoint |
+| `dradar refill stop` | 是 | 停止继续领取新题，保留已有任务和待上传结果 |
 | `dradar rename` | 是 | 修改榜单昵称，积分不变 |
 | `dradar link-github` | 是 | 绑定 GitHub 身份，显示头像并支持跨机器找回账号 |
 
@@ -237,12 +235,10 @@ DeepSeek API 价格按北京时间分段：每天 `09:00–12:00`、`14:00–18:
 - 每次启动前解析 npm 的最新稳定版 Codex，并把精确版本传给 Pier 以刷新 Docker 构建
   缓存；`0.147.0` 仅作为最低兼容版本。继续使用 Responses API，以及官方目录声明的
   1,048,576 token 上下文和 95% 有效上下文比例。
-- 基于 DRadar 固定的 checkpoint-capable Pier `codex` agent；附加代码负责校验并上传
-  官方模型目录，并给 checkpoint 写入明确的 DeepSeek provider 与精确 Codex 版本身份。
+- 使用公开 Pier `codex` agent；附加代码只负责校验并上传官方模型目录。
 - 基准配置关闭 Codex apps、remote plugin 和 web search，避免无关联网探测影响隔离性。
 - DeepSeek 格子只能显式领取，不进入 `/suggest`、`--auto` 或持续补题。
-- 支持 DeepSeek checkpoint；恢复前同时核对 assignment、任务、模型、档位、provider 和
-  精确 Codex 版本，缺少 provider 身份的旧 checkpoint 不会跨计费 provider 恢复。
+- 不提供任务中途 checkpoint；运行完成后由 content-bound 待上传账本保护精确产物。
 - 未显式领取 DeepSeek 格子时，原有 OpenAI Codex 与 Claude 行为完全不变。
 
 配置依据：[DeepSeek 官方 Codex 集成文档](https://api-docs.deepseek.com/quick_start/agent_integrations/codex/)、
@@ -273,8 +269,8 @@ dradar resume -y
 
 运行器通过 `uvx --isolated` 使用公开 `datacurve-pier==0.3.0`，并在任务容器内安装固定的
 `@deepseek-ai/dsh` 版本。普通 Codex、Claude、Grok 和 DeepSeek Codex 的环境检查与运行
-路径不受影响。DSH checkpoint 只保存工作区、原生 session 与图片附件；恢复使用原生
-`agents.resume`，并按完整 session transcript 累计前后两代 usage。
+路径不受影响。DSH 不创建或恢复任务 checkpoint；owner handoff 只负责容器文件权限，
+不会重新启动已经完成或中断的模型会话。
 
 ### Grok 订阅 OAuth 补充 agent
 
@@ -302,7 +298,7 @@ SHA-256，避免把 macOS/Windows 可执行文件误传给 Linux。OAuth 凭证�
 当前 canary 边界：新领题使用官方 Grok CLI `1.0.13`，模型固定为 `grok-4.6`，档位为
 `low`/`medium`/`high`/`xhigh`；只能显式领取，不进入自动推荐或补题；禁用 web search、memory、
 subagents 和 plan，并把容器运行时网络限制为 `auth.x.ai` 与
-`cli-chat-proxy.grok.com`、`code.grok.com`。第一版不支持 checkpoint。轨迹按 ATIF-v1.7 保存，但订阅
+`cli-chat-proxy.grok.com`、`code.grok.com`。轨迹按 ATIF-v1.7 保存，但订阅
 运行没有 API 账单，因此 cost 保持未知，不伪报为 `$0`。
 
 ### Kimi Code K3 订阅 OAuth agent
@@ -328,8 +324,8 @@ Kimi CLI 版本，因此 macOS、Windows 与 Linux 用户都不会把错误平�
 日志和工作区仍逐题隔离；刷新后会验证文件结构、权限和所有者，容器退出时其余运行状态
 全部销毁。模型以 `--auto` 运行，保留官方完整工具和 Agent/AgentSwarm 子代理能力。
 模型固定为 `k3`，只接受 `low`/`high`/`max`；DeepSWE 与庞贝壁画均可显式领取，但不进入
-自动推荐、排序或持续补题。checkpoint 保存工作区、Kimi session 与累计 usage stream，
-恢复使用官方 `--session`，不会追加恢复提示词。
+自动推荐、排序或持续补题。任务中断不会恢复原 Kimi session；运行完成后的精确 patch 和
+usage 由 durable artifact 与待上传账本保护。
 
 ### ZCode GLM-5.3 系列国内 Coding Plan agent
 
@@ -356,8 +352,7 @@ DRadar 服务端或轨迹。容器启动后 Key 会立即转入 ZCode 的内存�
 模型支持 `glm-5.3` 与 `glm-5.3-flash`，档位为 `low`/`high`/`max`。DeepSWE 与庞贝壁画
 均可显式领取，但不进入自动推荐或补题。Protocol 固定使用 `yolo`，不设置内部工具
 allowlist/denylist，保留完整编码和 `Agent` 子代理能力；网络仍只允许 ZCode 控制面与模型
-端点。checkpoint 保存工作区和无凭据的 ZCode session/rollout 状态，恢复使用原生
-`session/resume` 并重新注入仅驻内存的运行凭据。
+端点。任务中断不会恢复 ZCode session/rollout；运行完成后的精确产物只走待上传账本。
 
 ### Google Antigravity Gemini 3.7 Flash 订阅 OAuth agent
 
@@ -477,7 +472,7 @@ dradar cells --model deepseek-v4-flash --price-band peak --sort cost
 
 ## 领取与运行：`dradar go`
 
-`go` 会依次完成环境准备、补传旧结果、优先恢复本地 checkpoint、取得任务、运行 Pier、
+`go` 会依次完成环境准备、补传旧结果、取得任务、运行 Pier、
 上传 patch/trajectory/result。任务来源有三种：
 
 ### 1. 运行网页已经认领的任务
@@ -522,9 +517,10 @@ dradar resume
 dradar resume --assignment <ASSIGNMENT_ID>
 ```
 
-`resume` 首先发现并恢复本地 checkpoint，再运行账号仍持有但尚未完成的任务。指定
-`--assignment` 时只恢复对应 assignment，且必须使用单 worker，不能同时开启持续补题。
-如果没有 checkpoint 和活动租约，它安全退出，不会重新提交已完成任务。
+`resume` 首先重试 durable pending-upload，再运行账号仍持有且尚未开始的 waiting 任务。
+指定 `--assignment` 时只处理对应 assignment，且必须使用单 worker，不能同时开启持续补题。
+已存在待上传记录的 assignment 会阻止 go、resume、自动补位和多 worker 再次运行模型；
+如果没有待上传结果和活动租约，它安全退出。
 
 ## `go` / `resume` 通用运行参数
 
@@ -564,10 +560,10 @@ dradar resume --workers auto
 - worker 共享同一台机器的 CPU、内存、磁盘和模型额度。
 - 实际启动数不会超过已持有任务数、账号并发上限或用户硬上限。
 - 父池运行期间若某个 worker 正常退出，而服务端随后出现新的、已持有且可立即运行的
-  waiting 任务，父池会补回空槽；不会自行领取任务，也不会自动复活 paused checkpoint。
+  waiting 任务，父池会补回空槽；不会自行领取任务，也不会复活历史 paused 墓碑。
 - 未传 `-y` 时，父进程会在领取任务之前确认并发数。
 - Ctrl-C 或部分子进程启动失败时，父进程会停止已经启动的子进程；已上传结果、现有租约
-  和 checkpoint 保留，可用 `dradar resume` 继续。
+  和待上传结果保留，可用 `dradar resume` 继续补传或处理其他 waiting 任务。
 - 只有需要手工运行多个独立 CLI 进程时才使用 `--parallel`。它们仍通过服务端 checkout
   分配不同任务，但资源需要操作者自行控制。
 
@@ -594,7 +590,7 @@ dradar resume -y --benchmark deep-swe --workers 3 \
 限定模式从公开格子表发现符合条件的开放格子，再调用同一个精确领取接口；服务器仍负责
 账号上限、租约和并发冲突。没有匹配库存时 CLI 明确退出并保留计划，不会改领 Codex 或
 其他 Harness；之后用相同命令继续即可。认证失败、订阅额度耗尽、运行环境失败或任务未能
-提交仍会触发原有熔断，停止继续领取并保留已有任务/检查点。
+提交仍会触发原有熔断，停止继续领取并保留已有任务/待上传结果。
 
 - `--refill-to` 是希望持续保持的“运行中 + waiting”队列大小。
 - 启动补题计划时已经手工认领的题属于初始选择批次；必须全部成功提交后，CLI 才会领取
@@ -605,11 +601,12 @@ dradar resume -y --benchmark deep-swe --workers 3 \
 - `plus`、`pro-5x`、`pro-20x` 分别按对应额度窗口换算。
 - 没有可靠额度换算数据的题不会自动领取。
 - 接近预算或题数上限时停止补题，让已持有队列自然排空。
-- 任一任务没有正常提交时立即停止继续领题，但不会释放已有租约或删除 checkpoint。
+- 任一任务没有正常提交时立即停止继续领题，但不会释放已有租约或删除待上传产物。
 - 本机计划通过文件锁共享；正常新一轮可以安全替换无主旧计划，正常完成或显式执行
   `refill stop` 后会清理活动计划文件。因安全条件自动停止的诊断状态可以暂留供
-  `refill status` 查看。`checkpoint_invalid` / `checkpoint_incompatible` 会把计划置为
-  `faulted`：重启 CLI、换题、换档位或升级版本都不会自动复活；修复并验证后必须显式执行
+  `refill status` 查看。旧版本遗留的 `checkpoint_invalid` / `checkpoint_incompatible`
+  仍作为历史失败类别识别并把计划置为 `faulted`：重启 CLI、换题、换档位或升级版本都
+  不会自动复活；修复并验证后必须显式执行
   `refill stop`，才能启动新计划。手工 `--parallel` 无法证明旧计划无人使用时会保守拒绝
   覆盖。
 
@@ -651,37 +648,17 @@ dradar release --all --force -y             # 高风险：无确认释放全部
 默认不会释放 `running`。只有确认本地 Pier/Codex 已经停止、服务端状态仍卡住时才使用
 `--force`，否则任务可能仍在消耗额度，却被重新开放给其他人。
 
-## checkpoint 与中断续跑
+## Checkpoint 功能已退役
 
-Pier 在任务运行期间约每 30 秒把工作区差异、未跟踪文件、harness 原生 session、累计
-usage 所需状态、阶段和心跳写入 `~/.dradar/work/jobs/`。当前覆盖 OpenAI/DeepSeek Codex、
-DSH、Kimi 与 ZCode。模型容量不足、WebSocket/TLS 断开、代理抖动、CLI 退出或机器
-重启后，下一次 `go` / `resume` 会先尝试恢复，而不是从头运行。
+CLI 不再生成、扫描或恢复任务 checkpoint，也不再提供 `checkpoints` / `checkpoint discard`
+命令。旧目录只会在普通本地清理中按安全边界处理；其中的历史 checkpoint 元数据不会触发
+模型运行、自动提交或远端状态变更。
 
-```bash
-dradar checkpoints
-dradar resume
-dradar resume --assignment <ASSIGNMENT_ID>
-dradar checkpoint discard <CHECKPOINT_ID_OR_ASSIGNMENT_ID>
-```
-
-恢复优先级：
-
-1. 原工作区 + 与 harness/provider/版本严格匹配的原生 session；
-2. 支持安全降级的 harness 在原 session 不可用时保留工作区，并使用原始任务说明；
-3. checkpoint 损坏或身份不兼容时，保留本地 terminal 证据、停止同 Harness/provider 的
-   自动补领，并重新开放格子；超过 7 天或租约失效的普通旧状态按生命周期回收。
-
-同一 assignment 使用本地文件锁，健康运行中的任务不会被第二个 `resume` 重复启动。批量
-运行遇到 checkpoint 基础设施故障会停止后续 checkout，避免同一故障扩散到更多付费任务。
-
-checkpoint 不保存账号 Token、assignment nonce、API key 或 OAuth 文件。provider state
-使用逐 harness 最小白名单；provider state 出现通用凭据形态时会整段省略，并把恢复安全
-降级为“仅工作区 + 全新原生 session”。manifest、工作区或未跟踪文件出现敏感字段，或
-checkpoint 产物精确命中本次注入的真实凭据值时，仍会标记无效并拒绝恢复。
-
-`checkpoint discard` 会删除本地恢复数据；如果服务端租约仍有效，还会通过恢复协议重新
-开放格子。这是明确放弃进度的操作。
+任务中断后不会从原模型 session 续跑。用户应先确认原 runner/container 已停止，再明确
+释放或重新运行该 assignment。任务已经完成但上传失败时，durable `model.patch`、内容摘要、
+content-bound intent 和 `pending_uploads.json` 构成唯一恢复路径；`retry-upload` 只上传精确
+已完成结果，不会再次调用模型。若 assignment 已被新 owner 接管，旧结果会本地失败关闭并
+保留供审计，不能绕过 ownership fence。
 
 ## 上传补救：`dradar retry-upload`
 
@@ -722,8 +699,8 @@ Docker 镜像不会在每题结束后立刻删除。CLI 会记录本轮任务实
 pool 还会在每题成功提交后竞争一个跨进程节流标记，最多每 15 分钟由一个 worker 执行
 同样的安全维护，避免池长期不退出时缓存持续增长。默认 `balanced` 模式的
 动态上限为磁盘容量的 5%（最低 20 GiB、最高 50 GiB），超限后清理到上限的 75%；
-可用空间低于 25 GiB 时停止领取新题，但不打断已持有任务。运行中、待补传、存在
-checkpoint 或由 `--keep` 保护的镜像均不会删除。
+可用空间低于 25 GiB 时停止领取新题，但不打断已持有任务。运行中、待补传或由
+`--keep` 保护的镜像均不会删除。
 
 自动清理只处理 CLI 自己记录、且镜像 ID 与 Docker Compose 标签仍一致的条目；不运行
 全局 `docker image prune`，不使用强制删除，也不会碰其他 Docker 项目。升级前遗留的
@@ -764,7 +741,7 @@ dradar config show
 其他常见情况：
 
 - Docker 镜像构建在 agent 启动前失败：不消耗模型额度，CLI 自动重试一次；
-- CLI/Codex/Pier 中断：保留 checkpoint，使用 `dradar resume`；
+- CLI/Codex/Pier 在模型完成前中断：确认进程停止后释放或重新运行；不会自动恢复 session；
 - 上传失败：使用 `dradar retry-upload`；
 - Token 失效：重新执行官网登录命令，或使用已绑定身份的 `login --github`；
 - Ctrl-C：CLI 返回退出码 130，租约保留，可通过 `leases`、`resume` 或 `release` 处理。
@@ -777,7 +754,7 @@ dradar config show
 | --- | --- |
 | `~/.dradar/config.json` | 服务端、Token 和任务仓库路径；私有文件 |
 | `~/.dradar/deep-swe/tasks/` | 当前 DeepSWE 接入的兼容默认任务仓库路径 |
-| `~/.dradar/work/jobs/` | Pier 任务目录、artifact 和 checkpoint |
+| `~/.dradar/work/jobs/` | Pier 任务目录、artifact、terminal 证据和 `--keep` 现场 |
 | `~/.dradar/pending_uploads.json` | 待补传结果账本，不保存订阅凭据 |
 | `~/.dradar/refill-plan.json` | 当前持续补题计划或最近一次安全停止/熔断诊断；faulted 计划必须显式 `refill stop` 后才能重启 |
 
@@ -786,9 +763,8 @@ trial 完成后，CLI 会在对应任务目录内保存一份独立的 `model.pa
 `retry-upload` 共用同一套校验：若待上传副本丢失但权威副本仍完整，会通过临时文件和原子
 rename 自动重建；若两份文件摘要冲突，则保留两份现场并拒绝上传，不会猜测或覆盖。
 
-提交成功或服务端确认已经提交后，CLI 会清理不再需要的副本；恢复产生新副本时删除旧副本；
-过期或无租约的普通 checkpoint 会回收；基础设施判定为 invalid/incompatible 的现场会自动
-保留为 terminal evidence，不参与恢复。确认无需排查后，可用 `checkpoint discard` 或
+提交成功或服务端确认已经提交后，CLI 会清理不再需要的副本。被 `--keep` 保护或因基础
+设施异常保留的现场只作为 terminal evidence，不参与恢复；确认无需排查后可用
 `cleanup --include-kept` 清理。
 
 ## 心跳与隐私

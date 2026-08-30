@@ -400,8 +400,8 @@ class ApiClient:
         (build flake, agent crash, abandonment) with nothing uploaded, so the
         server should stop showing the cell as 解题中. Callers use bounded
         best-effort retries and surface a final failure; current servers also
-        reopen session-bound, uncheckpointed work after its exact runner is
-        stale. New clients fence this transition with owner_epoch."""
+        reopen session-bound work after its exact runner is stale. New clients
+        fence this transition with owner_epoch."""
         data = {
             "assignment_id": assignment_id,
             "defer_seconds": str(defer_seconds),
@@ -425,38 +425,6 @@ class ApiClient:
             # and an immediate explicit `dradar resume` must work. Older
             # servers ignore the extra form field harmlessly.
             data=data,
-        )
-
-    def checkpoint_pause(
-        self, assignment_id: str, checkpoint_id: str, resume_generation: int,
-    ) -> dict[str, Any]:
-        return self._post(
-            "/api/v1/assignment/checkpoint/pause",
-            data={"assignment_id": assignment_id, "checkpoint_id": checkpoint_id,
-                  "resume_generation": str(resume_generation)},
-        )
-
-    def checkpoint_resume(
-        self, assignment_id: str, checkpoint_id: str, resume_generation: int,
-        session_id: str | None = None,
-    ) -> dict[str, Any]:
-        return self._post(
-            "/api/v1/assignment/checkpoint/resume",
-            data={"assignment_id": assignment_id, "checkpoint_id": checkpoint_id,
-                  "resume_generation": str(resume_generation),
-                  "session_id": session_id or ""},
-        )
-
-    def checkpoint_discard(
-        self, assignment_id: str, checkpoint_id: str, resume_generation: int,
-        reason: str = "user_discard",
-    ) -> dict[str, Any]:
-        if reason not in {"user_discard", "invalid", "expired", "incompatible"}:
-            raise ValueError("unsupported checkpoint discard reason")
-        return self._post(
-            "/api/v1/assignment/checkpoint/discard",
-            data={"assignment_id": assignment_id, "checkpoint_id": checkpoint_id,
-                  "resume_generation": str(resume_generation), "reason": reason},
         )
 
     def submit(
