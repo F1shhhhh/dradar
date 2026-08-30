@@ -1616,6 +1616,67 @@ def test_surviving_worker_excludes_pre_failure_inventory(
     assert runloop._pool_degraded_exclusions(Client()) == {"old"}
 
 
+def test_replacement_worker_accepts_exact_returned_pre_failure_assignment(
+        tmp_path, monkeypatch,
+):
+    """The child must receive the safe-return proof used to spawn it.
+
+    Regression for 0.5.142: the parent counted this row as ready, but the
+    replacement child's degraded checkout filter excluded the same row and
+    exited without checkout until its slot was permanently suppressed.
+    """
+    cutoff = datetime.now(timezone.utc)
+    cutoff_file = tmp_path / "failure-cutoff"
+    cutoff_file.write_text(cutoff.isoformat())
+    returned_file = tmp_path / "returned.json"
+    runloop._write_pool_returned_assignments(returned_file, {"returned"})
+    monkeypatch.setenv(runloop._POOL_FAILURE_CUTOFF_ENV, str(cutoff_file))
+    monkeypatch.setenv(
+        runloop._POOL_RETURNED_ASSIGNMENTS_ENV, str(returned_file),
+    )
+    before = (cutoff - timedelta(seconds=1)).isoformat()
+    ready = (cutoff - timedelta(milliseconds=1)).isoformat()
+
+    class Client:
+        def get_assignment(self):
+            return {"active": [
+                {
+                    "assignment_id": "returned",
+                    "started_at": None,
+                    "leased_at": before,
+                    "execution_state": "waiting",
+                    "checkpoint_id": None,
+                    "retry_after": ready,
+                    "heartbeat_running": False,
+                    "runner_state": "waiting",
+                    "runner_phase": None,
+                },
+                {
+                    "assignment_id": "unrelated-old",
+                    "started_at": None,
+                    "leased_at": before,
+                    "execution_state": "waiting",
+                    "checkpoint_id": None,
+                    "retry_after": ready,
+                    "heartbeat_running": False,
+                    "runner_state": "waiting",
+                    "runner_phase": None,
+                },
+            ]}
+
+    assert runloop._pool_degraded_exclusions(Client()) == {"unrelated-old"}
+
+
+def test_malformed_returned_assignment_proof_fails_closed(tmp_path, monkeypatch):
+    returned_file = tmp_path / "returned.json"
+    returned_file.write_text('["safe", "../unsafe"]')
+    monkeypatch.setenv(
+        runloop._POOL_RETURNED_ASSIGNMENTS_ENV, str(returned_file),
+    )
+
+    assert runloop._read_pool_returned_assignments() == set()
+
+
 def test_backfill_counts_fresh_and_safely_recoverable_work(monkeypatch):
     checkpoint = SimpleNamespace(
         valid=True, checkpoint_id="cp-1", resume_generation=2,
