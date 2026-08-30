@@ -282,7 +282,14 @@ class ApiClient:
         scoped["resumed"] = True
         return scoped
 
-    def claim_assignment(self, task_id: str, model: str, effort: str) -> dict[str, Any]:
+    def claim_assignment(
+        self,
+        task_id: str,
+        model: str,
+        effort: str,
+        *,
+        refill_campaign_id: str | None = None,
+    ) -> dict[str, Any]:
         """Returns {assignment: dict, resumed: False}. Raises ApiError (409) if
         the cell went stale or the volunteer is already at the concurrent cap."""
         data = {"task_id": task_id, "model": model, "effort": effort}
@@ -290,7 +297,45 @@ class ApiClient:
             data["benchmark_id"] = self.benchmark_id
         if self.batch_id:
             data["batch_id"] = self.batch_id
+        if refill_campaign_id:
+            data["refill_campaign_id"] = refill_campaign_id
         return self._post("/api/v1/assignment/claim", data=data)
+
+    def configure_refill_campaign(
+        self,
+        *,
+        batch_id: str,
+        harness: str,
+        model: str,
+        effort: str,
+        refill_to: int,
+        max_tasks: int,
+    ) -> dict[str, Any]:
+        """Idempotently create the server-authoritative multi-machine plan."""
+        return self._post(
+            "/api/v1/refill-campaign/configure",
+            json={
+                "batch_id": batch_id,
+                "benchmark_id": self.benchmark_id or "deep-swe",
+                "harness": harness,
+                "model": model,
+                "effort": effort,
+                "refill_to": refill_to,
+                "max_tasks": max_tasks,
+            },
+        )
+
+    def refill_campaign_status(self, batch_id: str) -> dict[str, Any]:
+        path = self._query_path(
+            "/api/v1/refill-campaign/status", "batch_id", batch_id,
+        )
+        return self._get(path)
+
+    def stop_refill_campaign(self, batch_id: str, reason: str) -> dict[str, Any]:
+        return self._post(
+            "/api/v1/refill-campaign/stop",
+            json={"batch_id": batch_id, "reason": reason[:300]},
+        )
 
     def suggest(self, n: int) -> dict[str, Any]:
         """Weighted-random candidate cells (server-side balanced_random_cells,

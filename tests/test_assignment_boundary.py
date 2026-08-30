@@ -114,6 +114,23 @@ def test_forget_replaces_only_the_named_benchmark_boundary(tmp_path):
     assert "nonce" not in path.read_text()
 
 
+def test_same_benchmark_uses_independent_boundaries_per_exact_batch(tmp_path):
+    first = assignment_boundary.prepare(
+        tmp_path, "bench", [_assignment("a1")], batch_id="batch-a",
+    )
+    second = assignment_boundary.prepare(
+        tmp_path, "bench", [_assignment("b1")], batch_id="batch-b",
+    )
+
+    assert first is not None and second is not None and first != second
+    assert json.loads(first.read_text())["batch_id"] == "batch-a"
+    assert json.loads(second.read_text())["batch_id"] == "batch-b"
+
+    assignment_boundary.record_outcome(first, _assignment("a1"), "submitted")
+    assert assignment_boundary.reconcile(first, []).complete
+    assert assignment_boundary.reconcile(second, [_assignment("b1")]).complete is False
+
+
 def test_corrupt_boundary_fails_closed_without_explicit_forget(tmp_path):
     path = assignment_boundary.state_path(tmp_path, "bench")
     path.parent.mkdir(parents=True)

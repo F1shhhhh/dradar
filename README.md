@@ -93,6 +93,7 @@ dradar status                          # 查看自己的提交和判分
 | `dradar login` | 本地配置 | 保存服务端和 Token、注册新账号或通过 GitHub 恢复身份 |
 | `dradar doctor` | 可能安装依赖 | 检查 Docker、Pier、Codex/Claude、任务仓库、磁盘和登录状态 |
 | `dradar capacity` | 否 | 根据 Docker 资源、磁盘和账号上限推荐安全 worker 数 |
+| `dradar fleet add/status/watch/stop` | 是/否 | 在同机安全编排多个精确 Honeypot batch，并分别设置 worker 数 |
 | `dradar cells` | 否 | 查看、筛选和排序完整格子表，不领取任务 |
 | `dradar go` | 是 | 使用网页已领任务，或从 CLI 精确/自动领题并运行、上传 |
 | `dradar resume` | 是 | 补传已完成结果，再继续当前仍持有的 waiting 任务 |
@@ -530,7 +531,7 @@ dradar resume --assignment <ASSIGNMENT_ID>
 | `--keep` | 成功上传后保留最终本地任务目录，供调试或审计 |
 | `--archive-session` | 显式选择：成功上传并清理任务目录前，把 Codex session 以私有权限归档到 `~/.dradar/history/codex-sessions/`；默认关闭 |
 | `--allow-task-drift` | 显式允许本地 benchmark 版本或任务内容与服务端不一致；这类运行不可可靠比较，默认会在消耗模型额度前停止 |
-| `--workers N` | 由一个父进程管理 N 个并发 worker，范围 1–32，默认 1 |
+| `--workers N` | 由一个父进程管理 N 个并发 worker，范围 1–40，默认 1 |
 | `--workers auto` | 检测 Docker、磁盘和账号限制后选择保守并发数 |
 | `--parallel` | 高级选项：允许手工启动另一个独立 DRadar 会话；隐含 `-y` |
 | `--refill` | 显式开启持续自动补题；必须同时给出额度或题数硬上限 |
@@ -566,6 +567,45 @@ dradar resume --workers auto
   和待上传结果保留，可用 `dradar resume` 继续补传或处理其他 waiting 任务。
 - 只有需要手工运行多个独立 CLI 进程时才使用 `--parallel`。它们仍通过服务端 checkout
   分配不同任务，但资源需要操作者自行控制。
+
+## 多 Honeypot / batch Fleet
+
+网页每次认领都会返回一个精确 `batch_id`。同一台机器需要同时跑多个 Codex、Kimi、
+Grok、ZCode、Antigravity、CodeBuddy 或其他 Harness batch 时，把每个 batch 交给同一个
+本机 Fleet，而不是启动互相不知道资源占用的多个 `resume` 父进程：
+
+```bash
+dradar fleet add --batch-id <CODEX_BATCH> --workers 2
+dradar fleet add --batch-id <GROK_BATCH> --workers 2
+dradar fleet add --batch-id <KIMI_BATCH> --workers 1
+
+dradar fleet status
+dradar fleet watch --batch-id <GROK_BATCH>
+dradar fleet stop --batch-id <GROK_BATCH>
+```
+
+- 每个 batch 有独立 worker 池和 assignment 边界；同机重复 `fleet add` 同一 batch 是
+  幂等操作，不会启动第二份池。
+- Fleet 统一统计本机已经预留的 worker，并按 Docker CPU、内存、磁盘及账号并发上限
+  计算 `--workers auto`；手工总并发过高会打印明确警告。
+- 不同 Agent 对话可以分别执行 `fleet add`；协调器只保存在本机用户私有目录，不保存
+  Token 或 provider 凭据。
+- 不同机器可以加入同一账号的相同或不同 batch。服务端原子分配 assignment，避免两台
+  机器重复运行同一题；每台机器分别管理自己的本地资源预算。
+- `fleet stop --batch-id` 只停止目标 batch，不释放其他 batch 的 waiting/running 工作。
+
+网页明确开启持续补领时，Fleet 还要求精确 Harness、模型、档位和包含 seed 题的总上限：
+
+```bash
+dradar fleet add --batch-id <KIMI_BATCH> --workers 2 \
+  --refill --max-tasks 20 \
+  --refill-harness kimi-code --refill-model k3 --refill-effort low
+```
+
+seed assignment 必须全部被服务端接受提交后才会补领。campaign 的 `max_tasks` 由服务端
+在多台机器间共享，不能被每台机器各花一遍；停止、任务失败、释放或过期都会阻止继续
+补领，已经持有的任务不会被自动释放。默认不传 `--refill` 时，Fleet 严格只跑网页下发
+的 batch，不领取新题。
 
 ## 持续自动补题
 
