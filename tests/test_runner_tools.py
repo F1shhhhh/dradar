@@ -614,6 +614,7 @@ from dradar.runner import (
     summarize_result,
 )
 from dradar.runner import (
+    _artifact_tasks_overlay,
     _dsh_tasks_overlay,
     _normalize_utf16_patch,
     _verify_dsh_artifact_binding,
@@ -637,6 +638,68 @@ def test_dsh_pompeii_pack_with_existing_hook_accepts_non_git_base_marker(tmp_pat
         assert selected == tmp_path / "tasks"
 
 
+def test_artifact_task_overlay_adapts_verifier_collect_without_mutation(
+    tmp_path,
+):
+    task_id = "task-1"
+    tasks = tmp_path / "tasks"
+    task = tasks / task_id
+    task.mkdir(parents=True)
+    base_commit = "a" * 40
+    (task / "instruction.md").write_text("fix it\n")
+    (task / "task.toml").write_text(
+        'schema_version = "1.3"\n'
+        '[metadata]\nbase_commit_hash = "' + base_commit + '"\n'
+        '[[verifier.collect]]\ncommand = "collect model.patch"\n'
+    )
+
+    with _artifact_tasks_overlay(
+        {"task_id": task_id}, tasks, tmp_path / "work", "job"
+    ) as selected:
+        assert selected != tasks
+        hook = selected / task_id / "pre_artifacts.sh"
+        assert hook.stat().st_mode & 0o111
+        assert f"base_ref='{base_commit}'" in hook.read_text()
+        assert "git diff --binary" in hook.read_text()
+        assert not (task / "pre_artifacts.sh").exists()
+
+    assert not any((tmp_path / "work").iterdir())
+
+
+def test_artifact_task_overlay_preserves_existing_task_hook(tmp_path):
+    task_id = "task-1"
+    tasks = tmp_path / "tasks"
+    task = tasks / task_id
+    task.mkdir(parents=True)
+    (task / "task.toml").write_text('schema_version = "1.3"\n')
+    hook = task / "pre_artifacts.sh"
+    hook.write_text("#!/bin/sh\nexit 0\n")
+
+    with _artifact_tasks_overlay(
+        {"task_id": task_id}, tasks, tmp_path / "work", "job"
+    ) as selected:
+        assert selected == tasks
+        assert hook.read_text() == "#!/bin/sh\nexit 0\n"
+
+
+def test_artifact_task_overlay_rejects_untrusted_base_ref(tmp_path):
+    task_id = "task-1"
+    task = tmp_path / "tasks" / task_id
+    task.mkdir(parents=True)
+    (task / "task.toml").write_text(
+        '[metadata]\nbase_commit_hash = "main; touch /tmp/pwned"\n'
+    )
+
+    with pytest.raises(RunnerError, match="invalid metadata.base_commit_hash"):
+        with _artifact_tasks_overlay(
+            {"task_id": task_id},
+            tmp_path / "tasks",
+            tmp_path / "work",
+            "job",
+        ):
+            pass
+
+
 def _fake_pier(monkeypatch, work_dir, *, patch=True, trajectory=True,
                trajectory_payload=None, runtime_diagnostic=None,
                zcode_outcome=None, provider_usage_sidecar=None,
@@ -648,6 +711,10 @@ def _fake_pier(monkeypatch, work_dir, *, patch=True, trajectory=True,
     def fake_build(assignment, tasks_root, jobs_dir, job_name, home,
                    dev_agent=None, **provider_kwargs):
         captured["job_name"] = job_name
+        captured["tasks_root"] = tasks_root
+        hook = tasks_root / assignment["task_id"] / "pre_artifacts.sh"
+        if hook.is_file():
+            captured["pre_artifacts"] = hook.read_text()
         return ["pier", "run", job_name]
 
     class FakePopen:
@@ -717,6 +784,27 @@ def test_run_trial_on_started_exception_is_swallowed(tmp_path, monkeypatch):
     assert calls == [True]
     assert art.returncode == 0 and art.patch.is_file()
     assert art.trajectory is not None and art.trajectory.is_file()
+
+
+def test_run_trial_uses_artifact_overlay_for_verifier_collect_pack(
+    tmp_path, monkeypatch,
+):
+    task_id = "abs-module-cache-flags"
+    task = tmp_path / task_id
+    task.mkdir()
+    base_commit = "b" * 40
+    (task / "task.toml").write_text(
+        '[metadata]\nbase_commit_hash = "' + base_commit + '"\n'
+        '[[verifier.collect]]\ncommand = "collect model.patch"\n'
+    )
+    captured = _fake_pier(monkeypatch, tmp_path)
+
+    art = run_trial(_assignment("codex"), tmp_path, tmp_path)
+
+    assert art.returncode == 0
+    assert captured["tasks_root"] != tmp_path
+    assert f"base_ref='{base_commit}'" in captured["pre_artifacts"]
+    assert not (task / "pre_artifacts.sh").exists()
 
 
 def test_run_trial_timeout_raises_naming_log(tmp_path, monkeypatch):
