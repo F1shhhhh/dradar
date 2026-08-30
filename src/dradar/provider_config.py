@@ -19,6 +19,21 @@ from urllib.parse import urlsplit
 import certifi
 import httpx
 
+from .codebuddy_provider import (
+    CODEBUDDY_CLI_VERSION,
+    CODEBUDDY_CONTAINER_IMAGE,
+    CODEBUDDY_MODEL,
+    codebuddy_executable,
+    codebuddy_runtime_image_error,
+    codebuddy_subscription_session,
+    codebuddy_version,
+    ensure_codebuddy_runtime_image,
+    import_host_login,
+    managed_codebuddy_home,
+)
+from .codebuddy_provider import (
+    credential_status as codebuddy_credential_status,
+)
 from .providers import (
     ANTIGRAVITY_CLI_VERSION,
     ANTIGRAVITY_LINUX_ARTIFACTS,
@@ -55,18 +70,18 @@ from .providers import (
     kimi_live_error,
     managed_grok_cli_path,
     managed_kimi_cli_path,
-    parse_kimi_cli_version,
-    parse_grok_cli_version,
-    parse_zcode_cli_version,
     mark_antigravity_ready,
-    privatize_antigravity_home,
-    restore_antigravity_settings,
+    parse_grok_cli_version,
+    parse_kimi_cli_version,
+    parse_zcode_cli_version,
     prepare_antigravity_auth,
+    privatize_antigravity_home,
     provider_subprocess_env,
-    store_grok_auth,
+    restore_antigravity_settings,
     store_deepseek_api_key,
-    store_zcode_cli,
+    store_grok_auth,
     store_zcode_api_key,
+    store_zcode_cli,
     zcode_api_key,
     zcode_cli_error,
     zcode_cli_path,
@@ -661,6 +676,8 @@ def cmd_provider_setup(args) -> int:
         return _setup_zcode()
     if args.provider in {"agy", "antigravity"}:
         return _setup_antigravity_subscription()
+    if args.provider in {"codebuddy", "hy4"}:
+        return _setup_codebuddy_subscription()
     if args.provider != "deepseek":
         raise ValueError(f"unsupported provider: {args.provider}")
     if not sys.stdin.isatty():
@@ -703,6 +720,8 @@ def cmd_provider_status(args) -> int:
         return _status_zcode(live=live)
     if args.provider in {"agy", "antigravity"}:
         return _status_antigravity_subscription(live=live)
+    if args.provider in {"codebuddy", "hy4"}:
+        return _status_codebuddy_subscription(live=live)
     if args.provider != "deepseek":
         raise ValueError(f"unsupported provider: {args.provider}")
     path = deepseek_secret_path()
@@ -723,6 +742,182 @@ def cmd_provider_status(args) -> int:
         "  dradar provider setup deepseek"
     )
     return 1
+
+
+def _setup_codebuddy_subscription() -> int:
+    executable = codebuddy_executable()
+    version = codebuddy_version(executable)
+    if version != CODEBUDDY_CLI_VERSION:
+        print(
+            f"CodeBuddy CLI {CODEBUDDY_CLI_VERSION} is required; found "
+            f"{version or 'none'}. Install that reviewed official release, "
+            "complete CodeBuddy login in your own interactive Terminal, then retry."
+        )
+        return 1
+    try:
+        target = import_host_login()
+    except (OSError, ValueError) as exc:
+        print(
+            "CodeBuddy login could not be imported. Complete the official "
+            "CodeBuddy login in your own interactive Terminal, then run "
+            f"`dradar provider setup codebuddy` again: {exc}"
+        )
+        return 2
+    ok, detail = codebuddy_credential_status()
+    if not ok:
+        print(f"CodeBuddy provider not ready: {detail}")
+        return 1
+    docker = shutil.which("docker")
+    if not docker:
+        print("CodeBuddy setup needs Docker, which DRadar also uses for tasks.")
+        return 1
+    try:
+        image = ensure_codebuddy_runtime_image(docker)
+    except ValueError as exc:
+        print(f"CodeBuddy login was imported, but runtime preparation failed: {exc}")
+        return 1
+    print(
+        f"CodeBuddy subscription login imported to {target} (values hidden).\n"
+        f"Pinned Linux runtime ready as {image}; model {CODEBUDDY_MODEL}, "
+        "single-run concurrency."
+    )
+    print(
+        "No provider request was made. To spend one minimal probe request and "
+        "verify HY4 access, run: dradar provider status codebuddy --live"
+    )
+    return 0
+
+
+def _status_codebuddy_subscription(*, live: bool) -> int:
+    executable = codebuddy_executable()
+    version = codebuddy_version(executable)
+    if version != CODEBUDDY_CLI_VERSION:
+        print(
+            f"CodeBuddy provider not ready: CLI {CODEBUDDY_CLI_VERSION} required, "
+            f"found {version or 'none'}."
+        )
+        return 1
+    ok, detail = codebuddy_credential_status()
+    if not ok:
+        print(
+            f"CodeBuddy provider not ready: {detail}. Run "
+            "`dradar provider setup codebuddy` after completing official login."
+        )
+        return 1
+    issue = codebuddy_runtime_image_error()
+    if issue is not None:
+        print(
+            f"CodeBuddy provider not ready: {issue}. Run "
+            "`dradar provider setup codebuddy` to rebuild the reviewed runtime."
+        )
+        return 1
+    print(
+        f"CodeBuddy provider ready via {managed_codebuddy_home()} "
+        f"({detail}, CLI {CODEBUDDY_CLI_VERSION}, model {CODEBUDDY_MODEL}, "
+        "API keys disabled, concurrency 1)."
+    )
+    return _live_codebuddy_status() if live else 0
+
+
+def _live_codebuddy_status() -> int:
+    """Spend one minimal, tool-free request to verify container HY4 access."""
+
+    docker = shutil.which("docker")
+    if not docker:
+        print("CodeBuddy live status needs Docker.")
+        return 1
+    prompt = (
+        "Reply with exactly DRADAR_CODEBUDDY_AUTH_OK and nothing else. "
+        "Do not use tools."
+    )
+    script = r"""
+set -euo pipefail
+install -d -m 700 /tmp/codebuddy-config/local_storage /tmp/codebuddy-home
+install -d -m 700 \
+  /tmp/codebuddy-home/.local/share/CodeBuddyExtension/Data/Public/auth
+cp /run/secrets/codebuddy-login/local_storage/entry_*.info \
+  /tmp/codebuddy-config/local_storage/
+cp /run/secrets/codebuddy-login/auth/*.info \
+  /tmp/codebuddy-home/.local/share/CodeBuddyExtension/Data/Public/auth/
+chmod 600 /tmp/codebuddy-config/local_storage/entry_*.info
+chmod 600 /tmp/codebuddy-home/.local/share/CodeBuddyExtension/Data/Public/auth/*.info
+printf '%s\n' '{"mcpServers":{}}' > /tmp/codebuddy-empty-mcp.json
+export HOME=/tmp/codebuddy-home
+export CODEBUDDY_CONFIG_DIR=/tmp/codebuddy-config
+export CODEBUDDY_CODE_ENABLE_TELEMETRY=0
+export CODEBUDDY_DISABLE_AUTO_MEMORY=1
+export CODEBUDDY_CODE_DISABLE_AUTO_MEMORY=1
+export CODEBUDDY_DISABLE_BACKGROUND_TASKS=1
+export CODEBUDDY_CODE_DISABLE_BACKGROUND_TASKS=1
+export CODEBUDDY_DISABLE_CRON=1
+export CODEBUDDY_DISABLE_IDE=1
+export CODEBUDDY_SKIP_BUILTIN_MARKETPLACE=1
+export DISABLE_AUTOUPDATER=1
+exec /opt/codebuddy/bin/codebuddy --print --output-format text \
+  --model hy4-preview --effort minimal --permission-mode bypassPermissions \
+  --tools "" --strict-mcp-config --mcp-config /tmp/codebuddy-empty-mcp.json \
+  --setting-sources user --no-session-persistence --max-turns 1 "$1"
+""".strip()
+    print(
+        "Starting one minimal CodeBuddy HY4 access probe "
+        "(this consumes provider usage)..."
+    )
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="dradar-codebuddy-probe-",
+        ) as temporary:
+            with codebuddy_subscription_session(Path(temporary)) as login_root:
+                command = [
+                    docker, "run", "--rm", "--pull", "never",
+                    "--mount",
+                    "type=bind,source="
+                    f"{login_root.resolve()},target=/run/secrets/codebuddy-login,"
+                    "readonly",
+                    CODEBUDDY_CONTAINER_IMAGE,
+                    "/bin/bash", "-lc", script,
+                    "dradar-codebuddy-probe", prompt,
+                ]
+                probed = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                    check=False,
+                )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"CodeBuddy live probe failed: {type(exc).__name__}.")
+        return 1
+    except ValueError as exc:
+        print(f"CodeBuddy live probe did not start: {exc}")
+        return 1
+    combined = probed.stdout + "\n" + probed.stderr
+    if (
+        probed.returncode != 0
+        or probed.stdout.strip() != "DRADAR_CODEBUDDY_AUTH_OK"
+    ):
+        lowered = combined.lower()
+        if any(
+            marker in lowered
+            for marker in ("unauthorized", "login", "token expired")
+        ):
+            category = "the imported login was rejected"
+        elif any(
+            marker in lowered
+            for marker in ("quota", "usage limit", "rate limit")
+        ):
+            category = "the CodeBuddy usage window is unavailable"
+        else:
+            category = "the container could not complete the HY4 request"
+        print(
+            f"CodeBuddy live probe failed: {category}. Credentials and raw "
+            "provider output were not displayed."
+        )
+        return 1
+    print(
+        f"CodeBuddy container authentication and {CODEBUDDY_MODEL} access verified "
+        f"live with CLI {CODEBUDDY_CLI_VERSION}."
+    )
+    return 0
 
 
 def _live_deepseek_status(key: str) -> int:

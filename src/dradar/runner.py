@@ -29,6 +29,18 @@ from pathlib import Path
 import httpx
 
 from . import checkpoints, egress
+from .codebuddy_provider import (
+    CODEBUDDY_AGENT,
+    CODEBUDDY_API_KEY_ENVS,
+    CODEBUDDY_CLI_VERSION,
+    CODEBUDDY_CONTAINER_IMAGE,
+    CODEBUDDY_MODEL,
+    CODEBUDDY_PROVIDER,
+    CODEBUDDY_SOURCE_IMAGE_ENV,
+    CODEBUDDY_SUPPORTED_EFFORTS,
+    codebuddy_runtime_image_error,
+    codebuddy_subscription_session,
+)
 from .manifest import task_content_hash
 from .providers import (
     ANTIGRAVITY_AGENT,
@@ -190,6 +202,10 @@ ZCODE_AGENT_IMPORT_PATH = "_dradar_pier_zcode:ZCodeBigModel"
 ZCODE_AGENT_MODULE_FILENAME = "_dradar_pier_zcode.py"
 DSH_AGENT_IMPORT_PATH = "_dradar_pier_dsh:DshMinimal"
 DSH_AGENT_MODULE_FILENAME = "_dradar_pier_dsh.py"
+CODEBUDDY_AGENT_IMPORT_PATH = (
+    "_dradar_pier_codebuddy:CodeBuddySubscription"
+)
+CODEBUDDY_AGENT_MODULE_FILENAME = "_dradar_pier_codebuddy.py"
 CHECKPOINT_MODULE_FILENAME = "_dradar_pier_checkpoint.py"
 # Emergency public rollout gate. The shared durable runtime remains in the
 # package for diagnosis and controlled tests, but ordinary trials must use the
@@ -204,6 +220,7 @@ def durable_checkpoint_rollout_enabled() -> bool:
 BETA_SUBSCRIPTION_TRIAL_TIMEOUT_FLOOR_SEC = 120 * 60
 BETA_SUBSCRIPTION_AGENTS = frozenset({
     GROK_AGENT, KIMI_AGENT, ZCODE_AGENT, ANTIGRAVITY_AGENT,
+    CODEBUDDY_AGENT,
 })
 
 # Public Pier 0.3.0 only runs ``<task>/pre_artifacts.sh``.  Older published
@@ -311,6 +328,7 @@ class TrialArtifacts:
     zcode_cli_version: str | None = None
     zcode_cli_sha256: str | None = None
     dsh_version: str | None = None
+    codebuddy_cli_version: str | None = None
     dsh_artifact_binding: dict[str, object] | None = None
 
 
@@ -759,6 +777,17 @@ def _ensure_dsh_agent_module(home: Path) -> Path:
     )
 
 
+def _ensure_codebuddy_agent_module(home: Path) -> Path:
+    source = Path(__file__).with_name("pier_codebuddy.py")
+    if not source.is_file():
+        raise RunnerError(
+            "CodeBuddy Pier adapter is missing; reinstall or upgrade dradar"
+        )
+    return _materialize_shared_file(
+        home / CODEBUDDY_AGENT_MODULE_FILENAME, source.read_bytes()
+    )
+
+
 def _ensure_pier_sitecustomize(home: Path) -> Path:
     """Install the fail-closed prebuilt-egress shim into Pier's PYTHONPATH."""
 
@@ -906,6 +935,31 @@ def _validate_dsh_assignment(assignment: dict) -> None:
         )
 
 
+def _validate_codebuddy_assignment(assignment: dict) -> None:
+    if assignment.get("provider") != CODEBUDDY_PROVIDER:
+        raise RunnerError(
+            "CodeBuddy assignments must explicitly use provider "
+            f"{CODEBUDDY_PROVIDER!r}"
+        )
+    if assignment.get("model") != CODEBUDDY_MODEL:
+        raise RunnerError(
+            f"unsupported CodeBuddy model {assignment.get('model')!r}; "
+            f"only {CODEBUDDY_MODEL!r} is enabled"
+        )
+    if assignment.get("effort") not in CODEBUDDY_SUPPORTED_EFFORTS:
+        supported = ", ".join(sorted(CODEBUDDY_SUPPORTED_EFFORTS))
+        raise RunnerError(
+            f"CodeBuddy effort must be one of {supported}; "
+            f"got {assignment.get('effort')!r}"
+        )
+    requested = assignment.get("agent_version")
+    if requested != CODEBUDDY_CLI_VERSION:
+        raise RunnerError(
+            f"CodeBuddy requires CLI {CODEBUDDY_CLI_VERSION}; "
+            f"the assignment requested {requested!r}"
+        )
+
+
 def _pier_process_env(
     assignment: dict,
     *,
@@ -918,6 +972,7 @@ def _pier_process_env(
     antigravity_module_dir: Path | None = None,
     zcode_module_dir: Path | None = None,
     dsh_module_dir: Path | None = None,
+    codebuddy_module_dir: Path | None = None,
 ) -> dict[str, str]:
     """Keep provider secrets out of Pier's inherited environment."""
 
@@ -932,7 +987,7 @@ def _pier_process_env(
             pier_bootstrap_dir, codex_module_dir, deepseek_module_dir,
             grok_module_dir,
             kimi_module_dir, antigravity_module_dir,
-            zcode_module_dir, dsh_module_dir,
+            zcode_module_dir, dsh_module_dir, codebuddy_module_dir,
         ) if path is not None
     ]
     if python_dirs:
@@ -965,6 +1020,11 @@ def _pier_process_env(
             env.pop(name, None)
     if assignment.get("agent") == DSH_AGENT:
         env.pop(DEEPSEEK_API_KEY_ENV, None)
+    if assignment.get("agent") == CODEBUDDY_AGENT:
+        for name in tuple(env):
+            if name.startswith("CODEBUDDY_") or name in CODEBUDDY_API_KEY_ENVS:
+                env.pop(name, None)
+        env[CODEBUDDY_SOURCE_IMAGE_ENV] = CODEBUDDY_CONTAINER_IMAGE
     if egress_environment:
         env.update(egress_environment)
     return env
@@ -1166,6 +1226,14 @@ def build_pier_command(
         _validate_dsh_assignment(assignment)
         _ensure_dsh_agent_module(home)
         agent_args = ["--agent-import-path", DSH_AGENT_IMPORT_PATH]
+    elif agent == CODEBUDDY_AGENT:
+        _validate_codebuddy_assignment(assignment)
+        _ensure_codebuddy_agent_module(home)
+        if resume_checkpoint is not None:
+            raise RunnerError(
+                "CodeBuddy checkpoints are not supported yet; start a fresh run"
+            )
+        agent_args = ["--agent-import-path", CODEBUDDY_AGENT_IMPORT_PATH]
     else:
         agent_args = ["--agent", agent]
     cmd = [
@@ -1404,6 +1472,22 @@ def build_pier_command(
                 assignment, resume_checkpoint,
                 enabled=bool(assignment.get("_durable_checkpoint_enabled", True)),
             ),
+        ]
+    elif agent == CODEBUDDY_AGENT:
+        if provider_auth_path is None or not provider_auth_path.is_dir():
+            raise RunnerError(
+                "CodeBuddy subscription login is unavailable; run "
+                "`dradar provider setup codebuddy` after completing official login"
+            )
+        submission_prompt = _ensure_codex_submission_prompt(
+            home, assignment.get("benchmark_id")
+        )
+        cmd += [
+            "--model", assignment["model"],
+            "--ak", f"reasoning_effort={assignment['effort']}",
+            "--ak", f"auth_dir={provider_auth_path}",
+            "--ak", f"prompt_template_path={submission_prompt}",
+            "--ak", f"version={CODEBUDDY_CLI_VERSION}",
         ]
     return cmd
 
@@ -3360,6 +3444,7 @@ def run_trial(
     zcode_cli_version = None
     zcode_cli_sha256 = None
     dsh_version = None
+    codebuddy_cli_version = None
     codex_provider = None
     effective_agent = dev_agent or assignment["agent"]
     checkpoint_enabled = durable_checkpoint_rollout_enabled()
@@ -3445,6 +3530,19 @@ def run_trial(
             "_artifact_run_id": uuid.uuid4().hex,
         }
         print(f"verified pinned DSH Minimal: {dsh_version}")
+    elif effective_agent == CODEBUDDY_AGENT:
+        _validate_codebuddy_assignment(assignment)
+        image_issue = codebuddy_runtime_image_error()
+        if image_issue is not None:
+            raise RunnerError(
+                image_issue + "; run `dradar provider setup codebuddy` first"
+            )
+        codebuddy_cli_version = CODEBUDDY_CLI_VERSION
+        effective_assignment = {
+            **assignment,
+            "agent_version": codebuddy_cli_version,
+        }
+        print(f"verified pinned CodeBuddy CLI: {codebuddy_cli_version}")
 
     effective_assignment = {
         **effective_assignment,
@@ -3458,7 +3556,7 @@ def run_trial(
         raise RunnerError(
             f"Pier egress environment is not ready: {exc}; no model quota was used"
         ) from exc
-    if egress_environment:
+    if egress_environment or effective_agent == CODEBUDDY_AGENT:
         _ensure_pier_sitecustomize(work_dir)
     jobs_dir = work_dir / "jobs"
     job_name = f"a{assignment['assignment_id']}"
@@ -3478,7 +3576,7 @@ def run_trial(
     watch_live_account_errors = (
         (dev_agent or effective_assignment["agent"]) in (
             "codex", DSH_AGENT, GROK_AGENT, KIMI_AGENT,
-            ANTIGRAVITY_AGENT, ZCODE_AGENT,
+            ANTIGRAVITY_AGENT, ZCODE_AGENT, CODEBUDDY_AGENT,
         )
     )
 
@@ -3536,6 +3634,13 @@ def run_trial(
                 provider_auth_path = create_zcode_api_key_file(work_dir)
             except (OSError, ValueError) as exc:
                 raise RunnerError(str(exc)) from exc
+        elif effective_agent == CODEBUDDY_AGENT:
+            try:
+                provider_auth_path = provider_stack.enter_context(
+                    codebuddy_subscription_session(work_dir)
+                )
+            except (OSError, ValueError) as exc:
+                raise RunnerError(str(exc)) from exc
         provider_kwargs = (
             {
                 "provider_auth_path": provider_auth_path,
@@ -3548,7 +3653,7 @@ def run_trial(
                 codex_provider == DEEPSEEK_PROVIDER
                 or effective_agent in (
                     GROK_AGENT, KIMI_AGENT, ANTIGRAVITY_AGENT,
-                    ZCODE_AGENT, DSH_AGENT,
+                    ZCODE_AGENT, DSH_AGENT, CODEBUDDY_AGENT,
                 )
             )
             else {}
@@ -3604,6 +3709,9 @@ def run_trial(
             ),
             zcode_module_dir=(work_dir if effective_agent == ZCODE_AGENT else None),
             dsh_module_dir=(work_dir if effective_agent == DSH_AGENT else None),
+            codebuddy_module_dir=(
+                work_dir if effective_agent == CODEBUDDY_AGENT else None
+            ),
         )
         if on_started is not None:
             # Best-effort by design: this only confirms to the server that a
@@ -3615,7 +3723,7 @@ def run_trial(
             except Exception:
                 pass
         if not checkpoint_enabled and effective_agent in (
-            "codex", DSH_AGENT, KIMI_AGENT, ZCODE_AGENT,
+            "codex", DSH_AGENT, KIMI_AGENT, ZCODE_AGENT, CODEBUDDY_AGENT,
         ):
             print(
                 "checkpoint safety fallback active: this trial will run without "
@@ -3905,6 +4013,7 @@ def run_trial(
         zcode_cli_version=zcode_cli_version,
         zcode_cli_sha256=zcode_cli_sha256,
         dsh_version=dsh_version,
+        codebuddy_cli_version=codebuddy_cli_version,
         dsh_artifact_binding=dsh_artifact_binding,
     )
 
@@ -4117,7 +4226,8 @@ DIAG_ADVICE = {
         "the agent could not authenticate inside the container. Run the matching "
         "live check before claiming again: `dradar provider status deepseek "
         "--live`, `dradar provider status grok`, `dradar provider status kimi "
-        "--live`, or `dradar provider status zcode --live`; for the original "
+        "--live`, `dradar provider status zcode --live`, or `dradar provider "
+        "status codebuddy --live`; for the original "
         "OpenAI path run `codex login`, then re-check `dradar doctor`."),
     "model-capacity": (
         "the model stayed at capacity after Pier retried the original Codex "

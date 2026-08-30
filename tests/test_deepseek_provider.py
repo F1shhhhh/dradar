@@ -42,6 +42,13 @@ from dradar.runner import RunnerError
 TEST_CODEX_VERSION = "0.149.0"
 
 
+@pytest.fixture(autouse=True)
+def _isolate_codebuddy_capability(monkeypatch):
+    """DeepSeek tests must not inherit the host's CodeBuddy setup."""
+
+    monkeypatch.setattr(providers, "codebuddy_executable", lambda _env: None)
+
+
 def _assignment(**overrides) -> dict:
     values = {
         "assignment_id": "a1",

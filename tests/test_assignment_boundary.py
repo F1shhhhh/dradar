@@ -146,6 +146,43 @@ def test_runloop_reconciliation_reports_a_lost_assignment(
     assert path is not None and path.is_file()
 
 
+@pytest.mark.parametrize("code", ("claim_batch_not_found", None))
+def test_finished_exact_batch_404_completes_boundary(tmp_path, code):
+    assignment = _assignment("a1")
+    path = assignment_boundary.prepare(tmp_path, "bench", [assignment])
+    assignment_boundary.record_outcome(path, assignment, "submitted")
+
+    class Client:
+        batch_id = "550e8400e29b41d4a716446655440000"
+
+        def get_assignment(self):
+            raise runloop.ApiError(
+                "server returned 404: active claim batch not found",
+                status_code=404, code=code,
+            )
+
+    assert runloop._finish_assignment_boundary(Client(), path) is True
+    assert path is not None and not path.exists()
+
+
+def test_unrelated_batch_404_keeps_boundary(tmp_path, capsys):
+    assignment = _assignment("a1")
+    path = assignment_boundary.prepare(tmp_path, "bench", [assignment])
+
+    class Client:
+        batch_id = "550e8400e29b41d4a716446655440000"
+
+        def get_assignment(self):
+            raise runloop.ApiError(
+                "server returned 404: unrelated route missing",
+                status_code=404,
+            )
+
+    assert runloop._finish_assignment_boundary(Client(), path) is False
+    assert path is not None and path.is_file()
+    assert "boundary was kept" in capsys.readouterr().out
+
+
 def test_worker_child_does_not_reconcile_parent_owned_boundary(
         tmp_path, monkeypatch):
     path = tmp_path / "shared-boundary.json"
