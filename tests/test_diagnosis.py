@@ -642,7 +642,6 @@ def test_user_interrupt_without_checkpoint_reports_stopped_to_server(
         runloop, "run_trial",
         lambda *a, **kw: (_ for _ in ()).throw(KeyboardInterrupt()),
     )
-    monkeypatch.setattr(runloop, "_pause_checkpoint_quietly", lambda *a, **kw: None)
     stopped = []
     client = SubmitClient({})
     client.mark_stopped = lambda aid, **kw: stopped.append((aid, kw))

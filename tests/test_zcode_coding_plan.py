@@ -367,20 +367,6 @@ def test_zcode_assignment_version_is_only_a_hint() -> None:
     runner._validate_zcode_assignment(_assignment(agent_version="9.9.9"))
 
 
-def test_zcode_checkpoint_accepts_observed_compatible_runtime() -> None:
-    checkpoint = SimpleNamespace(
-        task_id="task-1",
-        model=ZCODE_MODEL,
-        effort="high",
-        harness=ZCODE_AGENT,
-        provider=ZCODE_PROVIDER,
-        agent_version="0.16.3",
-    )
-    assert runloop._checkpoint_identity_mismatches(
-        checkpoint, _assignment(agent_version=ZCODE_CLI_VERSION),
-    ) == []
-
-
 def test_zcode_checkpoint_resume_is_forwarded_with_exact_runtime_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -19,7 +19,6 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -75,7 +74,6 @@ from .providers import (
     assignment_codex_provider,
     prepare_antigravity_auth,
     validate_refill_scope,
-    zcode_cli_version_is_compatible,
 )
 from .runner import (
     CODEX_TRAJECTORY_BUNDLE_SCHEMA, DEEP_SWE_REPO, DIAG_ADVICE,
@@ -85,11 +83,10 @@ from .runner import (
     POMPEII_FINALIZATION_RESERVE_SEC, POMPEII_SOFT_BUDGET_SEC,
     POMPEII_TERMINAL_HEAVY_TIMEOUT_SEC,
     build_codex_trajectory_bundle, build_kimi_trajectory_bundle,
-    _recover_completed_checkpoint_patch,
     check_task_content_hash, classify_exception_message,
     codex_trajectory_bundle_usage,
     diagnose_exception, ensure_pier, ensure_tasks_root,
-    durable_checkpoint_rollout_enabled, local_deep_swe_commit,
+    local_deep_swe_commit,
     pompeii_agent_timeout_sec, run_trial,
     summarize_result, sync_deep_swe_commit, task_content_mismatch_diagnostic,
     trial_artifact_paths,
@@ -123,7 +120,7 @@ _NON_FAULT_RUNNER_OUTCOMES = {
 }
 _ACCOUNT_TERMINAL_OUTCOMES = {
     "auth-failure", "insufficient-balance", "quota-exhausted",
-    "recovery-exhausted", "runtime-incompatible", "provider-preflight-failed",
+    "runtime-incompatible", "provider-preflight-failed",
     "repeat-agent-failure",
 }
 _POOL_ABORT_ENV = "DRADAR_POOL_ABORT_FILE"
@@ -155,11 +152,6 @@ _POOL_BACKFILL_RETRY_MAX_SECONDS = 30.0
 _POOL_SESSION_CAPACITY_RETRY_SECONDS = 10 * 60
 _POOL_IMAGE_CACHE_MAINTENANCE_SECONDS = 15 * 60
 _POOL_TARGET_CACHE: dict[Path, int] = {}
-MAX_CHECKPOINT_RESUMES = 5
-_CHECKPOINT_BACKOFF_BASE_SECONDS = 30.0
-_CHECKPOINT_BACKOFF_MAX_SECONDS = 600.0
-_CHECKPOINT_RESUME_REPLAY_ATTEMPTS = 3
-_CHECKPOINT_RESUME_REPLAY_DELAY_SECONDS = 0.25
 _ZCODE_NETWORK_RETRY_DELAY_SECONDS = 2.0
 
 
@@ -172,14 +164,6 @@ def _retryable_zcode_network_failure(assignment: dict, exc: RunnerError) -> bool
         and diagnostic.get("zcode_provider_failure_reason") == "network_error"
     )
 
-
-@dataclass(frozen=True)
-class _CheckpointPauseFailure:
-    """A non-resumable checkpoint failure that stopped automatic refill."""
-
-    family: str
-    item: checkpoints.Checkpoint
-    discard_confirmed: bool
 
 # Cloudflare's common request-body ceiling is 100 MB. Keep enough headroom
 # for multipart boundaries and form fields so an optional trajectory bundle
@@ -439,7 +423,6 @@ def _announce_account_stop(outcome: str) -> None:
         "auth-failure": "agent authentication failed",
         "insufficient-balance": "paid API balance is exhausted",
         "quota-exhausted": "the account quota window is exhausted",
-        "recovery-exhausted": "checkpoint recovery reached its safety limit",
         "runtime-incompatible": "the agent runtime is incompatible",
         "provider-preflight-failed": (
             "the selected subscription provider failed its live check"
@@ -453,7 +436,7 @@ def _announce_account_stop(outcome: str) -> None:
         f"{reason} — stopping this worker before the next task or model run. "
         "The supervised pool will not check out or backfill new work, but "
         "siblings with model runs already in flight are allowed to finish. "
-        "Unstarted leases and checkpoints remain untouched; fix or wait for "
+        "Unstarted leases remain untouched; fix or wait for "
         "the condition, then explicitly start `dradar resume` again."
     )
 
@@ -599,96 +582,6 @@ def _terminal_failure_outcome(kind: str | None) -> str | None:
     outcome, abort_reason = policy
     _signal_pool_abort(abort_reason, interrupt_siblings=False)
     return outcome
-
-
-def _checkpoint_backoff_seconds(
-    item: checkpoints.Checkpoint, *, generation: int | None = None,
-    now: datetime | None = None,
-) -> float:
-    """Remaining bounded delay before the next checkpoint recovery attempt."""
-    effective_generation = (
-        item.resume_generation if generation is None else generation
-    )
-    if effective_generation <= 0:
-        return 0.0
-    delay = min(
-        _CHECKPOINT_BACKOFF_MAX_SECONDS,
-        _CHECKPOINT_BACKOFF_BASE_SECONDS * (2 ** (effective_generation - 1)),
-    )
-    current = now or datetime.now(timezone.utc)
-    elapsed = max(0.0, (current - item.updated_at).total_seconds())
-    return max(0.0, delay - elapsed)
-
-
-def _checkpoint_identity_mismatches(
-    item: checkpoints.Checkpoint, assignment: dict,
-) -> list[str]:
-    """Return fail-closed runtime identity differences before lease resume."""
-
-    expected = {
-        "task_id": assignment.get("task_id"),
-        "model": assignment.get("model"),
-        "effort": assignment.get("effort"),
-    }
-    mismatched = [
-        name for name, value in expected.items()
-        if getattr(item, name) != value
-    ]
-    agent = assignment.get("agent")
-    provider = assignment_codex_provider(assignment)
-    extended_identity_required = (
-        provider == DEEPSEEK_PROVIDER
-        or agent in {DSH_AGENT, KIMI_AGENT, ZCODE_AGENT}
-    )
-    if extended_identity_required:
-        expected_extended = {
-            "harness": "codex" if provider == DEEPSEEK_PROVIDER else agent,
-            "provider": assignment.get("provider"),
-        }
-        mismatched.extend(
-            name for name, value in expected_extended.items()
-            if getattr(item, name) != value
-        )
-        requested_version = assignment.get("agent_version")
-        if agent == ZCODE_AGENT:
-            if not zcode_cli_version_is_compatible(
-                item.agent_version, model=assignment.get("model"),
-            ):
-                mismatched.append("agent_version")
-        elif agent != "codex" and (
-            not isinstance(requested_version, str)
-            or item.agent_version != requested_version
-        ):
-            mismatched.append("agent_version")
-        elif agent == "codex" and not item.agent_version:
-            # The exact stable DeepSeek Codex version is resolved immediately
-            # before the run. The adapter compares that version again inside
-            # the container before restoring provider state.
-            mismatched.append("agent_version")
-    return list(dict.fromkeys(mismatched))
-
-
-def _checkpoint_resume_response_mismatches(
-    item: checkpoints.Checkpoint,
-    assignment: dict,
-    resumed: dict,
-) -> list[str]:
-    """Reject a resume grant that drifts from the authenticated lease."""
-
-    mismatched: list[str] = []
-    if resumed.get("checkpoint_id") != item.checkpoint_id:
-        mismatched.append("checkpoint_id")
-    nonce = resumed.get("nonce")
-    if not isinstance(nonce, str) or not nonce:
-        mismatched.append("nonce")
-    original_nonce = assignment.get("nonce")
-    if isinstance(original_nonce, str) and original_nonce and nonce != original_nonce:
-        mismatched.append("nonce")
-    for name in ("agent", "provider", "model", "effort", "agent_version"):
-        if resumed.get(name) != assignment.get(name):
-            mismatched.append(name)
-    mismatched.extend(_checkpoint_identity_mismatches(item, resumed))
-    return list(dict.fromkeys(mismatched))
 
 
 def _fmt_pct(pct: float) -> str:
@@ -1541,6 +1434,20 @@ def _upload_trial(
     entry = dict(entry)
     assignment_id = entry["assignment_id"]
     task_id = entry.get("task_id", "?")
+    blocked_reason = entry.get("upload_blocked")
+    if blocked_reason:
+        # A persisted block is a terminal *automatic* recovery decision, not
+        # a transient upload error.  Keep both the ledger row and artifacts so
+        # the paid result can be inspected explicitly, but never restage it or
+        # contact the server again.  pending.assignment_ids() deliberately
+        # continues to fence every model-start entry point for this assignment.
+        pending.record(HOME, entry)
+        print(
+            f"  {task_id}: upload is blocked ({blocked_reason}); local evidence "
+            "was kept, and this assignment will neither be retried nor run "
+            "again automatically"
+        )
+        return "upload-blocked"
     outcome = entry.get("outcome", "completed")
     trial_dir = Path(entry["trial_dir"])
     job_dir = Path(entry["job_dir"]) if entry.get("job_dir") else trial_dir.parent
@@ -2202,218 +2109,9 @@ def _mark_stopped_quietly(
     return False
 
 
-def _discard_checkpoint_quietly(
-    client: ApiClient,
-    item: checkpoints.Checkpoint,
-    assignment: dict | None = None,
-    *,
-    reason: str,
-    preserve_local: bool = False,
-) -> bool:
-    """Invalidate server state, optionally preserving its local evidence."""
-    assignment_id = item.assignment_id
-    if not assignment_id:
-        return False
-    checkpoint_id = (
-        (assignment or {}).get("checkpoint_id") or item.checkpoint_id
-        or f"invalid-{assignment_id[:16]}"
-    )
-    generation = int(
-        (assignment or {}).get("resume_generation", item.resume_generation)
-    )
-    try:
-        client.checkpoint_discard(
-            assignment_id, checkpoint_id, generation, reason=reason,
-        )
-    except ApiError as exc:
-        # A compatibility endpoint miss, a stale generation fence, a mismatched
-        # checkpoint id, and an already-settled assignment can all surface as
-        # 404/409/410 across server versions.  Treat the response as terminal
-        # only after the authoritative active list proves the lease is gone;
-        # otherwise keep the local item so the next startup retries cleanup.
-        if exc.status_code in (404, 409, 410):
-            try:
-                if assignment_id in _active_by_id(client):
-                    print(
-                        "  server still reports the checkpoint lease active after "
-                        "discard was rejected; kept locally for a safe retry"
-                    )
-                    return False
-            except ApiError:
-                return False
-        else:
-            print(f"  couldn't discard checkpoint {item.checkpoint_id or '?'}: {exc}; kept locally")
-            return False
-    if preserve_local:
-        checkpoints.mark_kept(HOME, item)
-    else:
-        checkpoints.cleanup_assignment(HOME, assignment_id)
-    return True
-
-
-def _pause_checkpoint_quietly(
-    client: ApiClient, assignment: dict,
-) -> checkpoints.Checkpoint | _CheckpointPauseFailure | None:
-    item = checkpoints.find_latest(HOME, assignment["assignment_id"])
-    if item is None:
-        return None
-    if item.phase == "agent_completed":
-        # Ctrl-C can arrive after Pier harvested a valid patch but before
-        # _run_and_submit regains control. Preserve the authoritative copy as
-        # part of pausing, so resume can rebuild a lost canonical artifact.
-        try:
-            artifact_staging.ensure_staged_patch(item.trial_dir)
-        except artifact_staging.PatchStagingError as exc:
-            print(
-                f"  completed checkpoint artifact staging will retry on resume ({exc})"
-            )
-    if not item.valid or not item.checkpoint_id:
-        family = "checkpoint_invalid"
-        refill_plan.open_circuit(HOME, assignment, family)
-        discarded = _discard_checkpoint_quietly(
-            client, item, assignment, reason="invalid", preserve_local=True,
-        )
-        if discarded:
-            checkpoints.mark_terminal(HOME, item)
-        return _CheckpointPauseFailure(family, item, discarded)
-    if item.phase == "incompatible":
-        family = "checkpoint_incompatible"
-        refill_plan.open_circuit(HOME, assignment, family)
-        discarded = _discard_checkpoint_quietly(
-            client, item, assignment, reason="incompatible", preserve_local=True,
-        )
-        if discarded:
-            checkpoints.mark_terminal(HOME, item)
-        return _CheckpointPauseFailure(family, item, discarded)
-    try:
-        client.checkpoint_pause(
-            assignment["assignment_id"], item.checkpoint_id,
-            item.resume_generation,
-        )
-    except ApiError as exc:
-        # The local checkpoint is still the source of truth while the network
-        # is down. A future `dradar resume` can renew it directly.
-        print(f"  checkpoint saved locally; server pause will retry later ({exc})")
-    checkpoints.prune_superseded(HOME, assignment["assignment_id"], item)
-    return item
-
-
-def _compensate_failed_checkpoint_resume(
-    client: ApiClient,
-    item: checkpoints.Checkpoint,
-    assignment: dict,
-    generation: int,
-) -> None:
-    """Return a server-granted recovery fence to a non-running state."""
-
-    try:
-        client.checkpoint_pause(
-            assignment["assignment_id"], item.checkpoint_id, generation,
-        )
-        return
-    except ApiError as exc:
-        print(
-            "  checkpoint resume compensation could not pause the new "
-            f"generation ({exc}); attempting to release its fence"
-        )
-    fenced = dict(assignment)
-    fenced["resume_generation"] = generation
-    fenced["checkpoint_id"] = item.checkpoint_id
-    discarded = _discard_checkpoint_quietly(
-        client,
-        item,
-        fenced,
-        # The public server deliberately accepts only its stable discard
-        # reason vocabulary.  A locally unpersistable or identity-drifted
-        # granted fence is invalid recovery state, so invalidate that fence
-        # and reopen the cell while retaining the local evidence.
-        reason="invalid",
-        preserve_local=True,
-    )
-    if discarded:
-        checkpoints.mark_terminal(HOME, item)
-
-
-def _resume_checkpoint_with_ambiguous_replay(
-    client: ApiClient,
-    *,
-    assignment_id: str,
-    checkpoint_id: str,
-    generation: int,
-    session_id: str | None,
-) -> dict:
-    """Replay only an ambiguous resume POST under the server's idempotency key.
-
-    The server commits a checkpoint fence before its HTTP response reaches the
-    client.  If that response is lost, advancing from a freshly observed
-    server generation would consume another fence.  A live runner session may
-    instead replay the *same* checkpoint, old generation and session id; the
-    server returns the already-issued generation without incrementing it.
-    Explicit 4xx responses are never retried here; 5xx and unreadable 2xx
-    responses remain ambiguous because a reverse proxy can fail after commit.
-    A caller without a session id has no safe idempotency key, so it gets one
-    attempt only.
-    """
-
-    attempts = _CHECKPOINT_RESUME_REPLAY_ATTEMPTS if session_id else 1
-    def minimally_valid_response(data: object) -> bool:
-        if not isinstance(data, dict):
-            return False
-        resumed = data.get("assignment")
-        if not isinstance(resumed, dict):
-            return False
-        resumed_generation = resumed.get("resume_generation")
-        return (
-            resumed.get("assignment_id") == assignment_id
-            and resumed.get("checkpoint_id") == checkpoint_id
-            and isinstance(resumed_generation, int)
-            and not isinstance(resumed_generation, bool)
-            and resumed_generation == generation + 1
-        )
-
-    for attempt in range(attempts):
-        try:
-            data = client.checkpoint_resume(
-                assignment_id,
-                checkpoint_id,
-                generation,
-                session_id=session_id,
-            )
-        except ApiError as exc:
-            ambiguous_http = (
-                exc.status_code is None or exc.status_code >= 500
-            )
-            if not ambiguous_http or attempt + 1 >= attempts:
-                raise
-        except json.JSONDecodeError as exc:
-            # A 2xx response can be truncated after the server committed.
-            # Normalize it only inside this idempotent checkpoint endpoint;
-            # generic API calls keep their existing JSON error behaviour.
-            if attempt + 1 >= attempts:
-                raise ApiError(
-                    "checkpoint resume returned an unreadable success response",
-                ) from exc
-        else:
-            if minimally_valid_response(data) or attempt + 1 >= attempts:
-                return data
-            print(
-                f"  {assignment_id}: checkpoint resume success response was "
-                "incomplete; replaying the same fenced request"
-            )
-            time.sleep(_CHECKPOINT_RESUME_REPLAY_DELAY_SECONDS * (2 ** attempt))
-            continue
-        print(
-            f"  {assignment_id}: checkpoint resume response was ambiguous; "
-            "replaying the same fenced request"
-        )
-        time.sleep(_CHECKPOINT_RESUME_REPLAY_DELAY_SECONDS * (2 ** attempt))
-    raise AssertionError("unreachable")
-
-
 def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                     args, local_commit: str | None,
                     telemetry: RunnerTelemetry | None = None,
-                    resume_checkpoint: checkpoints.Checkpoint | None = None,
                     _assignment_lock_held: bool = False) -> str:
     """Run one assignment and upload the artifacts. Returns an outcome tag —
     never exits, so the held-batch loop can carry on with the next item."""
@@ -2424,18 +2122,14 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         args._repeat_failure_invocation_id = (
             f"{os.getpid()}-{time.time_ns()}-{id(args)}"
         )
-    # The assignment lock must cover the whole quota-consuming lifetime, not
-    # just checkpoint recovery.  Otherwise a second `dradar resume` can see
-    # the checkpoint written by a healthy first run, ask the server for a new
-    # recovery generation, and start a duplicate Codex process before Pier's
-    # own job/container checks get a chance to reject it.
+    # The assignment lock covers the whole quota-consuming lifetime. A second
+    # local `dradar resume` must never start a duplicate paid model process.
     if not _assignment_lock_held:
         try:
             with assignment_lock.lock(HOME, assignment["assignment_id"]):
                 return _run_and_submit(
                     client, assignment, tasks_root, args, local_commit,
-                    telemetry=telemetry, resume_checkpoint=resume_checkpoint,
-                    _assignment_lock_held=True,
+                    telemetry=telemetry, _assignment_lock_held=True,
                 )
         except assignment_lock.AssignmentBusy:
             print(
@@ -2895,19 +2589,21 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
     return terminal_outcome or upload_outcome
 
 
-def _retry_pending_uploads(client: ApiClient) -> None:
+def _retry_pending_uploads(client: ApiClient) -> list[str]:
     """Auto-heal at the top of every `dradar go`/`resume`: flush anything a
     previous run couldn't upload before doing anything else. Silent no-op
     when the ledger is empty — this must never surprise a volunteer who has
     nothing pending."""
     entries = pending.load(HOME)
     if not entries:
-        return
-    print(f"retrying {len(entries)} upload(s) left over from a previous run...")
+        return []
+    print(f"checking {len(entries)} pending upload(s) left over from a previous run...")
+    outcomes = []
     for e in entries:
         # _upload_trial handles the gone-artifacts case (drops the entry).
-        _upload_trial(client, e)
+        outcomes.append(_upload_trial(client, e))
     print()
+    return outcomes
 
 
 def cmd_retry_upload(args) -> int:
@@ -2923,8 +2619,23 @@ def cmd_retry_upload(args) -> int:
     _retry_pending_uploads(client)
     remaining = pending.load(HOME)
     if remaining:
-        print(f"{len(remaining)} still pending (will retry again on the next "
-              "`dradar go`/`retry-upload`)")
+        blocked = [entry for entry in remaining if entry.get("upload_blocked")]
+        retryable = [entry for entry in remaining if not entry.get("upload_blocked")]
+        if blocked:
+            reasons = ", ".join(
+                f"{entry.get('task_id', entry.get('assignment_id', '?'))}:"
+                f"{entry['upload_blocked']}"
+                for entry in blocked
+            )
+            print(
+                f"{len(blocked)} upload(s) are blocked and require explicit "
+                f"review; they will not be retried automatically ({reasons})"
+            )
+        if retryable:
+            print(
+                f"{len(retryable)} still pending and retryable (will retry "
+                "again on the next `dradar go`/`retry-upload`)"
+            )
         return 1
     print("all clear")
     return 0
@@ -3085,389 +2796,6 @@ def _finish_invocation_assignment_boundary(
     return _finish_assignment_boundary(client, path)
 
 
-def _checkpoint_upload_entry(
-    item: checkpoints.Checkpoint, assignment: dict, args, local_commit: str | None,
-) -> dict:
-    recovered, checkpoint_error = _recover_completed_checkpoint_patch(
-        item.trial_dir, assignment,
-    )
-    if recovered:
-        print(
-            "  recovered model.patch from the completed, identity-matched "
-            "checkpoint; uploading without rerunning"
-        )
-    elif checkpoint_error is not None:
-        print(f"  completed checkpoint patch recovery blocked: {checkpoint_error}")
-    _patch, _trajectory, result = trial_artifact_paths(item.trial_dir)
-    stats = summarize_result(result)
-    return {
-        "assignment_id": assignment["assignment_id"],
-        "nonce": assignment["nonce"],
-        "task_id": assignment["task_id"],
-        "trial_dir": str(item.trial_dir),
-        "meta": {
-            "dradar_version": __version__,
-            "duration_sec": None,
-            "pier_returncode": 0,
-            "dev_agent": args.dev_agent,
-            "task_content_hash_match": None,
-            "deep_swe_commit": local_commit,
-            "recovered_completed_checkpoint": True,
-            **stats,
-        },
-        "outcome": "completed",
-        "job_dir": str(item.job_dir),
-        "keep": args.keep,
-        "archive_session": getattr(args, "archive_session", False),
-        "resume_generation": assignment.get(
-            "resume_generation", item.resume_generation),
-    }
-
-
-def _resume_one_checkpoint(
-    client: ApiClient,
-    item: checkpoints.Checkpoint,
-    assignment: dict | None,
-    args,
-    tasks_root: Path,
-    telemetry: RunnerTelemetry | None,
-) -> str:
-    assignment_id = item.assignment_id
-    if assignment_id is None:
-        checkpoints.remove(HOME, item)
-        return "discarded"
-    try:
-        with checkpoints.assignment_lock(HOME, assignment_id):
-            if assignment is None:
-                # Pending uploads were flushed before discovery. No active
-                # lease now therefore means submitted/expired/released.
-                checkpoints.cleanup_assignment(HOME, assignment_id)
-                print(f"  {assignment_id}: no active server lease; removed stale local checkpoint")
-                return "discarded"
-            if not item.valid or checkpoints.is_expired(item):
-                # Invalidity is an infrastructure fault even when the stale
-                # timestamp also crosses the ordinary TTL.  Do not let age
-                # downgrade it to routine expiry and bypass the circuit.
-                reason = "invalid" if not item.valid else "expired"
-                print(f"  {assignment_id}: checkpoint is {reason}; reopening the cell")
-                if reason == "invalid":
-                    refill_plan.open_circuit(
-                        HOME, assignment, "checkpoint_invalid",
-                    )
-                    discarded = _discard_checkpoint_quietly(
-                        client, item, assignment, reason=reason,
-                        preserve_local=True,
-                    )
-                    if discarded:
-                        checkpoints.mark_terminal(HOME, item)
-                    return (
-                        "checkpoint-invalid" if discarded else "paused"
-                    )
-                if _discard_checkpoint_quietly(
-                    client, item, assignment, reason=reason,
-                ):
-                    return "discarded"
-                return "paused"
-            if item.phase == "incompatible":
-                print(f"  {assignment_id}: checkpoint is incompatible; reopening the cell")
-                refill_plan.open_circuit(
-                    HOME, assignment, "checkpoint_incompatible",
-                )
-                discarded = _discard_checkpoint_quietly(
-                    client, item, assignment, reason="incompatible",
-                    preserve_local=True,
-                )
-                if discarded:
-                    checkpoints.mark_terminal(HOME, item)
-                return (
-                    "checkpoint-incompatible" if discarded else "paused"
-                )
-            if item.checkpoint_dir != item.trial_dir / "checkpoint":
-                print(
-                    f"  {assignment_id}: legacy agent-mounted checkpoint is "
-                    "untrusted; preserving its diagnostics without resuming paid work"
-                )
-                discarded = _discard_checkpoint_quietly(
-                    client,
-                    item,
-                    assignment,
-                    # Legacy agent-mounted state cannot satisfy the new
-                    # host-private publication contract.  The public server's
-                    # stable vocabulary calls that state incompatible.
-                    reason="incompatible",
-                    preserve_local=True,
-                )
-                if discarded:
-                    checkpoints.mark_terminal(HOME, item)
-                    return "legacy-checkpoint-unsupported"
-                return "paused"
-            if assignment.get("agent") == GROK_AGENT:
-                print(
-                    f"  {assignment_id}: Grok Build checkpoints are not "
-                    "supported; discarding the stale local checkpoint"
-                )
-                if _discard_checkpoint_quietly(
-                    client, item, assignment, reason="incompatible",
-                ):
-                    return "discarded"
-                return "paused"
-            identity_mismatches = _checkpoint_identity_mismatches(item, assignment)
-            if identity_mismatches:
-                print(
-                    f"  {assignment_id}: checkpoint runtime identity does not "
-                    "match the lease ("
-                    + ", ".join(identity_mismatches)
-                    + "); discarding it"
-                )
-                if _discard_checkpoint_quietly(
-                    client, item, assignment, reason="incompatible",
-                ):
-                    return "discarded"
-                return "paused"
-
-            local_commit = _check_version_pin(
-                assignment.get("deep_swe_commit"), tasks_root,
-                args.allow_task_drift,
-            )
-            if item.phase == "agent_completed":
-                try:
-                    item = checkpoints.revalidate_host_checkpoint(HOME, item)
-                except (OSError, RuntimeError, ValueError) as exc:
-                    print(
-                        f"  {assignment_id}: completed checkpoint failed its "
-                        f"host-private revalidation ({exc}); kept locally"
-                    )
-                    return "paused"
-                print(f"found completed checkpoint {item.checkpoint_id}; uploading without rerunning")
-                checkpoints.prune_superseded(HOME, assignment_id, item)
-                return _upload_trial(
-                    client,
-                    _checkpoint_upload_entry(
-                        item, assignment, args, local_commit,
-                    ),
-                    ask_cleanup=(
-                        not args.keep
-                        and not getattr(args, "yes", False)
-                        and not getattr(args, "parallel", False)
-                    ),
-                )
-
-            if not durable_checkpoint_rollout_enabled():
-                paused = _pause_checkpoint_quietly(client, assignment)
-                if isinstance(paused, _CheckpointPauseFailure):
-                    print(
-                        f"  {assignment_id}: saved checkpoint is "
-                        f"{paused.family}; automatic refill remains faulted"
-                    )
-                    return paused.family.replace("_", "-")
-                print(
-                    f"  {assignment_id}: durable checkpoint resume is "
-                    "temporarily disabled in this release; the checkpoint "
-                    "was kept and no model session was started"
-                )
-                return "paused"
-
-            generation = max(
-                item.resume_generation,
-                int(assignment.get("resume_generation") or 0),
-            )
-            if generation >= MAX_CHECKPOINT_RESUMES:
-                checkpoints.mark_terminal(HOME, item)
-                _signal_pool_abort(
-                    "checkpoint recovery safety limit reached",
-                    interrupt_siblings=False,
-                )
-                print(
-                    f"  {assignment_id}: checkpoint reached the "
-                    f"{MAX_CHECKPOINT_RESUMES}-resume safety limit; automatic "
-                    "recovery is now disabled and the diagnostic workspace was kept"
-                )
-                return "recovery-exhausted"
-
-            wait_seconds = _checkpoint_backoff_seconds(
-                item, generation=generation,
-            )
-            if wait_seconds > 0:
-                print(
-                    f"  {assignment_id}: checkpoint recovery backoff "
-                    f"{wait_seconds:.0f}s (attempt {generation + 1}/"
-                    f"{MAX_CHECKPOINT_RESUMES})"
-                )
-                time.sleep(wait_seconds)
-
-            if telemetry:
-                telemetry.bind_batch(assignment.get("batch_id"))
-                # Register the recovery process without claiming ownership.
-                # checkpoint/resume is the atomic bind + fencing operation.
-                telemetry.set_phase("queued")
-                telemetry.flush()
-            try:
-                data = _resume_checkpoint_with_ambiguous_replay(
-                    client,
-                    assignment_id=assignment_id,
-                    checkpoint_id=item.checkpoint_id,
-                    generation=generation,
-                    session_id=telemetry.session_id if telemetry else None,
-                )
-            except ApiError as exc:
-                if (
-                    exc.status_code == 409
-                    and getattr(args, "worker_child", False)
-                    and (
-                        exc.code == "checkpoint_runner_healthy"
-                        or "assignment is still running with a healthy runner"
-                        in str(exc)
-                    )
-                ):
-                    print(
-                        f"  {assignment_id}: checkpoint is already owned by a "
-                        "healthy runner; checking for a different waiting task"
-                    )
-                    return "busy"
-                if exc.status_code == 404:
-                    try:
-                        still_active = assignment_id in _active_by_id(client)
-                    except ApiError:
-                        still_active = True
-                    if still_active:
-                        print("  server does not support checkpoint resume yet; kept locally")
-                        return "paused"
-                if exc.status_code in (404, 410):
-                    checkpoints.cleanup_assignment(HOME, assignment_id)
-                    print(f"  {assignment_id}: checkpoint lease is gone ({exc}); removed locally")
-                    return "discarded"
-                print(f"  {assignment_id}: couldn't resume checkpoint ({exc}); kept locally")
-                return "paused"
-            resumed = data.get("assignment") if isinstance(data, dict) else None
-            resumed_generation = (
-                resumed.get("resume_generation")
-                if isinstance(resumed, dict) else None
-            )
-            expected_generation = generation + 1
-            response_identity_mismatches = (
-                _checkpoint_resume_response_mismatches(
-                    item, assignment, resumed,
-                )
-                if isinstance(resumed, dict)
-                else ["assignment"]
-            )
-            if (
-                not isinstance(resumed, dict)
-                or not isinstance(resumed_generation, int)
-                or isinstance(resumed_generation, bool)
-                or resumed_generation != expected_generation
-                or resumed.get("assignment_id") != assignment_id
-                or resumed.get("task_id") != assignment.get("task_id")
-                or response_identity_mismatches
-            ):
-                print(
-                    f"  {assignment_id}: server returned an invalid checkpoint "
-                    "resume response; pausing the granted fence and keeping it locally"
-                )
-                _compensate_failed_checkpoint_resume(
-                    client, item, assignment, expected_generation,
-                )
-                return "paused"
-            try:
-                # Publish a legacy agent-mounted snapshot only after the
-                # server has atomically granted this runner ownership. A peer
-                # can otherwise receive checkpoint_runner_healthy while its
-                # stale sibling copy hides the still-live legacy checkpoint.
-                item = checkpoints.materialize_host_checkpoint(HOME, item)
-                item = checkpoints.persist_resume_generation(
-                    HOME, item, resumed_generation,
-                )
-            except (OSError, ValueError) as exc:
-                print(
-                    f"  {assignment_id}: couldn't materialize and persist the "
-                    f"fenced checkpoint generation ({exc}); kept locally"
-                )
-                _compensate_failed_checkpoint_resume(
-                    client, item, assignment, resumed_generation,
-                )
-                return "paused"
-            if telemetry:
-                telemetry.set_phase(
-                    "running", assignment_id,
-                    resumed.get("resume_generation"),
-                )
-                telemetry.flush()
-            print(f"resuming checkpoint {item.checkpoint_id} for {resumed['task_id']} "
-                  f"(generation {resumed.get('resume_generation', '?')})")
-            outcome = _run_and_submit(
-                client, resumed, tasks_root, args, local_commit,
-                telemetry=telemetry, resume_checkpoint=item,
-                _assignment_lock_held=True,
-            )
-            if telemetry:
-                telemetry.set_phase("queued")
-            return outcome
-    except checkpoints.CheckpointBusy:
-        return "busy"
-
-
-def _resume_local_checkpoints(
-    client: ApiClient,
-    args,
-    tasks_root: Path,
-    telemetry: RunnerTelemetry | None,
-) -> tuple[list[str], bool]:
-    """Recover local work before the server is allowed to dispense new work."""
-    target = getattr(args, "assignment", None)
-    candidates = list(checkpoints.latest_by_assignment(HOME).values())
-    if target:
-        candidates = [c for c in candidates if c.assignment_id == target]
-    if not candidates:
-        if target:
-            print(f"no local checkpoint for assignment {target}")
-        return [], False
-
-    try:
-        active = _active_by_id(client)
-    except ApiError as exc:
-        _exit_for(exc)
-    if getattr(client, "benchmark_id", None):
-        # A checkpoint from another benchmark may still have a perfectly
-        # valid lease, but this channel's filtered assignment view cannot see
-        # it. Preserve it for the matching channel instead of misclassifying
-        # it as stale and deleting its only recovery state.
-        candidates = [c for c in candidates if c.assignment_id in active]
-        if not candidates:
-            return [], False
-    print(f"found {len(candidates)} unfinished checkpoint(s); recovering before new work...")
-    results = []
-    for item in candidates:
-        outcome = _resume_one_checkpoint(
-            client, item, active.get(item.assignment_id), args, tasks_root, telemetry,
-        )
-        if outcome == "busy":
-            continue
-        boundary_recorded = _record_assignment_boundary(
-            args,
-            active.get(item.assignment_id) or {
-                "assignment_id": item.assignment_id,
-                "task_id": getattr(item, "task_id", "unknown"),
-            },
-            outcome,
-        )
-        results.append(outcome)
-        if not boundary_recorded:
-            break
-        if outcome == "submitted" and getattr(args, "refill", False):
-            refill_plan.mark_submitted(HOME, item.assignment_id)
-        if outcome in _ACCOUNT_TERMINAL_OUTCOMES:
-            if getattr(args, "refill", False):
-                refill_plan.stop(HOME, f"account stop: {outcome}")
-            _announce_account_stop(outcome)
-            break
-        # Super-account batch workers use --parallel. Each process owns one
-        # checkpoint for its whole lifetime, so one corrupt worker cannot
-        # serialize or block the other 23.
-        if getattr(args, "parallel", False):
-            break
-    return results, True
-
-
 def _format_size(size: int) -> str:
     value = float(size)
     for unit in ("B", "KiB", "MiB", "GiB"):
@@ -3475,69 +2803,6 @@ def _format_size(size: int) -> str:
             return f"{value:.1f}{unit}"
         value /= 1024
     return f"{size}B"
-
-
-def cmd_checkpoints(args) -> int:
-    items = checkpoints.scan(HOME)
-    if not items:
-        print("no local checkpoints")
-        return 0
-    total = 0
-    for item in items:
-        size = item.size_bytes
-        total += size
-        if checkpoints.is_terminal(HOME, item):
-            state = "terminal evidence (not resumable)"
-        else:
-            state = item.phase if item.valid else f"invalid ({item.invalid_reason})"
-        print(f"{item.checkpoint_id or '?'}  assignment={item.assignment_id or '?'}  "
-              f"task={item.task_id or '?'}  state={state}  size={_format_size(size)}  "
-              f"updated={item.updated_at.isoformat()}")
-    print(f"total: {len(items)} checkpoint(s), {_format_size(total)}")
-    return 0
-
-
-def cmd_checkpoint_discard(args) -> int:
-    items = checkpoints.scan(HOME)
-    matches = [item for item in items if (
-        item.checkpoint_id == args.checkpoint_id
-        or item.assignment_id == args.checkpoint_id
-    )]
-    if not matches:
-        print(f"checkpoint not found: {args.checkpoint_id}")
-        return 1
-    terminal = [item for item in matches if checkpoints.is_terminal(HOME, item)]
-    resumable = [item for item in matches if not checkpoints.is_terminal(HOME, item)]
-    for item in terminal:
-        checkpoints.remove(HOME, item)
-    matches = resumable
-    if not matches:
-        print("terminal local evidence removed; server lease left unchanged")
-        return 0
-    cfg = _load_config()
-    client = _client(cfg)
-    try:
-        active = _active_by_id(client)
-    except ApiError as exc:
-        _exit_for(exc)
-    ok = True
-    seen = set()
-    for item in matches:
-        if item.assignment_id in seen:
-            continue
-        seen.add(item.assignment_id)
-        assignment = active.get(item.assignment_id)
-        if assignment is None:
-            if item.assignment_id:
-                checkpoints.cleanup_assignment(HOME, item.assignment_id)
-            else:
-                checkpoints.remove(HOME, item)
-            continue
-        ok &= _discard_checkpoint_quietly(
-            client, item, assignment, reason="user_discard",
-        )
-    print("checkpoint discarded; its cell is open again" if ok else "checkpoint kept")
-    return 0 if ok else 1
 
 
 def cmd_refill_status(args) -> int:
@@ -3830,8 +3095,6 @@ def cmd_go(args) -> int:
         sys.exit("invalid internal worker invocation")
     if (auto_workers or workers > 1) and getattr(args, "parallel", False):
         sys.exit("--workers already manages parallel sessions; do not combine it with --parallel")
-    if (auto_workers or workers > 1) and getattr(args, "assignment", None):
-        sys.exit("--assignment targets one checkpoint and requires --workers 1")
     if getattr(args, "refill_to", None) is not None:
         args.refill = True
     target_file = _pool_target_file(args)
@@ -4119,44 +3382,6 @@ def _assignment_is_ready_for_checkout(
     if ready_at.tzinfo is None:
         ready_at = ready_at.replace(tzinfo=timezone.utc)
     return ready_at <= (now or datetime.now(timezone.utc))
-
-
-def _assignment_is_recoverable_checkpoint(
-    assignment: dict, local: dict[str, checkpoints.Checkpoint],
-) -> bool:
-    """Whether a paused server lease has matching, safe local recovery state.
-
-    The server may be one generation ahead after it grants a resume fence and
-    the runner fails to persist that generation locally.  The compensating
-    pause deliberately keeps the original local snapshot intact, so a later
-    worker can resume from the authoritative server generation.  Reject only
-    local state *ahead* of the server; that direction cannot be explained by
-    the fail-closed compensation path.
-    """
-    if not durable_checkpoint_rollout_enabled():
-        return False
-    assignment_id = assignment.get("assignment_id")
-    item = local.get(assignment_id) if assignment_id else None
-    server_generation = assignment.get("resume_generation", 0)
-    if (
-        item is None or not item.valid or checkpoints.is_expired(item)
-        or checkpoints.is_terminal(HOME, item)
-        or assignment.get("execution_state") != "paused"
-        or assignment.get("runner_state") not in {None, "paused", "resumable"}
-        or not assignment.get("checkpoint_id")
-        or not isinstance(server_generation, int)
-        or isinstance(server_generation, bool)
-        or server_generation < 0
-        or server_generation >= MAX_CHECKPOINT_RESUMES
-    ):
-        return False
-    return (
-        item.checkpoint_id == assignment.get("checkpoint_id")
-        and item.resume_generation <= server_generation
-        and _checkpoint_backoff_seconds(
-            item, generation=server_generation,
-        ) <= 0
-    )
 
 
 def _pool_ready_work_count(
@@ -4903,7 +4128,7 @@ def _run_worker_pool(args) -> int:
             time.sleep(_POOL_SUPERVISOR_POLL_SECONDS)
     except (KeyboardInterrupt, EOFError):
         print("\nstopping workers safely; each active task is recoverable only after "
-              "a checkpoint is saved or the server confirms checkout cleanup...")
+              "the server confirms checkout cleanup or its completed upload is durable...")
         _signal_workers(processes)
         _maintain_image_cache(client, cfg, phase="after interrupted worker pool")
         cleanup_abort_file()
@@ -4946,8 +4171,8 @@ def _run_worker_pool(args) -> int:
     if failed:
         detail = ", ".join(f"worker {i}=exit {rc}" for i, rc in failed)
         print(f"worker pool finished with errors: {detail}")
-        print("completed uploads are preserved; use `dradar leases`, `dradar checkpoints`, "
-              "and `dradar resume` for remaining work")
+        print("completed uploads are preserved; use `dradar leases`, "
+              "`dradar retry-upload`, and `dradar resume` for remaining work")
         return 1
     if quarantined_slots:
         detail = ", ".join(str(slot) for slot in sorted(quarantined_slots))
@@ -5123,12 +4348,6 @@ def _run_batch(args, client: ApiClient, tasks_root: Path, active: list[dict],
             print(
                 "stopping this batch before later cells use the same mismatched "
                 "task checkout"
-            )
-            break
-        if outcome in {"checkpoint-invalid", "checkpoint-incompatible"}:
-            print(
-                "stopping this batch after a checkpoint infrastructure fault; "
-                "later cells were left untouched and the local evidence was kept"
             )
             break
     ok = all(o in _NON_FAULT_RUNNER_OUTCOMES for o in results)

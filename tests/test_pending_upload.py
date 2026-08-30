@@ -177,6 +177,67 @@ def test_intent_registration_conflict_keeps_artifact_without_submit(
     assert pending.load(tmp_path)[0]["runner_session_id"] == "session-1234"
 
 
+def test_superseded_owner_blocks_migrated_ledger_and_future_retries_locally(
+    tmp_path: Path, monkeypatch, capsys,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+
+    class SupersededDuringMigration(FakeClient):
+        def register_submission_upload_intent(
+            self, assignment_id, nonce, session_id, owner_epoch,
+            upload_intent_id, *, resume_generation=None, intent_version=None,
+        ):
+            fence = owner_epoch if owner_epoch is not None else resume_generation
+            self.intent_calls.append((assignment_id, session_id, fence, upload_intent_id))
+            if owner_epoch is None:
+                raise ApiError(
+                    "server returned 409: owner protocol upgrade required",
+                    status_code=409,
+                    code="owner_protocol_upgrade_required",
+                )
+            raise ApiError(
+                "server returned 409: upload owner superseded",
+                status_code=409,
+                code="upload_owner_superseded",
+            )
+
+    first = SupersededDuringMigration(
+        lambda _aid: pytest.fail("superseded result must not submit"),
+    )
+    outcome = runloop._upload_trial(
+        first,
+        _entry(
+            trial_dir,
+            runner_session_id="session-old",
+            resume_generation=0,
+        ),
+    )
+    assert outcome == "upload-blocked"
+    assert [call[2] for call in first.intent_calls] == [0, 0]
+    blocked = pending.load(tmp_path)[0]
+    assert blocked["ledger_version"] == 3
+    assert blocked["owner_epoch"] == 0
+    assert blocked["upload_blocked"] == "owner_superseded"
+    assert pending.assignment_ids(tmp_path) == {"a1"}
+
+    class MustStayLocal(FakeClient):
+        def register_submission_upload_intent(self, *_args, **_kwargs):
+            pytest.fail("blocked retry must not register an intent")
+
+        def submit(self, *_args, **_kwargs):
+            pytest.fail("blocked retry must not submit")
+
+    monkeypatch.setattr(
+        runloop.artifact_staging,
+        "ensure_staged_patch",
+        lambda *_a, **_k: pytest.fail("blocked retry must not restage"),
+    )
+    runloop._retry_pending_uploads(MustStayLocal(lambda _aid: None))
+    assert pending.assignment_ids(tmp_path) == {"a1"}
+    assert "will neither be retried nor run again automatically" in capsys.readouterr().out
+
+
 def test_expired_intent_registration_is_terminal_for_only_that_run(
     tmp_path: Path, monkeypatch,
 ):
@@ -1225,6 +1286,62 @@ def test_cmd_retry_upload_partial_failure_reports_rc_1_and_keeps_entry(tmp_path:
     assert "still pending" in capsys.readouterr().out
     entries = pending.load(tmp_path)
     assert len(entries) == 1 and entries[0]["assignment_id"] == "a1"  # kept for the next retry
+
+
+def test_cmd_retry_upload_reports_blocked_as_manual_review(
+    tmp_path: Path, monkeypatch, capsys,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    pending.record(tmp_path, {
+        "assignment_id": "a1", "task_id": "task1",
+        "upload_blocked": "owner_superseded",
+    })
+    client = FakeClient(lambda _aid: pytest.fail("blocked retry stays local"))
+    monkeypatch.setattr(runloop, "_load_config", lambda: {})
+    monkeypatch.setattr(runloop, "_client", lambda _cfg: client)
+
+    assert runloop.cmd_retry_upload(None) == 1
+    output = capsys.readouterr().out
+    assert "require explicit review" in output
+    assert "will not be retried automatically" in output
+    assert "will retry again" not in output
+    assert pending.assignment_ids(tmp_path) == {"a1"}
+
+
+def test_blocked_upload_fences_go_resume_pool_and_direct_model_start(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    pending.record(tmp_path, {
+        "assignment_id": "a1", "task_id": "task1",
+        "upload_blocked": "owner_superseded",
+    })
+    assignment = {
+        "assignment_id": "a1", "task_id": "task1", "nonce": "n1",
+        "started_at": None, "retry_after": None,
+    }
+
+    class InventoryClient:
+        def get_assignment(self):
+            return {"active": [assignment], "free_pick": True}
+
+    client = InventoryClient()
+    # Both `go` and `resume` enter through the same acquisition gate.
+    assert runloop._acquire_batch(client, True) == ([], True)
+    # The supervisor must not count a blocked assignment as refill capacity.
+    assert runloop._pool_ready_work_count(client) == 0
+    monkeypatch.setattr(runloop, "check_task_content_hash", lambda *_a: True)
+    monkeypatch.setattr(
+        runloop, "run_trial",
+        lambda *_a, **_k: pytest.fail("blocked assignment must not run a model"),
+    )
+    args = type("Args", (), {
+        "allow_task_drift": False,
+        "dev_agent": False,
+    })()
+    assert runloop._run_and_submit(
+        client, assignment, tmp_path, args, None,
+    ) == "pending-upload"
 
 
 def _raise(status):
