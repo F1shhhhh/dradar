@@ -363,7 +363,10 @@ Antigravity 只使用 DRadar 独立的 Google OAuth 状态和固定 Linux CLI `1
 不会因 headless 审批被静默拒绝。容器只挂载独立 `.gemini` 树，网络只开放 Google OAuth、
 Antigravity 模型控制面和固定运行时下载的精确域名；日常 Gemini 配置、宿主 HOME 与其他
 账号凭证不会进入任务容器。旧的安全策略文件会在不重新登录的情况下原子迁移到当前
-full-container 策略。
+full-container 策略。Pier 退出后，CLI 会独立审计其进程组和与本次 job 精确绑定的
+任务/出口代理容器；发现仍在运行的残留时只停止该 job，并继续保留已经收集的 patch、
+轨迹和用量证据。若无法证明容器归属或无法确认清理成功，则保持服务端租约不重试，避免
+同一题重复消耗订阅额度。
 
 体检失败不会领取任务。修复所有 `FAIL` 后重新运行即可。
 
