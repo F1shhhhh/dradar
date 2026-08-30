@@ -223,10 +223,11 @@ BETA_SUBSCRIPTION_AGENTS = frozenset({
     CODEBUDDY_AGENT,
 })
 
-# Public Pier 0.3.0 only runs ``<task>/pre_artifacts.sh``.  Older published
-# DeepSWE packs may not contain that hook, so DSH gets a per-run compatibility
-# overlay with this narrow, deterministic collector.  The shared checkout is
-# never modified and the overlay disappears with the provider context.
+# Public Pier 0.3.0 only runs ``<task>/pre_artifacts.sh`` when verification is
+# disabled.  Current DeepSWE packs express the same public collection command
+# as ``[[verifier.collect]]`` instead, but DRadar must keep the verifier itself
+# disabled on volunteer machines.  Per-run overlays therefore install this
+# narrow, deterministic collector without mutating the shared task checkout.
 DSH_PRE_ARTIFACTS_SCRIPT = """#!/bin/sh
 set -eu
 cd /app
@@ -3183,6 +3184,67 @@ def _dsh_tasks_overlay(
 
 
 @contextmanager
+def _artifact_tasks_overlay(
+    assignment: dict,
+    tasks_root: Path,
+    work_dir: Path,
+    job_name: str,
+):
+    """Backport ``verifier.collect`` to Pier's public pre-artifact hook.
+
+    DRadar intentionally launches Pier with ``--disable-verification`` because
+    volunteer clients must never run benchmark verification.  Pier 0.3.0 also
+    skips ``[[verifier.collect]]`` in that mode, so task packs that migrated
+    away from ``pre_artifacts.sh`` would otherwise complete a paid model turn
+    and then lose ``model.patch``.  Copy only the selected task into a private
+    overlay and add the equivalent, base-commit-pinned collection hook.
+    """
+
+    task_id = assignment.get("task_id")
+    if (
+        not isinstance(task_id, str)
+        or not task_id
+        or Path(task_id).name != task_id
+    ):
+        raise RunnerError(f"unsafe task id {task_id!r}")
+    source = tasks_root / task_id
+    if not source.is_dir():
+        raise RunnerError(f"task directory is missing: {source}")
+    if (source / "pre_artifacts.sh").is_file():
+        yield tasks_root
+        return
+    try:
+        task_config = tomllib.loads(
+            (source / "task.toml").read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise RunnerError(f"task.toml is unreadable: {exc}") from exc
+    base_commit = task_config.get("metadata", {}).get("base_commit_hash", "")
+    if not isinstance(base_commit, str) or (
+        base_commit
+        and re.fullmatch(r"[0-9a-f]{40}", base_commit) is None
+    ):
+        raise RunnerError("task has an invalid metadata.base_commit_hash")
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=f".{job_name}-artifact-task-", dir=work_dir,
+    ) as temporary:
+        overlay_root = Path(temporary)
+        overlay_task = overlay_root / task_id
+        shutil.copytree(source, overlay_task, symlinks=True)
+        hook = overlay_task / "pre_artifacts.sh"
+        hook.write_text(
+            DSH_PRE_ARTIFACTS_SCRIPT.replace(
+                "__DRADAR_BASE_COMMIT__", base_commit
+            ),
+            encoding="utf-8",
+        )
+        hook.chmod(0o755)
+        yield overlay_root
+
+
+@contextmanager
 def _antigravity_tasks_overlay(
     assignment: dict,
     tasks_root: Path,
@@ -3703,6 +3765,19 @@ def run_trial(
         elif effective_agent == ANTIGRAVITY_AGENT:
             pier_tasks_root = provider_stack.enter_context(
                 _antigravity_tasks_overlay(
+                    effective_assignment,
+                    tasks_root,
+                    work_dir,
+                    job_name,
+                )
+            )
+        elif (
+            tasks_root
+            / str(effective_assignment.get("task_id", ""))
+            / "task.toml"
+        ).is_file():
+            pier_tasks_root = provider_stack.enter_context(
+                _artifact_tasks_overlay(
                     effective_assignment,
                     tasks_root,
                     work_dir,
