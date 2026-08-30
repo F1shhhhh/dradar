@@ -1095,6 +1095,84 @@ def test_zcode_rc0_keeps_lease_running_when_cleanup_cannot_be_proven(
         run_trial(_zcode_assignment_for_trial(), tmp_path, tmp_path)
 
 
+def _antigravity_assignment_for_trial():
+    return _assignment(
+        runner_mod.ANTIGRAVITY_AGENT,
+        model=runner_mod.ANTIGRAVITY_MODEL,
+        effort="high",
+    ) | {
+        "provider": runner_mod.ANTIGRAVITY_PROVIDER,
+        "agent_version": runner_mod.ANTIGRAVITY_CLI_VERSION,
+    }
+
+
+def _prepare_fake_antigravity(monkeypatch, tmp_path):
+    @contextmanager
+    def fake_session(_work_dir):
+        yield tmp_path / "antigravity-auth"
+
+    @contextmanager
+    def passthrough_overlay(_assignment, tasks_root, _work_dir, _job_name):
+        yield tasks_root
+
+    monkeypatch.setattr(
+        runner_mod, "antigravity_subscription_session", fake_session,
+    )
+    monkeypatch.setattr(
+        runner_mod, "_antigravity_tasks_overlay", passthrough_overlay,
+    )
+
+
+def test_antigravity_rc0_reaps_live_exact_job_runtime_and_keeps_patch(
+    tmp_path, monkeypatch, capsys,
+):
+    _prepare_fake_antigravity(monkeypatch, tmp_path)
+    _fake_pier(monkeypatch, tmp_path, rc=0)
+    cleaned = []
+    process_groups = []
+    monkeypatch.setattr(
+        runner_mod,
+        "_cleanup_terminated_pier_containers",
+        lambda job_root: cleaned.append(job_root)
+        or runner_mod.PierContainerCleanup(matched=2, running=2),
+    )
+    monkeypatch.setattr(
+        runner_mod,
+        "_cleanup_exited_pier_process_group",
+        lambda proc: process_groups.append(proc) or True,
+    )
+
+    art = run_trial(
+        _antigravity_assignment_for_trial(), tmp_path, tmp_path,
+    )
+
+    assert art.returncode == 0
+    assert art.patch.read_text() == "diff"
+    assert cleaned == [tmp_path / "jobs" / "aa1"]
+    assert len(process_groups) == 1
+    assert "stopped exact-job residue" in capsys.readouterr().out
+
+
+def test_antigravity_keeps_lease_running_when_runtime_audit_fails(
+    tmp_path, monkeypatch,
+):
+    _prepare_fake_antigravity(monkeypatch, tmp_path)
+    _fake_pier(monkeypatch, tmp_path, rc=0)
+
+    def cleanup_failed(_job_root):
+        raise RunnerError("docker daemon unavailable")
+
+    monkeypatch.setattr(
+        runner_mod, "_cleanup_terminated_pier_containers", cleanup_failed,
+    )
+
+    with pytest.raises(
+        runner_mod.RunnerCleanupUnconfirmedError,
+        match="lease was intentionally left running",
+    ):
+        run_trial(_antigravity_assignment_for_trial(), tmp_path, tmp_path)
+
+
 def test_run_trial_stops_live_codex_quota_error_loop(tmp_path, monkeypatch):
     captured = {}
     terminated = []

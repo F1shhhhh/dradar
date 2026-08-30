@@ -3293,6 +3293,40 @@ def _cleanup_terminated_pier_containers(job_root: Path) -> PierContainerCleanup:
     return PierContainerCleanup(matched=len(owned), running=len(running))
 
 
+def _cleanup_exited_pier_runtime(
+    proc: subprocess.Popen,
+    job_root: Path,
+) -> tuple[bool, PierContainerCleanup]:
+    """Reap and prove ownership of runtime residue after Pier exits.
+
+    The process-group audit catches host-side helpers such as ``docker exec``;
+    the container audit independently catches an agent or egress proxy that
+    outlived that helper.  If either audit is unavailable, fail closed before
+    the server can reopen the assignment and start a duplicate paid run.
+    """
+
+    cleanup_errors: list[str] = []
+    process_residue = False
+    try:
+        process_residue = _cleanup_exited_pier_process_group(proc)
+    except RunnerError as exc:
+        cleanup_errors.append(str(exc))
+    try:
+        cleanup = _cleanup_terminated_pier_containers(job_root)
+    except RunnerError as exc:
+        cleanup_errors.append(str(exc))
+        cleanup = PierContainerCleanup()
+    if cleanup_errors:
+        raise RunnerCleanupUnconfirmedError(
+            "Pier exited, but exact-job runtime cleanup could not be "
+            "confirmed; the server lease was intentionally left running "
+            "to prevent a duplicate retry ("
+            + "; ".join(cleanup_errors)
+            + ")",
+        )
+    return process_residue, cleanup
+
+
 def run_trial(
     assignment: dict,
     tasks_root: Path,
@@ -3655,38 +3689,28 @@ def run_trial(
                     terminal_error = exc
                 else:
                     raise
-        if effective_agent == ZCODE_AGENT:
-            cleanup_errors: list[str] = []
-            process_residue = False
-            try:
-                process_residue = _cleanup_exited_pier_process_group(proc)
-            except RunnerError as exc:
-                cleanup_errors.append(str(exc))
-            try:
-                cleanup = _cleanup_terminated_pier_containers(jobs_dir / job_name)
-            except RunnerError as exc:
-                cleanup_errors.append(str(exc))
-                cleanup = PierContainerCleanup()
-            if cleanup_errors:
-                raise RunnerCleanupUnconfirmedError(
-                    "Pier exited, but exact-job runtime cleanup could not be "
-                    "confirmed; the server lease was intentionally left running "
-                    "to prevent a duplicate retry ("
-                    + "; ".join(cleanup_errors)
-                    + ")",
-                )
+        if effective_agent in (ANTIGRAVITY_AGENT, ZCODE_AGENT):
+            process_residue, cleanup = _cleanup_exited_pier_runtime(
+                proc, jobs_dir / job_name,
+            )
             if process_residue or cleanup.running:
-                raise RunnerTaskRetryableError(
-                    "Pier exited while the ZCode runtime was still active; exact-job "
-                    "processes and containers were stopped before the "
-                    "assignment was made retryable",
-                    failure_diagnostic=_zcode_failure_diagnostic(
-                        effective_assignment,
-                        tasks_root / assignment["task_id"],
-                        jobs_dir,
-                        job_name,
-                        "agent_no_artifact",
-                    ),
+                if effective_agent == ZCODE_AGENT:
+                    raise RunnerTaskRetryableError(
+                        "Pier exited while the ZCode runtime was still active; exact-job "
+                        "processes and containers were stopped before the "
+                        "assignment was made retryable",
+                        failure_diagnostic=_zcode_failure_diagnostic(
+                            effective_assignment,
+                            tasks_root / assignment["task_id"],
+                            jobs_dir,
+                            job_name,
+                            "agent_no_artifact",
+                        ),
+                    )
+                print(
+                    "  warning: Pier exited while the Antigravity runtime was still "
+                    "active; stopped exact-job residue and preserved harvested "
+                    "artifacts"
                 )
     finally:
         if provider_auth_path is not None:
