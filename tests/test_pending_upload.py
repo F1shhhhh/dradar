@@ -1056,6 +1056,7 @@ def test_upload_rebuilds_claude_usage_from_trajectory_when_sidecar_is_missing(
             assert meta["n_cache_tokens"] == 200
             assert meta["n_output_tokens"] == 21
             assert meta["subscription_reported_cost_usd"] == 0.25
+            assert meta["claude_usage_source"] == "uploaded-trajectory"
             return {"submission_id": "s1", "grade_status": "pending"}
 
     assert runloop._upload_trial(
@@ -1065,6 +1066,59 @@ def test_upload_rebuilds_claude_usage_from_trajectory_when_sidecar_is_missing(
             "claude_model": "claude-sonnet-5",
         }),
     ) == "submitted"
+
+
+def test_claude_trajectory_read_retries_a_transient_partial_json(
+    tmp_path: Path,
+    monkeypatch,
+):
+    trial_dir = _make_trial_dir(tmp_path)
+    agent_dir = trial_dir / "agent"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    trajectory_path = agent_dir / "trajectory.json"
+    trajectory_path.write_text("{", encoding="utf-8")
+    complete = json.dumps({
+        "agent": {"model_name": "claude-sonnet-5"},
+        "steps": [{
+            "timestamp": "2026-09-01T00:00:00Z",
+            "metrics": {
+                "prompt_tokens": 10,
+                "cached_tokens": 6,
+                "completion_tokens": 2,
+                "extra": {"cache_creation_input_tokens": 3},
+            },
+        }],
+        "final_metrics": {
+            "total_prompt_tokens": 10,
+            "total_cached_tokens": 6,
+            "total_completion_tokens": 2,
+            "total_cost_usd": 0.01,
+            "extra": {"total_cache_creation_input_tokens": 3},
+        },
+    })
+    original_read_text = Path.read_text
+    reads = 0
+
+    def finish_after_first_read(path, *args, **kwargs):
+        nonlocal reads
+        value = original_read_text(path, *args, **kwargs)
+        if path == trajectory_path:
+            reads += 1
+            if reads == 1:
+                trajectory_path.write_text(complete, encoding="utf-8")
+        return value
+
+    delays = []
+    monkeypatch.setattr(Path, "read_text", finish_after_first_read)
+    monkeypatch.setattr(runloop.time, "sleep", delays.append)
+
+    usage = runloop._claude_trial_usage_from_trajectory(
+        trial_dir, "claude-sonnet-5", attempts=3, retry_delay=0.2,
+    )
+
+    assert usage is not None and usage["request_count"] == 1
+    assert reads == 2
+    assert delays == [0.2]
 
 
 def test_upload_does_not_rebuild_claude_usage_for_wrong_assignment_model(
@@ -1102,6 +1156,9 @@ def test_upload_does_not_rebuild_claude_usage_for_wrong_assignment_model(
                    trajectory_bundle=None):
             assert "usage_aggregation" not in meta
             assert "n_input_tokens" not in meta
+            assert meta["claude_usage_diagnostic"] == (
+                "provider-sidecar-and-trajectory-unavailable-or-invalid"
+            )
             return {"submission_id": "s1", "grade_status": "pending"}
 
     assert runloop._upload_trial(

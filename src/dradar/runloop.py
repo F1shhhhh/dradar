@@ -1198,7 +1198,8 @@ def _subscription_trial_usage(trial_dir: Path, meta: dict) -> dict | None:
 
 
 def _claude_trial_usage_from_trajectory(
-    trial_dir: Path, expected_model: str,
+    trial_dir: Path, expected_model: str, *, attempts: int = 10,
+    retry_delay: float = 0.2,
 ) -> dict | None:
     """Rebuild Claude usage from the exact ATIF artifact being uploaded.
 
@@ -1213,11 +1214,22 @@ def _claude_trial_usage_from_trajectory(
     _patch, trajectory_path, _result = trial_artifact_paths(trial_dir)
     if trajectory_path is None:
         return None
-    try:
-        trajectory = json.loads(trajectory_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return None
-    return claude_usage_facts(trajectory, expected_model)
+    for attempt in range(max(1, attempts)):
+        try:
+            trajectory = json.loads(trajectory_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            trajectory = None
+        if trajectory is not None:
+            usage = claude_usage_facts(trajectory, expected_model)
+            if usage is not None:
+                return usage
+            # A complete JSON document with the wrong model or irreconcilable
+            # totals will not become trustworthy by waiting. Keep that case
+            # fail-closed rather than masking it as a filesystem race.
+            return None
+        if attempt + 1 < attempts and retry_delay > 0:
+            time.sleep(retry_delay)
+    return None
 
 
 def _dsh_completed_outcome(
@@ -1669,15 +1681,22 @@ def _upload_trial(
         if upload_meta.get("claude_cli_version")
         else None
     )
-    if claude_usage is None and upload_meta.get("claude_cli_version"):
-        claude_usage = _claude_trial_usage_from_trajectory(
-            trial_dir, str(upload_meta.get("claude_model") or ""),
-        )
+    claude_usage_source = "provider-sidecar" if claude_usage is not None else None
     trajectory_bundle = None
     if not upload_meta.get("codebuddy_cli_version"):
         trajectory_bundle = build_codex_trajectory_bundle(trial_dir)
         if trajectory_bundle is None:
             trajectory_bundle = build_kimi_trajectory_bundle(trial_dir)
+    # Pier finalizes Claude's ATIF file in a post-run hook. On some Docker
+    # filesystems the directory entry becomes visible a fraction before the
+    # final JSON bytes do. Build the audit bundle first, then make a bounded
+    # stable read of the exact trajectory that will be uploaded.
+    if claude_usage is None and upload_meta.get("claude_cli_version"):
+        claude_usage = _claude_trial_usage_from_trajectory(
+            trial_dir, str(upload_meta.get("claude_model") or ""),
+        )
+        if claude_usage is not None:
+            claude_usage_source = "uploaded-trajectory"
     usage = claude_usage or (
         codex_trajectory_bundle_usage(trajectory_bundle)
         if (
@@ -1700,6 +1719,8 @@ def _upload_trial(
         upload_meta["cost_usd"] = None
         upload_meta["usage_aggregation"] = usage["schema"]
         upload_meta["usage_aggregation_complete"] = usage["complete"]
+        if claude_usage_source is not None:
+            upload_meta["claude_usage_source"] = claude_usage_source
         for key in (
             "agent_session_count", "root_session_count",
             "subagent_session_count", "agent_session_usage", "request_count",
@@ -1737,6 +1758,10 @@ def _upload_trial(
                 )
                 else None
             )
+    elif upload_meta.get("claude_cli_version"):
+        upload_meta["claude_usage_diagnostic"] = (
+            "provider-sidecar-and-trajectory-unavailable-or-invalid"
+        )
 
     with tempfile.TemporaryDirectory() as td:
         scrubbed = Path(td)
