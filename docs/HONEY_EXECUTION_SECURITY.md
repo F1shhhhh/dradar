@@ -8,8 +8,8 @@ DRadar 用 Honey 驱动不同模型完成同一类 benchmark。模型能力评�
 > 模型及其子代理在一次性任务容器内获得完整、无人值守的编码权限；可信边界位于
 > Docker、挂载、网络出口和凭证生命周期，而不位于模型可见的工具审批层。
 
-本契约适用于当前六个 Honey：Codex、DeepSeek Harness（DSH）、ZCode、Kimi Code、
-Google Antigravity 和 Grok。以后接入任何新 Honey，设计评审、实现、测试和金丝雀都必须逐项
+本契约适用于当前七个 Honey：Codex、Claude Code、DeepSeek Harness（DSH）、ZCode、
+Kimi Code、Google Antigravity 和 Grok。以后接入任何新 Honey，设计评审、实现、测试和金丝雀都必须逐项
 检查本文，不能只证明“CLI 能启动”。
 
 ## 容器内必须放行的能力
@@ -65,11 +65,12 @@ Codex 的做法是基准：宿主先校验私有凭证，按题把它放入容�
 - 凭证存在于容器期间，安全性依赖一次性容器、最小挂载、出口白名单和产物脱敏；不得再
   用会阻断正常编码工具或子代理的内层审批规则“保护”凭证。
 
-## 当前六个 Honey 的合规映射
+## 当前七个 Honey 的合规映射
 
 | Honey | 容器内模式 | 子代理策略 | 凭证策略 | 外层网络 |
 | --- | --- | --- | --- | --- |
 | Codex | `--dangerously-bypass-approvals-and-sandbox` | 使用 Codex 原生多代理能力 | 临时 `CODEX_HOME` 与 `auth.json`，退出清理 | OpenAI/ChatGPT 精确域名 |
+| Claude Code | `--permission-mode=bypassPermissions` + `--safe-mode` 等价环境开关 | 保留内置 Agent/后台任务；safe mode 只禁用外来定制 | `claude setup-token` 的订阅 OAuth 存于宿主 `0600` 私有文件，仅注入一次性 provider 进程，退出清理 | `api.anthropic.com` |
 | DSH | `DSH_PERMISSION_MODE=danger-full-access`（审批 `never`） | 启用原生 spawn/fork/control/report/workflow | key 转成私有 credentials 文档，读入后 unlink | `api.deepseek.com` |
 | ZCode | Protocol `mode=yolo`，不传工具 allow/deny 列表 | 保留原生 `Agent` 与任务工具 | key 在 session 建立后、首个模型工具前 unlink | `open.bigmodel.cn`、`zcode.z.ai` |
 | Kimi Code | `--auto` | 保留 Agent/AgentSwarm，不设适配器并发上限 | 独立 KIMI_CODE_HOME，OAuth 私有回写，退出清理 | `auth.kimi.com`、`api.kimi.com` |

@@ -49,6 +49,12 @@ from .providers import (
     ANTIGRAVITY_PROVIDER,
     ANTIGRAVITY_RUNTIME_MODELS,
     ANTIGRAVITY_SUPPORTED_EFFORTS,
+    CLAUDE_AGENT,
+    CLAUDE_API_KEY_ENVS,
+    CLAUDE_CLI_VERSION,
+    CLAUDE_MODELS,
+    CLAUDE_PROVIDER,
+    CLAUDE_SUPPORTED_EFFORTS,
     DEFAULT_CODEX_PROVIDER,
     DEEPSEEK_API_KEY_ENV,
     DEEPSEEK_CATALOG_REMOTE_PATH,
@@ -84,6 +90,7 @@ from .providers import (
     ZCODE_SUPPORTED_EFFORTS,
     assignment_codex_provider,
     antigravity_subscription_session,
+    claude_subscription_session,
     create_deepseek_api_key_file,
     create_deepseek_auth_json,
     create_zcode_api_key_file,
@@ -184,6 +191,9 @@ DEEPSEEK_TOML = (
 )
 DEEPSEEK_AGENT_IMPORT_PATH = "_dradar_pier_deepseek:DeepSeekCodex"
 DEEPSEEK_AGENT_MODULE_FILENAME = "_dradar_pier_deepseek.py"
+CLAUDE_AGENT_IMPORT_PATH = "_dradar_pier_claude:ClaudeCodeSubscription"
+CLAUDE_AGENT_MODULE_FILENAME = "_dradar_pier_claude.py"
+CLAUDE_USAGE_MODULE_FILENAME = "_dradar_claude_usage.py"
 GROK_AGENT_IMPORT_PATH = "_dradar_pier_grok:GrokBuild"
 GROK_AGENT_MODULE_FILENAME = "_dradar_pier_grok.py"
 GROK_RECOVERY_MODULE_FILENAME = "_dradar_grok_recovery.py"
@@ -207,7 +217,7 @@ CODEBUDDY_AGENT_IMPORT_PATH = (
 CODEBUDDY_AGENT_MODULE_FILENAME = "_dradar_pier_codebuddy.py"
 BETA_SUBSCRIPTION_TRIAL_TIMEOUT_FLOOR_SEC = 120 * 60
 BETA_SUBSCRIPTION_AGENTS = frozenset({
-    GROK_AGENT, KIMI_AGENT, ZCODE_AGENT, ANTIGRAVITY_AGENT,
+    CLAUDE_AGENT, GROK_AGENT, KIMI_AGENT, ZCODE_AGENT, ANTIGRAVITY_AGENT,
     CODEBUDDY_AGENT,
 })
 
@@ -468,12 +478,6 @@ def codex_auth_path() -> Path:
     return Path(os.environ.get("CODEX_AUTH_JSON_PATH", Path.home() / ".codex" / "auth.json"))
 
 
-def claude_oauth_token() -> str | None:
-    """The Claude Code readiness signal — same sharing rationale as
-    codex_auth_path()."""
-    return os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
-
-
 def _materialize_shared_file(path: Path, data: bytes, mode: int = 0o600) -> Path:
     """Publish deterministic runner input without exposing partial contents.
 
@@ -582,6 +586,21 @@ def _ensure_deepseek_agent_module(home: Path) -> Path:
         )
     target = home / DEEPSEEK_AGENT_MODULE_FILENAME
     return _materialize_shared_file(target, source.read_bytes())
+
+
+def _ensure_claude_agent_module(home: Path) -> Path:
+    source = Path(__file__).with_name("pier_claude.py")
+    usage_source = Path(__file__).with_name("claude_usage.py")
+    if not source.is_file() or not usage_source.is_file():
+        raise RunnerError(
+            "Claude Code Pier adapter is missing; reinstall or upgrade dradar"
+        )
+    _materialize_shared_file(
+        home / CLAUDE_USAGE_MODULE_FILENAME, usage_source.read_bytes()
+    )
+    return _materialize_shared_file(
+        home / CLAUDE_AGENT_MODULE_FILENAME, source.read_bytes()
+    )
 
 
 def _ensure_runtime_safety_module(home: Path) -> Path:
@@ -835,6 +854,29 @@ def _validate_grok_assignment(assignment: dict) -> None:
         )
 
 
+def _validate_claude_assignment(assignment: dict) -> None:
+    if assignment.get("provider") != CLAUDE_PROVIDER:
+        raise RunnerError(
+            "Claude Code assignments must explicitly use provider "
+            f"{CLAUDE_PROVIDER!r}"
+        )
+    if assignment.get("model") not in CLAUDE_MODELS:
+        raise RunnerError(
+            f"unsupported Claude Code model {assignment.get('model')!r}; "
+            f"enabled models are {', '.join(sorted(CLAUDE_MODELS))}"
+        )
+    if assignment.get("effort") not in CLAUDE_SUPPORTED_EFFORTS:
+        raise RunnerError(
+            "Claude Code effort must be low, medium, high, xhigh, or max; "
+            f"got {assignment.get('effort')!r}"
+        )
+    if assignment.get("agent_version") != CLAUDE_CLI_VERSION:
+        raise RunnerError(
+            f"Claude Code requires CLI {CLAUDE_CLI_VERSION}; the assignment "
+            f"requested {assignment.get('agent_version')!r}"
+        )
+
+
 def _validate_kimi_assignment(assignment: dict) -> None:
     if assignment.get("provider") != KIMI_PROVIDER:
         raise RunnerError(
@@ -942,6 +984,7 @@ def _pier_process_env(
     pier_bootstrap_dir: Path | None = None,
     egress_environment: dict[str, str] | None = None,
     codex_module_dir: Path | None = None,
+    claude_module_dir: Path | None = None,
     deepseek_module_dir: Path | None = None,
     grok_module_dir: Path | None = None,
     kimi_module_dir: Path | None = None,
@@ -960,7 +1003,8 @@ def _pier_process_env(
     env.pop("PYTHONHOME", None)
     python_dirs = [
         path for path in (
-            pier_bootstrap_dir, codex_module_dir, deepseek_module_dir,
+            pier_bootstrap_dir, codex_module_dir, claude_module_dir,
+            deepseek_module_dir,
             grok_module_dir,
             kimi_module_dir, antigravity_module_dir,
             zcode_module_dir, dsh_module_dir, codebuddy_module_dir,
@@ -979,6 +1023,9 @@ def _pier_process_env(
         # adapter module. Ambient Python paths could accidentally shadow it.
     if assignment.get("agent") == GROK_AGENT:
         env.pop(GROK_API_KEY_ENV, None)
+    if assignment.get("agent") == CLAUDE_AGENT:
+        for name in (*CLAUDE_API_KEY_ENVS, "CLAUDE_CODE_OAUTH_TOKEN"):
+            env.pop(name, None)
     if assignment.get("agent") == KIMI_AGENT:
         for name in KIMI_API_KEY_ENVS:
             env.pop(name, None)
@@ -1131,6 +1178,10 @@ def build_pier_command(
         agent_args = ["--agent-import-path", DEEPSEEK_AGENT_IMPORT_PATH]
     elif agent == "codex" and provider == DEFAULT_CODEX_PROVIDER:
         agent_args = ["--agent", "codex"]
+    elif agent == CLAUDE_AGENT:
+        _validate_claude_assignment(assignment)
+        _ensure_claude_agent_module(home)
+        agent_args = ["--agent-import-path", CLAUDE_AGENT_IMPORT_PATH]
     elif agent == GROK_AGENT:
         _validate_grok_assignment(assignment)
         _ensure_grok_agent_module(home)
@@ -1247,19 +1298,18 @@ def build_pier_command(
             f"unsupported Codex provider {provider!r}; upgrade dradar if the "
             "server intentionally enabled a new provider"
         )
-    elif agent == "claude-code":
-        oauth_token = claude_oauth_token()
-        if not oauth_token:
+    elif agent == CLAUDE_AGENT:
+        if provider_auth_path is None or not provider_auth_path.is_file():
             raise RunnerError(
-                "CLAUDE_CODE_OAUTH_TOKEN not set (run: claude setup-token, "
-                "then export CLAUDE_CODE_OAUTH_TOKEN before dradar go)"
+                "Claude Code subscription OAuth is unavailable; run "
+                "`dradar provider setup claude` in your own interactive Terminal"
             )
         cmd += [
             "--model", assignment["model"],
             "--ak", f"reasoning_effort={assignment['effort']}",
-            "--ak", "version=2.1.197",
+            "--ak", f"version={CLAUDE_CLI_VERSION}",
+            "--ak", f"oauth_token_file={provider_auth_path}",
             "--ak", f"disallowed_tools={CLAUDE_DISALLOWED_TOOLS}",
-            "--ae", f"CLAUDE_CODE_OAUTH_TOKEN={oauth_token}",
             "--ae", "API_TIMEOUT_MS=3000000",
             "--ae", "CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000",
             "--ae", "CLAUDE_CODE_MAX_OUTPUT_TOKENS=128000",
@@ -3509,6 +3559,13 @@ def run_trial(
             **assignment,
             "agent_version": codex_cli_version,
         }
+    elif effective_agent == CLAUDE_AGENT:
+        _validate_claude_assignment(assignment)
+        effective_assignment = {
+            **assignment,
+            "agent_version": CLAUDE_CLI_VERSION,
+        }
+        print(f"verified pinned Claude Code subscription CLI: {CLAUDE_CLI_VERSION}")
     elif effective_agent == GROK_AGENT:
         _validate_grok_assignment(assignment)
         effective_assignment = {
@@ -3603,7 +3660,7 @@ def run_trial(
     live_error_counts: dict[str, int] = {}
     watch_live_account_errors = (
         (dev_agent or effective_assignment["agent"]) in (
-            "codex", DSH_AGENT, GROK_AGENT, KIMI_AGENT,
+            "codex", CLAUDE_AGENT, DSH_AGENT, GROK_AGENT, KIMI_AGENT,
             ANTIGRAVITY_AGENT, ZCODE_AGENT, CODEBUDDY_AGENT,
         )
     )
@@ -3615,6 +3672,13 @@ def run_trial(
         if codex_provider == DEEPSEEK_PROVIDER:
             try:
                 provider_auth_path = create_deepseek_auth_json(work_dir)
+            except (OSError, ValueError) as exc:
+                raise RunnerError(str(exc)) from exc
+        elif effective_agent == CLAUDE_AGENT:
+            try:
+                provider_auth_path = provider_stack.enter_context(
+                    claude_subscription_session(work_dir)
+                )
             except (OSError, ValueError) as exc:
                 raise RunnerError(str(exc)) from exc
         elif effective_agent == DSH_AGENT:
@@ -3680,7 +3744,7 @@ def run_trial(
             if (
                 codex_provider == DEEPSEEK_PROVIDER
                 or effective_agent in (
-                    GROK_AGENT, KIMI_AGENT, ANTIGRAVITY_AGENT,
+                    CLAUDE_AGENT, GROK_AGENT, KIMI_AGENT, ANTIGRAVITY_AGENT,
                     ZCODE_AGENT, DSH_AGENT, CODEBUDDY_AGENT,
                 )
             )
@@ -3727,6 +3791,9 @@ def run_trial(
             pier_bootstrap_dir=(work_dir if egress_environment else None),
             egress_environment=egress_environment,
             codex_module_dir=None,
+            claude_module_dir=(
+                work_dir if effective_agent == CLAUDE_AGENT else None
+            ),
             deepseek_module_dir=(
                 work_dir if codex_provider == DEEPSEEK_PROVIDER else None
             ),

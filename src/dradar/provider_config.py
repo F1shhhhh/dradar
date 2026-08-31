@@ -39,6 +39,10 @@ from .providers import (
     ANTIGRAVITY_LINUX_ARTIFACTS,
     ANTIGRAVITY_MODEL,
     ANTIGRAVITY_RUNTIME_MODELS,
+    CLAUDE_API_KEY_ENVS,
+    CLAUDE_CLI_VERSION,
+    CLAUDE_MODELS,
+    CLAUDE_SUPPORTED_EFFORTS,
     DEEPSEEK_API_KEY_ENV,
     DEEPSEEK_MODELS,
     GROK_API_KEY_ENV,
@@ -54,6 +58,8 @@ from .providers import (
     antigravity_auth_path,
     antigravity_home,
     antigravity_ready_path,
+    claude_oauth_error,
+    claude_oauth_path,
     deepseek_api_key,
     deepseek_credential_source,
     deepseek_secret_error,
@@ -79,6 +85,7 @@ from .providers import (
     provider_subprocess_env,
     restore_antigravity_settings,
     store_deepseek_api_key,
+    store_claude_oauth_token,
     store_grok_auth,
     store_zcode_api_key,
     store_zcode_cli,
@@ -665,9 +672,131 @@ def _status_antigravity_subscription(*, live: bool) -> int:
     return 0
 
 
+def _claude_cli_version(executable: str | Path) -> str | None:
+    try:
+        result = subprocess.run(
+            [str(executable), "--version"], capture_output=True, text=True,
+            timeout=15, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    first = (result.stdout + "\n" + result.stderr).strip().split(" ", 1)[0]
+    return first if first.count(".") == 2 else None
+
+
+def _setup_claude_subscription() -> int:
+    """Import an official Claude.ai setup token into DRadar's private store."""
+
+    executable = shutil.which("claude")
+    version = _claude_cli_version(executable) if executable else None
+    if not executable or version != CLAUDE_CLI_VERSION:
+        print(
+            f"Claude Code {CLAUDE_CLI_VERSION} is required; found "
+            f"{version or 'none'}. Run `claude install latest`, then retry."
+        )
+        return 1
+    if not sys.stdin.isatty():
+        print(
+            "Claude setup needs an interactive Terminal. First sign in with "
+            "`claude auth login --claudeai`, then run:\n"
+            "  dradar provider setup claude\n"
+            "Only the subscription OAuth token is accepted; API keys are rejected."
+        )
+        return 2
+    print(
+        "Claude Code will now create an official Claude.ai subscription setup "
+        "token. Complete its browser prompt, then copy the token once."
+    )
+    setup_env = provider_subprocess_env()
+    for key in (*CLAUDE_API_KEY_ENVS, "CLAUDE_CODE_OAUTH_TOKEN"):
+        setup_env.pop(key, None)
+    result = subprocess.run(
+        [executable, "setup-token"],
+        env=setup_env,
+        check=False,
+    )
+    if result.returncode != 0:
+        print("Claude Code did not complete subscription setup-token OAuth.")
+        return 1
+    token = getpass.getpass("Paste the setup token (input hidden): ")
+    try:
+        path = store_claude_oauth_token(token)
+    except (OSError, ValueError) as exc:
+        print(f"could not save Claude subscription OAuth: {exc}")
+        return 1
+    print(
+        f"Claude subscription OAuth saved locally at {path} (value hidden).\n"
+        "It is never sent to the DRadar server and no Anthropic API key is used."
+    )
+    return 0
+
+
+def _status_claude_subscription(*, live: bool) -> int:
+    path = claude_oauth_path()
+    issue = claude_oauth_error(path)
+    if issue is not None:
+        print(
+            f"Claude Code provider not ready: {issue}. Run "
+            "`dradar provider setup claude`."
+        )
+        return 1
+    executable = shutil.which("claude")
+    version = _claude_cli_version(executable) if executable else None
+    if version != CLAUDE_CLI_VERSION:
+        print(
+            f"Claude Code provider not ready: CLI {CLAUDE_CLI_VERSION} "
+            f"required, found {version or 'none'}."
+        )
+        return 1
+    print(
+        f"Claude Code provider ready via {path} (OAuth value hidden, CLI "
+        f"{CLAUDE_CLI_VERSION}, models {', '.join(sorted(CLAUDE_MODELS))}, "
+        "API keys disabled)."
+    )
+    return _live_claude_status(executable, path) if live else 0
+
+
+def _live_claude_status(executable: str, path: Path) -> int:
+    token = path.read_text(encoding="utf-8").strip()
+    base_env = provider_subprocess_env()
+    for name in (*CLAUDE_API_KEY_ENVS, "CLAUDE_CODE_OAUTH_TOKEN"):
+        base_env.pop(name, None)
+    base_env["CLAUDE_CODE_OAUTH_TOKEN"] = token
+    for model in sorted(CLAUDE_MODELS):
+        command = [
+            executable, "-p", "--safe-mode", "--disable-slash-commands",
+            "--no-session-persistence", "--tools", "", "--max-turns", "1",
+            "--model", model, "--effort", "low", "--output-format", "json",
+            "Reply with exactly DRADAR_CLAUDE_AUTH_OK.",
+        ]
+        try:
+            probe = subprocess.run(
+                command, env=base_env, capture_output=True, text=True,
+                timeout=180, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(f"Claude {model} live probe failed: {type(exc).__name__}.")
+            return 1
+        if probe.returncode != 0 or "DRADAR_CLAUDE_AUTH_OK" not in probe.stdout:
+            print(
+                f"Claude subscription login could not access {model}; raw "
+                "provider output and credentials were not displayed."
+            )
+            return 1
+    print(
+        "Claude subscription access verified live for Sonnet 5 and Opus 5; "
+        "this check consumed two minimal provider requests."
+    )
+    return 0
+
+
 def cmd_provider_setup(args) -> int:
     """Read a DeepSeek key without echoing it or placing it in argv/history."""
 
+    if args.provider in {"claude", "claude-code"}:
+        return _setup_claude_subscription()
     if args.provider == "grok":
         return _setup_grok_subscription()
     if args.provider == "kimi":
@@ -712,6 +841,8 @@ def cmd_provider_status(args) -> int:
     """Report credential readiness without printing secret material."""
 
     live = bool(getattr(args, "live", False))
+    if args.provider in {"claude", "claude-code"}:
+        return _status_claude_subscription(live=live)
     if args.provider == "grok":
         return _status_grok_subscription()
     if args.provider == "kimi":

@@ -50,6 +50,10 @@ from .providers import (
     ANTIGRAVITY_PROVIDER,
     ANTIGRAVITY_RUN_CONFIG_VERSION,
     ANTIGRAVITY_RUNTIME_PROFILE,
+    CLAUDE_AGENT,
+    CLAUDE_CLI_VERSION,
+    CLAUDE_RUN_CONFIG_VERSION,
+    CLAUDE_RUNTIME_PROFILE,
     DEEPSEEK_CATALOG_SHA256,
     DEEPSEEK_PROVIDER,
     DEEPSEEK_RUN_CONFIG_VERSION,
@@ -1083,7 +1087,8 @@ def _subscription_trial_usage(trial_dir: Path, meta: dict) -> dict | None:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     expected_provider = (
-        "antigravity" if meta.get("antigravity_cli_version")
+        "claude-code" if meta.get("claude_cli_version")
+        else "antigravity" if meta.get("antigravity_cli_version")
         else "zcode" if meta.get("zcode_cli_version")
         else "kimi-code" if meta.get("kimi_cli_version")
         else "grok" if meta.get("grok_cli_version")
@@ -1100,6 +1105,7 @@ def _subscription_trial_usage(trial_dir: Path, meta: dict) -> dict | None:
     complete = value.get("complete") is True
     incomplete_reason = value.get("usage_incomplete_reason")
     allowed_incomplete_reasons = {
+        "claude-code": {"request_ledger_unavailable_or_invalid"},
         "antigravity": {
             "terminal_aggregate_missing_or_inconsistent",
             "request_ledger_unavailable_or_invalid",
@@ -2725,6 +2731,20 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             "model_config_version": DEEPSEEK_RUN_CONFIG_VERSION,
             "model_catalog_sha256": DEEPSEEK_CATALOG_SHA256,
             "model_runtime_profile": DEEPSEEK_RUNTIME_PROFILE,
+        })
+    if assignment.get("agent") == CLAUDE_AGENT:
+        meta.update({
+            "model_config_version": CLAUDE_RUN_CONFIG_VERSION,
+            "model_runtime_profile": CLAUDE_RUNTIME_PROFILE,
+            "subscription_oauth": True,
+            "subscription_concurrency": (
+                telemetry.target_workers if telemetry is not None else 1
+            ),
+            "subscription_oauth_coordination": "shared-setup-token-v1",
+            "claude_cli_version": CLAUDE_CLI_VERSION,
+            "claude_native_efforts": ["low", "medium", "high", "xhigh", "max"],
+            "claude_credential_mode": "private-file-process-env-v1",
+            "claude_customizations": "disabled-isolated-config-v1",
         })
     if assignment.get("agent") == GROK_AGENT:
         meta.update({
