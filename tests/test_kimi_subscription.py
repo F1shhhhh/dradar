@@ -7,6 +7,9 @@ import os
 import ast
 import shlex
 import stat
+import subprocess
+import sys
+import tomllib
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -487,7 +490,8 @@ def test_kimi_assignment_version_is_only_a_hint() -> None:
 def test_kimi_adapter_source_has_fixed_security_contract() -> None:
     source = Path(providers.__file__).with_name("pier_kimi.py").read_text()
     assert 'return NetworkAllowlist(domains=["auth.kimi.com", "api.kimi.com"])' in source
-    assert "[tools]" not in source
+    assert "[tools]" in source
+    assert 'disabled = ["WebSearch", "FetchURL"]' in source
     # Kimi 0.39.1 rejects ``--prompt`` together with ``--auto``.  Prompt mode
     # remains fully autonomous through ``default_permission_mode = "auto"``
     # in the isolated config, so the mutually exclusive CLI flag must never be
@@ -496,6 +500,7 @@ def test_kimi_adapter_source_has_fixed_security_contract() -> None:
     assert '"--auto"' not in source
     assert "KIMI_CODE_AGENT_SWARM_MAX_CONCURRENCY" not in source
     assert "Agent|AgentSwarm" in source
+    assert "WebSearch|FetchURL" in source
     assert 'event = "PreToolUse"' in source
     assert '"KIMI_CODE_HOME": remote_home' in source
     assert "run_with_kimi_resume" in source
@@ -516,6 +521,56 @@ def test_kimi_adapter_source_has_fixed_security_contract() -> None:
     assert "oauth_guard_pid" in source
     assert "sleep 0.02" in source
     assert "aloha" not in source
+
+
+def _kimi_adapter_constant(name: str) -> str:
+    source = Path(providers.__file__).with_name("pier_kimi.py").read_text()
+    tree = ast.parse(source)
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if any(isinstance(target, ast.Name) and target.id == name for target in node.targets):
+            value = ast.literal_eval(node.value)
+            assert isinstance(value, str)
+            return value
+    raise AssertionError(f"missing Kimi adapter constant: {name}")
+
+
+def test_kimi_config_disables_only_external_web_tools() -> None:
+    config = tomllib.loads(_kimi_adapter_constant("KIMI_CONFIG"))
+    assert config["tools"]["disabled"] == ["WebSearch", "FetchURL"]
+    pre_tool_hooks = [
+        hook for hook in config["hooks"] if hook["event"] == "PreToolUse"
+    ]
+    assert len(pre_tool_hooks) == 1
+    matcher = set(pre_tool_hooks[0]["matcher"].split("|"))
+    assert {"WebSearch", "FetchURL"} <= matcher
+    assert {"Read", "Write", "Edit", "Bash", "Agent", "AgentSwarm"} <= matcher
+
+
+@pytest.mark.parametrize("tool_name", ["WebSearch", "FetchURL"])
+def test_kimi_policy_blocks_external_web_tools(tool_name: str) -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", _kimi_adapter_constant("KIMI_POLICY")],
+        input=json.dumps({"tool_name": tool_name, "tool_input": {"query": "test"}}),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "External web tools are disabled" in result.stderr
+
+
+def test_kimi_policy_keeps_coding_tools_available() -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", _kimi_adapter_constant("KIMI_POLICY")],
+        input=json.dumps({"tool_name": "Read", "tool_input": {"path": "/app/a.py"}}),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert result.stderr == ""
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX no-follow file semantics")

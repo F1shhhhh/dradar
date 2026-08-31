@@ -357,7 +357,8 @@ DRadar 默认把 OAuth 保存在 `~/.dradar/providers/kimi`，不会借用或覆
 Kimi CLI 版本，因此 macOS、Windows 与 Linux 用户都不会把错误平台的本机程序传进
 容器。容器只挂载 provider 专用的 `credentials` 与 `oauth` 目录，任务 session、配置、
 日志和工作区仍逐题隔离；刷新后会验证文件结构、权限和所有者，容器退出时其余运行状态
-全部销毁。模型以 `--auto` 运行，保留官方完整工具和 Agent/AgentSwarm 子代理能力。
+全部销毁。模型以 `--auto` 运行，保留完整编码工具和 Agent/AgentSwarm 子代理能力，但会在
+配置层禁用 `WebSearch`/`FetchURL`，并由 PreToolUse 策略作第二层拦截，避免外部资料污染基准。
 模型固定为 `k3`，只接受 `low`/`high`/`max`；DeepSWE 与庞贝壁画均可显式领取，但不进入
 自动推荐、排序或持续补题。任务中断不会恢复原 Kimi session；运行完成后的精确 patch 和
 usage 由 durable artifact 与待上传账本保护。

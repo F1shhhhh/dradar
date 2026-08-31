@@ -54,7 +54,8 @@ def test_all_non_codex_honeys_use_full_container_permissions() -> None:
     # Kimi 0.39.1 prompt mode rejects the redundant CLI ``--auto`` flag.  The
     # isolated config remains the single source of truth for full permissions.
     assert '"--auto"' not in kimi
-    assert "[tools]" not in kimi
+    assert "[tools]" in kimi
+    assert 'disabled = ["WebSearch", "FetchURL"]' in kimi
     assert "KIMI_CODE_AGENT_SWARM_MAX_CONCURRENCY" not in kimi
 
     antigravity = _source("pier_antigravity.py")

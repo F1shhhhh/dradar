@@ -77,9 +77,12 @@ max_running_tasks = 1
 keep_alive_on_exit = false
 bash_auto_background_on_timeout = false
 
+[tools]
+disabled = ["WebSearch", "FetchURL"]
+
 [[hooks]]
 event = "PreToolUse"
-matcher = "Read|ReadMediaFile|Glob|Grep|Write|Edit|Bash|Agent|AgentSwarm|Skill|AskUserQuestion|TodoList|TaskList|TaskOutput|TaskStop"
+matcher = "Read|ReadMediaFile|Glob|Grep|Write|Edit|Bash|Agent|AgentSwarm|Skill|AskUserQuestion|TodoList|TaskList|TaskOutput|TaskStop|WebSearch|FetchURL"
 command = "/usr/bin/python3 /tmp/dradar-kimi-policy.py"
 timeout = 5
 """
@@ -87,6 +90,8 @@ timeout = 5
 KIMI_POLICY = r'''#!/usr/bin/env python3
 import json
 import sys
+
+DENIED_TOOLS = {"WebSearch", "FetchURL"}
 
 PROTECTED = (
     "/tmp/dradar-kimi-home",
@@ -100,6 +105,11 @@ try:
     request = json.load(sys.stdin)
 except Exception:
     print("Kimi policy could not validate the tool request", file=sys.stderr)
+    raise SystemExit(2)
+
+tool_name = request.get("tool_name")
+if tool_name in DENIED_TOOLS:
+    print("External web tools are disabled for benchmark runs", file=sys.stderr)
     raise SystemExit(2)
 
 tool_input = json.dumps(request.get("tool_input", {}), ensure_ascii=False)
