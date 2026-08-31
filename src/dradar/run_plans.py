@@ -855,6 +855,41 @@ def _local_monitor_response(
     return result
 
 
+def _local_preparing_response(
+    server_response: dict[str, Any], *, selected: int, adjusted: bool = False,
+) -> dict[str, Any]:
+    """Keep server admission distinct from a locally ready worker parent."""
+
+    result = _local_monitor_response(server_response, selected=selected)
+    agent = dict(result.get("agent") or {})
+    agent["local_runner"] = {"status": "preparing"}
+    message = (
+        f"这台设备正在按同时处理 {selected} 道准备运行环境，题目尚未开始执行。"
+        "无需操作。"
+    )
+    if adjusted:
+        message = (
+            f"这台设备当前适合同时处理 {selected} 道，系统将按这个数量运行；"
+            "正在准备运行环境，题目尚未开始执行。无需操作。"
+        )
+    result.update({
+        "status": "preparing",
+        "interaction": "warn" if adjusted else "notify",
+        "decision_required": False,
+        "user_message": message,
+        "agent_action": "monitor",
+        "error_code": None,
+        "retryable": False,
+        "choices": [],
+        "poll_after_seconds": 10,
+        "user_message_policy": "on_change_or_heartbeat",
+        "agent": agent,
+    })
+    result.pop("decision", None)
+    result.pop("decision_token", None)
+    return result
+
+
 def _exact_pending_uploads(batch_id: str) -> list[dict[str, Any]]:
     """Read only durable completed results belonging to one exact plan batch."""
 
@@ -1158,6 +1193,29 @@ def _local_progress_fault_response(
             "choices": [],
             "poll_after_seconds": 30,
             "user_message_policy": "on_change_or_heartbeat",
+            "agent": agent,
+        })
+        return result
+    if (
+        isinstance(local_item, dict)
+        and local_item.get("startup_status") == "failed"
+    ):
+        agent["requires_user_action"] = True
+        result.update({
+            "status": "paused",
+            "interaction": "warn",
+            "decision_required": False,
+            "user_message": str(
+                local_item.get("startup_user_message")
+                or "这台设备未能完成运行准备，题目没有开始执行。请检查本机后重试。"
+            ),
+            "agent_action": "notify_only",
+            "error_code": str(
+                local_item.get("startup_error_code") or "local_start_failed"
+            ),
+            "retryable": bool(local_item.get("startup_retryable", True)),
+            "choices": [],
+            "poll_after_seconds": None,
             "agent": agent,
         })
         return result
@@ -1504,18 +1562,39 @@ def cmd_run_plan(args) -> int:
         refill = plan["refill"]
 
         def ensure_local_pool(workers: int) -> dict[str, Any]:
-            return fleet.add_batch(
-                batch_id=plan["batch_id"],
-                workers=workers,
-                credentials_file=path,
-                plan_id=plan["plan_id"],
-                retry=True,
-                refill=bool(refill.get("enabled")),
-                max_tasks=refill.get("max_tasks"),
-                refill_harness=plan["harness"],
-                refill_model=first.get("model"),
-                refill_effort=first.get("effort"),
-            )
+            try:
+                return fleet.add_batch(
+                    batch_id=plan["batch_id"],
+                    workers=workers,
+                    credentials_file=path,
+                    plan_id=plan["plan_id"],
+                    retry=True,
+                    refill=bool(refill.get("enabled")),
+                    max_tasks=refill.get("max_tasks"),
+                    refill_harness=plan["harness"],
+                    refill_model=first.get("model"),
+                    refill_effort=first.get("effort"),
+                )
+            except fleet.FleetStartupError as exc:
+                # Server admission is reversible until local readiness is
+                # acknowledged. Do not leave another device accounting for a
+                # machine that never actually became runnable.
+                try:
+                    client.stop_run_plan(
+                        plan_id=plan["plan_id"], scope="this_device",
+                    )
+                except ApiError:
+                    pass
+                raise RunPlanClientError(
+                    exc.code,
+                    exc.user_message,
+                    agent_action="notify_only",
+                    retryable=exc.retryable,
+                    agent_details={
+                        "schema_version": SCHEMA_VERSION,
+                        "requires_user_action": True,
+                    },
+                ) from exc
 
         def start_with_authoritative_recheck(
             *,
@@ -1606,13 +1685,18 @@ def cmd_run_plan(args) -> int:
                 # This is intentionally called even for a known live pool. The
                 # coordinator's exact-shape add is the idempotent local ensure
                 # needed after a lost server response or stale public snapshot.
-                ensure_local_pool(current_workers)
+                fleet_response = ensure_local_pool(current_workers)
             except fleet.FleetError as exc:
                 raise RunPlanClientError(
                     "local_start_failed",
                     "这台设备暂时无法继续运行；请检查本机状态后重试。",
                     retryable=True,
                 ) from exc
+            ensured_batch = fleet_response.get("batch") or {}
+            if ensured_batch.get("status") == "starting":
+                return _local_preparing_response(
+                    response, selected=current_workers,
+                )
             return _local_monitor_response(
                 response, selected=current_workers,
             )
@@ -1879,6 +1963,13 @@ def cmd_run_plan(args) -> int:
             ((fleet_response.get("batch") or {}).get("workers"))
             or selected_workers
         )
+        fleet_batch = fleet_response.get("batch") or {}
+        if fleet_batch.get("status") == "starting":
+            return _local_preparing_response(
+                response,
+                selected=actual_workers,
+                adjusted=auto_downgraded,
+            )
         if auto_downgraded:
             return _local_warn_response(response, selected=actual_workers)
         return _local_monitor_response(response, selected=actual_workers)
@@ -1927,7 +2018,13 @@ def cmd_progress_plan(args) -> int:
             and local_item.get("plan_id") == state["plan_id"]
         )
         local_status = local_item.get("status") if same_local_plan else None
-        local_fault = local_status in {"failed", "interrupted"}
+        local_fault = bool(
+            local_status in {"failed", "interrupted"}
+            or (
+                same_local_plan
+                and local_item.get("startup_status") == "failed"
+            )
+        )
         if pending_uploads:
             return _local_progress_fault_response(
                 response,
@@ -1945,6 +2042,14 @@ def cmd_progress_plan(args) -> int:
         ):
             return _local_progress_fault_response(
                 response, local_item,
+            )
+        if (
+            same_local_plan
+            and local_status == "starting"
+            and response["envelope"].get("agent_action") == "monitor"
+        ):
+            return _local_preparing_response(
+                response, selected=int(local_item.get("workers") or 1),
             )
         return response
 

@@ -622,6 +622,70 @@ def test_auto_refill_uses_safe_effective_concurrency_not_seed_count(
     assert added[0]["batch_id"] == BATCH_ID
 
 
+def test_run_reports_preparing_until_local_pool_acknowledges_readiness(
+    tmp_path, monkeypatch, capsys,
+):
+    plan = _plan()
+    client = FakeClient(starts=[_server_response(plan)])
+    _prepare_run(
+        monkeypatch, tmp_path, plan=plan, client=client,
+        snapshot=_snapshot(available=2, auto_workers=2),
+    )
+    monkeypatch.setattr(
+        fleet,
+        "add_batch",
+        lambda **kwargs: {
+            "batch": {
+                "workers": kwargs["workers"],
+                "status": "starting",
+                "startup_status": "pending",
+            },
+        },
+    )
+
+    assert run_plans.cmd_run_plan(_args()) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["status"] == "preparing"
+    assert payload["interaction"] == "notify"
+    assert payload["agent_action"] == "monitor"
+    assert payload["agent"]["local_runner"]["status"] == "preparing"
+    assert "尚未开始执行" in payload["user_message"]
+
+
+def test_structured_local_startup_failure_stops_phantom_device_immediately(
+    tmp_path, monkeypatch, capsys,
+):
+    plan = _plan()
+    stopped = _server_response(
+        plan, _envelope(status="stopped", agent_action="stop_runner"),
+    )
+    client = FakeClient(starts=[_server_response(plan)], stops=[stopped])
+    _prepare_run(
+        monkeypatch, tmp_path, plan=plan, client=client,
+        snapshot=_snapshot(available=2, auto_workers=2),
+    )
+
+    def fail_start(**_kwargs):
+        raise fleet.FleetStartupError(
+            "task_environment_update_failed",
+            "这台设备未能准备题目环境；已有本地文件没有被修改。",
+        )
+
+    monkeypatch.setattr(fleet, "add_batch", fail_start)
+
+    assert run_plans.cmd_run_plan(_args()) == 1
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["error_code"] == "task_environment_update_failed"
+    assert payload["agent_action"] == "notify_only"
+    assert payload["agent"]["requires_user_action"] is True
+    assert "已有本地文件没有被修改" in payload["user_message"]
+    assert client.stop_calls == [
+        {"plan_id": plan["plan_id"], "scope": "this_device"},
+    ]
+
+
 def test_auto_resource_downgrade_returns_one_top_level_warn_envelope(
     tmp_path, monkeypatch, capsys,
 ):
@@ -2165,6 +2229,85 @@ def test_stale_stop_all_decision_rechecks_once_without_stopping(
     assert len(client.stop_calls) == 2
     assert client.stop_calls[0]["decision_token"] == "drd_stale_stop_once"
     assert client.stop_calls[1]["decision_token"] is None
+
+
+def test_progress_keeps_local_preparation_distinct_from_server_admission(
+    tmp_path, monkeypatch, capsys,
+):
+    plan = _plan()
+    path, state = _state(tmp_path, plan)
+    progress = _server_response(
+        plan,
+        _envelope(
+            status="running",
+            user_message="服务端已为这台设备预留运行位置。",
+            agent_action="monitor",
+        ),
+    )
+    client = FakeClient(progress=[progress])
+    monkeypatch.setattr(
+        run_plans,
+        "_state_and_client",
+        lambda _args: (RUN_CODE, path, state, client),
+    )
+    monkeypatch.setattr(fleet, "batch_status", lambda _batch_id: {
+        "batch_id": BATCH_ID,
+        "plan_id": plan["plan_id"],
+        "status": "starting",
+        "startup_status": "pending",
+        "workers": 2,
+    })
+
+    assert run_plans.cmd_progress_plan(_args()) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["status"] == "preparing"
+    assert payload["interaction"] == "notify"
+    assert payload["agent_action"] == "monitor"
+    assert "尚未开始执行" in payload["user_message"]
+    assert payload["agent"]["server_status"]["status"] == "running"
+
+
+def test_progress_surfaces_specific_pre_start_failure_without_internal_terms(
+    tmp_path, monkeypatch, capsys,
+):
+    plan = _plan()
+    path, state = _state(tmp_path, plan)
+    progress = _server_response(
+        plan,
+        _envelope(status="running", agent_action="monitor"),
+        state={"healthy_other_devices": 0, "other_healthy": []},
+    )
+    client = FakeClient(progress=[progress])
+    monkeypatch.setattr(
+        run_plans,
+        "_state_and_client",
+        lambda _args: (RUN_CODE, path, state, client),
+    )
+    monkeypatch.setattr(fleet, "batch_status", lambda _batch_id: {
+        "batch_id": BATCH_ID,
+        "plan_id": plan["plan_id"],
+        "status": "failed",
+        "startup_status": "failed",
+        "startup_error_code": "task_environment_update_failed",
+        "startup_user_message": (
+            "这台设备未能准备题目环境；已有本地文件没有被修改。"
+        ),
+        "startup_retryable": True,
+        "returncode": 1,
+    })
+
+    assert run_plans.cmd_progress_plan(_args()) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["status"] == "paused"
+    assert payload["error_code"] == "task_environment_update_failed"
+    assert payload["agent"]["requires_user_action"] is True
+    assert "已有本地文件没有被修改" in payload["user_message"]
+    assert all(
+        word not in payload["user_message"]
+        for word in ("Fleet", "batch", "provider", "refill")
+    )
 
 
 @pytest.mark.parametrize(

@@ -80,7 +80,7 @@ from .providers import (
     validate_refill_scope,
 )
 from .runner import (
-    CODEX_TRAJECTORY_BUNDLE_SCHEMA, DEEP_SWE_REPO, DIAG_ADVICE,
+    CODEX_TRAJECTORY_BUNDLE_SCHEMA, DIAG_ADVICE,
     BuildFlakeError, RunnerError,
     RunnerCleanupUnconfirmedError, RunnerTaskRetryableError,
     POMPEII_BENCHMARK_ID,
@@ -91,8 +91,9 @@ from .runner import (
     codex_trajectory_bundle_usage,
     diagnose_exception, ensure_pier, ensure_tasks_root,
     local_deep_swe_commit,
+    prepare_pinned_deep_swe_tasks,
     pompeii_agent_timeout_sec, run_trial,
-    summarize_result, sync_deep_swe_commit, task_content_mismatch_diagnostic,
+    summarize_result, task_content_mismatch_diagnostic,
     trial_artifact_paths,
 )
 from .scrub import (
@@ -138,6 +139,7 @@ _POOL_WORKER_ACTIVITY_ENV = "DRADAR_POOL_WORKER_ACTIVITY_FILE"
 _POOL_BACKFILL_V2_ENV = "DRADAR_POOL_BACKFILL_V2"
 _REPEAT_FAILURE_STATE_ENV = "DRADAR_REPEAT_FAILURE_STATE_FILE"
 _ASSIGNMENT_BOUNDARY_ENV = "DRADAR_ASSIGNMENT_BOUNDARY_FILE"
+_PINNED_TASKS_ROOT_ENV = "DRADAR_PINNED_TASKS_ROOT"
 _POOL_DRAIN_PREFIX = "drain:"
 # EX_TEMPFAIL: a supervised child uses this to distinguish one unsafe slot
 # from a generic failure that must freeze the pool's shared waiting queue.
@@ -237,6 +239,9 @@ def _ensure_egress_runtime(*, probe_connectivity: bool = True) -> None:
 
 
 def _selected_tasks_root(cfg: dict) -> Path:
+    pinned_override = os.environ.get(_PINNED_TASKS_ROOT_ENV)
+    if pinned_override:
+        return Path(pinned_override)
     benchmark = cfg.get("benchmark") or DEFAULT_BENCHMARK
     if benchmark == DEFAULT_BENCHMARK:
         return tasks_root_from_config(cfg)
@@ -885,35 +890,59 @@ def _exit_for(exc: ApiError) -> None:
     sys.exit(str(exc))
 
 
-def _check_version_pin(pinned: str | None, tasks_root: Path, allow_drift: bool) -> str | None:
+def _check_version_pin(
+    pinned: str | None,
+    tasks_root: Path,
+    allow_drift: bool,
+    *,
+    return_tasks_root: bool = False,
+) -> str | None | tuple[Path, str | None]:
     """Refuse to burn real quota on a checkout the server won't grade the same
     way. The lease stays active across the exit."""
     local_commit = local_deep_swe_commit(tasks_root)
     if pinned and local_commit and local_commit != pinned:
-        # Self-heal: fetch + checkout the exact commit the server grades against,
-        # rather than making the volunteer do it by hand.
+        # Never mutate the volunteer's configured checkout. It may contain their
+        # own edits, and another concurrently running batch may need a different
+        # grading commit. Build/reuse one immutable DRadar-owned snapshot instead.
         print(f"deep-swe drifted (local {local_commit[:12]} != server {pinned[:12]}); "
-              "syncing to the server's pinned commit...")
-        if sync_deep_swe_commit(tasks_root, pinned):
-            print(f"  synced to {pinned[:12]}")
-            return pinned
-        fix = (
-            f"  git -C {tasks_root} fetch --depth 1 {DEEP_SWE_REPO} {pinned}\n"
-            f"  git -C {tasks_root} checkout {pinned}"
-        )
+              "preparing an isolated verified task snapshot...")
+        snapshot_error = None
+        try:
+            pinned_root = prepare_pinned_deep_swe_tasks(HOME, pinned)
+        except RunnerError as exc:
+            pinned_root = None
+            snapshot_error = str(exc)
         if not allow_drift:
-            sys.exit(
-                "couldn't auto-sync your deep-swe checkout to the version this "
-                f"server grades against:\n  local:  {local_commit}\n  server: {pinned}\n"
-                f"do it by hand, then re-run (the lease stays active):\n{fix}\n"
-                "or re-run with --allow-task-drift to proceed anyway (the "
-                "submission will be flagged for review)"
-            )
+            if pinned_root is None:
+                sys.exit(
+                    "couldn't prepare a verified task environment for this run; "
+                    "your configured task files were left unchanged. Check Git, "
+                    "network access, and free disk space, then retry"
+                    + (f" ({snapshot_error})" if snapshot_error else "")
+                )
+        if pinned_root is not None:
+            print(f"  isolated task snapshot ready at {pinned[:12]}")
+            return (pinned_root, pinned) if return_tasks_root else pinned
         print(
             f"warning: proceeding with task drift (local {local_commit[:12]} != "
             f"server {pinned[:12]}); the submission will be flagged for review"
         )
-    return local_commit
+    return (tasks_root, local_commit) if return_tasks_root else local_commit
+
+
+def _version_pinned_tasks_root(
+    pinned: str | None, tasks_root: Path, allow_drift: bool,
+) -> tuple[Path, str | None]:
+    """Internal adapter that preserves the historical pin-check test seam."""
+
+    result = _check_version_pin(
+        pinned, tasks_root, allow_drift, return_tasks_root=True,
+    )
+    if isinstance(result, tuple):
+        return result
+    # Older embedders/tests may replace the historical helper with a callable
+    # returning only the commit (or None). Keep their configured root intact.
+    return tasks_root, result
 
 
 # The trial-dir artifact layout is owned by runner (pier writes it); retry
@@ -3326,6 +3355,74 @@ def _preflight_scoped_provider(args) -> None:
     )
 
 
+def _publish_fleet_startup_failure(args, reason: object) -> None:
+    """Best-effort structured failure for the Agent-facing startup contract."""
+
+    if not getattr(args, "fleet_pool", False):
+        return
+    from . import fleet
+
+    detail = " ".join(str(reason).split()).lower()
+    if "deep-swe" in detail or "task snapshot" in detail or "version pin" in detail:
+        code = "task_environment_update_failed"
+        message = (
+            "这台设备未能准备与判分一致的题目环境；已有本地文件没有被修改。"
+            "请检查网络和磁盘空间后，再次使用原运行说明。"
+        )
+    elif any(word in detail for word in ("docker", "pier", "egress", "disk space")):
+        code = "local_environment_not_ready"
+        message = (
+            "这台设备的运行环境尚未准备好，题目没有开始执行。"
+            "请检查 Docker、网络和磁盘空间后，再次使用原运行说明。"
+        )
+    elif "auth" in detail or "provider" in detail or "login" in detail:
+        code = "runtime_tool_not_ready"
+        message = (
+            "这台设备上的运行工具尚未准备好，题目没有开始执行。"
+            "请先完成该运行工具的登录或修复，再次使用原运行说明。"
+        )
+    elif reason == "pool ended before startup acknowledgement":
+        code = "run_state_changed_before_start"
+        message = (
+            "题目状态在本机准备期间发生了变化，没有题目开始执行。"
+            "请重新检查网页状态后，再次使用原运行说明。"
+        )
+    else:
+        code = "local_start_failed"
+        message = (
+            "这台设备未能完成运行准备，题目没有开始执行。"
+            "请检查本机状态后，再次使用原运行说明。"
+        )
+    try:
+        fleet.publish_pool_startup_failure(
+            HOME,
+            args.batch_id,
+            error_code=code,
+            user_message=message,
+            retryable=True,
+        )
+    except (fleet.FleetError, OSError, ValueError):
+        # The original startup result remains authoritative. A dead coordinator
+        # or an already-ready pool must never be replaced by reporting cleanup.
+        pass
+
+
+def _ack_fleet_startup_ready(args) -> None:
+    if not getattr(args, "fleet_pool", False):
+        return
+    from . import fleet
+
+    if not os.environ.get(fleet.POOL_STARTUP_FILE_ENV):
+        return
+    try:
+        fleet.publish_pool_startup_ready(HOME, args.batch_id)
+    except (fleet.FleetError, OSError, ValueError) as exc:
+        raise SystemExit(
+            "couldn't confirm that the local run finished preparing; no task "
+            "will be started"
+        ) from exc
+
+
 def cmd_go(args) -> int:
     try:
         args.batch_id = normalize_batch_id(getattr(args, "batch_id", None))
@@ -3451,17 +3548,34 @@ def cmd_go(args) -> int:
             sys.exit("--max-estimated-quota-pct must be greater than 0")
     if not auto_workers:
         _align_refill_target_with_workers(args)
-    _preflight_scoped_provider(args)
     if (auto_workers or workers > 1) and not getattr(args, "worker_child", False):
-        return _run_worker_pool(args)
-    cfg = _run_config(args)
-    cfg["benchmark"] = (
-        getattr(args, "benchmark", None)
-        or cfg.get("benchmark")
-        or DEFAULT_BENCHMARK
-    )
-    client = _client(cfg, auto_register=True)
-    _scope_client_to_batch(client, args.batch_id)
+        try:
+            _preflight_scoped_provider(args)
+            result = _run_worker_pool(args)
+        except BaseException as exc:
+            _publish_fleet_startup_failure(args, exc)
+            raise
+        _publish_fleet_startup_failure(
+            args, "pool ended before startup acknowledgement",
+        )
+        return result
+    try:
+        _preflight_scoped_provider(args)
+    except BaseException as exc:
+        _publish_fleet_startup_failure(args, exc)
+        raise
+    try:
+        cfg = _run_config(args)
+        cfg["benchmark"] = (
+            getattr(args, "benchmark", None)
+            or cfg.get("benchmark")
+            or DEFAULT_BENCHMARK
+        )
+        client = _client(cfg, auto_register=True)
+        _scope_client_to_batch(client, args.batch_id)
+    except BaseException as exc:
+        _publish_fleet_startup_failure(args, exc)
+        raise
     # Pre-default configs may not carry tasks_root at all.  They now get the
     # same hidden checkout as a fresh login, while any explicit legacy path
     # remains authoritative.
@@ -3528,6 +3642,7 @@ def cmd_go(args) -> int:
                     probe_connectivity=not getattr(args, "worker_child", False),
                 )
         except RunnerError as exc:
+            _publish_fleet_startup_failure(args, exc)
             sys.exit(str(exc))
 
         telemetry.set_phase("queued")
@@ -3546,7 +3661,14 @@ def cmd_go(args) -> int:
         # Completed paid work is represented only by the durable pending-upload
         # ledger above; old retired state directories can never start a model.
 
-        rc = _go_menu(args, cfg, client, tasks_root, telemetry=telemetry)
+        try:
+            rc = _go_menu(args, cfg, client, tasks_root, telemetry=telemetry)
+        except BaseException as exc:
+            _publish_fleet_startup_failure(args, exc)
+            raise
+        _publish_fleet_startup_failure(
+            args, "pool ended before startup acknowledgement",
+        )
         if not getattr(args, "parallel", False) and not fleet_pool:
             _maintain_image_cache(client, cfg, phase="after run")
         if not _finish_invocation_assignment_boundary(
@@ -4091,6 +4213,12 @@ def _run_worker_pool(args) -> int:
             )
     if not active:
         return 0
+    worker_tasks_root = tasks_root
+    if active[0].get("deep_swe_commit"):
+        worker_tasks_root, _worker_task_commit = _version_pinned_tasks_root(
+            active[0].get("deep_swe_commit"), tasks_root,
+            args.allow_task_drift,
+        )
     boundary_path = _assignment_boundary_path(args)
     if cfg.get("benchmark"):
         boundary_path = _prepare_assignment_boundary(
@@ -4198,6 +4326,7 @@ def _run_worker_pool(args) -> int:
             sorted(returned_assignment_ids), separators=(",", ":"),
         )
         env[_POOL_WORKER_ACTIVITY_ENV] = str(activity_file)
+        env[_PINNED_TASKS_ROOT_ENV] = str(worker_tasks_root)
         if boundary_path is not None:
             env[_ASSIGNMENT_BOUNDARY_ENV] = str(boundary_path)
         process = subprocess.Popen(command, env=env, **popen_kwargs)
@@ -4208,6 +4337,17 @@ def _run_worker_pool(args) -> int:
     try:
         for index in range(1, count + 1):
             spawn_worker(index)
+        if fleet_pool and os.environ.get(fleet.POOL_STARTUP_FILE_ENV):
+            try:
+                fleet.publish_pool_startup_ready(HOME, args.batch_id)
+            except (fleet.FleetError, OSError, ValueError):
+                print(
+                    "couldn't confirm that the local run finished preparing; "
+                    "stopping the newly started workers safely"
+                )
+                _signal_workers(processes)
+                cleanup_abort_file()
+                return 1
 
         next_backfill_check = 0.0
         while True:
@@ -4664,8 +4804,10 @@ def _run_batch(args, client: ApiClient, tasks_root: Path, active: list[dict],
     if not active:
         print("all held assignments already have durable pending results; refusing to rerun")
         return 1
-    local_commit = _check_version_pin(active[0].get("deep_swe_commit"), tasks_root,
-                                      args.allow_task_drift)
+    tasks_root, local_commit = _version_pinned_tasks_root(
+        active[0].get("deep_swe_commit"), tasks_root, args.allow_task_drift,
+    )
+    _ack_fleet_startup_ready(args)
 
     n = len(active)
     if n > 1:
@@ -4753,8 +4895,10 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
     batch instead of racing over a shared snapshot. Returns None when the
     server predates the checkout endpoint — the caller falls back to the
     legacy whole-batch flow."""
-    local_commit = _check_version_pin(active[0].get("deep_swe_commit"), tasks_root,
-                                      args.allow_task_drift)
+    tasks_root, local_commit = _version_pinned_tasks_root(
+        active[0].get("deep_swe_commit"), tasks_root, args.allow_task_drift,
+    )
+    _ack_fleet_startup_ready(args)
     results, failed_ids = [], set()
     batch_assignment_ids = {
         item["assignment_id"] for item in active if item.get("assignment_id")
