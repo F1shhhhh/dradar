@@ -1636,12 +1636,21 @@ def _upload_trial(
 
     upload_meta = dict(entry.get("meta") or {})
     trial_dir = Path(entry["trial_dir"])
+    # Claude Code emits an ATIF trajectory that is intentionally useful for
+    # audit, but it is not a Codex session tree. Prefer the adapter's strictly
+    # reconciled provider sidecar so the generic Codex bundle parser cannot
+    # shadow complete Claude request usage with an incomplete session bundle.
+    claude_usage = (
+        _subscription_trial_usage(trial_dir, upload_meta)
+        if upload_meta.get("claude_cli_version")
+        else None
+    )
     trajectory_bundle = None
     if not upload_meta.get("codebuddy_cli_version"):
         trajectory_bundle = build_codex_trajectory_bundle(trial_dir)
         if trajectory_bundle is None:
             trajectory_bundle = build_kimi_trajectory_bundle(trial_dir)
-    usage = (
+    usage = claude_usage or (
         codex_trajectory_bundle_usage(trajectory_bundle)
         if (
             trajectory_bundle is not None
