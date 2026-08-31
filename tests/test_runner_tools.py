@@ -11,6 +11,20 @@ def _assignment(agent, model="gpt-5.5", effort="medium"):
             "agent_version": "0.145.0"}
 
 
+def _claude_assignment(effort="high", model="claude-sonnet-5"):
+    return _assignment("claude-code", model=model, effort=effort) | {
+        "provider": runner_mod.CLAUDE_PROVIDER,
+        "agent_version": runner_mod.CLAUDE_CLI_VERSION,
+    }
+
+
+def _claude_auth(tmp_path):
+    path = tmp_path / "claude-oauth"
+    path.write_text("sk-ant-oat01-" + "x" * 64)
+    path.chmod(0o600)
+    return path
+
+
 def _stub_pier(monkeypatch):
     # build_pier_command resolves pier via shutil.which; stub it so the test
     # doesn't depend on pier being on the runner's PATH.
@@ -164,11 +178,16 @@ def test_claude_code_disallows_web_tools(tmp_path, monkeypatch):
     _stub_pier(monkeypatch)
     task = tmp_path / "abs-module-cache-flags"
     task.mkdir()
-    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "tok")
-    cmd = build_pier_command(_assignment("claude-code", model="claude-sonnet-5", effort="high"),
-                             tmp_path, tmp_path / "jobs", "j", tmp_path / "home")
+    auth = _claude_auth(tmp_path)
+    cmd = build_pier_command(
+        _claude_assignment(), tmp_path, tmp_path / "jobs", "j",
+        tmp_path / "home", provider_auth_path=auth,
+    )
     assert f"disallowed_tools={CLAUDE_DISALLOWED_TOOLS}" in cmd
     assert "WebSearch" in CLAUDE_DISALLOWED_TOOLS and "WebFetch" in CLAUDE_DISALLOWED_TOOLS
+    assert not any("sk-ant-oat" in part for part in cmd)
+    assert not any(part.startswith("CLAUDE_CODE_OAUTH_TOKEN=") for part in cmd)
+    assert f"oauth_token_file={auth}" in cmd
 
 
 # --- pier's inner agent timeout must never undercut DRadar's own outer one --
@@ -293,23 +312,25 @@ def test_multiplier_is_one_without_task_toml(tmp_path):
 def test_build_pier_command_passes_multiplier_for_long_estimate(tmp_path, monkeypatch):
     _stub_pier(monkeypatch)
     task = _task_with_toml(tmp_path, task_id="abs-module-cache-flags", timeout_sec=5400.0)
-    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "tok")
-    a = _assignment("claude-code", model="claude-sonnet-5", effort="high")
+    auth = _claude_auth(tmp_path)
+    a = _claude_assignment()
     a["est_minutes"] = 68
-    cmd = build_pier_command(a, tmp_path, tmp_path / "jobs", "j", tmp_path / "home")
+    cmd = build_pier_command(a, tmp_path, tmp_path / "jobs", "j", tmp_path / "home", provider_auth_path=auth)
     assert "--agent-timeout-multiplier" in cmd
     got = float(cmd[cmd.index("--agent-timeout-multiplier") + 1])
     assert got * 5400.0 >= 16320 + 60
 
 
-def test_build_pier_command_omits_multiplier_for_short_estimate(tmp_path, monkeypatch):
+def test_build_pier_command_keeps_canary_timeout_floor_for_short_estimate(tmp_path, monkeypatch):
     _stub_pier(monkeypatch)
     task = _task_with_toml(tmp_path, task_id="abs-module-cache-flags", timeout_sec=5400.0)
-    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "tok")
-    a = _assignment("claude-code", model="claude-sonnet-5", effort="high")
+    auth = _claude_auth(tmp_path)
+    a = _claude_assignment()
     a["est_minutes"] = 5
-    cmd = build_pier_command(a, tmp_path, tmp_path / "jobs", "j", tmp_path / "home")
-    assert "--agent-timeout-multiplier" not in cmd
+    cmd = build_pier_command(a, tmp_path, tmp_path / "jobs", "j", tmp_path / "home", provider_auth_path=auth)
+    assert "--agent-timeout-multiplier" in cmd
+    got = float(cmd[cmd.index("--agent-timeout-multiplier") + 1])
+    assert got * 5400.0 >= runner_mod.BETA_SUBSCRIPTION_TRIAL_TIMEOUT_FLOOR_SEC + 60
 
 
 def test_build_pier_command_keeps_two_hour_pompeii_pack(tmp_path, monkeypatch):
@@ -317,15 +338,14 @@ def test_build_pier_command_keeps_two_hour_pompeii_pack(tmp_path, monkeypatch):
     _task_with_toml(
         tmp_path, task_id="abs-module-cache-flags", timeout_sec=7200.0,
     )
-    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "tok")
-    assignment = _assignment(
-        "claude-code", model="claude-sonnet-5", effort="high",
-    ) | {
+    auth = _claude_auth(tmp_path)
+    assignment = _claude_assignment() | {
         "benchmark_id": runner_mod.POMPEII_BENCHMARK_ID,
         "est_minutes": 120,
     }
     cmd = build_pier_command(
         assignment, tmp_path, tmp_path / "jobs", "j", tmp_path / "home",
+        provider_auth_path=auth,
     )
     assert "--agent-timeout-multiplier" not in cmd
 
@@ -335,15 +355,14 @@ def test_build_pier_command_stretches_90_minute_pompeii_pack(tmp_path, monkeypat
     _task_with_toml(
         tmp_path, task_id="abs-module-cache-flags", timeout_sec=5400.0,
     )
-    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "tok")
-    assignment = _assignment(
-        "claude-code", model="claude-sonnet-5", effort="high",
-    ) | {
+    auth = _claude_auth(tmp_path)
+    assignment = _claude_assignment() | {
         "benchmark_id": runner_mod.POMPEII_BENCHMARK_ID,
         "est_minutes": 120,
     }
     cmd = build_pier_command(
         assignment, tmp_path, tmp_path / "jobs", "j", tmp_path / "home",
+        provider_auth_path=auth,
     )
     index = cmd.index("--agent-timeout-multiplier")
     assert cmd[index + 1] == "1.333333"
@@ -2261,7 +2280,7 @@ def test_run_trial_egress_failure_starts_nothing(tmp_path, monkeypatch):
 
     with pytest.raises(RunnerError, match="no model quota was used"):
         run_trial(
-            _assignment("claude-code"),
+            _claude_assignment(),
             tmp_path,
             tmp_path,
             on_started=lambda: marked_started.append(True),

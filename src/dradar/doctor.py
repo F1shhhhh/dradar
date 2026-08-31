@@ -26,6 +26,9 @@ from .local_config import _load_config, tasks_root_from_config
 from .providers import (
     ANTIGRAVITY_AGENT,
     ANTIGRAVITY_CLI_VERSION,
+    CLAUDE_AGENT,
+    CLAUDE_CLI_VERSION,
+    CLAUDE_MODELS,
     DEFAULT_CODEX_PROVIDER,
     DEEPSEEK_API_KEY_ENV,
     DEEPSEEK_PROVIDER,
@@ -37,6 +40,8 @@ from .providers import (
     ZCODE_CLI_VERSION,
     prepare_antigravity_auth,
     antigravity_auth_path,
+    claude_oauth_error,
+    claude_oauth_path,
     deepseek_api_key,
     deepseek_catalog_error,
     deepseek_opted_in,
@@ -505,6 +510,7 @@ def cmd_doctor(args) -> int:
     plat = _platform()
     selected_agent = getattr(args, "agent", None)
     codex_only = selected_agent == "codex"
+    claude_only = selected_agent == CLAUDE_AGENT
     dsh_only = selected_agent == "dsh-minimal"
     grok_only = selected_agent == GROK_AGENT
     kimi_only = selected_agent == KIMI_AGENT
@@ -513,6 +519,7 @@ def cmd_doctor(args) -> int:
     codebuddy_only = selected_agent == CODEBUDDY_AGENT
     scopes = {
         "codex": " — Codex",
+        CLAUDE_AGENT: " — Claude Code",
         "dsh-minimal": " — DSH Minimal",
         GROK_AGENT: " — Grok Build",
         KIMI_AGENT: " — Kimi Code",
@@ -631,7 +638,12 @@ def cmd_doctor(args) -> int:
     codex = shutil.which("codex")
     auth = runner.codex_auth_path()
     codex_ready = bool(codex) and auth.is_file()
-    claude_ready = bool(shutil.which("claude")) and bool(runner.claude_oauth_token())
+    claude_requested = claude_only or (
+        selected_agent is None and claude_oauth_path().exists()
+    )
+    claude_cli = shutil.which("claude") if claude_requested else None
+    claude_oauth_issue = claude_oauth_error() if claude_requested else None
+    claude_ready = bool(claude_cli and claude_oauth_issue is None)
     grok_requested = grok_only or (
         selected_agent is None and grok_auth_path().exists()
     )
@@ -728,9 +740,25 @@ def cmd_doctor(args) -> int:
         if deepseek_key_ready:
             _check("DeepSeek V4 Flash / Pro / Vision — DSH Minimal agent ready", True)
     elif (
-        grok_requested or kimi_requested or zcode_requested
+        claude_requested or grok_requested or kimi_requested or zcode_requested
         or antigravity_requested or codebuddy_requested
     ):
+        if claude_requested:
+            all_ok &= _check(
+                f"Claude Code CLI {CLAUDE_CLI_VERSION} — subscription runner",
+                bool(claude_cli),
+                "run `claude install latest`",
+            )
+            all_ok &= _check(
+                "Claude.ai subscription OAuth — dedicated DRadar slot",
+                claude_oauth_issue is None,
+                claude_oauth_issue or "run `dradar provider setup claude`",
+            )
+            if claude_ready:
+                _check(
+                    "Claude Sonnet 5 / Opus 5 — five native effort tiers ready",
+                    set(CLAUDE_MODELS) == {"claude-sonnet-5", "claude-opus-5"},
+                )
         if grok_requested:
             all_ok &= _check(
                 f"Grok CLI {GROK_CLI_VERSION} — subscription runner",
@@ -839,19 +867,17 @@ def cmd_doctor(args) -> int:
     elif codex_ready:
         _check("codex — agent ready", True)
     elif claude_ready and not codex_only:
-        _check("claude — agent ready", True)
+        _check("Claude Code subscription — agent ready", True)
     else:
         _check("codex CLI", bool(codex), _CODEX_HINTS[plat])
         _check("codex auth.json", auth.is_file(), "run: codex login")
         if not codex_only:
-            _check("claude CLI (alternative to codex)", bool(shutil.which("claude")),
-                   "npm install -g @anthropic-ai/claude-code")
-            _check("CLAUDE_CODE_OAUTH_TOKEN (alternative to codex)",
-                   bool(runner.claude_oauth_token()),
-                   "or: claude setup-token, then export CLAUDE_CODE_OAUTH_TOKEN each shell")
+            _check("Claude Code subscription slot", False,
+                   "run: dradar provider setup claude")
     if (
         not dsh_only
         and not deepseek_requested
+        and not claude_requested
         and not grok_requested
         and not kimi_requested
         and not zcode_requested

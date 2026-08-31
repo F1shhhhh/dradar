@@ -16,7 +16,7 @@ def test_honey_contract_is_linked_and_names_every_supported_honey() -> None:
         encoding="utf-8",
     )
     assert "docs/HONEY_EXECUTION_SECURITY.md" in readme
-    for name in ("Codex", "DSH", "ZCode", "Kimi Code", "Antigravity"):
+    for name in ("Codex", "Claude Code", "DSH", "ZCode", "Kimi Code", "Antigravity"):
         assert name in contract
     assert "新 Honey 接入门禁" in contract
     assert "子代理" in contract
@@ -62,8 +62,13 @@ def test_all_non_codex_honeys_use_full_container_permissions() -> None:
     assert '"--sandbox"' not in antigravity
     assert 'init.get("permission_mode") == "always-proceed"' in antigravity
 
+    claude = _source("pier_claude.py")
+    assert "class ClaudeCodeSubscription(ClaudeCode)" in claude
+    assert 'extra_env["CLAUDE_CODE_SAFE_MODE"] = "1"' in claude
+    assert 'extra_env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"' in claude
+
     assert providers.HONEY_SECURITY_AGENTS == {
-        "codex", "dsh-minimal", "zcode", "kimi-code", "antigravity",
+        "codex", "claude-code", "dsh-minimal", "zcode", "kimi-code", "antigravity",
     }
 
 

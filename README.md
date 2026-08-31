@@ -12,6 +12,7 @@ Pier + Docker 作为现阶段的任务执行方案；未来可以继续接入其
 - CLI 仓库：[github.com/SecurityMind/dradar](https://github.com/SecurityMind/dradar)
 - 当前 CLI 版本：运行 `dradar --version` 查看
 - 设计原则：[CLI 用户—Agent 双层交互设计原则](docs/CLI_USER_AGENT_INTERACTION_PRINCIPLES.md)
+- 接入指南：[DRadar Harness 接入最佳实践指南](docs/HARNESS_INTEGRATION_BEST_PRACTICES.md)
 
 ## 工作原理
 
@@ -37,7 +38,7 @@ Pier + Docker 作为现阶段的任务执行方案；未来可以继续接入其
   安装层缓存失效；本机 npm 不可达时，只接受服务端最近确认仍新鲜的精确版本。两边
   都无法确认最新版时不会启动模型，也不会消耗额度。已经运行中的任务不会被中途升级，
   下一道任务再更新。
-- **Honey 权限在容器内完整、边界在容器外**：Codex、DSH、ZCode、Kimi Code、
+- **Honey 权限在容器内完整、边界在容器外**：Codex、Claude Code、DSH、ZCode、Kimi Code、
   Antigravity 和 Grok 统一使用无人值守的完整编码/子代理权限，由 Docker 挂载、网络出口和凭证
   生命周期防作弊。新增 Honey 必须逐项通过
   [Honey 容器内完整权限与容器外隔离契约](docs/HONEY_EXECUTION_SECURITY.md) 的接入门禁。
@@ -197,6 +198,34 @@ DRadar 服务端。若代理协议、容器路由或官方镜像下载不可用�
 官方 egress 镜像通过普通 HTTPS 下载并校验归档 SHA-256，随后使用 `docker load` 本地
 载入；普通用户不需要登录 GHCR，也不需要为 Docker daemon 单独配置代理。只有显式设置
 `DRADAR_EGRESS_PROXY_IMAGE_OVERRIDE` 的运维回滚路径才会直接从 GHCR 拉取固定 digest。
+
+### Claude Code 订阅 Harness
+
+Claude Code Harness 只接受 Claude.ai 订阅 OAuth，不接受 `ANTHROPIC_API_KEY`、
+`ANTHROPIC_AUTH_TOKEN`、Bedrock 或自定义 API Base URL。普通 `claude auth login` 用于先确认
+当前账号和模型权限；Pier 容器需要官方 `claude setup-token` 生成的长期订阅 OAuth，统一由
+下面的交互式命令采集，输入不回显：
+
+```bash
+claude install latest
+claude auth login --claudeai
+dradar provider setup claude
+dradar provider status claude --live
+dradar doctor --agent claude-code
+```
+
+当前运行合同固定为 Claude Code `2.1.251`，前端展示两张模型卡片：
+
+| 模型卡片 | 原生 effort 格子 |
+| --- | --- |
+| Claude Sonnet 5 | `low`、`medium`、`high`、`xhigh`、`max` |
+| Claude Opus 5 | `low`、`medium`、`high`、`xhigh`、`max` |
+
+这十个格子都只允许网页显式领取，不进入默认自动推荐。凭证保存在 provider 专用的 `0600`
+私有文件中，不进入命令参数、任务目录、trajectory 或服务端请求；任务容器使用隔离配置和
+Claude Code safe mode，不加载宿主的 `CLAUDE.md`、skills、plugins、hooks、MCP、自定义命令
+或自定义 agents。榜单金额按服务器收到的真实 token 用量重新计算为官方 API 等价美元，
+只用于横向比较，不表示 Claude Code 订阅实际扣款。
 
 ### DeepSeek V4 Flash / Pro 补充 provider
 

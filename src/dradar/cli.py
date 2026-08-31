@@ -111,7 +111,7 @@ def main(argv: list[str] | None = None) -> int:
     p_doc = sub.add_parser("doctor", help="preflight checks")
     p_doc.add_argument(
         "--agent", choices=(
-            "codex", "dsh-minimal", "grok-build", "kimi-code", "zcode", "antigravity",
+            "codex", "claude-code", "dsh-minimal", "grok-build", "kimi-code", "zcode", "antigravity",
             "codebuddy",
         ), default=None,
         help="check only the dependencies required by this agent",
@@ -406,7 +406,7 @@ def main(argv: list[str] | None = None) -> int:
         "setup", help="securely configure a provider credential or OAuth session")
     p_provider_setup.add_argument(
         "provider", choices=(
-            "deepseek", "grok", "kimi", "zcode", "antigravity", "agy",
+            "deepseek", "claude", "claude-code", "grok", "kimi", "zcode", "antigravity", "agy",
             "codebuddy", "hy4",
         )
     )
@@ -415,7 +415,7 @@ def main(argv: list[str] | None = None) -> int:
         "status", help="check provider readiness without displaying credentials")
     p_provider_status.add_argument(
         "provider", choices=(
-            "deepseek", "grok", "kimi", "zcode", "antigravity", "agy",
+            "deepseek", "claude", "claude-code", "grok", "kimi", "zcode", "antigravity", "agy",
             "codebuddy", "hy4",
         )
     )
