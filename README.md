@@ -11,6 +11,7 @@ Pier + Docker 作为现阶段的任务执行方案；未来可以继续接入其
 - 官网与任务大表：[deng.codexradar.com](https://deng.codexradar.com)
 - CLI 仓库：[github.com/SecurityMind/dradar](https://github.com/SecurityMind/dradar)
 - 当前 CLI 版本：运行 `dradar --version` 查看
+- 设计原则：[CLI 用户—Agent 双层交互设计原则](docs/CLI_USER_AGENT_INTERACTION_PRINCIPLES.md)
 
 ## 工作原理
 
