@@ -397,6 +397,18 @@ def _stub_latest_codex_version(monkeypatch, request):
     )
 
 
+@pytest.fixture(autouse=True)
+def _stub_disposable_trial_builder(monkeypatch):
+    """Runner unit fakes replace Popen globally; keep Docker calls out of them."""
+    monkeypatch.setattr(
+        runner_mod.image_cache,
+        "prepare_trial_builder",
+        lambda *_a, **_k: runner_mod.image_cache.TrialBuilderLease(
+            "dradar-task-test", True,
+        ),
+    )
+
+
 def test_ensure_pier_noop_when_required_version_present(monkeypatch):
     monkeypatch.setattr(runner_mod.shutil, "which", lambda n: "/usr/bin/pier")
     monkeypatch.setattr(runner_mod, "_pier_version", lambda _: runner_mod.PIER_VERSION)

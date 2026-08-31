@@ -2354,6 +2354,10 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
                 "machine; refusing to start a duplicate model session"
             )
             return "busy"
+    # This flag belongs to exactly one checked-out task. A cleanup failure
+    # stops this worker before another checkout; a prior task must never poison
+    # a later explicit invocation after the user has repaired Docker.
+    args._docker_cleanup_blocked = None
     hash_match = check_task_content_hash(assignment, tasks_root)
     if hash_match is False and not getattr(args, "allow_task_drift", False):
         print(
@@ -2404,9 +2408,23 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
 
     for attempt in (1, 2):
         try:
-            art = run_trial(
-                assignment, tasks_root, work_dir, dev_agent=args.dev_agent,
-                on_started=bind_owner)
+            try:
+                art = run_trial(
+                    assignment, tasks_root, work_dir, dev_agent=args.dev_agent,
+                    on_started=bind_owner)
+            finally:
+                # A per-assignment builder owns only this trial's BuildKit
+                # state. Remove it as soon as Pier exits, including exception
+                # paths; task images/runtime objects are handled after the
+                # durable patch has been staged below.
+                builder_removed, builder_note = image_cache.remove_trial_builder(
+                    HOME, assignment["assignment_id"],
+                )
+                if not builder_removed:
+                    args._docker_cleanup_blocked = (
+                        "临时构建空间未能删除："
+                        + (builder_note or "Docker 未返回具体原因")
+                    )
             break
         except BuildFlakeError as exc:
             # The image build died before the agent ran — a free failure
@@ -2543,6 +2561,30 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         task_id=assignment["task_id"],
         trial_name=art.trial_dir.name,
     )
+    cleanup = image_cache.cleanup_trial_resources(
+        HOME,
+        assignment_id=assignment["assignment_id"],
+        job_dir=art.job_dir,
+        trial_name=art.trial_dir.name,
+        builder_isolated=art.builder_isolated,
+        keep_images=bool(args.keep),
+    )
+    removed_objects = (
+        cleanup.removed_containers + cleanup.removed_networks
+        + cleanup.removed_volumes + cleanup.removed_images
+    )
+    if cleanup.success:
+        reclaimed = _format_size(cleanup.estimated_reclaimed)
+        print(
+            f"  本题运行环境已清理（{removed_objects} 项，"
+            f"预计释放 {reclaimed}）"
+        )
+    else:
+        args._docker_cleanup_blocked = cleanup.note or "题目运行环境未能完整清理"
+        print(
+            "  提示：本题运行环境没有清理完整；这一路运行不会继续下一题"
+        )
+        print(f"  -> {args._docker_cleanup_blocked}")
 
     stats = summarize_result(art.result)
     # A recorded agent exception is always interrupted. A nonzero outer Pier
@@ -3300,10 +3342,10 @@ def _maintain_image_cache(client: ApiClient, cfg: dict, *, phase: str) -> bool:
 
 def _disk_allows_refill(cfg: dict) -> bool:
     policy = image_cache.effective_policy(HOME, cfg)
-    try:
-        return shutil.disk_usage(HOME).free >= policy.min_free_bytes
-    except OSError:
-        return True
+    allowed, _reason = image_cache.disk_allows_new_tasks(
+        HOME, min_free_bytes=policy.min_free_bytes,
+    )
+    return allowed
 
 
 def _scope_client_to_batch(client: ApiClient, batch_id: str | None) -> None:
@@ -4858,6 +4900,16 @@ def _run_batch(args, client: ApiClient, tasks_root: Path, active: list[dict],
                 telemetry.set_phase("queued")
         if not boundary_recorded:
             break
+        cleanup_blocked = getattr(args, "_docker_cleanup_blocked", None)
+        if cleanup_blocked:
+            if getattr(args, "refill", False):
+                refill_plan.stop(HOME, "local Docker cleanup was not confirmed")
+            print(
+                "本题结果已保存，但本机运行环境没有清理完整；已停止继续领取或运行下一题。"
+            )
+            print(f"  -> {cleanup_blocked}")
+            results.append(outcome)
+            break
         if outcome == "cleanup-unconfirmed":
             if getattr(args, "worker_child", False):
                 print(
@@ -5037,6 +5089,16 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
             else:
                 telemetry.set_phase("queued")
         if not boundary_recorded:
+            results.append(outcome)
+            break
+        cleanup_blocked = getattr(args, "_docker_cleanup_blocked", None)
+        if cleanup_blocked:
+            if getattr(args, "refill", False):
+                refill_plan.stop(HOME, "local Docker cleanup was not confirmed")
+            print(
+                "本题结果已保存，但本机运行环境没有清理完整；已停止继续领取或运行下一题。"
+            )
+            print(f"  -> {cleanup_blocked}")
             results.append(outcome)
             break
         if outcome == "cleanup-unconfirmed":

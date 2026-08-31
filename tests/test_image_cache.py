@@ -86,6 +86,121 @@ def test_periodic_maintenance_claim_is_shared_and_throttled(tmp_path: Path):
     )
 
 
+def test_trial_builder_is_assignment_scoped_and_never_selected_globally(
+    tmp_path: Path, monkeypatch,
+):
+    calls = []
+
+    def run(command, **_kwargs):
+        calls.append(command)
+        if command[:2] == ["buildx", "inspect"]:
+            return subprocess.CompletedProcess(command, 1, "", "not found")
+        return subprocess.CompletedProcess(command, 0, "ok", "")
+
+    monkeypatch.setattr(image_cache, "_run_docker", run)
+    lease = image_cache.prepare_trial_builder(
+        tmp_path, assignment_id="a1", runtime={},
+    )
+
+    assert lease.isolated and lease.name == image_cache.trial_builder_name(tmp_path, "a1")
+    assert calls[-1] == [
+        "buildx", "create", "--name", lease.name,
+        "--driver", "docker-container",
+    ]
+    assert "--use" not in calls[-1]
+
+
+def test_trial_builder_falls_back_without_exposing_loopback_proxy(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(
+        image_cache, "_run_docker",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("must not call Docker")),
+    )
+    lease = image_cache.prepare_trial_builder(
+        tmp_path,
+        assignment_id="a1",
+        runtime={
+            "DRADAR_EGRESS_UPSTREAM_HOST": "host.docker.internal",
+            "DRADAR_EGRESS_BUILD_PROXY": "http://secret@host.docker.internal:7890",
+        },
+    )
+
+    assert not lease.isolated and lease.name is None
+    assert "代理" in lease.note
+
+
+def test_wsl_host_disk_space_is_read_from_distribution_storage_drive(
+    monkeypatch,
+):
+    monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu")
+    monkeypatch.setattr(image_cache.shutil, "which", lambda _name: "/mnt/c/powershell.exe")
+    seen = {}
+
+    def run(command, **kwargs):
+        seen["command"] = command
+        seen["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(command, 0, str(80 * image_cache.GIB), "")
+
+    monkeypatch.setattr(image_cache.subprocess, "run", run)
+
+    assert image_cache.wsl_host_disk_free_bytes() == 80 * image_cache.GIB
+    assert seen["env"]["WSL_DISTRO_NAME"] == "Ubuntu"
+    assert "BasePath" in seen["command"][-1]
+
+
+def test_wsl_refill_stops_when_windows_host_disk_is_low(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(image_cache, "is_wsl", lambda: True)
+    monkeypatch.setattr(
+        image_cache, "disk_free_bytes",
+        lambda _home: (100 * image_cache.GIB, 10 * image_cache.GIB),
+    )
+
+    allowed, reason = image_cache.disk_allows_new_tasks(
+        tmp_path, min_free_bytes=25 * image_cache.GIB,
+    )
+
+    assert not allowed
+    assert "Windows" in reason
+
+
+def test_wsl_refill_fails_closed_when_host_disk_cannot_be_checked(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(image_cache, "is_wsl", lambda: True)
+    monkeypatch.setattr(
+        image_cache, "disk_free_bytes",
+        lambda _home: (100 * image_cache.GIB, None),
+    )
+
+    allowed, reason = image_cache.disk_allows_new_tasks(
+        tmp_path, min_free_bytes=25 * image_cache.GIB,
+    )
+
+    assert not allowed
+    assert "无法确认" in reason
+
+
+def test_remove_trial_builder_deletes_only_deterministic_assignment_builder(
+    tmp_path: Path, monkeypatch,
+):
+    calls = []
+
+    def run(command, **_kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(image_cache, "_run_docker", run)
+    assert image_cache.remove_trial_builder(tmp_path, "a1") == (True, None)
+    name = image_cache.trial_builder_name(tmp_path, "a1")
+    assert calls == [
+        ["buildx", "inspect", name],
+        ["buildx", "rm", name],
+    ]
+
+
 def test_invalid_trial_name_never_queries_docker(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(
         image_cache, "_run_docker",
@@ -166,6 +281,101 @@ def test_remove_prunes_only_matching_ledger_entry(tmp_path: Path, monkeypatch):
 
     assert removed == 1 and reclaimed == image.unique_size
     assert set(image_cache.load(tmp_path)) == {PROXY_REF}
+
+
+def test_per_task_image_cleanup_avoids_global_prune_and_inventory_scan(
+    tmp_path: Path, monkeypatch,
+):
+    with image_cache._ledger_lock(tmp_path):
+        image_cache._save_unlocked(tmp_path, {
+            MAIN_REF: {
+                "image_id": "sha256:abc",
+                "assignment_id": "a1",
+                "project": PROJECT,
+            },
+        })
+    calls = []
+
+    def run(command, **_kwargs):
+        calls.append(command)
+        if command[:2] == ["image", "inspect"]:
+            return subprocess.CompletedProcess(command, 0, json.dumps([_inspect()]), "")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(image_cache, "_run_docker", run)
+
+    removed, reclaimed, note = image_cache.remove_assignment_images(
+        tmp_path, assignment_id="a1", project=PROJECT,
+    )
+
+    assert (removed, reclaimed, note) == (1, 2 * image_cache.GIB, None)
+    assert image_cache.load(tmp_path) == {}
+    assert ["image", "rm", MAIN_REF] in calls
+    assert all(command[:2] != ["system", "df"] for command in calls)
+    assert all("prune" not in command for command in calls)
+
+
+def test_settled_task_cleanup_removes_only_exact_owned_resources(
+    tmp_path: Path, monkeypatch,
+):
+    assignment_id = "a1"
+    job_dir = tmp_path / "work" / "jobs" / "aa1"
+    (job_dir / PROJECT).mkdir(parents=True)
+    image = _image()
+    with image_cache._ledger_lock(tmp_path):
+        image_cache._save_unlocked(tmp_path, {
+            MAIN_REF: {
+                "image_id": image.image_id,
+                "assignment_id": assignment_id,
+                "project": PROJECT,
+            },
+        })
+    monkeypatch.setattr(
+        image_cache, "_remove_project_runtime", lambda *_a: (1, 1, 1),
+    )
+    removed = []
+    monkeypatch.setattr(
+        image_cache, "remove_assignment_images",
+        lambda *_a, **_k: (removed.append(image) or 1, image.unique_size, None),
+    )
+    monkeypatch.setattr(
+        image_cache, "remove_trial_builder", lambda *_a: (True, None),
+    )
+
+    result = image_cache.cleanup_trial_resources(
+        tmp_path,
+        assignment_id=assignment_id,
+        job_dir=job_dir,
+        trial_name=PROJECT,
+        builder_isolated=True,
+    )
+
+    assert result.success
+    assert (result.removed_containers, result.removed_networks,
+            result.removed_volumes, result.removed_images) == (1, 1, 1, 1)
+    assert removed == [image]
+
+
+def test_task_cleanup_refuses_a_directory_outside_managed_jobs(
+    tmp_path: Path, monkeypatch,
+):
+    external = tmp_path / "external"
+    (external / PROJECT).mkdir(parents=True)
+    monkeypatch.setattr(
+        image_cache, "_remove_project_runtime",
+        lambda *_a: (_ for _ in ()).throw(AssertionError("must not touch Docker")),
+    )
+
+    result = image_cache.cleanup_trial_resources(
+        tmp_path,
+        assignment_id="a1",
+        job_dir=external,
+        trial_name=PROJECT,
+        builder_isolated=True,
+    )
+
+    assert not result.success
+    assert "不属于 DRadar" in result.note
 
 
 def test_remove_revalidates_id_and_never_uses_force(monkeypatch):

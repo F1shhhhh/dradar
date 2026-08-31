@@ -28,7 +28,7 @@ from pathlib import Path
 
 import httpx
 
-from . import egress
+from . import egress, image_cache
 from .codebuddy_provider import (
     CODEBUDDY_AGENT,
     CODEBUDDY_API_KEY_ENVS,
@@ -319,6 +319,11 @@ class TrialArtifacts:
     dsh_version: str | None = None
     codebuddy_cli_version: str | None = None
     dsh_artifact_binding: dict[str, object] | None = None
+    # External/test adapters that construct TrialArtifacts predate the builder
+    # field and represent an already-contained run. The real run_trial path
+    # always sets this explicitly from prepare_trial_builder.
+    builder_isolated: bool = True
+    builder_note: str | None = None
 
 
 class RunnerError(RuntimeError):
@@ -3569,6 +3574,18 @@ def run_trial(
         ) from exc
     if egress_environment or effective_agent == CODEBUDDY_AGENT:
         _ensure_pier_sitecustomize(work_dir)
+    builder_lease = image_cache.prepare_trial_builder(
+        work_dir.parent,
+        assignment_id=str(assignment["assignment_id"]),
+        runtime=egress_environment,
+    )
+    if builder_lease.isolated:
+        print("已为本题准备独立的临时运行环境")
+    else:
+        print(
+            "提示：本题可以继续运行，但临时环境暂时无法安全隔离；"
+            f"完成后不会继续领取下一题（{builder_lease.note}）"
+        )
     jobs_dir = work_dir / "jobs"
     job_name = f"a{assignment['assignment_id']}"
     # A fresh lease re-run must not collide with a stale job dir.
@@ -3724,6 +3741,10 @@ def run_trial(
                 work_dir if effective_agent == CODEBUDDY_AGENT else None
             ),
         )
+        if builder_lease.name is not None:
+            # Select the assignment builder only for Pier. Never mutate the
+            # user's global/default buildx selection.
+            env["BUILDX_BUILDER"] = builder_lease.name
         if on_started is not None:
             # This is now the authoritative ownership bind. Never start a paid
             # model when the server has not fenced this exact session/epoch.
@@ -3990,6 +4011,8 @@ def run_trial(
         dsh_version=dsh_version,
         codebuddy_cli_version=codebuddy_cli_version,
         dsh_artifact_binding=dsh_artifact_binding,
+        builder_isolated=builder_lease.isolated,
+        builder_note=builder_lease.note,
     )
 
 

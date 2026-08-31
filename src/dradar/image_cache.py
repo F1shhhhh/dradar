@@ -13,12 +13,14 @@ they require the explicit ``cleanup --docker --all-task-images`` path.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import time
+import urllib.parse
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -30,6 +32,7 @@ SCHEMA_VERSION = 1
 LEDGER_NAME = "image-cache.json"
 LOCK_NAME = "image-cache.lock"
 MAINTENANCE_STAMP_NAME = "image-cache-maintenance.stamp"
+BUILDER_PREFIX = "dradar-task-"
 GIB = 1024 ** 3
 DEFAULT_MIN_FREE_GIB = 25.0
 _PROJECT_RE = re.compile(r"[a-z0-9][a-z0-9-]*__[a-z0-9]{6,8}$")
@@ -80,14 +83,109 @@ class MaintenanceResult:
     cache_bytes: int = 0
     limit_bytes: int = 0
     disk_free_bytes: int = 0
+    host_disk_free_bytes: int | None = None
     allow_new_claims: bool = True
     note: str | None = None
     legacy_count: int = 0
     legacy_bytes: int = 0
 
 
+@dataclass(frozen=True)
+class TrialBuilderLease:
+    name: str | None
+    isolated: bool
+    note: str | None = None
+
+
+@dataclass
+class TaskCleanupResult:
+    removed_containers: int = 0
+    removed_networks: int = 0
+    removed_volumes: int = 0
+    removed_images: int = 0
+    estimated_reclaimed: int = 0
+    builder_removed: bool = True
+    success: bool = True
+    note: str | None = None
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def is_wsl() -> bool:
+    if os.environ.get("WSL_DISTRO_NAME"):
+        return True
+    try:
+        release = Path("/proc/sys/kernel/osrelease").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return "microsoft" in release.lower()
+
+
+def wsl_host_disk_free_bytes() -> int | None:
+    """Read the Windows drive that physically stores this WSL distribution."""
+    if not is_wsl():
+        return None
+    powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+    distro = os.environ.get("WSL_DISTRO_NAME", "").strip()
+    if not powershell or not distro:
+        return None
+    script = r"""
+$entry = Get-ChildItem 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss' |
+  ForEach-Object { Get-ItemProperty $_.PSPath } |
+  Where-Object { $_.DistributionName -eq $env:WSL_DISTRO_NAME } |
+  Select-Object -First 1
+if ($null -eq $entry) { exit 2 }
+$base = [Environment]::ExpandEnvironmentVariables([string]$entry.BasePath)
+if ($base -notmatch '^(?:\\\\\?\\)?([A-Za-z]):\\') { exit 3 }
+$drive = Get-PSDrive -Name $Matches[1]
+[Console]::Out.Write([string][int64]$drive.Free)
+""".strip()
+    try:
+        proc = subprocess.run(
+            [
+                powershell, "-NoLogo", "-NoProfile", "-NonInteractive",
+                "-Command", script,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env={**os.environ, "WSL_DISTRO_NAME": distro},
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        value = int(proc.stdout.strip())
+    except ValueError:
+        return None
+    return value if value >= 0 else None
+
+
+def disk_free_bytes(home: Path) -> tuple[int | None, int | None]:
+    """Return guest and, on WSL, physical Windows-host free bytes."""
+    try:
+        guest = int(shutil.disk_usage(home).free)
+    except OSError:
+        guest = None
+    return guest, wsl_host_disk_free_bytes()
+
+
+def disk_allows_new_tasks(home: Path, *, min_free_bytes: int) -> tuple[bool, str | None]:
+    guest, host = disk_free_bytes(home)
+    if guest is None:
+        return False, "无法确认本机剩余磁盘空间"
+    if guest < min_free_bytes:
+        scope = "Ubuntu" if is_wsl() else "本机"
+        return False, f"{scope}可用磁盘空间低于安全线"
+    if is_wsl():
+        if host is None:
+            return False, "无法确认承载 Ubuntu 的 Windows 磁盘剩余空间"
+        if host < min_free_bytes:
+            return False, "承载 Ubuntu 的 Windows 磁盘空间低于安全线"
+    return True, None
 
 
 def _sanitize_project(name: str) -> str:
@@ -95,6 +193,100 @@ def _sanitize_project(name: str) -> str:
     if not re.match(r"^[a-z0-9]", value):
         value = "0" + value
     return re.sub(r"[^a-z0-9_-]", "-", value)
+
+
+def trial_builder_name(home: Path, assignment_id: str) -> str:
+    """Return a deterministic builder name scoped to one home and assignment."""
+    identity = f"{home.resolve()}\0{assignment_id}".encode("utf-8", "surrogatepass")
+    return BUILDER_PREFIX + hashlib.sha256(identity).hexdigest()[:20]
+
+
+def _builder_proxy_is_safe(runtime: dict[str, str]) -> tuple[bool, str | None]:
+    """Whether a dedicated bridge builder can use the configured build proxy.
+
+    A loopback proxy is translated to ``host.docker.internal`` for normal
+    Compose builds through an explicit host-gateway mapping. BuildKit's own
+    daemon container does not inherit that mapping. Falling back for one task
+    is safer than silently breaking a working volunteer setup; refill is then
+    stopped after the task because its cache could not be isolated.
+    """
+    if runtime.get("DRADAR_EGRESS_UPSTREAM_HOST") == "host.docker.internal":
+        return False, "本机代理暂时无法用于隔离的临时构建空间"
+    raw = runtime.get("DRADAR_EGRESS_BUILD_PROXY")
+    if not raw:
+        return True, None
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+    except ValueError:
+        return False, "本机代理地址无法安全用于临时构建空间"
+    if parsed.username or parsed.password:
+        # Never put proxy credentials into buildx driver options/process argv.
+        return False, "带密码的本机代理无法安全传给临时构建空间"
+    return True, None
+
+
+def prepare_trial_builder(
+    home: Path, *, assignment_id: str, runtime: dict[str, str] | None = None,
+) -> TrialBuilderLease:
+    """Create an isolated BuildKit builder for exactly one assignment.
+
+    The builder is never selected globally. ``BUILDX_BUILDER`` is applied only
+    to Pier's child environment, and deleting the builder removes its dedicated
+    BuildKit state volume without touching the user's default builder cache.
+    """
+    runtime = runtime or {}
+    safe, note = _builder_proxy_is_safe(runtime)
+    if not safe:
+        return TrialBuilderLease(None, False, note)
+    name = trial_builder_name(home, assignment_id)
+    try:
+        version = _run_docker(["buildx", "version"], timeout=30, allow_fail=True)
+        if version.returncode != 0:
+            return TrialBuilderLease(
+                None, False, "Docker 的临时构建空间功能不可用",
+            )
+        existing = _run_docker(
+            ["buildx", "inspect", name], timeout=30, allow_fail=True,
+        )
+        if existing.returncode == 0:
+            # The assignment lock proves this same home cannot be running the
+            # assignment concurrently. A matching builder is stale residue
+            # from a crashed prior attempt and is safe to replace exactly.
+            _run_docker(["buildx", "rm", name], timeout=180)
+        created = _run_docker([
+            "buildx", "create", "--name", name,
+            "--driver", "docker-container",
+        ], timeout=120, allow_fail=True)
+        if created.returncode != 0:
+            detail = (created.stderr or created.stdout or "").strip()
+            return TrialBuilderLease(
+                None, False,
+                "无法创建隔离的临时构建空间"
+                + (f"：{detail[:160]}" if detail else ""),
+            )
+    except DockerUnavailable as exc:
+        return TrialBuilderLease(None, False, f"临时构建空间不可用：{exc}")
+    return TrialBuilderLease(name, True)
+
+
+def remove_trial_builder(home: Path, assignment_id: str) -> tuple[bool, str | None]:
+    """Remove only the deterministic builder owned by one assignment."""
+    name = trial_builder_name(home, assignment_id)
+    try:
+        inspected = _run_docker(
+            ["buildx", "inspect", name], timeout=30, allow_fail=True,
+        )
+        if inspected.returncode != 0:
+            return True, None
+        removed = _run_docker(
+            ["buildx", "rm", name], timeout=180, allow_fail=True,
+        )
+    except DockerUnavailable as exc:
+        return False, str(exc)
+    if removed.returncode != 0:
+        detail = (removed.stderr or removed.stdout or "Docker 拒绝清理").strip()
+        return False, detail[:300]
+    return True, None
 
 
 def _parse_size(value: object) -> int:
@@ -619,19 +811,267 @@ def remove_images(home: Path, images: list[DockerImage]) -> tuple[int, int]:
     return removed, _estimate(removed_images)
 
 
+def remove_assignment_images(
+    home: Path, *, assignment_id: str, project: str,
+) -> tuple[int, int, str | None]:
+    """Remove exact ledger-bound tags without scanning the whole Docker cache."""
+    records = load(home)
+    expected = {
+        reference: record for reference, record in records.items()
+        if record.get("assignment_id") == assignment_id
+        and record.get("project") == project
+    }
+    removed: list[DockerImage] = []
+    stale: set[str] = set()
+    notes: list[str] = []
+    for reference, record in expected.items():
+        inspected_proc = _run_docker(
+            ["image", "inspect", reference], timeout=60, allow_fail=True,
+        )
+        if inspected_proc.returncode != 0:
+            detail = (inspected_proc.stderr or inspected_proc.stdout or "").lower()
+            if "no such image" in detail:
+                stale.add(reference)
+                continue
+            notes.append(f"{reference} 无法检查")
+            continue
+        try:
+            values = json.loads(inspected_proc.stdout)
+        except json.JSONDecodeError:
+            notes.append(f"{reference} 返回了无效信息")
+            continue
+        if not isinstance(values, list) or len(values) != 1 or not isinstance(values[0], dict):
+            notes.append(f"{reference} 返回了无效信息")
+            continue
+        inspected = values[0]
+        raw = {
+            "ID": inspected.get("Id"),
+            "UniqueSize": inspected.get("Size"),
+            "Containers": 0,
+            "CreatedAt": inspected.get("Created"),
+        }
+        image = _validated_image(reference, raw, inspected)
+        if image is None or image.image_id != record.get("image_id"):
+            notes.append(f"{reference} 归属发生变化")
+            continue
+        users = _run_docker([
+            "ps", "-aq", "--filter", f"ancestor={image.image_id}",
+        ], timeout=30)
+        if users.stdout.split():
+            notes.append(f"{reference} 仍被容器使用")
+            continue
+        deleted = _run_docker(
+            ["image", "rm", reference], timeout=180, allow_fail=True,
+        )
+        if deleted.returncode != 0:
+            notes.append(f"{reference} 删除失败")
+            continue
+        removed.append(image)
+    cleared = stale | {item.reference for item in removed}
+    if cleared:
+        with _ledger_lock(home):
+            latest = _load_unlocked(home)
+            for reference in cleared:
+                if latest.get(reference, {}).get("assignment_id") == assignment_id:
+                    latest.pop(reference, None)
+            _save_unlocked(home, latest)
+    return len(removed), _estimate(removed), "；".join(notes) if notes else None
+
+
+def _managed_trial_project(
+    home: Path, job_dir: Path, trial_name: str,
+) -> tuple[str, Path] | None:
+    project = _sanitize_project(trial_name)
+    if _PROJECT_RE.fullmatch(project) is None:
+        return None
+    try:
+        jobs_root = (home / "work" / "jobs").resolve()
+        resolved_job = job_dir.resolve()
+        resolved_trial = (resolved_job / trial_name).resolve()
+    except (OSError, RuntimeError):
+        return None
+    if resolved_job == jobs_root or jobs_root not in resolved_job.parents:
+        return None
+    if resolved_trial.parent != resolved_job or not resolved_trial.is_dir():
+        return None
+    return project, resolved_job
+
+
+def _inspect_json(command: list[str], *, timeout: int = 60) -> list[dict]:
+    proc = _run_docker(command, timeout=timeout)
+    try:
+        values = json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        raise DockerUnavailable("Docker returned malformed resource metadata") from exc
+    if not isinstance(values, list) or any(not isinstance(item, dict) for item in values):
+        raise DockerUnavailable("Docker returned malformed resource metadata")
+    return values
+
+
+def _container_owned_by_job(container: dict, project: str, job_dir: Path) -> bool:
+    labels = (container.get("Config", {}).get("Labels", {}) or {})
+    if labels.get("com.docker.compose.project") != project:
+        return False
+    mounts_owned = any(
+        isinstance(mount, dict)
+        and mount.get("Type") == "bind"
+        and _path_belongs_to(str(mount.get("Source", "")), job_dir)
+        for mount in container.get("Mounts", [])
+    )
+    configs_owned = any(
+        _path_belongs_to(value.strip(), job_dir)
+        for value in str(
+            labels.get("com.docker.compose.project.config_files", ""),
+        ).split(",")
+        if value.strip()
+    )
+    return mounts_owned or configs_owned
+
+
+def _path_belongs_to(path: str, root: Path) -> bool:
+    if not path:
+        return False
+    try:
+        return Path(path).resolve().is_relative_to(root.resolve())
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _remove_project_runtime(project: str, job_dir: Path) -> tuple[int, int, int]:
+    """Remove exact Compose runtime objects after proving trial ownership."""
+    listed = _run_docker([
+        "ps", "-aq", "--filter", f"label=com.docker.compose.project={project}",
+    ], timeout=30)
+    container_ids = [
+        value for value in listed.stdout.split()
+        if re.fullmatch(r"[0-9a-f]{12,64}", value)
+    ]
+    owned_ids: list[str] = []
+    if container_ids:
+        containers = _inspect_json(["inspect", *container_ids], timeout=60)
+        for container in containers:
+            container_id = container.get("Id")
+            if (
+                isinstance(container_id, str)
+                and any(container_id.startswith(value) for value in container_ids)
+                and _container_owned_by_job(container, project, job_dir)
+            ):
+                owned_ids.append(container_id)
+        if len(owned_ids) != len(container_ids):
+            raise DockerUnavailable(
+                "a Compose container matched the task name but not its exact job path"
+            )
+        if owned_ids:
+            _run_docker(["rm", "-f", *owned_ids], timeout=180)
+
+    removed_networks = 0
+    networks = _run_docker([
+        "network", "ls", "-q", "--filter",
+        f"label=com.docker.compose.project={project}",
+    ], timeout=30).stdout.split()
+    if networks:
+        inspected_networks = _inspect_json(
+            ["network", "inspect", *networks], timeout=60,
+        )
+        exact_networks = [
+            str(item.get("Id") or item.get("Name"))
+            for item in inspected_networks
+            if (item.get("Labels") or {}).get("com.docker.compose.project") == project
+            and (item.get("Id") or item.get("Name"))
+        ]
+        if len(exact_networks) != len(networks):
+            raise DockerUnavailable("Docker network ownership could not be confirmed")
+        if exact_networks:
+            _run_docker(["network", "rm", *exact_networks], timeout=120)
+            removed_networks = len(exact_networks)
+
+    removed_volumes = 0
+    volumes = _run_docker([
+        "volume", "ls", "-q", "--filter",
+        f"label=com.docker.compose.project={project}",
+    ], timeout=30).stdout.split()
+    if volumes:
+        inspected_volumes = _inspect_json(
+            ["volume", "inspect", *volumes], timeout=60,
+        )
+        exact_volumes = [
+            str(item.get("Name"))
+            for item in inspected_volumes
+            if (item.get("Labels") or {}).get("com.docker.compose.project") == project
+            and item.get("Name")
+        ]
+        if len(exact_volumes) != len(volumes):
+            raise DockerUnavailable("Docker volume ownership could not be confirmed")
+        if exact_volumes:
+            _run_docker(["volume", "rm", *exact_volumes], timeout=120)
+            removed_volumes = len(exact_volumes)
+    return len(owned_ids), removed_networks, removed_volumes
+
+
+def cleanup_trial_resources(
+    home: Path, *, assignment_id: str, job_dir: Path, trial_name: str,
+    builder_isolated: bool, keep_images: bool = False,
+) -> TaskCleanupResult:
+    """Delete one settled task's exact Docker resources before any refill.
+
+    No global prune is used. Runtime objects require the exact Compose project
+    label plus a managed job path, images require the existing ID-validated
+    ledger, and BuildKit cleanup removes only the per-assignment builder.
+    """
+    result = TaskCleanupResult()
+    managed = _managed_trial_project(home, job_dir, trial_name)
+    if managed is None:
+        result.success = False
+        result.note = "题目运行目录不属于 DRadar，未执行 Docker 清理"
+        return result
+    project, resolved_job = managed
+    notes: list[str] = []
+    try:
+        (
+            result.removed_containers,
+            result.removed_networks,
+            result.removed_volumes,
+        ) = _remove_project_runtime(project, resolved_job)
+    except DockerUnavailable as exc:
+        result.success = False
+        notes.append(f"运行环境清理失败：{exc}")
+
+    if not keep_images:
+        try:
+            removed, reclaimed, image_note = remove_assignment_images(
+                home, assignment_id=assignment_id, project=project,
+            )
+        except DockerUnavailable as exc:
+            result.success = False
+            notes.append(f"题目镜像检查失败：{exc}")
+        else:
+            result.removed_images = removed
+            result.estimated_reclaimed = reclaimed
+            if image_note:
+                result.success = False
+                notes.append(image_note)
+
+    builder_removed, builder_note = remove_trial_builder(home, assignment_id)
+    result.builder_removed = builder_removed
+    if not builder_isolated:
+        result.success = False
+        notes.append("本题未使用隔离的临时构建空间")
+    elif not builder_removed:
+        result.success = False
+        notes.append(f"临时构建空间清理失败：{builder_note or 'unknown error'}")
+    result.note = "；".join(notes) if notes else None
+    return result
+
+
 def automatic_maintenance(
     home: Path, cfg: dict, *, protected_assignment_ids: set[str],
 ) -> MaintenanceResult:
     policy = effective_policy(home, cfg)
-    disk_known = True
-    try:
-        disk_free = shutil.disk_usage(home).free
-    except OSError:
-        # An unreadable filesystem statistic is not proof of low space.  Keep
-        # cleanup disabled and let the normal runner surface any real write
-        # failure instead of blocking the user on an unknown value.
-        disk_known = False
-        disk_free = policy.min_free_bytes
+    guest_free, host_free = disk_free_bytes(home)
+    disk_known = guest_free is not None
+    host_known = not is_wsl() or host_free is not None
+    known_free = [value for value in (guest_free, host_free) if value is not None]
+    disk_free = min(known_free) if known_free else policy.min_free_bytes
     plan = plan_cleanup(
         home, protected_assignment_ids=protected_assignment_ids,
         include_kept=False, include_legacy=False,
@@ -640,21 +1080,27 @@ def automatic_maintenance(
         cache_bytes=plan.total_owned_bytes,
         limit_bytes=policy.limit_bytes,
         disk_free_bytes=disk_free,
+        host_disk_free_bytes=host_free,
         legacy_count=plan.legacy_count,
         legacy_bytes=plan.legacy_bytes,
     )
     if not plan.docker_available:
         result.note = plan.note
         result.allow_new_claims = (
-            not disk_known or disk_free >= policy.min_free_bytes
+            disk_known and host_known and disk_free >= policy.min_free_bytes
         )
         if not result.allow_new_claims:
+            disk_reason = (
+                "the Windows host disk could not be checked"
+                if not host_known
+                else "disk space is below the 25 GiB safety floor"
+            )
             result.note = (
-                f"{plan.note}; disk space is below the 25 GiB safety floor, "
+                f"{plan.note}; {disk_reason}, "
                 "so no new task will be claimed"
             )
         return result
-    pressure = disk_free < policy.min_free_bytes
+    pressure = disk_free < policy.min_free_bytes or not host_known or not disk_known
     over_limit = plan.total_owned_bytes > policy.limit_bytes
     if not pressure and not over_limit:
         return result
@@ -683,16 +1129,29 @@ def automatic_maintenance(
     result.removed = removed
     result.estimated_reclaimed = reclaimed
     result.cache_bytes = max(0, plan.total_owned_bytes - reclaimed)
-    try:
-        result.disk_free_bytes = shutil.disk_usage(home).free
-    except OSError:
-        pass
-    result.allow_new_claims = result.disk_free_bytes >= policy.min_free_bytes
+    refreshed_guest, refreshed_host = disk_free_bytes(home)
+    refreshed_known = [
+        value for value in (refreshed_guest, refreshed_host) if value is not None
+    ]
+    if refreshed_known:
+        result.disk_free_bytes = min(refreshed_known)
+    result.host_disk_free_bytes = refreshed_host
+    result.allow_new_claims = (
+        refreshed_guest is not None
+        and (not is_wsl() or refreshed_host is not None)
+        and result.disk_free_bytes >= policy.min_free_bytes
+    )
     if pressure and not result.allow_new_claims:
-        result.note = (
-            "disk space is still below the 25 GiB safety floor; no new task "
-            "will be claimed"
-        )
+        if is_wsl() and refreshed_host is None:
+            result.note = (
+                "the Windows disk holding Ubuntu could not be checked; no new "
+                "task will be claimed"
+            )
+        else:
+            result.note = (
+                "disk space is still below the 25 GiB safety floor; no new task "
+                "will be claimed"
+            )
     return result
 
 
@@ -749,8 +1208,12 @@ def cmd_config_set(args) -> int:
 
 __all__ = [
     "CachePolicy", "CleanupPlan", "DockerImage", "DockerUnavailable",
-    "MaintenanceResult", "automatic_maintenance", "discover_pier_images",
-    "claim_periodic_maintenance", "effective_policy", "load", "plan_cleanup",
-    "proxy_detected",
-    "record_trial_images", "remove_images", "cmd_config_set", "cmd_config_show",
+    "MaintenanceResult", "TaskCleanupResult", "TrialBuilderLease",
+    "automatic_maintenance", "cleanup_trial_resources", "discover_pier_images",
+    "claim_periodic_maintenance", "disk_allows_new_tasks", "disk_free_bytes",
+    "effective_policy", "is_wsl", "load", "plan_cleanup",
+    "prepare_trial_builder", "proxy_detected", "record_trial_images",
+    "remove_assignment_images", "remove_images", "remove_trial_builder",
+    "trial_builder_name",
+    "wsl_host_disk_free_bytes", "cmd_config_set", "cmd_config_show",
 ]

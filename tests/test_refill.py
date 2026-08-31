@@ -723,6 +723,35 @@ def test_non_submitted_outcome_stops_shared_plan(tmp_path: Path, monkeypatch):
     assert refill.load(tmp_path) is None
 
 
+def test_successful_task_does_not_refill_when_local_docker_cleanup_failed(
+    tmp_path: Path, monkeypatch,
+):
+    from test_go_menu import _args
+
+    first = _assignment("a1")
+    first.update(
+        agent="codex", expires_at="2099-01-01T00:00:00Z",
+        deep_swe_commit=None,
+    )
+    client = LoopClient([first])
+    _configure(tmp_path, [first], refill_to=1, max_tasks=3)
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)
+
+    def run(_client, assignment, _tasks_root, args, *_a, **_kw):
+        client.submit_locally(assignment["assignment_id"])
+        args._docker_cleanup_blocked = "题目镜像未能删除"
+        return "submitted"
+
+    monkeypatch.setattr(runloop, "_run_and_submit", run)
+    args = _args()
+    args.refill = True
+
+    assert runloop._run_checkout_loop(args, client, tmp_path, [first]) == 0
+    assert client.claimed == []
+    assert refill.load(tmp_path) is None
+
+
 def test_checkout_loop_refills_until_hard_cap_then_drains(
     tmp_path: Path, monkeypatch,
 ):
