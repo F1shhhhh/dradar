@@ -863,15 +863,28 @@ def _local_preparing_response(
     result = _local_monitor_response(server_response, selected=selected)
     agent = dict(result.get("agent") or {})
     agent["local_runner"] = {"status": "preparing"}
-    message = (
-        f"这台设备正在按同时处理 {selected} 道准备运行环境，题目尚未开始执行。"
-        "无需操作。"
-    )
-    if adjusted:
+    if selected == 1:
         message = (
-            f"这台设备当前适合同时处理 {selected} 道，系统将按这个数量运行；"
-            "正在准备运行环境，题目尚未开始执行。无需操作。"
+            "这台设备正在准备运行环境，稍后会逐个运行这次选择的题目。"
+            "题目尚未开始执行。无需操作。"
         )
+    else:
+        message = (
+            f"这台设备正在准备运行环境，稍后最多会同时运行 {selected} 道题。"
+            "题目尚未开始执行。无需操作。"
+        )
+    if adjusted:
+        if selected == 1:
+            message = (
+                "系统已根据这台设备的可用资源调整为逐个运行。"
+                "正在准备运行环境，题目尚未开始执行。无需操作。"
+            )
+        else:
+            message = (
+                "系统已根据这台设备的可用资源调整为"
+                f"最多同时运行 {selected} 道题。"
+                "正在准备运行环境，题目尚未开始执行。无需操作。"
+            )
     result.update({
         "status": "preparing",
         "interaction": "warn" if adjusted else "notify",

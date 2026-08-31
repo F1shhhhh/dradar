@@ -625,11 +625,11 @@ def test_auto_refill_uses_safe_effective_concurrency_not_seed_count(
 def test_run_reports_preparing_until_local_pool_acknowledges_readiness(
     tmp_path, monkeypatch, capsys,
 ):
-    plan = _plan()
+    plan = _plan(mode="fixed", concurrency=1)
     client = FakeClient(starts=[_server_response(plan)])
     _prepare_run(
         monkeypatch, tmp_path, plan=plan, client=client,
-        snapshot=_snapshot(available=2, auto_workers=2),
+        snapshot=_snapshot(available=1, auto_workers=1),
     )
     monkeypatch.setattr(
         fleet,
@@ -650,7 +650,10 @@ def test_run_reports_preparing_until_local_pool_acknowledges_readiness(
     assert payload["interaction"] == "notify"
     assert payload["agent_action"] == "monitor"
     assert payload["agent"]["local_runner"]["status"] == "preparing"
-    assert "尚未开始执行" in payload["user_message"]
+    assert payload["user_message"] == (
+        "这台设备正在准备运行环境，稍后会逐个运行这次选择的题目。"
+        "题目尚未开始执行。无需操作。"
+    )
 
 
 def test_structured_local_startup_failure_stops_phantom_device_immediately(
@@ -2264,7 +2267,10 @@ def test_progress_keeps_local_preparation_distinct_from_server_admission(
     assert payload["status"] == "preparing"
     assert payload["interaction"] == "notify"
     assert payload["agent_action"] == "monitor"
-    assert "尚未开始执行" in payload["user_message"]
+    assert payload["user_message"] == (
+        "这台设备正在准备运行环境，稍后最多会同时运行 2 道题。"
+        "题目尚未开始执行。无需操作。"
+    )
     assert payload["agent"]["server_status"]["status"] == "running"
 
 
