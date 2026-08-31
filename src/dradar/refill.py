@@ -17,7 +17,11 @@ from typing import Iterator
 from uuid import uuid4
 
 from .api_client import ApiError
-from .providers import REFILL_HARNESS_PROVIDERS, validate_refill_scope
+from .providers import (
+    REFILL_HARNESS_PROVIDERS,
+    normalize_refill_harness,
+    validate_refill_scope,
+)
 
 SCHEMA_VERSION = 1
 PLAN_FILE = "refill-plan.json"
@@ -328,6 +332,7 @@ def configure(
     refill_effort: str | None = None,
     refill_order: str = "cost",
     server_campaign_id: str | None = None,
+    points_tier: str | None = None,
     replace_existing: bool = False,
 ) -> dict:
     if refill_to < 1 or max_tasks < 1:
@@ -340,6 +345,8 @@ def configure(
         raise RefillError(f"unknown refill order: {refill_order}")
     if refill_harness is None and refill_order != "cost":
         raise RefillError("non-default refill order requires a refill harness")
+    if points_tier is not None and points_tier not in TIERS:
+        raise RefillError(f"unknown plan points tier: {points_tier}")
     if refill_harness is not None:
         try:
             refill_harness, refill_model, refill_effort = validate_refill_scope(
@@ -360,6 +367,8 @@ def configure(
     }
     if server_campaign_id is not None:
         desired["server_campaign_id"] = server_campaign_id
+        if points_tier is not None:
+            desired["points_tier"] = points_tier
     # A scoped plan owns only its Harness/model/effort lane.  The account may
     # legitimately hold work for other independent Harness campaigns; treating
     # those assignments as seeds would block this plan until the entire account
@@ -440,11 +449,20 @@ def configure(
         if current and current.get("status") in RUNNING_STATES:
             plan = current
         else:
-            seed_assignment_ids = list(dict.fromkeys(
-                assignment.get("assignment_id")
-                for assignment in active
-                if assignment.get("assignment_id")
-            ))
+            # A run-plan campaign can be shared by several machines. Each
+            # machine sees the whole exact batch but only observes its own
+            # submissions locally, so a machine-local seed ledger can never be
+            # authoritative there. The server campaign owns that global
+            # barrier. Legacy/local refill keeps the original durable ledger.
+            seed_assignment_ids = (
+                []
+                if server_campaign_id is not None else
+                list(dict.fromkeys(
+                    assignment.get("assignment_id")
+                    for assignment in active
+                    if assignment.get("assignment_id")
+                ))
+            )
             plan = {
                 "schema_version": SCHEMA_VERSION,
                 "plan_id": uuid4().hex,
@@ -460,6 +478,9 @@ def configure(
                 # at different times.
                 "seed_assignment_ids": seed_assignment_ids,
                 "submitted_seed_assignment_ids": [],
+                "seed_barrier": (
+                    "server" if server_campaign_id is not None else "local"
+                ),
                 **desired,
             }
             if replaced_plan_id:
@@ -679,6 +700,55 @@ def complete_if_empty(home: Path, held: int) -> None:
             _path(home).unlink(missing_ok=True)
 
 
+def _authoritative_campaign_snapshot(plan: dict, client) -> dict | None:
+    """Read and validate the global campaign state for a run-plan refill.
+
+    A scoped campaign is shared across devices, while the JSON file guarded by
+    this module is necessarily machine-local.  Seed completion, held queue
+    size, target and total budget therefore come from the server or fail
+    closed; the local ledger remains useful only for crash-safe metadata about
+    assignments this machine has observed.
+    """
+
+    campaign_id = plan.get("server_campaign_id")
+    if not campaign_id:
+        return None
+    response = client.refill_campaign_status(campaign_id)
+    campaign = response.get("campaign") if isinstance(response, dict) else None
+    # Compare the server's wire name with the local canonical name. This is a
+    # defensive protocol check only: the CLI still rejects continuous refill
+    # for paid-API DSH before campaign setup, so this does not enable it.
+    try:
+        campaign_harness = normalize_refill_harness(
+            campaign.get("harness") if isinstance(campaign, dict) else "",
+        )
+    except (AttributeError, ValueError):
+        campaign_harness = None
+    valid_statuses = {"active", "draining", "stopped", "completed"}
+    integer_fields = ("refill_to", "max_tasks", "planned", "held", "seed_pending")
+    valid = bool(
+        isinstance(campaign, dict)
+        and campaign.get("batch_id") == campaign_id
+        and campaign.get("status") in valid_statuses
+        and all(
+            isinstance(campaign.get(key), int)
+            and not isinstance(campaign.get(key), bool)
+            and campaign[key] >= (1 if key in {"refill_to", "max_tasks"} else 0)
+            for key in integer_fields
+        )
+        and campaign["refill_to"] <= campaign["max_tasks"]
+        and campaign["planned"] <= campaign["max_tasks"]
+        and campaign["held"] <= campaign["planned"]
+        and campaign["seed_pending"] <= campaign["planned"]
+        and campaign_harness == plan.get("refill_harness")
+        and campaign.get("model") == plan.get("refill_model")
+        and campaign.get("effort") == plan.get("refill_effort")
+    )
+    if not valid:
+        raise RefillError("server returned an invalid exact refill campaign status")
+    return campaign
+
+
 def refill_once(home: Path, client) -> dict:
     """Reconcile server-held work and atomically refill toward the plan target.
 
@@ -690,7 +760,7 @@ def refill_once(home: Path, client) -> dict:
         plan = _load_unlocked(home)
         if not plan or plan.get("status") not in RUNNING_STATES:
             return {"status": plan.get("status") if plan else "none", "claimed": 0}
-        if plan.get("status") == "draining":
+        if plan.get("status") == "draining" and not plan.get("server_campaign_id"):
             return {"status": "draining", "claimed": 0,
                     "planned": len(plan.get("assignments", {})),
                     "reason": plan.get("stop_reason")}
@@ -737,7 +807,58 @@ def refill_once(home: Path, client) -> dict:
             return {"status": "stopped", "claimed": 0,
                     "held": len(active), "planned": planned,
                     "reason": plan["stop_reason"]}
-        seed_pending = _pending_seed_assignment_ids(plan)
+        campaign = _authoritative_campaign_snapshot(plan, client)
+        if campaign is not None:
+            campaign_status = campaign["status"]
+            planned = campaign["planned"]
+            if campaign_status in {"stopped", "completed"}:
+                plan["status"] = campaign_status
+                plan["stop_reason"] = campaign.get("stop_reason")
+                _save_unlocked(home, plan)
+                return {
+                    "status": campaign_status,
+                    "claimed": 0,
+                    "held": campaign["held"],
+                    "planned": planned,
+                    "reason": campaign.get("stop_reason"),
+                }
+            if campaign["seed_pending"]:
+                # The exact server campaign counts submissions from every
+                # admitted device. Never gate this path on the machine-local
+                # submitted_seed_assignment_ids list.
+                plan["status"] = campaign_status
+                _save_unlocked(home, plan)
+                return {
+                    "status": campaign_status,
+                    "claimed": 0,
+                    "held": campaign["held"],
+                    "planned": planned,
+                    "seed_pending": campaign["seed_pending"],
+                }
+            if campaign_status == "draining":
+                plan["status"] = "draining"
+                plan["stop_reason"] = campaign.get("stop_reason")
+                _save_unlocked(home, plan)
+                return {
+                    "status": "draining",
+                    "claimed": 0,
+                    "held": campaign["held"],
+                    "planned": planned,
+                    "reason": campaign.get("stop_reason"),
+                }
+            plan["status"] = "active"
+            plan["stop_reason"] = None
+            held_for_target = campaign["held"]
+            target_for_refill = campaign["refill_to"]
+            max_tasks_for_refill = campaign["max_tasks"]
+        else:
+            held_for_target = len(active)
+            target_for_refill = int(plan["refill_to"])
+            max_tasks_for_refill = int(plan["max_tasks"])
+
+        seed_pending = (
+            [] if campaign is not None else _pending_seed_assignment_ids(plan)
+        )
         if seed_pending:
             # A user-selected batch is a priority barrier, not merely older
             # FIFO work. Waiting here prevents a fast worker from starting an
@@ -746,8 +867,8 @@ def refill_once(home: Path, client) -> dict:
             return {"status": plan["status"], "claimed": 0,
                     "held": len(active), "planned": planned,
                     "seed_pending": len(seed_pending)}
-        slots_left = max(0, int(plan["max_tasks"]) - planned)
-        missing = max(0, int(plan["refill_to"]) - len(active))
+        slots_left = max(0, max_tasks_for_refill - planned)
+        missing = max(0, target_for_refill - held_for_target)
         wanted = min(missing, slots_left)
         if wanted == 0:
             if slots_left == 0:
@@ -755,7 +876,7 @@ def refill_once(home: Path, client) -> dict:
                 plan["stop_reason"] = "max_tasks reserved; draining queue"
             _save_unlocked(home, plan)
             return {"status": plan["status"], "claimed": 0,
-                    "held": len(active), "planned": planned}
+                    "held": held_for_target, "planned": planned}
 
         claimed = 0
         # Ask for a few alternates so a stale recommendation or one expensive
@@ -776,6 +897,7 @@ def refill_once(home: Path, client) -> dict:
         quota_blocked = False
         missing_quota_estimate = False
         server_target_satisfied = False
+        server_seed_pending = 0
         for cell in suggestions:
             if claimed >= wanted:
                 break
@@ -794,6 +916,7 @@ def refill_once(home: Path, client) -> dict:
                     ack = client.claim_assignment(
                         cell["task_id"], cell["model"], cell["effort"],
                         refill_campaign_id=campaign_id,
+                        tier=plan.get("points_tier"),
                     )
                 else:
                     ack = client.claim_assignment(
@@ -816,6 +939,15 @@ def refill_once(home: Path, client) -> dict:
                     server_target_satisfied = (
                         exc.code == "refill_target_satisfied"
                     )
+                    if exc.code == "refill_seed_pending":
+                        payload = exc.payload if isinstance(exc.payload, dict) else {}
+                        remote_campaign = payload.get("campaign")
+                        if isinstance(remote_campaign, dict):
+                            value = remote_campaign.get("seed_pending")
+                            if isinstance(value, int) and not isinstance(value, bool):
+                                server_seed_pending = max(1, value)
+                        if server_seed_pending == 0:
+                            server_seed_pending = 1
                     break
                 if exc.status_code == 409:
                     continue
@@ -829,8 +961,11 @@ def refill_once(home: Path, client) -> dict:
                     plan["stop_reason"] = str(exc)
                     _save_unlocked(home, plan)
                     return {"status": "stopped", "claimed": claimed,
-                            "held": len(active) + claimed,
-                            "planned": len(plan["assignments"]),
+                            "held": held_for_target + claimed,
+                            "planned": (
+                                planned + claimed if campaign is not None else
+                                len(plan["assignments"])
+                            ),
                             "reason": str(exc)}
                 if accepted:
                     claimed += 1
@@ -850,16 +985,21 @@ def refill_once(home: Path, client) -> dict:
             plan["stop_reason"] = "no recommended task fits the estimated quota left"
         _save_unlocked(home, plan)
         result = {"status": plan["status"], "claimed": claimed,
-                "held": len(active) + claimed,
-                "planned": len(plan["assignments"]),
+                "held": held_for_target + claimed,
+                "planned": (
+                    planned + claimed if campaign is not None else
+                    len(plan["assignments"])
+                ),
                 "reserved_quota_pct": _reserved_quota(plan),
                 "reason": plan.get("stop_reason")}
         if server_target_satisfied:
             result["target_satisfied"] = True
+        if server_seed_pending:
+            result["seed_pending"] = server_seed_pending
         if (claimed == 0 and plan.get("refill_harness")
                 and plan.get("status") == "active"
                 and not missing_quota_estimate and not quota_blocked
-                and not server_target_satisfied):
+                and not server_target_satisfied and not server_seed_pending):
             result["waiting_for_inventory"] = True
             result["reason"] = (
                 "no currently claimable open cells match the configured refill scope"

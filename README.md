@@ -11,6 +11,7 @@ Pier + Docker 作为现阶段的任务执行方案；未来可以继续接入其
 - 官网与任务大表：[deng.codexradar.com](https://deng.codexradar.com)
 - CLI 仓库：[github.com/SecurityMind/dradar](https://github.com/SecurityMind/dradar)
 - 当前 CLI 版本：运行 `dradar --version` 查看
+- 设计原则：[CLI 用户—Agent 双层交互设计原则](docs/CLI_USER_AGENT_INTERACTION_PRINCIPLES.md)
 
 ## 工作原理
 
@@ -93,6 +94,8 @@ dradar status                          # 查看自己的提交和判分
 | `dradar login` | 本地配置 | 保存服务端和 Token、注册新账号或通过 GitHub 恢复身份 |
 | `dradar doctor` | 可能安装依赖 | 检查 Docker、Pier、Codex/Claude、任务仓库、磁盘和登录状态 |
 | `dradar capacity` | 否 | 根据 Docker 资源、磁盘和账号上限推荐安全 worker 数 |
+| `dradar run/progress/stop` | 是/否 | 供 Agent 按网页运行说明开始、跟进或停止一次精确领取；普通用户无需理解内部编号 |
+| `dradar schema run/progress/stop` | 否 | 输出版本化、机器可读的 Agent 命令合同 |
 | `dradar fleet add/status/watch/stop` | 是/否 | 在同机安全编排多个精确 Honeypot batch，并分别设置 worker 数 |
 | `dradar cells` | 否 | 查看、筛选和排序完整格子表，不领取任务 |
 | `dradar go` | 是 | 使用网页已领任务，或从 CLI 精确/自动领题并运行、上传 |
@@ -115,6 +118,8 @@ dradar --help
 dradar go --help
 dradar cells --help
 ```
+
+网页普通流程会把完整运行说明交给 Agent。若一次运行停止后仍有已经完成的结果没有送达，`progress --json` 会给 Agent 返回精确的恢复动作；Agent 使用同一次运行说明执行 `run --upload-only --json`，只补交本机完成结果，不重新运行题目。没有需要补交的结果时该动作会直接成功。
 
 ## 账号与环境命令
 

@@ -160,6 +160,71 @@ def test_fleet_tracks_separate_honeypot_batches_and_total_workers(
     assert persisted["batches"][BATCH_B]["workers"] == 3
 
 
+def test_controller_liveness_requires_process_lifetime_lease_not_reused_pid(
+    tmp_path, monkeypatch,
+):
+    state = fleet._initial_state("controller-reused-pid", None)
+    state["status"] = "active"
+    fleet._write_state(tmp_path, state)
+    monkeypatch.setattr(fleet, "_pid_alive", lambda _pid: True)
+
+    # A live-looking/reused PID and fresh heartbeat are insufficient without
+    # the exact controller lease held by the controller process.
+    assert fleet.controller_is_active(tmp_path) is False
+
+    with fleet._controller_lease(tmp_path, "controller-reused-pid"):
+        assert fleet.controller_is_active(tmp_path) is True
+
+
+def test_dead_controller_without_pool_lock_exposes_interrupted_zero_reservation(
+    tmp_path,
+):
+    state = fleet._initial_state("dead-controller", None)
+    state["status"] = "active"
+    state["batches"][BATCH_A] = {
+        "batch_id": BATCH_A,
+        "status": "running",
+        "workers": 3,
+        "plan_id": "plan-dead",
+    }
+    fleet._write_state(tmp_path, state)
+
+    public = fleet._public_state(tmp_path)
+
+    assert public["active"] is False
+    assert public["batches"][BATCH_A]["status"] == "interrupted"
+    assert public["total_workers"] == 0
+    assert fleet.batch_status(BATCH_A, home=tmp_path)["status"] == "interrupted"
+    assert fleet.reserved_workers(tmp_path) == 0
+
+
+def test_dead_controller_with_live_pool_lock_keeps_orphan_reservation_and_credential(
+    tmp_path,
+):
+    credentials = tmp_path / "run-plans" / "plan-orphan.json"
+    credentials.parent.mkdir(parents=True)
+    credentials.write_text("{}")
+    state = fleet._initial_state("dead-controller", None)
+    state["status"] = "active"
+    state["batches"][BATCH_A] = {
+        "batch_id": BATCH_A,
+        "status": "running",
+        "workers": 2,
+        "plan_id": "plan-orphan",
+        "credentials_file": str(credentials),
+    }
+    fleet._write_state(tmp_path, state)
+    fleet.acquire_pool_lock(tmp_path, BATCH_A, "dead-controller")
+
+    public = fleet._public_state(tmp_path)
+
+    assert public["active"] is False
+    assert public["batches"][BATCH_A]["status"] == "orphaned"
+    assert public["total_workers"] == 2
+    assert fleet.reserved_workers(tmp_path) == 2
+    assert fleet.credentials_file_in_use(credentials, home=tmp_path) is True
+
+
 def test_auto_workers_subtract_existing_machine_reservations(monkeypatch):
     class Client:
         def set_batch_id(self, value):
@@ -257,6 +322,74 @@ def test_refill_pool_command_keeps_exact_batch_and_total_cap(tmp_path, monkeypat
     assert command[command.index("--refill-model") + 1] == "kimi-k2.5"
     assert command[command.index("--refill-effort") + 1] == "high"
     assert captured["env"]["DRADAR_REFILL_PLAN_SCOPE"] == BATCH_A
+
+
+def test_plan_token_stays_in_private_file_not_fleet_argv_env_or_state(
+    tmp_path, monkeypatch,
+):
+    fleet._prepare_dirs(tmp_path)
+    credentials = tmp_path / "run-plans" / "plan-example.json"
+    credentials.parent.mkdir(mode=0o700)
+    token = "drp_extremely_private_plan_token"
+    credentials.write_text(json.dumps({"token": token}))
+    credentials.chmod(0o600)
+    captured = {}
+
+    class Process:
+        pid = 321
+
+        def poll(self):
+            return None
+
+    def popen(command, **kwargs):
+        captured["command"] = command
+        captured["env"] = kwargs["env"]
+        return Process()
+
+    monkeypatch.setattr(fleet.subprocess, "Popen", popen)
+    monkeypatch.setattr("dradar.machine._lock_handle", None)
+    process, log = fleet._spawn_pool(
+        tmp_path,
+        {"controller_id": "controller-1"},
+        BATCH_A,
+        2,
+        credentials_file=str(credentials),
+    )
+    log.close()
+    assert process.pid == 321
+    assert captured["command"][captured["command"].index("--credentials-file") + 1] == str(credentials)
+    assert token not in captured["command"]
+    assert all(token not in str(value) for value in captured["env"].values())
+
+    state = fleet._initial_state("controller-1", None)
+    state["status"] = "active"
+    monkeypatch.setattr(
+        fleet, "_resolve_workers",
+        lambda *_args: (2, [], {"account_limit": 4}),
+    )
+    monkeypatch.setattr(
+        fleet,
+        "_spawn_pool",
+        lambda *_args, **_kwargs: (Process(), io.StringIO()),
+    )
+    fleet._handle_request(
+        tmp_path,
+        state,
+        {},
+        {},
+        {
+            "request_id": "plan-request",
+            "controller_id": "controller-1",
+            "command": "add",
+            "batch_id": BATCH_A,
+            "workers": 2,
+            "credentials_file": str(credentials),
+            "plan_id": "plan-example",
+        },
+    )
+    persisted = fleet._state_path(tmp_path).read_text()
+    assert token not in persisted
+    assert str(credentials) in persisted
 
 
 def test_pool_lock_rejects_duplicate_parent_and_dies_with_process(tmp_path):
@@ -382,3 +515,148 @@ def test_failed_refill_pool_stops_server_campaign(tmp_path, monkeypatch):
 
     assert state["batches"][BATCH_A]["status"] == "failed"
     assert stopped == [(BATCH_A, "local Fleet pool exited with code 7")]
+
+
+def test_run_plan_device_stop_drains_without_interrupting_or_stopping_campaign(
+    tmp_path, monkeypatch,
+):
+    fleet._prepare_dirs(tmp_path)
+    state = fleet._initial_state("controller-1", None)
+    state["status"] = "active"
+    state["batches"][BATCH_A] = {
+        "batch_id": BATCH_A,
+        "workers": 2,
+        "status": "running",
+        "refill": True,
+        "plan_id": "plan-a",
+        "credentials_file": str(tmp_path / "plan-a.json"),
+    }
+    signals = []
+
+    class Process:
+        def poll(self):
+            return None
+
+        def send_signal(self, value):
+            signals.append(value)
+
+    stopped_devices = []
+    monkeypatch.setattr(
+        fleet,
+        "_stop_run_plan_device",
+        lambda item, reason: stopped_devices.append((item["plan_id"], reason)),
+    )
+    monkeypatch.setattr(
+        fleet,
+        "_stop_item_refill",
+        lambda *_args: pytest.fail("a plan-local stop must not stop the shared campaign"),
+    )
+
+    fleet._handle_request(
+        tmp_path,
+        state,
+        {BATCH_A: Process()},
+        {BATCH_A: io.StringIO()},
+        {
+            "request_id": "stop-plan-a",
+            "controller_id": "controller-1",
+            "command": "stop",
+            "batch_id": BATCH_A,
+        },
+    )
+
+    assert signals == []
+    assert stopped_devices == [("plan-a", "a machine-local stop request")]
+    assert state["batches"][BATCH_A]["status"] == "stopping"
+    marker = fleet._root(tmp_path) / fleet.ABORT_DIR / f"{BATCH_A}.stop"
+    assert marker.read_text().startswith("drain:")
+    response = json.loads(
+        (fleet._root(tmp_path) / fleet.RESPONSE_DIR / "stop-plan-a.json").read_text()
+    )
+    assert response["ok"] is True
+    assert response["stopping"] == [BATCH_A]
+    assert response["warnings"] == []
+
+
+def test_failed_run_plan_pool_stops_only_its_device_not_shared_campaign(
+    tmp_path, monkeypatch,
+):
+    fleet._prepare_dirs(tmp_path)
+    state = fleet._initial_state("controller-1", None)
+    state["status"] = "active"
+    state["batches"][BATCH_A] = {
+        "batch_id": BATCH_A,
+        "workers": 2,
+        "status": "running",
+        "refill": True,
+        "plan_id": "plan-a",
+        "credentials_file": str(tmp_path / "plan-a.json"),
+    }
+    stopped_devices = []
+    monkeypatch.setattr(
+        fleet,
+        "_stop_run_plan_device",
+        lambda item, reason: stopped_devices.append((item["plan_id"], reason)),
+    )
+    monkeypatch.setattr(
+        fleet,
+        "_stop_item_refill",
+        lambda *_args: pytest.fail("one failed device must not stop the shared campaign"),
+    )
+
+    fleet._settle_pool(
+        tmp_path,
+        state,
+        {BATCH_A: object()},
+        {BATCH_A: io.StringIO()},
+        BATCH_A,
+        7,
+    )
+
+    assert state["batches"][BATCH_A]["status"] == "failed"
+    assert stopped_devices == [("plan-a", "local runner exit code 7")]
+
+
+@pytest.mark.parametrize(
+    "returncode,expected_status",
+    [(0, "stopped"), (1, "interrupted")],
+)
+def test_run_plan_stop_is_clean_only_when_active_work_settles_cleanly(
+    tmp_path, monkeypatch, returncode, expected_status,
+):
+    fleet._prepare_dirs(tmp_path)
+    state = fleet._initial_state("controller-1", None)
+    state["status"] = "active"
+    state["batches"][BATCH_A] = {
+        "batch_id": BATCH_A,
+        "workers": 1,
+        "status": "stopping",
+        "refill": True,
+        "plan_id": "plan-a",
+        "credentials_file": str(tmp_path / "plan-a.json"),
+    }
+    monkeypatch.setattr(
+        fleet,
+        "_stop_item_refill",
+        lambda *_args: pytest.fail("settling a plan stop must not stop the campaign"),
+    )
+    monkeypatch.setattr(
+        fleet,
+        "_stop_run_plan_device",
+        lambda *_args: pytest.fail("the requested stop was already sent"),
+    )
+
+    fleet._settle_pool(
+        tmp_path,
+        state,
+        {BATCH_A: object()},
+        {BATCH_A: io.StringIO()},
+        BATCH_A,
+        returncode,
+    )
+
+    assert state["batches"][BATCH_A]["status"] == expected_status
+    if returncode:
+        assert "recovery" in state["batches"][BATCH_A]["detail"]
+    else:
+        assert "detail" not in state["batches"][BATCH_A]

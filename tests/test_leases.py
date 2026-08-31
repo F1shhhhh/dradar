@@ -1,4 +1,5 @@
 from argparse import Namespace
+import json
 
 import pytest
 
@@ -65,6 +66,36 @@ def test_leases_lists_waiting_and_running_with_recovery_hint(monkeypatch, capsys
     assert "a1" in out and "a2" in out
     assert "dradar release --all" in out
     assert "--force" in out
+
+
+def test_leases_json_preserves_exact_batch_evidence(monkeypatch, capsys):
+    waiting = _cell("a1")
+    waiting["batch_id"] = "550e8400e29b41d4a716446655440000"
+    running = _cell("a2", started=True)
+    running.update({
+        "batch_id": "6ba7b8109dad11d180b400c04fd430c8",
+        "heartbeat_running": True,
+        "execution_state": "running",
+    })
+    client = FakeClient([waiting, running])
+    _wire(monkeypatch, client)
+
+    assert leases.cmd_leases(Namespace(json=True)) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["schema_version"] == 1
+    assert payload["status"] == "ok"
+    assert payload["summary"] == {
+        "paused": 0,
+        "running": 1,
+        "stale": 0,
+        "total": 2,
+        "waiting": 1,
+    }
+    assert [item["batch_id"] for item in payload["active"]] == [
+        "550e8400e29b41d4a716446655440000",
+        "6ba7b8109dad11d180b400c04fd430c8",
+    ]
 
 
 def test_leases_keeps_recent_expired_unsubmitted_assignment_visible(

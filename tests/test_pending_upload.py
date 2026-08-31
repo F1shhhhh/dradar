@@ -151,6 +151,94 @@ def test_session_bound_upload_registers_intent_before_submit(
     assert len(client.last_upload_intent_id) == 64
 
 
+def test_plan_pending_upload_replays_closed_exact_session_without_model_rerun(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    batch_id = "550e8400e29b41d4a716446655440000"
+    session_id = "session-plan-device-1"
+
+    class ClosedSessionPlanClient(FakeClient):
+        def __init__(self):
+            super().__init__(
+                lambda _aid: {"submission_id": "s1", "grade_status": "pending"},
+            )
+            self.closed_sessions = set()
+            self.network_available = False
+
+        def register_submission_upload_intent(
+            self, assignment_id, nonce, session_id_arg, owner_epoch,
+            upload_intent_id, *, resume_generation=None, intent_version=None,
+        ):
+            self.intent_calls.append((
+                assignment_id, session_id_arg, owner_epoch, upload_intent_id,
+            ))
+            if not self.network_available:
+                raise ApiError("connection lost before intent", status_code=None)
+            # The server contract allows this same exact mapped session/owner
+            # to register its first content intent immediately after close.
+            assert session_id_arg in self.closed_sessions
+            assert session_id_arg == session_id
+            assert owner_epoch == 0
+            return upload_intent_id
+
+    client = ClosedSessionPlanClient()
+    entry = _entry(
+        trial_dir,
+        batch_id=batch_id,
+        runner_session_id=session_id,
+        owner_epoch=0,
+        ledger_version=3,
+    )
+
+    assert runloop._upload_trial(client, entry) == "upload-failed"
+    saved = pending.load(tmp_path)
+    assert len(saved) == 1
+    assert saved[0]["batch_id"] == batch_id
+    assert saved[0]["runner_session_id"] == session_id
+
+    # Model work has already finished. Closing the runner and immediately
+    # repeating the same plan must replay only the exact durable upload.
+    client.closed_sessions.add(session_id)
+    client.network_available = True
+    monkeypatch.setattr(
+        runloop,
+        "_run_and_submit",
+        lambda *_args, **_kwargs: pytest.fail("replay must not run the model again"),
+    )
+
+    outcomes = runloop._retry_pending_uploads(client, batch_id=batch_id)
+
+    assert outcomes == ["submitted"]
+    assert pending.load(tmp_path) == []
+    assert client.calls == ["a1"]
+    assert len(client.intent_calls) == 2
+
+
+def test_plan_pending_replay_is_exact_batch_scoped(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    batch_a = "550e8400e29b41d4a716446655440000"
+    batch_b = "6ba7b8109dad11d180b400c04fd430c8"
+    pending.record(tmp_path, {"assignment_id": "a", "batch_id": batch_a})
+    pending.record(tmp_path, {"assignment_id": "b", "batch_id": batch_b})
+    pending.record(tmp_path, {"assignment_id": "legacy-without-scope"})
+    touched = []
+
+    def upload(_client, entry):
+        touched.append(entry["assignment_id"])
+        pending.remove(tmp_path, entry["assignment_id"])
+        return "submitted"
+
+    monkeypatch.setattr(runloop, "_upload_trial", upload)
+
+    assert runloop._retry_pending_uploads(object(), batch_id=batch_a) == ["submitted"]
+    assert touched == ["a"]
+    assert {entry["assignment_id"] for entry in pending.load(tmp_path)} == {
+        "b", "legacy-without-scope",
+    }
+
+
 def test_intent_registration_conflict_keeps_artifact_without_submit(
     tmp_path: Path, monkeypatch,
 ):

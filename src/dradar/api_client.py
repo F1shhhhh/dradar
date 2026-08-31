@@ -57,7 +57,8 @@ def _env_proxies_set() -> bool:
 class ApiError(RuntimeError):
     def __init__(self, message: str, status_code: int | None = None,
                  code: str | None = None, retry_after: float | None = None,
-                 required_capability: str | None = None):
+                 required_capability: str | None = None,
+                 payload: dict[str, Any] | None = None):
         # None means "never got a real HTTP response" (DNS/connect/timeout) —
         # callers that need to branch on a specific status (e.g. 409 vs 410)
         # must check this instead of grepping the message, which can contain
@@ -74,6 +75,9 @@ class ApiError(RuntimeError):
         # provider is not ready. Preserve the server's exact requirement so
         # run supervision never has to infer the provider from prose.
         self.required_capability = required_capability
+        # Versioned endpoints can return a complete Agent-facing envelope.
+        # Keep it as structured data so callers never have to parse prose.
+        self.payload = payload
 
 
 class ApiClient:
@@ -83,6 +87,7 @@ class ApiClient:
                  benchmark_id: str | None = None,
                  batch_id: str | None = None):
         self.server = server.rstrip("/")
+        self.plan_scoped = token.startswith("drp_")
         self.benchmark_id = benchmark_id
         self.batch_id = normalize_batch_id(batch_id)
         # write=None: large uploads over a slow tunnel must not hit a write
@@ -171,9 +176,11 @@ class ApiClient:
             detail: Any = resp.text
             code = None
             required_capability = None
+            payload = None
             try:
                 body = resp.json()
                 if isinstance(body, dict):
+                    payload = body
                     detail = body.get("detail", resp.text)
                     raw_code = body.get("code")
                     if isinstance(raw_code, str):
@@ -191,6 +198,7 @@ class ApiClient:
                     self._retry_after(resp) if resp.status_code == 429 else None
                 ),
                 required_capability=required_capability,
+                payload=payload,
             )
         return resp.json()
 
@@ -217,7 +225,87 @@ class ApiClient:
         return self._post("/api/v1/github/whoami", data={"access_token": access_token})
 
     def whoami(self) -> dict[str, Any]:
+        if self.plan_scoped:
+            return self._get("/api/v1/run-plans/identity")
         return self._get("/api/v1/whoami")
+
+    def exchange_run_plan(
+        self,
+        *,
+        run_code: str,
+        device_id: str,
+        device_name: str | None = None,
+        locale: str | None = None,
+    ) -> dict[str, Any]:
+        """Exchange a high-entropy invitation for one plan-scoped token.
+
+        The invitation is deliberately sent in the JSON body so the HTTP
+        exchange does not put it in a URL, access log, or Authorization
+        header. The initial ``dradar --plan`` invocation may contain it in
+        argv; this method never forwards it to a worker process. It is called
+        on a tokenless client.
+        """
+        payload: dict[str, Any] = {
+            "schema_version": 1,
+            "run_code": run_code,
+            "device_id": device_id,
+        }
+        if device_name:
+            payload["device_name"] = device_name
+        if locale:
+            payload["locale"] = locale
+        return self._post("/api/v1/run-plans/exchange", json=payload)
+
+    def renew_run_plan_access(self) -> dict[str, Any]:
+        return self._post(
+            "/api/v1/run-plans/renew", json={"schema_version": 1},
+        )
+
+    def start_run_plan(
+        self,
+        *,
+        plan_id: str,
+        logical_session_id: str,
+        concurrency_mode: str,
+        concurrency: int | None = None,
+        decision: str | None = None,
+        decision_token: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "schema_version": 1,
+            "plan_id": plan_id,
+            "logical_session_id": logical_session_id,
+            "concurrency_mode": concurrency_mode,
+        }
+        if concurrency is not None:
+            payload["concurrency"] = concurrency
+        if decision is not None:
+            payload["decision"] = decision
+        if decision_token is not None:
+            payload["decision_token"] = decision_token
+        return self._post("/api/v1/run-plans/start", json=payload)
+
+    def run_plan_progress(self, plan_id: str) -> dict[str, Any]:
+        return self._post(
+            "/api/v1/run-plans/progress",
+            json={"schema_version": 1, "plan_id": plan_id},
+        )
+
+    def stop_run_plan(
+        self,
+        *,
+        plan_id: str,
+        scope: str,
+        decision_token: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "schema_version": 1,
+            "plan_id": plan_id,
+            "scope": scope,
+        }
+        if decision_token is not None:
+            payload["decision_token"] = decision_token
+        return self._post("/api/v1/run-plans/stop", json=payload)
 
     def benchmarks(self) -> dict[str, Any]:
         """Public benchmark catalog, including optional task-pack metadata."""
@@ -289,6 +377,7 @@ class ApiClient:
         effort: str,
         *,
         refill_campaign_id: str | None = None,
+        tier: str | None = None,
     ) -> dict[str, Any]:
         """Returns {assignment: dict, resumed: False}. Raises ApiError (409) if
         the cell went stale or the volunteer is already at the concurrent cap."""
@@ -299,6 +388,8 @@ class ApiClient:
             data["batch_id"] = self.batch_id
         if refill_campaign_id:
             data["refill_campaign_id"] = refill_campaign_id
+        if tier is not None:
+            data["tier"] = tier
         return self._post("/api/v1/assignment/claim", data=data)
 
     def configure_refill_campaign(

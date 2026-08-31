@@ -147,6 +147,28 @@ def test_precheckout_flush_keeps_legacy_heartbeat_404_compatibility():
     assert len(client.heartbeats) == 1
 
 
+def test_plan_stop_heartbeat_publishes_shared_pool_abort_before_checkout(
+    tmp_path, monkeypatch,
+):
+    marker = tmp_path / "aborts" / "batch.stop"
+    monkeypatch.setenv("DRADAR_POOL_ABORT_FILE", str(marker))
+    client = FakeClient([{
+        "accepted": True,
+        "action": "continue",
+        "batch_id": "batch-1",
+        "next_heartbeat_sec": 60,
+        "stop_requested": True,
+        "user_message": "这次运行已经停止。",
+    }])
+    telemetry = RunnerTelemetry(client, jitter=False)
+    telemetry.bind_batch("batch-1")
+
+    assert telemetry.flush_for_checkout() is True
+    assert telemetry.stop_requested is True
+    assert marker.read_text().startswith("drain:")
+    assert len(client.heartbeats) == 1
+
+
 def test_close_carries_only_session_batch_seq_and_reason():
     client = FakeClient()
     telemetry = RunnerTelemetry(client, jitter=False)
