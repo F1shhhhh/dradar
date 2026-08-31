@@ -51,13 +51,14 @@ from .codebuddy_provider import (
 from .identity import _client
 from .local_config import HOME, _load_config, runtime_config
 from .machine import acquire_run_lock
+from .providers import KIMI_CREDENTIAL_PATH_ENV
 
 
 SCHEMA_VERSION = 1
 # Version the machine-local controller contract independently from the public
 # state schema.  A controller with no value here predates per-request runtime
 # selection and would keep spawning pools from its own stale installation.
-CONTROLLER_PROTOCOL_VERSION = 4
+CONTROLLER_PROTOCOL_VERSION = 5
 FLEET_DIR = "fleet"
 STATE_FILE = "state.json"
 START_LOCK_FILE = "start.lock"
@@ -88,6 +89,7 @@ POOL_EXECUTABLE_ENV_KEYS = (
 POOL_RUNTIME_ENV_PATH_KINDS = {
     **{key: "file" for key in POOL_EXECUTABLE_ENV_KEYS},
     CODEBUDDY_MANAGED_HOME_ENV: "directory",
+    KIMI_CREDENTIAL_PATH_ENV: "private_file",
 }
 POOL_RUNTIME_ENV_KEYS = tuple(POOL_RUNTIME_ENV_PATH_KINDS)
 
@@ -492,6 +494,17 @@ def _pool_executable_environment(
         if not path.is_absolute() or path.is_symlink():
             continue
         if kind == "file" and path.is_file():
+            selected[key] = str(path)
+        elif kind == "private_file" and path.is_file():
+            try:
+                info = path.stat()
+            except OSError:
+                continue
+            if os.name != "nt" and (
+                info.st_mode & 0o077
+                or (hasattr(os, "getuid") and info.st_uid != os.getuid())
+            ):
+                continue
             selected[key] = str(path)
         elif kind == "directory" and path.is_dir():
             try:
@@ -1047,8 +1060,17 @@ def _handle_request(
                     or path.is_symlink()
                 ):
                     raise FleetError("invalid provider runtime paths for the new local run")
-                if kind == "file" and not path.is_file():
+                if kind in {"file", "private_file"} and not path.is_file():
                     raise FleetError("invalid provider runtime paths for the new local run")
+                if kind == "private_file":
+                    info = path.stat()
+                    if os.name != "nt" and (
+                        info.st_mode & 0o077
+                        or (hasattr(os, "getuid") and info.st_uid != os.getuid())
+                    ):
+                        raise FleetError(
+                            "invalid provider runtime paths for the new local run"
+                        )
                 if kind == "directory":
                     if not path.is_dir():
                         raise FleetError("invalid provider runtime paths for the new local run")

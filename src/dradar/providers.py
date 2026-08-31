@@ -191,6 +191,7 @@ KIMI_BINARY_SHA256 = {
 }
 KIMI_HOME_RELATIVE_PATH = Path("providers") / "kimi"
 KIMI_ACCOUNT_HOME_ENV = "DRADAR_KIMI_HOME"
+KIMI_CREDENTIAL_PATH_ENV = "KIMI_CREDENTIAL_PATH"
 KIMI_AUTH_RELATIVE_PATH = Path("credentials") / "kimi-code.json"
 KIMI_API_KEY_ENVS = frozenset({
     "KIMI_API_KEY",
@@ -1592,17 +1593,43 @@ def parse_grok_cli_version(output: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _configured_kimi_auth_path() -> Path | None:
+    value = os.environ.get(KIMI_CREDENTIAL_PATH_ENV, "").strip()
+    return Path(value).expanduser() if value else None
+
+
+def _kimi_home_from_auth_path(path: Path) -> Path | None:
+    if (
+        not path.is_absolute()
+        or path.name != KIMI_AUTH_RELATIVE_PATH.name
+        or path.parent.name != KIMI_AUTH_RELATIVE_PATH.parent.name
+    ):
+        return None
+    return path.parent.parent
+
+
 def kimi_home(home: Path | None = None) -> Path:
     """Return the account-scoped Kimi provider home.
 
     ``DRADAR_HOME`` remains the default for ordinary single-profile users.
     Operators that keep campaign state in separate DRADAR_HOME directories
     must point every campaign for the same Kimi account at one explicit
-    ``DRADAR_KIMI_HOME``.  Kimi rotates refresh tokens, so copying its OAuth
-    JSON into campaign-local homes creates mutually stale credential forks.
+    ``DRADAR_KIMI_HOME`` or the same absolute ``KIMI_CREDENTIAL_PATH``.
+    Kimi rotates refresh tokens, so copying its OAuth JSON into
+    campaign-local homes creates mutually stale credential forks.
     """
 
     if home is None:
+        explicit_auth = _configured_kimi_auth_path()
+        if explicit_auth is not None:
+            explicit_home = _kimi_home_from_auth_path(explicit_auth)
+            if explicit_home is not None:
+                return explicit_home
+            # ``kimi_auth_error()`` reports the malformed binding before any
+            # provider process can use this fallback.  Keep path resolution
+            # deterministic so diagnostics never silently inspect another
+            # account's default credential.
+            return explicit_auth.parent.parent
         account_home = os.environ.get(KIMI_ACCOUNT_HOME_ENV)
         if account_home:
             return Path(account_home).expanduser()
@@ -1611,6 +1638,10 @@ def kimi_home(home: Path | None = None) -> Path:
 
 
 def kimi_auth_path(home: Path | None = None) -> Path:
+    if home is None:
+        explicit_auth = _configured_kimi_auth_path()
+        if explicit_auth is not None:
+            return explicit_auth
     return kimi_home(home) / KIMI_AUTH_RELATIVE_PATH
 
 
@@ -1641,7 +1672,17 @@ def _revoked_kimi_auth_payload(payload: object) -> bool:
 def kimi_auth_error(path: Path | None = None) -> str | None:
     """Fail closed for unsafe or non-refreshable Kimi OAuth credentials."""
 
-    path = kimi_auth_path() if path is None else path
+    if path is None:
+        explicit_auth = _configured_kimi_auth_path()
+        if (
+            explicit_auth is not None
+            and _kimi_home_from_auth_path(explicit_auth) is None
+        ):
+            return (
+                f"{KIMI_CREDENTIAL_PATH_ENV} must be an absolute "
+                "credentials/kimi-code.json path"
+            )
+        path = kimi_auth_path()
     try:
         info = path.lstat()
     except FileNotFoundError:
@@ -1652,6 +1693,9 @@ def kimi_auth_error(path: Path | None = None) -> str | None:
         return f"{path} must be a regular file, not a symlink"
     if not stat.S_ISREG(info.st_mode):
         return f"{path} must be a regular file"
+    getuid = getattr(os, "getuid", None)
+    if os.name != "nt" and callable(getuid) and info.st_uid != getuid():
+        return f"{path} must be owned by the current user"
     if os.name != "nt" and stat.S_IMODE(info.st_mode) & 0o077:
         return f"{path} is too broadly readable; run: chmod 600 {path}"
     try:
@@ -1777,7 +1821,13 @@ def managed_kimi_cli_path(home: Path | None = None) -> Path:
 
     executable = "kimi.exe" if os.name == "nt" else "kimi"
     if home is None:
-        root = kimi_home()
+        if os.environ.get(KIMI_ACCOUNT_HOME_ENV):
+            root = kimi_home()
+        else:
+            dradar_home = Path(
+                os.environ.get("DRADAR_HOME", Path.home() / ".dradar")
+            )
+            root = dradar_home / KIMI_HOME_RELATIVE_PATH
     else:
         root = Path(home) / KIMI_HOME_RELATIVE_PATH
     return root / "runtime" / KIMI_CLI_VERSION / "bin" / executable
