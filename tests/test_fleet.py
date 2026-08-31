@@ -117,6 +117,58 @@ def test_fleet_add_is_idempotent_for_one_batch(tmp_path, monkeypatch):
     assert response["batch"]["workers"] == 2
 
 
+def test_later_harness_pool_uses_only_its_requesting_agent_executable_paths(
+    tmp_path, monkeypatch,
+):
+    fleet._prepare_dirs(tmp_path)
+    state = fleet._initial_state("controller-1", None)
+    state["status"] = "active"
+    executable = tmp_path / "codebuddy"
+    executable.write_text("binary")
+    captured = {}
+
+    class Process:
+        pid = 1234
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(
+        fleet, "_resolve_workers", lambda *_args: (1, [], {"account_limit": 5}),
+    )
+
+    def spawn(*_args, **kwargs):
+        captured.update(kwargs.get("runtime_environment") or {})
+        return Process(), io.StringIO()
+
+    monkeypatch.setattr(fleet, "_spawn_pool", spawn)
+    fleet._handle_request(tmp_path, state, {}, {}, {
+        "request_id": "provider-path-request",
+        "controller_id": "controller-1",
+        "controller_protocol_version": fleet.CONTROLLER_PROTOCOL_VERSION,
+        "runtime_executable": sys.executable,
+        "runtime_environment": {"CODEBUDDY_CLI_PATH": str(executable)},
+        "command": "add",
+        "batch_id": BATCH_A,
+        "workers": 1,
+    })
+
+    assert captured == {"CODEBUDDY_CLI_PATH": str(executable)}
+    persisted = json.loads(fleet._state_path(tmp_path).read_text())
+    assert "runtime_environment" not in json.dumps(persisted)
+
+
+def test_provider_runtime_environment_rejects_secrets_and_unknown_keys(tmp_path):
+    executable = tmp_path / "codebuddy"
+    executable.write_text("binary")
+    selected = fleet._pool_executable_environment({
+        "CODEBUDDY_CLI_PATH": str(executable),
+        "DEEPSEEK_API_KEY": "secret-value",
+        "UNKNOWN_PROVIDER_VALUE": str(executable),
+    })
+    assert selected == {"CODEBUDDY_CLI_PATH": str(executable)}
+
+
 def test_fleet_tracks_separate_honeypot_batches_and_total_workers(
     tmp_path, monkeypatch,
 ):
@@ -357,9 +409,15 @@ def test_pool_command_is_exact_batch_resume_without_claim_or_refill(
 
     monkeypatch.setattr(fleet.subprocess, "Popen", popen)
     monkeypatch.setattr("dradar.machine._lock_handle", None)
+    monkeypatch.setenv("CODEBUDDY_CLI_PATH", "/stale/controller/codebuddy")
+    requested_grok = tmp_path / "grok"
+    requested_grok.write_text("binary")
     state = {"controller_id": "controller-1"}
 
-    _process, log = fleet._spawn_pool(tmp_path, state, BATCH_A, 2)
+    _process, log = fleet._spawn_pool(
+        tmp_path, state, BATCH_A, 2,
+        runtime_environment={"GROK_CLI_PATH": str(requested_grok)},
+    )
     log.close()
 
     assert captured["command"][3:5] == ["resume", "-y"]
@@ -368,6 +426,8 @@ def test_pool_command_is_exact_batch_resume_without_claim_or_refill(
     assert "--refill" not in captured["command"]
     assert "--auto" not in captured["command"]
     assert captured["env"][fleet.POOL_BATCH_ENV] == BATCH_A
+    assert "CODEBUDDY_CLI_PATH" not in captured["env"]
+    assert captured["env"]["GROK_CLI_PATH"] == str(requested_grok)
     assert captured["env"][fleet.POOL_STARTUP_FILE_ENV] == str(
         fleet._pool_startup_path(tmp_path, BATCH_A)
     )
