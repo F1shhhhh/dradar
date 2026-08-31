@@ -148,13 +148,19 @@ class ApiClient:
     def set_batch_id(self, batch_id: str | None) -> None:
         self.batch_id = normalize_batch_id(batch_id)
 
-    def _request(self, method: str, path: str, **kw) -> httpx.Response:
+    def _request(
+        self, method: str, path: str, *, retry_rate_limit: bool = True, **kw,
+    ) -> httpx.Response:
         for attempt in range(_RATE_LIMIT_RETRIES + 1):
             try:
                 response = self._client.request(method, path, **kw)
             except httpx.HTTPError as exc:  # transport-level: connect/timeout/etc.
                 raise ApiError(f"cannot reach {self.server}: {exc}") from exc
-            if response.status_code != 429 or attempt == _RATE_LIMIT_RETRIES:
+            if (
+                response.status_code != 429
+                or not retry_rate_limit
+                or attempt == _RATE_LIMIT_RETRIES
+            ):
                 return response
             retry_after = self._retry_after(response)
             # A small independent offset prevents a 20-worker pool from
@@ -254,11 +260,15 @@ class ApiClient:
             payload["device_name"] = device_name
         if locale:
             payload["locale"] = locale
-        return self._post("/api/v1/run-plans/exchange", json=payload)
+        return self._post(
+            "/api/v1/run-plans/exchange", json=payload,
+            retry_rate_limit=False,
+        )
 
     def renew_run_plan_access(self) -> dict[str, Any]:
         return self._post(
             "/api/v1/run-plans/renew", json={"schema_version": 1},
+            retry_rate_limit=False,
         )
 
     def start_run_plan(
@@ -283,12 +293,16 @@ class ApiClient:
             payload["decision"] = decision
         if decision_token is not None:
             payload["decision_token"] = decision_token
-        return self._post("/api/v1/run-plans/start", json=payload)
+        return self._post(
+            "/api/v1/run-plans/start", json=payload,
+            retry_rate_limit=False,
+        )
 
     def run_plan_progress(self, plan_id: str) -> dict[str, Any]:
         return self._post(
             "/api/v1/run-plans/progress",
             json={"schema_version": 1, "plan_id": plan_id},
+            retry_rate_limit=False,
         )
 
     def stop_run_plan(
@@ -305,7 +319,10 @@ class ApiClient:
         }
         if decision_token is not None:
             payload["decision_token"] = decision_token
-        return self._post("/api/v1/run-plans/stop", json=payload)
+        return self._post(
+            "/api/v1/run-plans/stop", json=payload,
+            retry_rate_limit=False,
+        )
 
     def benchmarks(self) -> dict[str, Any]:
         """Public benchmark catalog, including optional task-pack metadata."""

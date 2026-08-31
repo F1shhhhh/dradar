@@ -156,6 +156,33 @@ def test_429_retry_is_bounded_and_exposes_retry_after():
     assert ei.value.retry_after == 60.0
 
 
+def test_run_plan_interactions_surface_rate_limit_without_sleeping():
+    calls = 0
+
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            429, headers={"Retry-After": "30"},
+            json={"detail": "try again shortly"},
+        )
+
+    client = _client(handler)
+    waits = []
+    client._sleep = waits.append
+
+    with pytest.raises(ApiError) as raised:
+        client.start_run_plan(
+            plan_id="plan-1", logical_session_id="session-1",
+            concurrency_mode="fixed", concurrency=1,
+        )
+
+    assert calls == 1
+    assert waits == []
+    assert raised.value.status_code == 429
+    assert raised.value.retry_after == 30.0
+
+
 def test_multipart_submission_can_retry_after_429(tmp_path):
     bodies = []
 

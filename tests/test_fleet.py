@@ -2,6 +2,7 @@ import argparse
 import io
 import json
 import os
+import signal
 import subprocess
 import sys
 import textwrap
@@ -97,6 +98,8 @@ def test_fleet_add_is_idempotent_for_one_batch(tmp_path, monkeypatch):
     monkeypatch.setattr(fleet, "_spawn_pool", spawn)
     first = {
         "request_id": "request-1", "controller_id": "controller-1",
+        "controller_protocol_version": fleet.CONTROLLER_PROTOCOL_VERSION,
+        "runtime_executable": sys.executable,
         "command": "add", "batch_id": BATCH_A, "workers": 2,
     }
     second = dict(first, request_id="request-2")
@@ -148,6 +151,8 @@ def test_fleet_tracks_separate_honeypot_batches_and_total_workers(
         fleet._handle_request(tmp_path, state, processes, logs, {
             "request_id": request_id,
             "controller_id": "controller-1",
+            "controller_protocol_version": fleet.CONTROLLER_PROTOCOL_VERSION,
+            "runtime_executable": sys.executable,
             "command": "add",
             "batch_id": batch_id,
             "workers": "auto",
@@ -174,6 +179,83 @@ def test_controller_liveness_requires_process_lifetime_lease_not_reused_pid(
 
     with fleet._controller_lease(tmp_path, "controller-reused-pid"):
         assert fleet.controller_is_active(tmp_path) is True
+
+
+def test_new_batch_waits_for_active_legacy_controller_without_interrupting(
+    tmp_path, monkeypatch,
+):
+    state = fleet._initial_state("legacy-controller", None)
+    state.pop("controller_protocol_version")
+    state["status"] = "active"
+    state["batches"][BATCH_A] = {
+        "batch_id": BATCH_A,
+        "status": "running",
+        "workers": 2,
+    }
+    fleet._write_state(tmp_path, state)
+    monkeypatch.setattr(fleet, "controller_is_active", lambda _home: True)
+    monkeypatch.setattr(
+        fleet.os,
+        "kill",
+        lambda *_args: pytest.fail("an active legacy run must not be interrupted"),
+    )
+
+    with pytest.raises(
+        fleet.FleetControllerUpdatePending,
+        match="现有题目",
+    ):
+        fleet.prepare_new_batch_runtime(tmp_path)
+
+
+def test_idle_legacy_controller_is_rotated_without_user_decision(
+    tmp_path, monkeypatch,
+):
+    state = fleet._initial_state("legacy-controller", None)
+    state.pop("controller_protocol_version")
+    state["status"] = "active"
+    fleet._write_state(tmp_path, state)
+    live = {"value": True}
+    signals = []
+    monkeypatch.setattr(
+        fleet, "controller_is_active", lambda _home: live["value"],
+    )
+
+    def stop(pid, signum):
+        signals.append((pid, signum))
+        live["value"] = False
+
+    monkeypatch.setattr(fleet.os, "kill", stop)
+
+    fleet.prepare_new_batch_runtime(tmp_path)
+
+    assert signals == [(state["pid"], signal.SIGTERM)]
+
+
+def test_legacy_add_request_cannot_make_current_controller_spawn_old_runtime(
+    tmp_path, monkeypatch,
+):
+    fleet._prepare_dirs(tmp_path)
+    state = fleet._initial_state("controller-1", None)
+    state["status"] = "active"
+    monkeypatch.setattr(
+        fleet,
+        "_spawn_pool",
+        lambda *_args, **_kwargs: pytest.fail("legacy add must be rejected"),
+    )
+
+    fleet._handle_request(tmp_path, state, {}, {}, {
+        "request_id": "legacy-add",
+        "controller_id": "controller-1",
+        "command": "add",
+        "batch_id": BATCH_A,
+        "workers": 1,
+    })
+
+    response = json.loads(
+        (fleet._root(tmp_path) / fleet.RESPONSE_DIR / "legacy-add.json").read_text()
+    )
+    assert response["ok"] is False
+    assert response["error_code"] == "local_runtime_update_pending"
 
 
 def test_dead_controller_without_pool_lock_exposes_interrupted_zero_reservation(
@@ -470,6 +552,8 @@ def test_plan_token_stays_in_private_file_not_fleet_argv_env_or_state(
         {
             "request_id": "plan-request",
             "controller_id": "controller-1",
+            "controller_protocol_version": fleet.CONTROLLER_PROTOCOL_VERSION,
+            "runtime_executable": sys.executable,
             "command": "add",
             "batch_id": BATCH_A,
             "workers": 2,
