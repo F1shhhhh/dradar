@@ -513,15 +513,46 @@ def test_pier_dockerfile_rewrite_uses_only_reviewed_local_image(
         "DRADAR_CODEBUDDY_SOURCE_IMAGE",
         f"dradar-codebuddy:{CODEBUDDY_CLI_VERSION}",
     )
+    staged = []
+    monkeypatch.setattr(
+        pier_sitecustomize, "_materialize_codebuddy_runtime",
+        lambda image, build_dir: staged.append((image, build_dir)),
+    )
     pier_sitecustomize._rewrite_codebuddy_agent_dockerfile(environment)
     rewritten = dockerfile.read_text(encoding="utf-8")
-    assert rewritten.startswith(
-        f"FROM dradar-codebuddy:{CODEBUDDY_CLI_VERSION} "
-        "AS dradar_codebuddy_source\n"
-    )
-    assert "COPY --from=dradar_codebuddy_source" in rewritten
+    assert rewritten.startswith("FROM alpine:3.22\n")
+    assert "COPY dradar-codebuddy-runtime/ /opt/codebuddy/runtime/" in rewritten
+    assert "COPY --from=" not in rewritten
+    assert staged == [(f"dradar-codebuddy:{CODEBUDDY_CLI_VERSION}", tmp_path)]
     assert install_command not in rewritten
     assert verify_command in rewritten
+
+
+def test_codebuddy_runtime_is_staged_without_builder_pulling_local_tag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    def run(command, **_kwargs):
+        calls.append(command)
+        if command[1] == "cp":
+            destination = Path(command[-1])
+            (destination / "codebuddy").write_bytes(b"binary")
+            (destination / "loader").write_bytes(b"loader")
+            (destination / "lib").mkdir()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(pier_sitecustomize.subprocess, "run", run)
+    image = f"dradar-codebuddy:{CODEBUDDY_CLI_VERSION}"
+
+    staged = pier_sitecustomize._materialize_codebuddy_runtime(image, tmp_path)
+
+    assert staged == tmp_path / "dradar-codebuddy-runtime"
+    assert calls[0][0:2] == ["docker", "run"]
+    assert calls[0][calls[0].index("--pull") + 1] == "never"
+    assert image in calls[0]
+    assert calls[1][0:2] == ["docker", "cp"]
+    assert calls[2][0:3] == ["docker", "rm", "-f"]
 
 
 def test_adapter_and_pier_bootstrap_keep_credentials_and_tools_narrow() -> None:
@@ -536,7 +567,7 @@ def test_adapter_and_pier_bootstrap_keep_credentials_and_tools_narrow() -> None:
     assert "cp -R" in adapter
     assert "/logs/agent/sessions/projects" in adapter
     assert "await environment.download_file" in adapter
-    assert "COPY --from=dradar_codebuddy_source" in bootstrap
+    assert "COPY dradar-codebuddy-runtime/" in bootstrap
     assert "CodeBuddy source image is missing or version-mismatched" in bootstrap
     runloop = (root / "runloop.py").read_text(encoding="utf-8")
     assert '"subscription_oauth_coordination": "host-monotonic-merge-v2"' in runloop

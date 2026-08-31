@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from dradar import cli, doctor, fleet, pending, run_plans, runloop
+from dradar import cli, doctor, fleet, pending, provider_config, run_plans, runloop
 from dradar.api_client import ApiClient, ApiError
 
 
@@ -622,6 +622,43 @@ def test_auto_refill_uses_safe_effective_concurrency_not_seed_count(
     assert added[0]["batch_id"] == BATCH_ID
 
 
+def test_active_legacy_controller_waits_before_server_admission(
+    tmp_path, monkeypatch, capsys,
+):
+    plan = _plan()
+    client = FakeClient(starts=[_server_response(plan)])
+    _prepare_run(
+        monkeypatch, tmp_path, plan=plan, client=client,
+        snapshot=_snapshot(available=2, auto_workers=2),
+    )
+    controller = fleet._initial_state("legacy-controller", None)
+    controller.pop("controller_protocol_version")
+    controller["status"] = "active"
+    other_batch = "87654321876543218765432187654321"
+    controller["batches"][other_batch] = {
+        "batch_id": other_batch,
+        "status": "running",
+        "workers": 1,
+    }
+    fleet._write_state(tmp_path, controller)
+    monkeypatch.setattr(fleet, "controller_is_active", lambda _home: True)
+    monkeypatch.setattr(
+        fleet.os,
+        "kill",
+        lambda *_args: pytest.fail("existing work must keep running"),
+    )
+
+    assert run_plans.cmd_run_plan(_args()) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["status"] == "waiting"
+    assert payload["error_code"] == "local_runtime_update_pending"
+    assert payload["agent_action"] == "recheck_plan"
+    assert payload["agent"]["schema_version"] == 1
+    assert "Fleet" not in payload["user_message"]
+    assert client.start_calls == []
+
+
 def test_run_reports_preparing_until_local_pool_acknowledges_readiness(
     tmp_path, monkeypatch, capsys,
 ):
@@ -770,8 +807,8 @@ def test_fixed_capacity_reservation_race_requires_one_use_lower_decision(
     assert confirm["decision"] == "server_capacity"
     assert confirm["decision_required"] is True
     assert confirm["choices"] == [
-        {"id": "use_recommended", "label": "按建议数量运行（2 道）"},
-        {"id": "cancel", "label": "取消"},
+        {"id": "use_recommended", "label": "按建议同时运行 2 道"},
+        {"id": "cancel", "label": "暂不启动"},
     ]
     assert confirm["agent"]["choice_actions"]["use_recommended"]["args"] == [
         "--concurrency", "2", "--decision-token", token,
@@ -2054,11 +2091,12 @@ def test_missing_current_tool_on_second_machine_has_actionable_issue(
     monkeypatch.setattr(doctor, "_probe", lambda _command: True)
     monkeypatch.setattr(doctor.runner, "ensure_pier", lambda: None)
     monkeypatch.setattr(doctor, "grok_cli_path", lambda: None)
+    monkeypatch.setattr(doctor, "grok_auth_error", lambda: "not signed in")
 
     issue = doctor.plan_environment_issue(_plan(harness="grok-build"))
 
     assert issue["error_code"] == "current_tool_not_ready"
-    assert issue["user_message"] == "这次运行需要 Grok；请完成 Grok 的安装和登录后重试。"
+    assert issue["user_message"] == "Grok 运行工具需要安装或更新；请完成准备后重试。"
     assert issue["agent_action"] == "setup_current_tool"
     assert issue["agent"]["requires_user_action"] is True
     assert [item["argv"] for item in issue["agent"]["next_commands"]] == [
@@ -2109,6 +2147,70 @@ def test_claude_plan_fails_closed_with_actionable_setup(missing, monkeypatch):
         ["dradar", "provider", "setup", "claude"],
         ["dradar", "provider", "status", "claude", "--live"],
         ["dradar", "doctor", "--agent", "claude-code"],
+    ]
+
+
+@pytest.mark.parametrize(
+    "harness,old_path,new_path,version,cli_path_name,auth_name,ensure_name",
+    [
+        ("kimi-code", "/old/kimi", "/managed/kimi", doctor.KIMI_CLI_VERSION,
+         "kimi_cli_path", "kimi_auth_error", "_ensure_kimi_cli"),
+        ("grok-build", "/old/grok", "/managed/grok", doctor.GROK_CLI_VERSION,
+         "grok_cli_path", "grok_auth_error", "_ensure_grok_cli"),
+    ],
+)
+def test_plan_preflight_repairs_stale_subscription_cli_before_server_start(
+    monkeypatch, harness, old_path, new_path, version,
+    cli_path_name, auth_name, ensure_name,
+):
+    monkeypatch.setattr(
+        doctor.shutil, "which",
+        lambda name: "/usr/bin/docker" if name == "docker" else None,
+    )
+    monkeypatch.setattr(doctor, "_probe", lambda _command: True)
+    monkeypatch.setattr(doctor.runner, "ensure_pier", lambda: None)
+    monkeypatch.setattr(doctor, cli_path_name, lambda: old_path)
+    monkeypatch.setattr(doctor, auth_name, lambda: None)
+    monkeypatch.setattr(
+        doctor, "_subscription_cli_version",
+        lambda executable, _parser: version if executable == new_path else "old",
+    )
+    repaired = []
+    monkeypatch.setattr(
+        provider_config, ensure_name,
+        lambda: repaired.append(new_path) or new_path,
+    )
+
+    assert doctor.plan_environment_issue(_plan(harness=harness)) is None
+    assert repaired == [new_path]
+
+
+def test_agent_details_always_carry_their_own_schema_version(capsys):
+    response = {
+        "schema_version": 1,
+        **_envelope(),
+        "agent": {"next_commands": [{
+            "argv": ["dradar", "fleet", "status"], "interactive": False,
+        }]},
+    }
+    assert run_plans._output(_args(), response) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["schema_version"] == 1
+    assert payload["agent"]["schema_version"] == 1
+
+
+def test_zero_spare_capacity_asks_in_plain_language_without_internal_ids(tmp_path):
+    plan = _plan(mode="fixed", concurrency=1)
+    path, state = _state(tmp_path, plan)
+    response = run_plans._local_capacity_response(
+        path, state, requested=1, recommended=0,
+        snapshot=_snapshot(available=0, auto_workers=0),
+    )
+    assert response["user_message"] == (
+        "这台设备正在运行其他题目。继续同时启动这 1 道可能会让机器变慢，是否仍然启动？"
+    )
+    assert [choice["label"] for choice in response["choices"]] == [
+        "仍然同时启动 1 道", "暂不启动",
     ]
 
 

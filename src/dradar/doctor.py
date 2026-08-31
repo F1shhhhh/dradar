@@ -146,6 +146,25 @@ def _probe(cmd: list[str]) -> bool:
         return False
 
 
+def _subscription_cli_version(
+    executable: str | None, parser, *, timeout: int = 10,
+) -> str | None:
+    """Read one subscription CLI version without trusting path existence."""
+
+    if not executable:
+        return None
+    try:
+        result = subprocess.run(
+            [executable, "--version"], capture_output=True, text=True,
+            timeout=timeout, check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    return parser(result.stdout + "\n" + result.stderr)
+
+
 def _plan_agent_recovery(
     harness: str,
     *,
@@ -305,21 +324,33 @@ def plan_environment_issue(plan: dict) -> dict | None:
         return None
     if harness == GROK_AGENT:
         executable = grok_cli_path()
-        ready = bool(executable) and grok_auth_error() is None
+        auth_issue = grok_auth_error()
+        version = _subscription_cli_version(executable, parse_grok_cli_version)
+        if auth_issue is None and version != GROK_CLI_VERSION:
+            from . import provider_config
+            executable = provider_config._ensure_grok_cli()
+            version = _subscription_cli_version(executable, parse_grok_cli_version)
+        ready = bool(executable) and auth_issue is None and version == GROK_CLI_VERSION
         if not ready:
             return _plan_issue(
                 harness, "current_tool_not_ready",
-                "这次运行需要 Grok；请完成 Grok 的安装和登录后重试。",
+                "Grok 运行工具需要安装或更新；请完成准备后重试。",
                 "setup_current_tool", setup_provider="grok",
             )
         return None
     if harness == KIMI_AGENT:
         executable = kimi_cli_path()
-        ready = bool(executable) and kimi_auth_error() is None
+        auth_issue = kimi_auth_error()
+        version = _subscription_cli_version(executable, parse_kimi_cli_version)
+        if auth_issue is None and version != KIMI_CLI_VERSION:
+            from . import provider_config
+            executable = provider_config._ensure_kimi_cli()
+            version = _subscription_cli_version(executable, parse_kimi_cli_version)
+        ready = bool(executable) and auth_issue is None and version == KIMI_CLI_VERSION
         if not ready:
             return _plan_issue(
                 harness, "current_tool_not_ready",
-                "这次运行需要 Kimi；请完成 Kimi 的安装和登录后重试。",
+                "Kimi 运行工具需要安装或更新；请完成准备后重试。",
                 "setup_current_tool", setup_provider="kimi",
             )
         return None

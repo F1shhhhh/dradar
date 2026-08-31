@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
+from . import __version__
 from .api_client import ApiError, normalize_batch_id
 from .capacity import (
     AUTO_WORKER_CAP,
@@ -45,6 +46,10 @@ from .machine import acquire_run_lock
 
 
 SCHEMA_VERSION = 1
+# Version the machine-local controller contract independently from the public
+# state schema.  A controller with no value here predates per-request runtime
+# selection and would keep spawning pools from its own stale installation.
+CONTROLLER_PROTOCOL_VERSION = 2
 FLEET_DIR = "fleet"
 STATE_FILE = "state.json"
 START_LOCK_FILE = "start.lock"
@@ -89,6 +94,17 @@ class FleetStartupError(FleetError):
         self.code = code
         self.user_message = user_message
         self.retryable = retryable
+
+
+class FleetControllerUpdatePending(FleetError):
+    code = "local_runtime_update_pending"
+    user_message = (
+        "这台设备正在继续运行先前启动的题目。DRadar 刚完成升级；为避免中断"
+        "现有题目，新领取的题会等它们结束后再启动。我会稍后自动重试。"
+    )
+
+    def __init__(self) -> None:
+        super().__init__(self.user_message)
 
 
 def _now() -> str:
@@ -335,6 +351,54 @@ def _tail(path: Path, *, max_bytes: int = 6000) -> str:
         return ""
 
 
+def _controller_protocol_matches(state: dict | None) -> bool:
+    return bool(
+        isinstance(state, dict)
+        and state.get("controller_protocol_version")
+        == CONTROLLER_PROTOCOL_VERSION
+    )
+
+
+def _retire_incompatible_idle_controller(
+    home: Path, state: dict,
+) -> None:
+    """Gracefully replace a stale controller only when it owns no live pool."""
+
+    if _active_batches(state):
+        raise FleetControllerUpdatePending()
+    pid = state.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool):
+        raise FleetControllerUpdatePending()
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except OSError as exc:
+        raise FleetControllerUpdatePending() from exc
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline:
+        if not controller_is_active(home):
+            return
+        time.sleep(0.1)
+    raise FleetControllerUpdatePending()
+
+
+def prepare_new_batch_runtime(home: Path = HOME) -> None:
+    """Fail closed before server admission if an old live pool must drain.
+
+    An incompatible but idle controller is rotated without user interaction.
+    Existing pools are never interrupted merely because the foreground CLI was
+    upgraded.
+    """
+
+    _prepare_dirs(home)
+    with _locked(_root(home) / START_LOCK_FILE):
+        state = _read_json(_state_path(home))
+        if not controller_is_active(home) or _controller_protocol_matches(state):
+            return
+        _retire_incompatible_idle_controller(home, state or {})
+
+
 def _ensure_controller(home: Path = HOME) -> dict:
     _prepare_dirs(home)
     with _locked(_root(home) / START_LOCK_FILE):
@@ -396,6 +460,9 @@ def _request(command: str, payload: dict, *, home: Path = HOME) -> dict:
     response_path = _root(home) / RESPONSE_DIR / f"{request_id}.json"
     body = {
         "schema_version": SCHEMA_VERSION,
+        "controller_protocol_version": CONTROLLER_PROTOCOL_VERSION,
+        "client_version": __version__,
+        "runtime_executable": os.path.abspath(sys.executable),
         "request_id": request_id,
         "controller_id": controller_id,
         "command": command,
@@ -609,6 +676,8 @@ def _initial_state(controller_id: str, previous: dict | None) -> dict:
             batches[batch_id] = kept
     return {
         "schema_version": SCHEMA_VERSION,
+        "controller_protocol_version": CONTROLLER_PROTOCOL_VERSION,
+        "dradar_version": __version__,
         "controller_id": controller_id,
         "pid": os.getpid(),
         "status": "starting",
@@ -635,12 +704,16 @@ def _spawn_pool(
     refill_model: str | None = None,
     refill_effort: str | None = None,
     credentials_file: str | None = None,
+    runtime_executable: str | None = None,
 ) -> tuple[subprocess.Popen, object]:
     controller_id = str(state["controller_id"])
     log_path = _root(home) / LOG_DIR / f"batch-{batch_id}.log"
     log_handle = open(log_path, "a", encoding="utf-8")
+    executable = runtime_executable or sys.executable
+    if not os.path.isabs(executable) or not Path(executable).is_file():
+        raise FleetError("invalid DRadar runtime for the new local run")
     command = [
-        sys.executable, "-m", "dradar.cli", "resume", "-y",
+        executable, "-m", "dradar.cli", "resume", "-y",
         "--batch-id", batch_id, "--workers", str(workers), "--fleet-pool",
     ]
     if credentials_file:
@@ -797,6 +870,16 @@ def _handle_request(
         return
     command = request.get("command")
     if command == "add":
+        if (
+            request.get("controller_protocol_version")
+            != CONTROLLER_PROTOCOL_VERSION
+        ):
+            _response(home, request_id, {
+                "ok": False,
+                "error": FleetControllerUpdatePending.user_message,
+                "error_code": FleetControllerUpdatePending.code,
+            })
+            return
         try:
             batch_id = normalize_batch_id(request.get("batch_id"))
             if batch_id is None:
@@ -887,6 +970,9 @@ def _handle_request(
                 request.get("workers", "auto"), batch_id, state,
                 credentials_file,
             )
+            runtime_executable = request.get("runtime_executable")
+            if not isinstance(runtime_executable, str):
+                raise FleetError("invalid DRadar runtime for the new local run")
             process, log_handle = _spawn_pool(
                 home, state, batch_id, workers,
                 refill=refill,
@@ -895,6 +981,7 @@ def _handle_request(
                 refill_model=refill_model,
                 refill_effort=refill_effort,
                 credentials_file=credentials_file,
+                runtime_executable=runtime_executable,
             )
             try:
                 item = {
@@ -1321,6 +1408,7 @@ def add_batch(
         raise FleetError(str(exc)) from exc
     if normalized is None:
         raise FleetError("an exact batch is required")
+    prepare_new_batch_runtime()
     response = _request("add", {
         "batch_id": normalized,
         "workers": workers,

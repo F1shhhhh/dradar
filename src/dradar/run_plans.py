@@ -681,14 +681,14 @@ def _local_capacity_response(
     if recommended >= 1:
         choices.append({
             "id": "use_recommended",
-            "label": f"按建议数量运行（{recommended} 道）",
+            "label": f"按建议同时运行 {recommended} 道",
         })
     if allow_keep:
         choices.append({
             "id": "keep_requested",
-            "label": f"仍按 {requested} 道运行",
+            "label": f"仍然同时启动 {requested} 道",
         })
-    choices.append({"id": "cancel", "label": "取消"})
+    choices.append({"id": "cancel", "label": "暂不启动"})
     agent = {
         "plan": state["plan"],
         "requested_concurrency": requested,
@@ -718,10 +718,11 @@ def _local_capacity_response(
         "decision": decision,
         "decision_token": token,
         "user_message": user_message or (
-            f"这台设备当前建议同时运行 {recommended} 道，低于你设置的 "
-            f"{requested} 道。请选择如何处理。"
+            f"根据这台设备当前的负载，建议这次同时运行 {recommended} 道；"
+            f"你原来选择了 {requested} 道。请选择如何运行。"
             if recommended >= 1 else
-            f"这台设备当前没有空余运行位置，低于你设置的 {requested} 道。请选择如何处理。"
+            f"这台设备正在运行其他题目。继续同时启动这 {requested} 道可能会让"
+            "机器变慢，是否仍然启动？"
         ),
         "agent_action": "ask_user",
         "error_code": None,
@@ -1307,6 +1308,14 @@ def _output(args, response: dict[str, Any]) -> int:
     if not isinstance(response, dict) or response.get("schema_version") != SCHEMA_VERSION:
         raise RunPlanClientError("protocol_invalid", "服务返回的信息不完整，请升级后重试。")
     _validate_envelope(response)
+    agent = response.get("agent")
+    if isinstance(agent, dict):
+        nested_version = agent.get("schema_version")
+        if nested_version not in {None, SCHEMA_VERSION}:
+            raise RunPlanClientError(
+                "schema_version_unsupported", "运行协议版本不兼容，请升级后重试。",
+            )
+        agent.setdefault("schema_version", SCHEMA_VERSION)
     if getattr(args, "json", False):
         print(json.dumps(response, ensure_ascii=False, sort_keys=True))
     else:
@@ -1727,6 +1736,18 @@ def cmd_run_plan(args) -> int:
                 agent_action=environment_issue["agent_action"],
                 agent_details=environment_issue.get("agent"),
             )
+
+        if not already_local:
+            try:
+                fleet.prepare_new_batch_runtime(home=path.parent.parent)
+            except fleet.FleetControllerUpdatePending as exc:
+                return _plan_recheck_response(
+                    path=path,
+                    state=state,
+                    error_code=exc.code,
+                    user_message=exc.user_message,
+                    poll_after_seconds=30,
+                )
 
         snapshot = _capacity_snapshot(client, plan, state.get("limits"))
         auto_downgraded = False

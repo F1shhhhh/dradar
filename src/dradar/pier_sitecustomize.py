@@ -9,7 +9,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 _IMAGE_ENV = "DRADAR_EGRESS_PROXY_IMAGE"
@@ -21,6 +24,17 @@ _CODEBUDDY_SOURCE_IMAGE_RE = re.compile(
 )
 _OFFICIAL_DIGEST_PREFIX = (
     "ghcr.io/codex-radar/dradar-egress-proxy@sha256:"
+)
+_CODEBUDDY_BUNDLE_COMMAND = (
+    "set -euo pipefail; runtime=/opt/dradar-codebuddy-runtime; "
+    "mkdir -p \"$runtime/lib\"; "
+    "cp -L /opt/codebuddy/bin/codebuddy \"$runtime/codebuddy\"; "
+    "loader=$(ldd /opt/codebuddy/bin/codebuddy | "
+    "awk '/ld-linux/{print $1; exit}'); "
+    "test -n \"$loader\"; cp -L \"$loader\" \"$runtime/loader\"; "
+    "ldd /opt/codebuddy/bin/codebuddy | "
+    "awk '$2 == \"=>\" && $3 ~ /^\\// {print $3}' | "
+    "while IFS= read -r library; do cp -L \"$library\" \"$runtime/lib/\"; done"
 )
 
 
@@ -130,6 +144,78 @@ def _finalize_docker_proxy_compose(
         pass
 
 
+def _remove_codebuddy_helper(name: str) -> bool:
+    try:
+        removed = subprocess.run(
+            ["docker", "rm", "-f", name], capture_output=True,
+            text=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return removed.returncode == 0
+
+
+def _materialize_codebuddy_runtime(source_image: str, build_dir: Path) -> Path:
+    """Export the reviewed runtime into Pier's assignment-local build context.
+
+    Per-assignment BuildKit builders deliberately cannot see Docker Engine's
+    local image store.  Referencing the local source tag in a Dockerfile makes
+    BuildKit try Docker Hub instead.  Run the already validated image with
+    pulling disabled, copy only the bundled executable/runtime libraries into
+    the build context, then remove the exact stopped helper container.
+    """
+
+    destination = build_dir / "dradar-codebuddy-runtime"
+    if destination.exists():
+        raise RuntimeError("CodeBuddy runtime build context already exists")
+    helper = f"dradar-codebuddy-source-{os.getpid()}-{uuid.uuid4().hex[:12]}"
+    try:
+        run = subprocess.run(
+            [
+                "docker", "run", "--name", helper, "--pull", "never",
+                source_image, "/bin/bash", "-c", _CODEBUDDY_BUNDLE_COMMAND,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _remove_codebuddy_helper(helper)
+        raise RuntimeError(
+            "could not export the validated CodeBuddy runtime"
+        ) from exc
+    if run.returncode != 0:
+        _remove_codebuddy_helper(helper)
+        raise RuntimeError("could not export the validated CodeBuddy runtime")
+    destination.mkdir(mode=0o700)
+    try:
+        copy = subprocess.run(
+            [
+                "docker", "cp",
+                f"{helper}:/opt/dradar-codebuddy-runtime/.", str(destination),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        copy = None
+    removed = _remove_codebuddy_helper(helper)
+    if copy is None or copy.returncode != 0 or not removed:
+        shutil.rmtree(destination, ignore_errors=True)
+        raise RuntimeError("could not stage the validated CodeBuddy runtime")
+    if not (
+        (destination / "codebuddy").is_file()
+        and (destination / "loader").is_file()
+        and (destination / "lib").is_dir()
+    ):
+        shutil.rmtree(destination, ignore_errors=True)
+        raise RuntimeError("validated CodeBuddy runtime bundle is incomplete")
+    return destination
+
+
 def _rewrite_codebuddy_agent_dockerfile(environment) -> None:
     """Copy the reviewed CLI and glibc bundle from a validated local image."""
 
@@ -156,18 +242,6 @@ def _rewrite_codebuddy_agent_dockerfile(environment) -> None:
     verify_run = "RUN " + json.dumps(
         ["/bin/bash", "-c", install.verification_command]
     )
-    bundle_command = (
-        "set -euo pipefail; runtime=/opt/dradar-codebuddy-runtime; "
-        "mkdir -p \"$runtime/lib\"; "
-        "cp -L /opt/codebuddy/bin/codebuddy \"$runtime/codebuddy\"; "
-        "loader=$(ldd /opt/codebuddy/bin/codebuddy | "
-        "awk '/ld-linux/{print $1; exit}'); "
-        "test -n \"$loader\"; cp -L \"$loader\" \"$runtime/loader\"; "
-        "ldd /opt/codebuddy/bin/codebuddy | "
-        "awk '$2 == \"=>\" && $3 ~ /^\\// {print $3}' | "
-        "while IFS= read -r library; do cp -L \"$library\" \"$runtime/lib/\"; done"
-    )
-    bundle_run = "RUN " + json.dumps(["/bin/bash", "-c", bundle_command])
     wrapper_command = (
         "set -euo pipefail; mkdir -p /opt/codebuddy/bin; "
         "printf '%s\\n' '#!/bin/sh' "
@@ -176,17 +250,16 @@ def _rewrite_codebuddy_agent_dockerfile(environment) -> None:
         "> /opt/codebuddy/bin/codebuddy; chmod 0755 /opt/codebuddy/bin/codebuddy"
     )
     wrapper_run = "RUN " + json.dumps(["/bin/bash", "-c", wrapper_command])
+    _materialize_codebuddy_runtime(source_image, build_dir)
     replacement = (
         "USER root\n"
-        "COPY --from=dradar_codebuddy_source /opt/dradar-codebuddy-runtime/ "
+        "COPY dradar-codebuddy-runtime/ "
         "/opt/codebuddy/runtime/\n"
         f"{wrapper_run}\n"
         f"{verify_run}\n"
     )
     dockerfile_path.write_text(
-        f"FROM {source_image} AS dradar_codebuddy_source\n"
-        f"{bundle_run}\n"
-        + dockerfile[: -len(suffix)]
+        dockerfile[: -len(suffix)]
         + replacement,
         encoding="utf-8",
     )
