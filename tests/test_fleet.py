@@ -286,6 +286,96 @@ def test_pool_command_is_exact_batch_resume_without_claim_or_refill(
     assert "--refill" not in captured["command"]
     assert "--auto" not in captured["command"]
     assert captured["env"][fleet.POOL_BATCH_ENV] == BATCH_A
+    assert captured["env"][fleet.POOL_STARTUP_FILE_ENV] == str(
+        fleet._pool_startup_path(tmp_path, BATCH_A)
+    )
+
+
+def test_pool_is_not_running_until_exact_parent_acknowledges_readiness(
+    tmp_path, monkeypatch,
+):
+    fleet._prepare_dirs(tmp_path)
+    controller_id = "controller-1"
+    state = fleet._initial_state(controller_id, None)
+    state["status"] = "active"
+    state["batches"][BATCH_A] = {
+        "batch_id": BATCH_A,
+        "workers": 2,
+        "status": "starting",
+        "startup_status": "pending",
+    }
+
+    class Process:
+        pid = os.getpid()
+
+    monkeypatch.setenv(fleet.CONTROLLER_ID_ENV, controller_id)
+    monkeypatch.setenv(fleet.POOL_BATCH_ENV, BATCH_A)
+    monkeypatch.setenv(
+        fleet.POOL_STARTUP_FILE_ENV,
+        str(fleet._pool_startup_path(tmp_path, BATCH_A)),
+    )
+    monkeypatch.setattr(fleet, "controller_matches", lambda *_args: True)
+
+    fleet.publish_pool_startup_ready(tmp_path, BATCH_A)
+    fleet._refresh_pool_startups(tmp_path, state, {BATCH_A: Process()})
+
+    assert state["batches"][BATCH_A]["status"] == "running"
+    assert state["batches"][BATCH_A]["startup_status"] == "ready"
+    assert state["batches"][BATCH_A]["ready_at"]
+
+
+def test_structured_startup_failure_survives_parent_exit(
+    tmp_path, monkeypatch,
+):
+    fleet._prepare_dirs(tmp_path)
+    controller_id = "controller-1"
+    state = fleet._initial_state(controller_id, None)
+    state["status"] = "active"
+    state["batches"][BATCH_A] = {
+        "batch_id": BATCH_A,
+        "workers": 2,
+        "status": "starting",
+        "startup_status": "pending",
+        "plan_id": "plan-a",
+        "credentials_file": str(tmp_path / "plan-a.json"),
+    }
+
+    class Process:
+        pid = os.getpid()
+
+    process = Process()
+    log = io.StringIO()
+    processes = {BATCH_A: process}
+    logs = {BATCH_A: log}
+    monkeypatch.setenv(fleet.CONTROLLER_ID_ENV, controller_id)
+    monkeypatch.setenv(fleet.POOL_BATCH_ENV, BATCH_A)
+    monkeypatch.setenv(
+        fleet.POOL_STARTUP_FILE_ENV,
+        str(fleet._pool_startup_path(tmp_path, BATCH_A)),
+    )
+    monkeypatch.setattr(fleet, "controller_matches", lambda *_args: True)
+    stopped = []
+    monkeypatch.setattr(
+        fleet, "_stop_run_plan_device",
+        lambda item, reason: stopped.append((item["plan_id"], reason)),
+    )
+
+    fleet.publish_pool_startup_failure(
+        tmp_path,
+        BATCH_A,
+        error_code="task_environment_update_failed",
+        user_message="这台设备未能准备题目环境；已有文件没有被修改。",
+    )
+    fleet._refresh_pool_startups(tmp_path, state, processes)
+    fleet._settle_pool(tmp_path, state, processes, logs, BATCH_A, 1)
+
+    item = state["batches"][BATCH_A]
+    assert item["status"] == "failed"
+    assert item["startup_error_code"] == "task_environment_update_failed"
+    assert "已有文件没有被修改" in item["startup_user_message"]
+    assert stopped == [
+        ("plan-a", "local startup failed (task_environment_update_failed)"),
+    ]
 
 
 def test_refill_pool_command_keeps_exact_batch_and_total_cap(tmp_path, monkeypatch):

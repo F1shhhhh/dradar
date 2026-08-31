@@ -2395,6 +2395,131 @@ def sync_deep_swe_commit(tasks_root: Path, pinned: str) -> bool:
     return local_deep_swe_commit(tasks_root) == pinned
 
 
+def _task_snapshot_lock_path(home: Path) -> Path:
+    return home / "task-snapshots" / "prepare.lock"
+
+
+@contextmanager
+def _task_snapshot_lock(home: Path):
+    """Serialize immutable task-snapshot creation across local run parents."""
+
+    path = _task_snapshot_lock_path(home)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with path.open("a+b") as handle:
+        locked = False
+        windows_lock = False
+        try:
+            if os.name == "nt":  # pragma: no cover - exercised on Windows runners
+                import msvcrt
+
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                windows_lock = True
+                locked = True
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                locked = True
+            yield
+        finally:
+            if windows_lock and locked:  # pragma: no cover - Windows runners
+                try:
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+            elif os.name != "nt" and locked:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def prepare_pinned_deep_swe_tasks(home: Path, pinned: str) -> Path:
+    """Return an immutable, DRadar-owned checkout for one grading commit.
+
+    A volunteer's configured checkout may contain their own edits, and two live
+    batches may temporarily target different grading commits.  Updating that
+    shared checkout in place is therefore both destructive and racy.  Build one
+    managed snapshot per immutable commit instead; the configured checkout is
+    never fetched, reset, or checked out by this path.
+    """
+
+    if not re.fullmatch(r"[0-9a-fA-F]{40,64}", str(pinned)):
+        raise RunnerError("the server returned an invalid deep-swe version pin")
+    commit = str(pinned).lower()
+    snapshots = home / "task-snapshots" / "deep-swe"
+    destination = snapshots / commit
+    tasks_root = destination / "tasks"
+
+    with _task_snapshot_lock(home):
+        if (
+            tasks_root.is_dir()
+            and local_deep_swe_commit(tasks_root) == commit
+        ):
+            return tasks_root
+        if destination.exists():
+            raise RunnerError(
+                "the managed deep-swe task snapshot is incomplete; remove only "
+                f"{destination} after active DRadar runs finish, then retry"
+            )
+
+        snapshots.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temporary = Path(tempfile.mkdtemp(
+            prefix=f".{commit[:12]}-", dir=snapshots,
+        ))
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+        try:
+            commands = (
+                (["git", "init", "-q", str(temporary)], 30),
+                ([
+                    "git", "-C", str(temporary), "fetch", "--quiet",
+                    "--depth", "1", "--no-tags", DEEP_SWE_REPO, commit,
+                ], 180),
+                ([
+                    "git", "-C", str(temporary), "-c",
+                    "advice.detachedHead=false", "checkout", "--quiet",
+                    "--detach", "FETCH_HEAD",
+                ], 60),
+            )
+            for command, timeout in commands:
+                try:
+                    result = subprocess.run(
+                        command, capture_output=True, text=True,
+                        timeout=timeout, env=env,
+                    )
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    raise RunnerError(
+                        "couldn't prepare the isolated deep-swe task snapshot; "
+                        "check Git, network access, and free disk space"
+                    ) from exc
+                if result.returncode != 0:
+                    raise RunnerError(
+                        "couldn't prepare the isolated deep-swe task snapshot; "
+                        "check Git, network access, and free disk space"
+                    )
+            prepared_tasks = temporary / "tasks"
+            if (
+                not prepared_tasks.is_dir()
+                or local_deep_swe_commit(prepared_tasks) != commit
+            ):
+                raise RunnerError(
+                    "the isolated deep-swe task snapshot did not match the "
+                    "server's grading version"
+                )
+            os.replace(temporary, destination)
+            return tasks_root
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary, ignore_errors=True)
+
+
 def check_task_content_hash(assignment: dict, tasks_root: Path) -> bool | None:
     """Compare the server's task_content_hash against this volunteer's local
     checkout. Returns None when the assignment carries no hash to compare
