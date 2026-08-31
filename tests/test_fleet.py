@@ -160,6 +160,71 @@ def test_fleet_tracks_separate_honeypot_batches_and_total_workers(
     assert persisted["batches"][BATCH_B]["workers"] == 3
 
 
+def test_controller_liveness_requires_process_lifetime_lease_not_reused_pid(
+    tmp_path, monkeypatch,
+):
+    state = fleet._initial_state("controller-reused-pid", None)
+    state["status"] = "active"
+    fleet._write_state(tmp_path, state)
+    monkeypatch.setattr(fleet, "_pid_alive", lambda _pid: True)
+
+    # A live-looking/reused PID and fresh heartbeat are insufficient without
+    # the exact controller lease held by the controller process.
+    assert fleet.controller_is_active(tmp_path) is False
+
+    with fleet._controller_lease(tmp_path, "controller-reused-pid"):
+        assert fleet.controller_is_active(tmp_path) is True
+
+
+def test_dead_controller_without_pool_lock_exposes_interrupted_zero_reservation(
+    tmp_path,
+):
+    state = fleet._initial_state("dead-controller", None)
+    state["status"] = "active"
+    state["batches"][BATCH_A] = {
+        "batch_id": BATCH_A,
+        "status": "running",
+        "workers": 3,
+        "plan_id": "plan-dead",
+    }
+    fleet._write_state(tmp_path, state)
+
+    public = fleet._public_state(tmp_path)
+
+    assert public["active"] is False
+    assert public["batches"][BATCH_A]["status"] == "interrupted"
+    assert public["total_workers"] == 0
+    assert fleet.batch_status(BATCH_A, home=tmp_path)["status"] == "interrupted"
+    assert fleet.reserved_workers(tmp_path) == 0
+
+
+def test_dead_controller_with_live_pool_lock_keeps_orphan_reservation_and_credential(
+    tmp_path,
+):
+    credentials = tmp_path / "run-plans" / "plan-orphan.json"
+    credentials.parent.mkdir(parents=True)
+    credentials.write_text("{}")
+    state = fleet._initial_state("dead-controller", None)
+    state["status"] = "active"
+    state["batches"][BATCH_A] = {
+        "batch_id": BATCH_A,
+        "status": "running",
+        "workers": 2,
+        "plan_id": "plan-orphan",
+        "credentials_file": str(credentials),
+    }
+    fleet._write_state(tmp_path, state)
+    fleet.acquire_pool_lock(tmp_path, BATCH_A, "dead-controller")
+
+    public = fleet._public_state(tmp_path)
+
+    assert public["active"] is False
+    assert public["batches"][BATCH_A]["status"] == "orphaned"
+    assert public["total_workers"] == 2
+    assert fleet.reserved_workers(tmp_path) == 2
+    assert fleet.credentials_file_in_use(credentials, home=tmp_path) is True
+
+
 def test_auto_workers_subtract_existing_machine_reservations(monkeypatch):
     class Client:
         def set_batch_id(self, value):
@@ -257,6 +322,74 @@ def test_refill_pool_command_keeps_exact_batch_and_total_cap(tmp_path, monkeypat
     assert command[command.index("--refill-model") + 1] == "kimi-k2.5"
     assert command[command.index("--refill-effort") + 1] == "high"
     assert captured["env"]["DRADAR_REFILL_PLAN_SCOPE"] == BATCH_A
+
+
+def test_plan_token_stays_in_private_file_not_fleet_argv_env_or_state(
+    tmp_path, monkeypatch,
+):
+    fleet._prepare_dirs(tmp_path)
+    credentials = tmp_path / "run-plans" / "plan-example.json"
+    credentials.parent.mkdir(mode=0o700)
+    token = "drp_extremely_private_plan_token"
+    credentials.write_text(json.dumps({"token": token}))
+    credentials.chmod(0o600)
+    captured = {}
+
+    class Process:
+        pid = 321
+
+        def poll(self):
+            return None
+
+    def popen(command, **kwargs):
+        captured["command"] = command
+        captured["env"] = kwargs["env"]
+        return Process()
+
+    monkeypatch.setattr(fleet.subprocess, "Popen", popen)
+    monkeypatch.setattr("dradar.machine._lock_handle", None)
+    process, log = fleet._spawn_pool(
+        tmp_path,
+        {"controller_id": "controller-1"},
+        BATCH_A,
+        2,
+        credentials_file=str(credentials),
+    )
+    log.close()
+    assert process.pid == 321
+    assert captured["command"][captured["command"].index("--credentials-file") + 1] == str(credentials)
+    assert token not in captured["command"]
+    assert all(token not in str(value) for value in captured["env"].values())
+
+    state = fleet._initial_state("controller-1", None)
+    state["status"] = "active"
+    monkeypatch.setattr(
+        fleet, "_resolve_workers",
+        lambda *_args: (2, [], {"account_limit": 4}),
+    )
+    monkeypatch.setattr(
+        fleet,
+        "_spawn_pool",
+        lambda *_args, **_kwargs: (Process(), io.StringIO()),
+    )
+    fleet._handle_request(
+        tmp_path,
+        state,
+        {},
+        {},
+        {
+            "request_id": "plan-request",
+            "controller_id": "controller-1",
+            "command": "add",
+            "batch_id": BATCH_A,
+            "workers": 2,
+            "credentials_file": str(credentials),
+            "plan_id": "plan-example",
+        },
+    )
+    persisted = fleet._state_path(tmp_path).read_text()
+    assert token not in persisted
+    assert str(credentials) in persisted
 
 
 def test_pool_lock_rejects_duplicate_parent_and_dies_with_process(tmp_path):

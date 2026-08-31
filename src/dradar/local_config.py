@@ -74,3 +74,58 @@ def _save_config(cfg: dict) -> None:
         fh.write(json.dumps(cfg, indent=2) + "\n")
     os.chmod(tmp, 0o600)  # O_CREAT's mode is ignored when tmp pre-existed
     os.replace(tmp, CONFIG_PATH)
+
+
+def runtime_config(credentials_file: str | os.PathLike[str] | None = None) -> dict:
+    """Load ordinary config or overlay one private run-plan credential.
+
+    The credentials-file path is safe to forward to supervised subprocesses;
+    its ``drp_`` value is not.  Reject symlinks and permissive modes before
+    reading so an internal argument cannot be turned into an arbitrary-file
+    credential source.
+    """
+    if credentials_file is None:
+        return _load_config()
+    # A plan-scoped capability is deliberately sufficient on a fresh device.
+    # A damaged unrelated long-term config must not force the user to copy a
+    # drt_ credential before this exact plan can run. Preserve valid local task
+    # paths when available, but fail independently from that optional file.
+    try:
+        cfg = _load_config()
+    except SystemExit:
+        cfg = {}
+    path = Path(credentials_file).expanduser()
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise ValueError
+        stat = path.stat()
+        if os.name != "nt":
+            if stat.st_mode & 0o077:
+                raise ValueError
+            if hasattr(os, "getuid") and stat.st_uid != os.getuid():
+                raise ValueError
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        raise ValueError("invalid private run-plan credentials file") from None
+    if not isinstance(payload, dict) or payload.get("credential_kind") != "run_plan_v1":
+        raise ValueError("invalid private run-plan credentials file")
+    server = payload.get("server")
+    token = payload.get("token")
+    benchmark = payload.get("benchmark")
+    batch_id = payload.get("batch_id")
+    if (
+        not isinstance(server, str) or not server
+        or not isinstance(token, str) or not token.startswith("drp_")
+        or not isinstance(benchmark, str) or not benchmark
+        or not isinstance(batch_id, str) or not batch_id
+    ):
+        raise ValueError("invalid private run-plan credentials file")
+    runtime = dict(cfg)
+    runtime.update({
+        "server": server,
+        "token": token,
+        "benchmark": benchmark,
+        "run_plan_batch_id": batch_id,
+        "run_plan_id": payload.get("plan_id"),
+    })
+    return runtime

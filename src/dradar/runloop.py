@@ -38,7 +38,8 @@ from .codebuddy_provider import (
 )
 from .identity import _client
 from .local_config import (
-    DEFAULT_BENCHMARK, HOME, _load_config, tasks_root_from_config,
+    DEFAULT_BENCHMARK, HOME, _load_config, runtime_config,
+    tasks_root_from_config,
 )
 from .machine import acquire_run_lock, sweep_orphan_compose
 from .patch_guard import check_pompeii_patch, format_patch_guard_report
@@ -239,6 +240,25 @@ def _selected_tasks_root(cfg: dict) -> Path:
     if benchmark == DEFAULT_BENCHMARK:
         return tasks_root_from_config(cfg)
     return tasks_root_from_config(cfg, benchmark)
+
+
+def _run_config(args) -> dict:
+    credentials_file = getattr(args, "credentials_file", None)
+    try:
+        cfg = (
+            runtime_config(credentials_file)
+            if credentials_file else _load_config()
+        )
+    except ValueError as exc:
+        sys.exit(str(exc))
+    scoped_batch = cfg.get("run_plan_batch_id")
+    normalized_scope = (
+        scoped_batch.replace("-", "").lower()
+        if isinstance(scoped_batch, str) else scoped_batch
+    )
+    if normalized_scope and normalized_scope != getattr(args, "batch_id", None):
+        sys.exit("run-plan credentials do not match the exact selected batch")
+    return cfg
 
 
 def _is_trajectory_bundle_rejection(exc: ApiError) -> bool:
@@ -3409,7 +3429,7 @@ def cmd_go(args) -> int:
     _preflight_scoped_provider(args)
     if (auto_workers or workers > 1) and not getattr(args, "worker_child", False):
         return _run_worker_pool(args)
-    cfg = _load_config()
+    cfg = _run_config(args)
     cfg["benchmark"] = (
         getattr(args, "benchmark", None)
         or cfg.get("benchmark")
@@ -3544,6 +3564,8 @@ def _worker_command(args) -> list[str]:
         command.extend(("--benchmark", args.benchmark))
     if getattr(args, "batch_id", None):
         command.extend(("--batch-id", args.batch_id))
+    if getattr(args, "credentials_file", None):
+        command.extend(("--credentials-file", args.credentials_file))
     if getattr(args, "refill", False):
         command.extend(("--refill", "--max-tasks", str(args.max_tasks)))
         if args.refill_to is not None:
@@ -3936,7 +3958,7 @@ def _run_worker_pool(args) -> int:
     if args.workers == "auto":
         from .capacity import AUTO_WORKER_CAP, inspect_capacity, print_report
 
-        cfg = _load_config()
+        cfg = _run_config(args)
         cfg["benchmark"] = (
             getattr(args, "benchmark", None)
             or cfg.get("benchmark")
@@ -3991,7 +4013,7 @@ def _run_worker_pool(args) -> int:
     args.yes = True
 
     if cfg is None or client is None:
-        cfg = _load_config()
+        cfg = _run_config(args)
         cfg["benchmark"] = (
             getattr(args, "benchmark", None)
             or cfg.get("benchmark")
@@ -4674,7 +4696,9 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
             # The server applies this exclusion before stamping started_at,
             # allowing the loop to keep draining other waiting cells.
             if telemetry:
-                telemetry.flush_for_checkout()
+                if telemetry.flush_for_checkout():
+                    print("this device was asked to stop before another checkout")
+                    break
                 data = client.checkout(
                     exclude_assignment_ids=checkout_exclusions,
                     session_id=telemetry.session_id,
@@ -4834,7 +4858,7 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
                     f"could not be synchronized ({exc})"
                 )
             replenished = None
-            runtime_cfg = _load_config()
+            runtime_cfg = _run_config(args)
             maintenance_allows_refill = True
             if (getattr(args, "worker_child", False)
                     and image_cache.claim_periodic_maintenance(

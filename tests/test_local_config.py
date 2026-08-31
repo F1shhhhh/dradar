@@ -78,3 +78,66 @@ def test_benchmark_task_roots_are_isolated_from_legacy_deep_swe(home):
         cfg, "pompeii-adjacency") == local_config.Path("/visual/pompeii/tasks")
     assert local_config.default_tasks_root(
         "pompeii-adjacency") == home / "benchmarks" / "pompeii-adjacency" / "tasks"
+
+
+def test_private_run_plan_credentials_overlay_without_replacing_user_config(home):
+    local_config._save_config({
+        "server": "https://ordinary.example",
+        "token": "drt_ordinary",
+        "tasks_root": "/kept/tasks",
+    })
+    credentials = home / "run-plans" / "plan-example.json"
+    credentials.parent.mkdir(mode=0o700)
+    credentials.write_text(json.dumps({
+        "credential_kind": "run_plan_v1",
+        "server": "https://api.codexradar.com",
+        "token": "drp_scoped",
+        "benchmark": "deep-swe",
+        "batch_id": "12345678123456781234567812345678",
+        "plan_id": "plan-example",
+    }))
+    credentials.chmod(0o600)
+
+    runtime = local_config.runtime_config(credentials)
+
+    assert runtime["server"] == "https://api.codexradar.com"
+    assert runtime["token"] == "drp_scoped"
+    assert runtime["run_plan_batch_id"] == "12345678123456781234567812345678"
+    assert runtime["tasks_root"] == "/kept/tasks"
+    assert local_config._load_config()["token"] == "drt_ordinary"
+
+
+def test_private_run_plan_credentials_reject_permissive_mode(home):
+    credentials = home / "plan.json"
+    credentials.write_text(json.dumps({
+        "credential_kind": "run_plan_v1",
+        "server": "https://api.codexradar.com",
+        "token": "drp_scoped",
+        "benchmark": "deep-swe",
+        "batch_id": "12345678123456781234567812345678",
+    }))
+    if os.name == "nt":
+        pytest.skip("POSIX permission contract")
+    credentials.chmod(0o644)
+
+    with pytest.raises(ValueError, match="invalid private run-plan"):
+        local_config.runtime_config(credentials)
+
+
+def test_private_run_plan_does_not_require_a_valid_long_term_login_config(home):
+    (home / "config.json").write_text("{broken")
+    credentials = home / "plan.json"
+    credentials.write_text(json.dumps({
+        "credential_kind": "run_plan_v1",
+        "server": "https://api.claudecoderadar.com",
+        "token": "drp_scoped",
+        "benchmark": "deep-swe",
+        "batch_id": "12345678123456781234567812345678",
+        "plan_id": "plan-example",
+    }))
+    credentials.chmod(0o600)
+
+    runtime = local_config.runtime_config(credentials)
+
+    assert runtime["server"] == "https://api.claudecoderadar.com"
+    assert runtime["token"] == "drp_scoped"

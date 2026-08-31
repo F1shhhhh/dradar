@@ -139,6 +139,204 @@ def _probe(cmd: list[str]) -> bool:
         return False
 
 
+def _plan_agent_recovery(
+    harness: str,
+    *,
+    setup_provider: str | None = None,
+    codex_login: bool = False,
+) -> dict:
+    """Versioned, non-secret next steps for an Agent; never guess prose."""
+    harness = {"dsh": "dsh-minimal"}.get(harness, harness)
+    commands = []
+    if codex_login:
+        commands.append({
+            "argv": ["codex", "login"],
+            "interactive": True,
+            "purpose": "authenticate_current_tool",
+        })
+    if setup_provider:
+        commands.extend((
+            {
+                "argv": ["dradar", "provider", "setup", setup_provider],
+                "interactive": True,
+                "purpose": "setup_current_tool",
+            },
+            {
+                "argv": ["dradar", "provider", "status", setup_provider, "--live"],
+                "interactive": False,
+                "purpose": "verify_current_tool",
+            },
+        ))
+    if harness in {
+        "codex", "dsh-minimal", GROK_AGENT, KIMI_AGENT, ZCODE_AGENT,
+        ANTIGRAVITY_AGENT, CODEBUDDY_AGENT,
+    }:
+        commands.append({
+            "argv": ["dradar", "doctor", "--agent", harness],
+            "interactive": False,
+            "purpose": "verify_current_environment",
+        })
+    return {
+        "schema_version": 1,
+        "requires_user_action": bool(codex_login or setup_provider),
+        "next_commands": commands,
+    }
+
+
+def _plan_issue(
+    harness: str,
+    error_code: str,
+    user_message: str,
+    agent_action: str,
+    *,
+    setup_provider: str | None = None,
+    codex_login: bool = False,
+    requires_user_action: bool | None = None,
+) -> dict:
+    agent = _plan_agent_recovery(
+        harness, setup_provider=setup_provider, codex_login=codex_login,
+    )
+    if requires_user_action is not None:
+        agent["requires_user_action"] = requires_user_action
+    return {
+        "error_code": error_code,
+        "user_message": user_message,
+        "agent_action": agent_action,
+        "agent": agent,
+    }
+
+
+def plan_environment_issue(plan: dict) -> dict | None:
+    """Return one actionable issue for exactly this run plan, or ``None``.
+
+    This preflight is intentionally narrow and runs before the device is
+    registered with the server. It never checks credentials for unrelated
+    tools, which prevents a missing Grok/Kimi setup from blocking Codex work.
+    """
+    harness = str(plan.get("harness") or "").lower()
+    harness = {"dsh": "dsh-minimal"}.get(harness, harness)
+    docker = shutil.which("docker")
+    if not docker:
+        return _plan_issue(
+            harness, "docker_not_installed",
+            "这次运行需要 Docker；请先安装并启动 Docker，再重试。",
+            "setup_docker", requires_user_action=True,
+        )
+    if not _probe([docker, "info"]):
+        return _plan_issue(
+            harness, "docker_not_running",
+            "Docker 还没有启动；请启动 Docker 后重试。",
+            "start_docker", requires_user_action=True,
+        )
+    if not _probe([docker, "compose", "version"]):
+        return _plan_issue(
+            harness, "docker_compose_missing",
+            "Docker Compose 尚未就绪；请安装 Compose 组件后重试。",
+            "setup_docker", requires_user_action=True,
+        )
+    try:
+        runner.ensure_pier()
+    except runner.RunnerError:
+        return _plan_issue(
+            harness, "runtime_setup_failed",
+            "本机运行环境暂时无法准备；请检查网络后重试。",
+            "repair_local_environment", requires_user_action=True,
+        )
+
+    assignments = plan.get("assignments") or []
+    provider = str(
+        assignments[0].get("provider") if assignments
+        and isinstance(assignments[0], dict) else ""
+    ).lower()
+    if harness == "codex":
+        codex = runner._resolve_user_tool("codex")
+        if not codex:
+            return _plan_issue(
+                harness, "codex_not_installed",
+                "这次运行需要 Codex；请先安装 Codex，再重试。",
+                "setup_current_tool", requires_user_action=True,
+            )
+        if provider == "deepseek":
+            if not deepseek_api_key() or deepseek_catalog_error() is not None:
+                return _plan_issue(
+                    harness, "current_tool_not_authenticated",
+                    "这次运行所需的模型权限尚未配置；请完成当前运行工具的登录后重试。",
+                    "authenticate_current_tool", setup_provider="deepseek",
+                )
+        elif not runner.codex_auth_path().is_file():
+            return _plan_issue(
+                harness, "codex_not_authenticated",
+                "Codex 尚未登录；请完成 Codex 登录后重试。",
+                "authenticate_current_tool", codex_login=True,
+            )
+        return None
+    if harness == "dsh-minimal":
+        if not runner._resolve_user_tool("uvx") or not deepseek_api_key():
+            return _plan_issue(
+                harness, "current_tool_not_ready",
+                "这次运行所需的工具或模型权限尚未就绪；请完成当前运行工具的设置后重试。",
+                "setup_current_tool", setup_provider="deepseek",
+            )
+        return None
+    if harness == GROK_AGENT:
+        executable = grok_cli_path()
+        ready = bool(executable) and grok_auth_error() is None
+        if not ready:
+            return _plan_issue(
+                harness, "current_tool_not_ready",
+                "这次运行需要 Grok；请完成 Grok 的安装和登录后重试。",
+                "setup_current_tool", setup_provider="grok",
+            )
+        return None
+    if harness == KIMI_AGENT:
+        executable = kimi_cli_path()
+        ready = bool(executable) and kimi_auth_error() is None
+        if not ready:
+            return _plan_issue(
+                harness, "current_tool_not_ready",
+                "这次运行需要 Kimi；请完成 Kimi 的安装和登录后重试。",
+                "setup_current_tool", setup_provider="kimi",
+            )
+        return None
+    if harness == ZCODE_AGENT:
+        if not zcode_api_key() or zcode_cli_error(zcode_cli_path()) is not None:
+            return _plan_issue(
+                harness, "current_tool_not_ready",
+                "这次运行需要 ZCode；请完成 ZCode 的安装和登录后重试。",
+                "setup_current_tool", setup_provider="zcode",
+            )
+        return None
+    if harness == ANTIGRAVITY_AGENT:
+        if prepare_antigravity_auth() is not None:
+            return _plan_issue(
+                harness, "current_tool_not_ready",
+                "这次运行需要 Antigravity；请完成当前运行工具的登录后重试。",
+                "authenticate_current_tool", setup_provider="antigravity",
+            )
+        return None
+    if harness == CODEBUDDY_AGENT:
+        executable = codebuddy_executable()
+        credentials_ready, _detail = codebuddy_credential_status()
+        image_issue = codebuddy_runtime_image_error(docker)
+        if (
+            not executable
+            or codebuddy_version(executable) != CODEBUDDY_CLI_VERSION
+            or not credentials_ready
+            or image_issue is not None
+        ):
+            return _plan_issue(
+                harness, "current_tool_not_ready",
+                "这次运行需要 CodeBuddy；请完成 CodeBuddy 的安装和登录后重试。",
+                "setup_current_tool", setup_provider="codebuddy",
+            )
+        return None
+    return _plan_issue(
+        harness, "current_tool_unsupported",
+        "当前版本还不能运行网页选择的工具；请升级 DRadar 后重试。",
+        "upgrade_cli", requires_user_action=True,
+    )
+
+
 def _docker_hub_hint(output: str, platform: str) -> str:
     """Turn BuildKit/registry failures into an actionable volunteer hint."""
 
@@ -286,6 +484,7 @@ def cmd_doctor(args) -> int:
     cfg = _load_config()
     plat = _platform()
     selected_agent = getattr(args, "agent", None)
+    codex_only = selected_agent == "codex"
     dsh_only = selected_agent == "dsh-minimal"
     grok_only = selected_agent == GROK_AGENT
     kimi_only = selected_agent == KIMI_AGENT
@@ -293,6 +492,7 @@ def cmd_doctor(args) -> int:
     antigravity_only = selected_agent == ANTIGRAVITY_AGENT
     codebuddy_only = selected_agent == CODEBUDDY_AGENT
     scopes = {
+        "codex": " — Codex",
         "dsh-minimal": " — DSH Minimal",
         GROK_AGENT: " — Grok Build",
         KIMI_AGENT: " — Kimi Code",
@@ -496,7 +696,7 @@ def cmd_doctor(args) -> int:
         and codebuddy_credentials_ready
         and codebuddy_image_issue is None
     )
-    deepseek_requested = deepseek_opted_in()
+    deepseek_requested = selected_agent is None and deepseek_opted_in()
     deepseek_key_ready = bool(deepseek_api_key())
     if dsh_only:
         all_ok &= _check(
@@ -618,16 +818,17 @@ def cmd_doctor(args) -> int:
             _check("DeepSeek V4 Flash / Pro / Vision — DSH Minimal agent ready", True)
     elif codex_ready:
         _check("codex — agent ready", True)
-    elif claude_ready:
+    elif claude_ready and not codex_only:
         _check("claude — agent ready", True)
     else:
         _check("codex CLI", bool(codex), _CODEX_HINTS[plat])
         _check("codex auth.json", auth.is_file(), "run: codex login")
-        _check("claude CLI (alternative to codex)", bool(shutil.which("claude")),
-               "npm install -g @anthropic-ai/claude-code")
-        _check("CLAUDE_CODE_OAUTH_TOKEN (alternative to codex)",
-               bool(runner.claude_oauth_token()),
-               "or: claude setup-token, then export CLAUDE_CODE_OAUTH_TOKEN each shell")
+        if not codex_only:
+            _check("claude CLI (alternative to codex)", bool(shutil.which("claude")),
+                   "npm install -g @anthropic-ai/claude-code")
+            _check("CLAUDE_CODE_OAUTH_TOKEN (alternative to codex)",
+                   bool(runner.claude_oauth_token()),
+                   "or: claude setup-token, then export CLAUDE_CODE_OAUTH_TOKEN each shell")
     if (
         not dsh_only
         and not deepseek_requested
@@ -637,7 +838,7 @@ def cmd_doctor(args) -> int:
         and not antigravity_requested
         and not codebuddy_requested
     ):
-        all_ok &= (codex_ready or claude_ready)
+        all_ok &= codex_ready if codex_only else (codex_ready or claude_ready)
 
     # The task repo is auto-cloned on `dradar go`; do it here too so a missing
     # checkout reports OK instead of a FAIL whose hint doesn't actually fix it.
@@ -691,7 +892,7 @@ def cmd_doctor(args) -> int:
 
 
 __all__ = [
-    "cmd_doctor", "_platform", "_check", "_warn", "_probe", "_DOCKER_HINTS",
+    "cmd_doctor", "plan_environment_issue", "_platform", "_check", "_warn", "_probe", "_DOCKER_HINTS",
     "_CODEX_HINTS", "_docker_hub_hint", "_docker_hub_preflight",
     "_windows_virtualization_state",
 ]

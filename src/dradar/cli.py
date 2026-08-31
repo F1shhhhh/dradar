@@ -19,6 +19,7 @@ import argparse
 import sys
 
 from . import __version__
+from .agent_schema import cmd_schema
 from .api_client import normalize_batch_id
 from .capacity import cmd_capacity
 from .cells import cmd_cells
@@ -31,6 +32,7 @@ from .identity import cmd_link_github, cmd_login, cmd_rename, cmd_status
 from .image_cache import cmd_config_set, cmd_config_show
 from .leases import cmd_leases, cmd_release
 from .provider_config import cmd_provider_setup, cmd_provider_status
+from .run_plans import cmd_progress_plan, cmd_run_plan, cmd_stop_plan
 from .runloop import (
     cmd_cleanup, cmd_go, cmd_refill_status, cmd_refill_stop, cmd_retry_upload,
 )
@@ -109,7 +111,7 @@ def main(argv: list[str] | None = None) -> int:
     p_doc = sub.add_parser("doctor", help="preflight checks")
     p_doc.add_argument(
         "--agent", choices=(
-            "dsh-minimal", "grok-build", "kimi-code", "zcode", "antigravity",
+            "codex", "dsh-minimal", "grok-build", "kimi-code", "zcode", "antigravity",
             "codebuddy",
         ), default=None,
         help="check only the dependencies required by this agent",
@@ -119,6 +121,64 @@ def main(argv: list[str] | None = None) -> int:
     p_capacity = sub.add_parser(
         "capacity", help="recommend a safe local worker count from Docker resources")
     p_capacity.set_defaults(func=cmd_capacity)
+
+    p_schema = sub.add_parser(
+        "schema", help="show the versioned command contract used by Agents")
+    schema_sub = p_schema.add_subparsers(
+        dest="schema_command", required=True, metavar="{run,progress,stop}")
+    for schema_command in ("run", "progress", "stop"):
+        p_command_schema = schema_sub.add_parser(
+            schema_command, help=f"show the {schema_command} command contract")
+        p_command_schema.add_argument(
+            "--json", action="store_true", help="emit machine-readable JSON")
+        p_command_schema.set_defaults(func=cmd_schema)
+
+    p_run_plan = sub.add_parser(
+        "run", help="run the exact tasks selected on the website")
+    p_run_plan.add_argument(
+        "--plan", required=True, metavar="CODE",
+        help="short-lived run code copied from the website",
+    )
+    p_run_plan.add_argument(
+        "--server", metavar="HTTPS_URL",
+        help="website API address (saved per run after the first exchange)",
+    )
+    p_run_plan.add_argument(
+        "--concurrency", type=_workers_value, default=None, metavar="N|auto",
+        help="tasks to run at once, or auto (default: the website choice)",
+    )
+    p_run_plan.add_argument(
+        "--decision-token", help="short-lived confirmation returned by the previous check",
+    )
+    p_run_plan.add_argument(
+        "--json", action="store_true", help="emit the versioned Agent response",
+    )
+    p_run_plan.set_defaults(func=cmd_run_plan)
+
+    p_progress_plan = sub.add_parser(
+        "progress", help="show progress for one website-selected run")
+    p_progress_plan.add_argument("--plan", required=True, metavar="CODE")
+    p_progress_plan.add_argument("--server", metavar="HTTPS_URL")
+    p_progress_plan.add_argument(
+        "--json", action="store_true", help="emit the versioned Agent response",
+    )
+    p_progress_plan.set_defaults(func=cmd_progress_plan)
+
+    p_stop_plan = sub.add_parser(
+        "stop", help="stop this run on this device or every device")
+    p_stop_plan.add_argument("--plan", required=True, metavar="CODE")
+    p_stop_plan.add_argument("--server", metavar="HTTPS_URL")
+    p_stop_plan.add_argument(
+        "--scope", required=True, choices=("this-device", "all-devices"),
+        help="stop only here, or (after confirmation) on every device",
+    )
+    p_stop_plan.add_argument(
+        "--decision-token", help="short-lived confirmation returned by the previous check",
+    )
+    p_stop_plan.add_argument(
+        "--json", action="store_true", help="emit the versioned Agent response",
+    )
+    p_stop_plan.set_defaults(func=cmd_stop_plan)
 
     p_fleet = sub.add_parser(
         "fleet",
@@ -262,6 +322,10 @@ def main(argv: list[str] | None = None) -> int:
 
     p_ls = sub.add_parser(
         "leases", help="list cells you currently hold and whether each is running or waiting")
+    p_ls.add_argument(
+        "--json", action="store_true",
+        help="emit the exact machine-readable inventory for an Agent",
+    )
     p_ls.set_defaults(func=cmd_leases)
 
     p_rel = sub.add_parser(
@@ -428,6 +492,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         p.add_argument("--worker-child", action="store_true", help=argparse.SUPPRESS)
         p.add_argument("--fleet-pool", action="store_true", help=argparse.SUPPRESS)
+        p.add_argument("--credentials-file", help=argparse.SUPPRESS)
         p.add_argument(
             "--refill", action="store_true",
             help="keep replenishing the held queue (requires a quota or task limit)",

@@ -6,6 +6,7 @@ release protects cells whose runner has started; ``--force`` is the escape
 hatch for a genuinely stuck local process.
 """
 
+import json
 import sys
 from datetime import datetime
 
@@ -152,6 +153,22 @@ def cmd_leases(args) -> int:
         active, recent_inactive = _all_inventory(client)
     except ApiError as exc:
         sys.exit(f"lease check failed: {exc}")
+    if getattr(args, "json", False):
+        payload = {
+            "schema_version": 1,
+            "status": "ok",
+            "active": active,
+            "recent_inactive": recent_inactive,
+            "summary": {
+                "total": len(active),
+                "running": sum(_state(item) == "running" for item in active),
+                "waiting": sum(_state(item) == "waiting" for item in active),
+                "paused": sum(_state(item) == "paused" for item in active),
+                "stale": sum(_state(item) == "stale" for item in active),
+            },
+        }
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return 0
     if not active and not recent_inactive:
         print("no active leases")
         return 0

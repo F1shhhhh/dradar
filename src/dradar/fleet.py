@@ -11,7 +11,9 @@ untouched because older ``--parallel`` sessions did not hold the machine lock.
 The control plane is deliberately local-file based.  It works without an
 open TCP port, stores no credentials, and uses atomic rename for every public
 state transition.  Request/response files are user-private and contain only
-batch IDs, worker targets, and bounded control flags.
+batch IDs, worker targets, bounded control flags, and (for run plans) the path
+to a mode-0600 credential file. Credential values never enter Fleet state,
+requests, environment variables, or process arguments.
 """
 
 from __future__ import annotations
@@ -38,7 +40,7 @@ from .capacity import (
     worker_resource_warnings,
 )
 from .identity import _client
-from .local_config import HOME, _load_config
+from .local_config import HOME, _load_config, runtime_config
 from .machine import acquire_run_lock
 
 
@@ -46,11 +48,13 @@ SCHEMA_VERSION = 1
 FLEET_DIR = "fleet"
 STATE_FILE = "state.json"
 START_LOCK_FILE = "start.lock"
+CONTROLLER_LOCK_FILE = "controller.lock"
 PREPARATION_LOCK_FILE = "preparation.lock"
 POOL_LOCK_DIR = "batch-locks"
 REQUEST_DIR = "requests"
 RESPONSE_DIR = "responses"
 LOG_DIR = "logs"
+ABORT_DIR = "aborts"
 CONTROLLER_LOG = "controller.log"
 
 _LAUNCH_ID_ENV = "DRADAR_FLEET_LAUNCH_ID"
@@ -95,7 +99,7 @@ def _private_dir(path: Path) -> None:
 def _prepare_dirs(home: Path = HOME) -> None:
     root = _root(home)
     _private_dir(root)
-    for name in (POOL_LOCK_DIR, REQUEST_DIR, RESPONSE_DIR, LOG_DIR):
+    for name in (POOL_LOCK_DIR, REQUEST_DIR, RESPONSE_DIR, LOG_DIR, ABORT_DIR):
         _private_dir(root / name)
 
 
@@ -183,6 +187,48 @@ def _pid_alive(pid: object) -> bool:
     return True
 
 
+def _lock_is_held(path: Path) -> bool:
+    """Return true only when another live file description owns the lock."""
+    if not path.is_file():
+        return False
+    try:
+        with _locked(path, blocking=False):
+            return False
+    except FleetBusy:
+        return True
+
+
+@contextmanager
+def _controller_lease(home: Path, controller_id: str) -> Iterator[None]:
+    """Tie controller identity to process lifetime, defeating PID reuse."""
+    path = _root(home) / CONTROLLER_LOCK_FILE
+    with _locked(path, blocking=False) as handle:
+        handle.seek(0)
+        handle.truncate()
+        json.dump({
+            "schema_version": SCHEMA_VERSION,
+            "controller_id": controller_id,
+            "pid": os.getpid(),
+            "started_at": _now(),
+        }, handle)
+        handle.write("\n")
+        handle.flush()
+        if os.name != "nt":
+            os.fsync(handle.fileno())
+        yield
+
+
+def _controller_lease_matches(home: Path, controller_id: object) -> bool:
+    path = _root(home) / CONTROLLER_LOCK_FILE
+    recorded = _read_json(path)
+    return bool(
+        isinstance(controller_id, str)
+        and recorded
+        and recorded.get("controller_id") == controller_id
+        and _lock_is_held(path)
+    )
+
+
 def _parse_time(value: object) -> float | None:
     if not isinstance(value, str):
         return None
@@ -201,7 +247,10 @@ def controller_is_active(home: Path = HOME) -> bool:
     heartbeat = _parse_time(state.get("heartbeat_at"))
     if heartbeat is None or time.time() - heartbeat > HEARTBEAT_STALE_SECONDS:
         return False
-    return _pid_alive(state.get("pid"))
+    return bool(
+        _pid_alive(state.get("pid"))
+        and _controller_lease_matches(home, state.get("controller_id"))
+    )
 
 
 def controller_matches(controller_id: str, home: Path = HOME) -> bool:
@@ -359,14 +408,21 @@ def _active_batches(state: dict) -> dict[str, dict]:
     return {
         batch_id: item for batch_id, item in batches.items()
         if isinstance(item, dict)
-        and item.get("status") in {"starting", "running", "stopping"}
+        and item.get("status") in {"starting", "running", "stopping", "orphaned"}
     }
 
 
 def _resolve_workers(
     requested: int | str, batch_id: str, state: dict,
+    credentials_file: str | None = None,
 ) -> tuple[int, list[str], dict]:
-    cfg = _load_config()
+    try:
+        cfg = (
+            runtime_config(credentials_file)
+            if credentials_file else _load_config()
+        )
+    except ValueError as exc:
+        raise FleetError(str(exc)) from exc
     client = _client(cfg)
     client.set_batch_id(batch_id)
     try:
@@ -493,6 +549,7 @@ def _spawn_pool(
     refill_harness: str | None = None,
     refill_model: str | None = None,
     refill_effort: str | None = None,
+    credentials_file: str | None = None,
 ) -> tuple[subprocess.Popen, object]:
     controller_id = str(state["controller_id"])
     log_path = _root(home) / LOG_DIR / f"batch-{batch_id}.log"
@@ -501,6 +558,8 @@ def _spawn_pool(
         sys.executable, "-m", "dradar.cli", "resume", "-y",
         "--batch-id", batch_id, "--workers", str(workers), "--fleet-pool",
     ]
+    if credentials_file:
+        command.extend(("--credentials-file", credentials_file))
     if refill:
         command.extend((
             "--refill", "--refill-to", str(workers),
@@ -513,6 +572,9 @@ def _spawn_pool(
     env[CONTROLLER_ID_ENV] = controller_id
     env[POOL_BATCH_ENV] = batch_id
     env["DRADAR_REFILL_PLAN_SCOPE"] = batch_id
+    abort_path = _root(home) / ABORT_DIR / f"{batch_id}.stop"
+    abort_path.unlink(missing_ok=True)
+    env["DRADAR_POOL_ABORT_FILE"] = str(abort_path)
     kwargs: dict = {
         "env": env,
         "stdin": subprocess.DEVNULL,
@@ -553,16 +615,25 @@ def _send_interrupt(process: subprocess.Popen) -> None:
         pass
 
 
-def _stop_remote_refill(batch_id: str, reason: str) -> str | None:
+def _stop_remote_refill(
+    batch_id: str, reason: str, credentials_file: str | None = None,
+) -> str | None:
     """Stop one server-authoritative campaign; return a user-facing warning."""
     try:
-        cfg = _load_config()
+        cfg = runtime_config(credentials_file)
         remote = _client(cfg)
         remote.set_batch_id(batch_id)
         remote.stop_refill_campaign(batch_id, reason)
     except (ApiError, OSError, ValueError) as exc:
         return f"could not confirm server refill stop for {batch_id}: {exc}"
     return None
+
+
+def _stop_item_refill(item: dict, batch_id: str, reason: str) -> str | None:
+    credentials_file = item.get("credentials_file")
+    if credentials_file:
+        return _stop_remote_refill(batch_id, reason, credentials_file)
+    return _stop_remote_refill(batch_id, reason)
 
 
 def _response(home: Path, request_id: str, payload: dict) -> None:
@@ -596,6 +667,8 @@ def _handle_request(
             current = state["batches"].get(batch_id)
             if current and current.get("status") in {"starting", "running", "stopping"}:
                 requested_shape = {
+                    "plan_id": request.get("plan_id"),
+                    "credentials_file": request.get("credentials_file"),
                     "refill": bool(request.get("refill")),
                     "max_tasks": request.get("max_tasks"),
                     "refill_harness": request.get("refill_harness"),
@@ -645,6 +718,15 @@ def _handle_request(
             refill_harness = request.get("refill_harness")
             refill_model = request.get("refill_model")
             refill_effort = request.get("refill_effort")
+            credentials_file = request.get("credentials_file")
+            plan_id = request.get("plan_id")
+            if credentials_file is not None and not isinstance(credentials_file, str):
+                raise FleetError("invalid private run-plan credentials file")
+            if plan_id is not None and (
+                not isinstance(plan_id, str) or not plan_id
+                or credentials_file is None
+            ):
+                raise FleetError("a run plan requires its private credentials file")
             if refill:
                 if (
                     not isinstance(max_tasks, int)
@@ -666,6 +748,7 @@ def _handle_request(
                     )
             workers, warnings, capacity = _resolve_workers(
                 request.get("workers", "auto"), batch_id, state,
+                credentials_file,
             )
             process, log_handle = _spawn_pool(
                 home, state, batch_id, workers,
@@ -674,6 +757,7 @@ def _handle_request(
                 refill_harness=refill_harness,
                 refill_model=refill_model,
                 refill_effort=refill_effort,
+                credentials_file=credentials_file,
             )
             try:
                 item = {
@@ -688,6 +772,8 @@ def _handle_request(
                     ),
                     "warnings": warnings,
                     "capacity": capacity,
+                    "plan_id": plan_id,
+                    "credentials_file": credentials_file,
                     "refill": refill,
                     "max_tasks": max_tasks,
                     "refill_harness": refill_harness,
@@ -723,8 +809,8 @@ def _handle_request(
                 continue
             item = state["batches"].get(batch_id) or {}
             if item.get("refill"):
-                warning = _stop_remote_refill(
-                    batch_id, "stopped by the machine-local Fleet",
+                warning = _stop_item_refill(
+                    item, batch_id, "stopped by the machine-local Fleet",
                 )
                 if warning:
                     warnings.append(warning)
@@ -771,8 +857,8 @@ def _settle_pool(
     item = state["batches"][batch_id]
     requested_stop = item.get("status") == "stopping"
     if item.get("refill") and returncode != 0:
-        warning = _stop_remote_refill(
-            batch_id,
+        warning = _stop_item_refill(
+            item, batch_id,
             (
                 "stopped by the machine-local Fleet"
                 if requested_stop else
@@ -862,17 +948,25 @@ def cmd_fleet_serve(args) -> int:
     # rather than live work from one of those compatible sessions. The pool
     # watchdog and inherited run.lock protect all Fleet-owned containers from
     # this point forward; uncertain pre-Fleet containers are left untouched.
-    previous = _read_json(_state_path(HOME))
-    state = _initial_state(launch_id, previous)
-    state["status"] = "active"
-    _write_state(HOME, state)
-    # One coordinator, one startup replay. Batch pool parents skip this shared
-    # ledger pass so two Honeypots cannot race the same durable upload.
-    from .runloop import _retry_pending_uploads
+    with _controller_lease(HOME, launch_id):
+        previous = _read_json(_state_path(HOME))
+        state = _initial_state(launch_id, previous)
+        state["status"] = "active"
+        _write_state(HOME, state)
+        # One coordinator, one startup replay. Batch pool parents skip this shared
+        # ledger pass so two Honeypots cannot race the same durable upload.
+        from .runloop import _retry_pending_uploads
 
-    cfg = _load_config()
-    _retry_pending_uploads(_client(cfg))
-    return _controller_loop(HOME, state)
+        try:
+            cfg = _load_config()
+        except SystemExit:
+            # Plan-only devices have no need for the ordinary account config. The
+            # exact credentials file arrives with each add request; startup replay
+            # is simply unavailable until the unrelated config is repaired.
+            cfg = {}
+        if cfg.get("server") and cfg.get("token"):
+            _retry_pending_uploads(_client(cfg))
+        return _controller_loop(HOME, state)
 
 
 def _print_add_response(response: dict) -> int:
@@ -922,19 +1016,56 @@ def cmd_fleet_add(args) -> int:
     ):
         raise SystemExit("Fleet refill limits and scope require --refill")
     try:
-        response = _request("add", {
-            "batch_id": args.batch_id,
-            "workers": args.workers,
-            "retry": bool(getattr(args, "retry", False)),
-            "refill": bool(args.refill),
-            "max_tasks": args.max_tasks,
-            "refill_harness": args.refill_harness,
-            "refill_model": args.refill_model,
-            "refill_effort": args.refill_effort,
-        })
+        response = add_batch(
+            batch_id=args.batch_id,
+            workers=args.workers,
+            retry=bool(getattr(args, "retry", False)),
+            refill=bool(args.refill),
+            max_tasks=args.max_tasks,
+            refill_harness=args.refill_harness,
+            refill_model=args.refill_model,
+            refill_effort=args.refill_effort,
+        )
     except FleetError as exc:
         raise SystemExit(str(exc)) from exc
     return _print_add_response(response)
+
+
+def add_batch(
+    *,
+    batch_id: str,
+    workers: int | str = "auto",
+    retry: bool = False,
+    refill: bool = False,
+    max_tasks: int | None = None,
+    refill_harness: str | None = None,
+    refill_model: str | None = None,
+    refill_effort: str | None = None,
+    credentials_file: Path | str | None = None,
+    plan_id: str | None = None,
+) -> dict:
+    """Programmatic, idempotent Fleet add used by the intent-level CLI."""
+    try:
+        normalized = normalize_batch_id(batch_id)
+    except ValueError as exc:
+        raise FleetError(str(exc)) from exc
+    if normalized is None:
+        raise FleetError("an exact batch is required")
+    response = _request("add", {
+        "batch_id": normalized,
+        "workers": workers,
+        "retry": retry,
+        "refill": refill,
+        "max_tasks": max_tasks,
+        "refill_harness": refill_harness,
+        "refill_model": refill_model,
+        "refill_effort": refill_effort,
+        "credentials_file": str(credentials_file) if credentials_file else None,
+        "plan_id": plan_id,
+    })
+    if not response.get("ok"):
+        raise FleetError(str(response.get("error") or "local coordinator rejected the run"))
+    return response
 
 
 def _public_state(home: Path = HOME) -> dict:
@@ -942,8 +1073,84 @@ def _public_state(home: Path = HOME) -> dict:
     if not state:
         return {"active": False, "status": "absent", "batches": {}}
     public = dict(state)
-    public["active"] = controller_is_active(home)
+    active = controller_is_active(home)
+    public["active"] = active
+    if not active:
+        # Persisted state is historical unless the controller's process-lifetime
+        # lease proves it is live. Never let a crashed controller reserve workers
+        # or make run-plan recovery believe a phantom pool is still running.
+        batches = {}
+        orphaned_workers = 0
+        for batch_id, raw in (state.get("batches") or {}).items():
+            if not isinstance(raw, dict):
+                continue
+            item = dict(raw)
+            if item.get("status") in {"starting", "running", "stopping"}:
+                try:
+                    normalized = normalize_batch_id(batch_id)
+                except ValueError:
+                    normalized = None
+                if normalized and _lock_is_held(_pool_lock_path(home, normalized)):
+                    item["status"] = "orphaned"
+                    item["detail"] = (
+                        "pool is still winding down without its Fleet coordinator"
+                    )
+                    orphaned_workers += int(item.get("workers") or 0)
+                else:
+                    item["status"] = "interrupted"
+                    item["detail"] = (
+                        "Fleet coordinator is not active; safe retry is required"
+                    )
+            batches[batch_id] = item
+        public["batches"] = batches
+        public["total_workers"] = orphaned_workers
     return public
+
+
+def credentials_file_in_use(path: Path | str, home: Path = HOME) -> bool:
+    """Prove a run-plan file is referenced by a live or safely winding pool."""
+    target = os.path.abspath(os.fspath(path))
+    state = _read_json(_state_path(home))
+    if not isinstance(state, dict):
+        return False
+    controller_live = controller_is_active(home)
+    for batch_id, item in (state.get("batches") or {}).items():
+        if (
+            not isinstance(item, dict)
+            or item.get("status") not in {"starting", "running", "stopping"}
+            or not isinstance(item.get("credentials_file"), str)
+            or os.path.abspath(item["credentials_file"]) != target
+        ):
+            continue
+        # A pool owns its exact lock for process lifetime. This preserves the
+        # credential during the watchdog's bounded shutdown even if its parent
+        # controller has already crashed.
+        try:
+            normalized = normalize_batch_id(batch_id)
+        except ValueError:
+            normalized = None
+        if controller_live or (
+            normalized and _lock_is_held(_pool_lock_path(home, normalized))
+        ):
+            return True
+    return False
+
+
+def batch_status(batch_id: str, home: Path = HOME) -> dict | None:
+    try:
+        normalized = normalize_batch_id(batch_id)
+    except ValueError:
+        return None
+    return (_public_state(home).get("batches") or {}).get(normalized)
+
+
+def reserved_workers(home: Path = HOME, *, exclude_batch_id: str | None = None) -> int:
+    state = _public_state(home)
+    return sum(
+        int(item.get("workers") or 0)
+        for batch_id, item in _active_batches(state).items()
+        if batch_id != exclude_batch_id
+    )
 
 
 def cmd_fleet_status(args) -> int:
@@ -1011,10 +1218,7 @@ def cmd_fleet_stop(args) -> int:
         print("no active local DRadar Fleet")
         return 0
     try:
-        response = _request("stop", {
-            "batch_id": args.batch_id,
-            "all": bool(args.all),
-        })
+        response = stop_batch(args.batch_id, all_batches=bool(args.all))
     except FleetError as exc:
         raise SystemExit(str(exc)) from exc
     if not response.get("ok"):
@@ -1029,16 +1233,37 @@ def cmd_fleet_stop(args) -> int:
     return 0
 
 
+def stop_batch(
+    batch_id: str | None = None, *, all_batches: bool = False,
+) -> dict:
+    if not all_batches and not batch_id:
+        raise FleetError("an exact batch is required")
+    if not controller_is_active():
+        return {"ok": True, "stopping": [], "warnings": []}
+    response = _request("stop", {
+        "batch_id": batch_id,
+        "all": all_batches,
+    })
+    if not response.get("ok"):
+        raise FleetError(str(response.get("error") or "local coordinator rejected the stop"))
+    return response
+
+
 __all__ = [
     "FleetError",
+    "add_batch",
     "acquire_pool_lock",
     "cmd_fleet_add",
     "cmd_fleet_serve",
     "cmd_fleet_status",
     "cmd_fleet_stop",
     "cmd_fleet_watch",
+    "batch_status",
     "controller_matches",
     "controller_is_active",
+    "credentials_file_in_use",
     "preparation_lock",
+    "reserved_workers",
+    "stop_batch",
     "start_pool_watchdog",
 ]

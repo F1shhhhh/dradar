@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import uuid
+from pathlib import Path
 
 from . import __version__
 from .api_client import ApiClient, ApiError
@@ -68,6 +69,29 @@ class RunnerTelemetry:
         self._disabled = False
         self._jitter = jitter
         self._shown_notice_ids: set[str] = set()
+        self._stop_requested = False
+
+    @property
+    def stop_requested(self) -> bool:
+        return self._stop_requested
+
+    @staticmethod
+    def _publish_stop_marker() -> None:
+        raw = os.environ.get("DRADAR_POOL_ABORT_FILE")
+        if not raw:
+            return
+        path = Path(raw)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            temporary.write_text(
+                "drain:the server asked this device to stop", encoding="utf-8",
+            )
+            os.replace(temporary, path)
+        except OSError:
+            pass
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _show_notices(self, response: dict) -> None:
         """Print each bounded server notice at most once per runner process."""
@@ -190,6 +214,9 @@ class RunnerTelemetry:
             self._failures = 0
             self._warned = False
             self._show_notices(response)
+            if response.get("stop_requested") is True:
+                self._stop_requested = True
+                self._publish_stop_marker()
             if response.get("batch_id"):
                 with self._lock:
                     self._batch_id = response["batch_id"]
@@ -204,7 +231,7 @@ class RunnerTelemetry:
         """Best-effort synchronous update while work is already recoverable."""
         self._send_once()
 
-    def flush_for_checkout(self) -> None:
+    def flush_for_checkout(self) -> bool:
         """Register synchronously or expose the error before session checkout.
 
         A 404 keeps the legacy compatibility path: old servers did not require
@@ -213,6 +240,7 @@ class RunnerTelemetry:
         ``runner session is not registered`` response.
         """
         self._send_once(propagate_errors=True)
+        return self._stop_requested
 
     def _loop(self) -> None:
         while not self._stop.is_set():

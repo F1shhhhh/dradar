@@ -1,0 +1,1411 @@
+"""User-intent run-plan commands.
+
+The web gives an Agent a short-lived, high-entropy run code.  This module
+exchanges it in an HTTPS request body for a plan-scoped ``drp_`` credential,
+persists that credential in a private file, and connects the versioned server
+decision protocol to the existing exact-batch Fleet coordinator.
+
+The short-lived run code is necessarily present in the initial Agent command's
+``--plan`` argument.  It is never placed in a URL, persisted in plaintext, or
+forwarded to Fleet/worker arguments.  The exchanged ``drp_`` access token has
+the stricter boundary: it is never printed or placed in any process argument.
+Repeated commands locate private state by a one-way digest of the run code.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+import platform
+import re
+import secrets
+import tempfile
+import time
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable
+from urllib.parse import urlsplit, urlunsplit
+
+from .api_client import ApiClient, ApiError, normalize_batch_id
+from .local_config import HOME, _load_config
+
+
+SCHEMA_VERSION = 1
+DEFAULT_SERVER = "https://api.codexradar.com"
+PLAN_DIR = "run-plans"
+DEVICE_FILE = "device.json"
+DEVICE_LOCK_FILE = "device.lock"
+STATE_LOCK_FILE = "state.lock"
+ADMISSION_LOCK_FILE = "admission.lock"
+STATE_SUFFIX = ".json"
+MAX_CREDENTIAL_STATES = 64
+MAX_AUDIT_SUMMARIES = 64
+AUDIT_RETENTION_SECONDS = 30 * 24 * 60 * 60
+_SAFE_PLAN_ID = re.compile(r"[A-Za-z0-9_-]{8,160}\Z")
+
+
+class RunPlanClientError(RuntimeError):
+    def __init__(
+        self,
+        code: str,
+        user_message: str,
+        *,
+        retryable: bool = False,
+        agent_action: str | None = None,
+        agent_details: dict[str, Any] | None = None,
+    ):
+        super().__init__(user_message)
+        self.code = code
+        self.user_message = user_message
+        self.retryable = retryable
+        self.agent_action = agent_action or ("retry" if retryable else "stop")
+        self.agent_details = agent_details
+
+
+def _private_dir(path: Path) -> None:
+    if path.is_symlink() or (path.exists() and not path.is_dir()):
+        raise RunPlanClientError(
+            "local_state_unsafe",
+            "本机运行信息目录不安全；请修复目录权限后重试。",
+        )
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name != "nt":
+        os.chmod(path, 0o700)
+
+
+def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+    _private_dir(path.parent)
+    fd, raw = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp",
+    )
+    temporary = Path(raw)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.name != "nt":
+            os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _read_private_json(path: Path) -> dict[str, Any] | None:
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        stat = path.stat()
+        if os.name != "nt" and stat.st_mode & 0o077:
+            return None
+        if (
+            os.name != "nt" and hasattr(os, "getuid")
+            and stat.st_uid != os.getuid()
+        ):
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+@contextmanager
+def _exclusive_lock(path: Path):
+    """Serialize first-use identity/state creation across Agent processes."""
+    _private_dir(path.parent)
+    handle = open(path, "a+", encoding="utf-8")
+    if os.name != "nt":
+        os.chmod(path, 0o600)
+    try:
+        if os.name == "nt":  # pragma: no cover - exercised on Windows CI
+            import msvcrt
+
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write("\0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if os.name == "nt":  # pragma: no cover
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        handle.close()
+
+
+def _root(home: Path = HOME) -> Path:
+    return home / PLAN_DIR
+
+
+def _device_path(home: Path = HOME) -> Path:
+    return _root(home) / DEVICE_FILE
+
+
+def stable_device(home: Path = HOME) -> tuple[str, str]:
+    """Return a random stable ID and a privacy-preserving display label."""
+    path = _device_path(home)
+    with _exclusive_lock(_root(home) / DEVICE_LOCK_FILE):
+        # Re-read only after taking the lock. Two conversations can enter on a
+        # brand-new machine at the same instant, but only one identity may win.
+        saved = _read_private_json(path)
+        if saved and saved.get("schema_version") == SCHEMA_VERSION:
+            device_id = saved.get("device_id")
+            device_name = saved.get("device_name")
+            if (
+                isinstance(device_id, str) and device_id.startswith("drv_")
+                and 20 <= len(device_id) <= 100
+                and isinstance(device_name, str) and device_name
+            ):
+                return device_id, device_name
+        family = {
+            "Darwin": "这台 Mac",
+            "Windows": "这台 Windows 设备",
+            "Linux": "这台 Linux 设备",
+        }.get(platform.system(), "这台设备")
+        payload = {
+            "schema_version": SCHEMA_VERSION,
+            "device_id": "drv_" + secrets.token_urlsafe(24),
+            "device_name": family,
+        }
+        _atomic_json(path, payload)
+        return payload["device_id"], payload["device_name"]
+
+
+def _run_code_digest(run_code: str) -> str:
+    return hashlib.sha256(
+        b"dradar:local-run-code-v1:" + run_code.encode("utf-8"),
+    ).hexdigest()
+
+
+def _validate_run_code(value: object) -> str:
+    if not isinstance(value, str):
+        raise RunPlanClientError("run_code_invalid", "网页复制的运行信息无效，请回网页重新复制。")
+    code = value.strip()
+    if code != value or not 8 <= len(code) <= 256 or any(ch.isspace() for ch in code):
+        raise RunPlanClientError("run_code_invalid", "网页复制的运行信息无效，请回网页重新复制。")
+    return code
+
+
+def validate_server_url(value: str) -> str:
+    """Allow production HTTPS and loopback HTTP used by local development."""
+    try:
+        parsed = urlsplit(value.strip())
+        host = (parsed.hostname or "").lower()
+        loopback = host in {"localhost", "127.0.0.1", "::1"}
+        valid_scheme = parsed.scheme == "https" or (parsed.scheme == "http" and loopback)
+        if (
+            not valid_scheme or not host or parsed.username or parsed.password
+            or parsed.query or parsed.fragment
+            or parsed.path not in {"", "/"}
+        ):
+            raise ValueError
+        # Touching port makes malformed ports fail here rather than inside httpx.
+        parsed.port
+    except (AttributeError, TypeError, ValueError):
+        raise RunPlanClientError(
+            "server_url_invalid",
+            "运行地址无效；请使用网页提供的 HTTPS 地址。",
+        ) from None
+    netloc = parsed.netloc
+    return urlunsplit((parsed.scheme, netloc, "", "", "")).rstrip("/")
+
+
+def _state_path(plan_id: str, home: Path = HOME) -> Path:
+    if not isinstance(plan_id, str) or not _SAFE_PLAN_ID.fullmatch(plan_id):
+        raise RunPlanClientError("plan_response_invalid", "运行信息无效，请回网页重新复制。")
+    return _root(home) / f"plan-{plan_id}{STATE_SUFFIX}"
+
+
+def _iter_states(home: Path = HOME):
+    root = _root(home)
+    if root.is_symlink() or not root.is_dir():
+        return
+    for path in sorted(root.glob(f"plan-*{STATE_SUFFIX}")):
+        state = _read_private_json(path)
+        if (
+            state and state.get("schema_version") == SCHEMA_VERSION
+            and state.get("credential_kind") == "run_plan_v1"
+        ):
+            yield path, state
+
+
+def _expiry_timestamp(value: object) -> float | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _state_expired(state: dict[str, Any], *, now: float) -> bool:
+    plan = state.get("plan") if isinstance(state.get("plan"), dict) else {}
+    expiries = [
+        value for value in (
+            _expiry_timestamp(state.get("access_expires_at")),
+            _expiry_timestamp(plan.get("expires_at")),
+        )
+        if value is not None
+    ]
+    return bool(expiries and min(expiries) <= now)
+
+
+def _state_in_active_fleet(path: Path, *, home: Path = HOME) -> bool:
+    """Do not scrub a credential while any live/orphan-safe pool holds it."""
+    try:
+        from . import fleet
+
+        return fleet.credentials_file_in_use(path, home=home)
+    except (OSError, ValueError):
+        # A failed liveness probe is not proof that deletion is safe.
+        return True
+
+
+def _scrub_state(path: Path, state: dict[str, Any], *, reason: str, now: float) -> None:
+    """Replace credentials with a bounded, non-secret local audit summary."""
+    summary = {
+        "schema_version": SCHEMA_VERSION,
+        "credential_kind": "run_plan_expired_summary_v1",
+        "plan_id": state.get("plan_id"),
+        "server": state.get("server"),
+        "expired_at": datetime.fromtimestamp(now).astimezone().isoformat(),
+        "cleanup_reason": reason,
+    }
+    _atomic_json(path, summary)
+
+
+def _cleanup_states(home: Path = HOME) -> None:
+    """Bound inactive local state without touching credentials used by Fleet."""
+    root = _root(home)
+    if root.is_symlink() or not root.is_dir():
+        return
+    now = time.time()
+    credentials: list[tuple[float, Path, dict[str, Any]]] = []
+    summaries: list[tuple[float, Path]] = []
+    for path in sorted(root.glob(f"plan-*{STATE_SUFFIX}")):
+        state = _read_private_json(path)
+        if not state or state.get("schema_version") != SCHEMA_VERSION:
+            continue
+        try:
+            modified = path.stat().st_mtime
+        except OSError:
+            continue
+        if state.get("credential_kind") == "run_plan_v1":
+            if _state_in_active_fleet(path, home=home):
+                continue
+            if _state_expired(state, now=now):
+                _scrub_state(path, state, reason="expired", now=now)
+                summaries.append((now, path))
+            else:
+                credentials.append((modified, path, state))
+        elif state.get("credential_kind") == "run_plan_expired_summary_v1":
+            summaries.append((modified, path))
+
+    # Short-lived plan credentials are useful, but an inactive machine should
+    # not become an unbounded token archive. Keep the newest bounded set.
+    credentials.sort(reverse=True, key=lambda item: item[0])
+    for _modified, path, state in credentials[MAX_CREDENTIAL_STATES:]:
+        if _state_in_active_fleet(path, home=home):
+            continue
+        _scrub_state(path, state, reason="inactive_state_limit", now=now)
+        summaries.append((now, path))
+
+    summaries.sort(reverse=True, key=lambda item: item[0])
+    for index, (modified, path) in enumerate(summaries):
+        too_old = now - modified > AUDIT_RETENTION_SECONDS
+        over_limit = index >= MAX_AUDIT_SUMMARIES
+        if too_old or over_limit:
+            path.unlink(missing_ok=True)
+
+
+def _saved_state(run_code: str, home: Path = HOME) -> tuple[Path, dict[str, Any]] | None:
+    _cleanup_states(home)
+    digest = _run_code_digest(run_code)
+    for path, state in _iter_states(home) or ():
+        if _state_expired(state, now=time.time()):
+            # Active Fleet credentials may still need to remain on disk for a
+            # graceful close, but an interactive command must never reuse them.
+            continue
+        if secrets.compare_digest(str(state.get("run_code_hash") or ""), digest):
+            return path, state
+    return None
+
+
+def _resolve_server(
+    explicit: str | None,
+    saved: tuple[Path, dict[str, Any]] | None,
+) -> str:
+    saved_server = None
+    if saved is not None:
+        raw = saved[1].get("server")
+        if isinstance(raw, str):
+            saved_server = validate_server_url(raw)
+    if explicit:
+        selected = validate_server_url(explicit)
+        if saved_server and selected != saved_server:
+            raise RunPlanClientError(
+                "server_scope_mismatch",
+                "这次运行属于另一个站点，请使用网页复制的原命令。",
+            )
+        return selected
+    if saved_server:
+        return saved_server
+    cfg = _load_config()
+    if isinstance(cfg.get("server"), str) and cfg["server"]:
+        return validate_server_url(cfg["server"])
+    return DEFAULT_SERVER
+
+
+def _validate_envelope(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise RunPlanClientError("protocol_invalid", "服务返回的信息不完整，请升级后重试。")
+    required = {
+        "status", "interaction", "decision_required", "user_message",
+        "agent_action", "error_code", "retryable", "choices",
+    }
+    if not required.issubset(value):
+        raise RunPlanClientError("protocol_invalid", "服务返回的信息不完整，请升级后重试。")
+    if value.get("schema_version", SCHEMA_VERSION) != SCHEMA_VERSION:
+        raise RunPlanClientError("schema_version_unsupported", "运行协议版本不兼容，请升级后重试。")
+    return value
+
+
+def _validate_response(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict) or value.get("schema_version") != SCHEMA_VERSION:
+        raise RunPlanClientError("schema_version_unsupported", "运行协议版本不兼容，请升级后重试。")
+    _validate_envelope(value.get("envelope"))
+    return value
+
+
+def _validate_plan(value: object) -> dict[str, Any]:
+    if (
+        not isinstance(value, dict)
+        or value.get("schema_version") != SCHEMA_VERSION
+        or value.get("plan_version") != 1
+    ):
+        raise RunPlanClientError("plan_response_invalid", "运行信息无效，请回网页重新复制。")
+    required_strings = ("plan_id", "batch_id", "benchmark_id", "harness")
+    if any(not isinstance(value.get(key), str) or not value[key] for key in required_strings):
+        raise RunPlanClientError("plan_response_invalid", "运行信息无效，请回网页重新复制。")
+    try:
+        normalize_batch_id(value["batch_id"])
+    except ValueError:
+        raise RunPlanClientError("plan_response_invalid", "运行信息无效，请回网页重新复制。") from None
+    assignments = value.get("assignments")
+    if not isinstance(assignments, list) or not assignments:
+        raise RunPlanClientError("plan_response_invalid", "运行信息无效，请回网页重新复制。")
+    for assignment in assignments:
+        if not isinstance(assignment, dict) or any(
+            not isinstance(assignment.get(key), str) or not assignment[key]
+            for key in ("assignment_id", "task_id", "model", "effort")
+        ):
+            raise RunPlanClientError("plan_response_invalid", "运行信息无效，请回网页重新复制。")
+        provider = assignment.get("provider")
+        if provider is not None and (not isinstance(provider, str) or not provider):
+            raise RunPlanClientError("plan_response_invalid", "运行信息无效，请回网页重新复制。")
+    concurrency = value.get("concurrency")
+    refill = value.get("refill")
+    if not isinstance(concurrency, dict) or not isinstance(refill, dict):
+        raise RunPlanClientError("plan_response_invalid", "运行信息无效，请回网页重新复制。")
+    mode = concurrency.get("mode")
+    configured = concurrency.get("value")
+    if (
+        mode not in {"auto", "fixed"}
+        or (mode == "auto" and configured is not None)
+        or (
+            mode == "fixed" and (
+                not isinstance(configured, int) or isinstance(configured, bool)
+                or not 1 <= configured <= 40
+            )
+        )
+    ):
+        raise RunPlanClientError("plan_response_invalid", "运行信息无效，请回网页重新复制。")
+    enabled = refill.get("enabled")
+    refill_to = refill.get("refill_to")
+    max_tasks = refill.get("max_tasks")
+    def valid_positive(item: object) -> bool:
+        return isinstance(item, int) and not isinstance(item, bool) and item >= 1
+    if not isinstance(enabled, bool):
+        raise RunPlanClientError("plan_response_invalid", "运行信息无效，请回网页重新复制。")
+    if enabled:
+        if (
+            not valid_positive(max_tasks)
+            or max_tasks < len(assignments)
+            or (refill_to is not None and not valid_positive(refill_to))
+            or (refill_to is not None and refill_to > max_tasks)
+        ):
+            raise RunPlanClientError("plan_response_invalid", "运行信息无效，请回网页重新复制。")
+    elif refill_to is not None or max_tasks is not None:
+        raise RunPlanClientError("plan_response_invalid", "运行信息无效，请回网页重新复制。")
+    _state_path(value["plan_id"])
+    return value
+
+
+def _exchange(
+    run_code: str,
+    server: str,
+    *,
+    home: Path = HOME,
+) -> tuple[Path, dict[str, Any]]:
+    device_id, device_name = stable_device(home)
+    response = ApiClient(server, "").exchange_run_plan(
+        run_code=run_code,
+        device_id=device_id,
+        device_name=device_name,
+    )
+    if not isinstance(response, dict) or response.get("schema_version") != SCHEMA_VERSION:
+        raise RunPlanClientError("schema_version_unsupported", "运行协议版本不兼容，请升级后重试。")
+    token = response.get("plan_access_token")
+    if not isinstance(token, str) or not token.startswith("drp_") or len(token) > 512:
+        raise RunPlanClientError("plan_response_invalid", "运行信息无效，请回网页重新复制。")
+    plan = _validate_plan(response.get("plan"))
+    if response.get("envelope") is not None:
+        _validate_envelope(response["envelope"])
+    state = {
+        "schema_version": SCHEMA_VERSION,
+        "credential_kind": "run_plan_v1",
+        "server": server,
+        "token": token,
+        "access_expires_at": response.get("access_expires_at"),
+        "run_code_hash": _run_code_digest(run_code),
+        "plan": plan,
+        "plan_id": plan["plan_id"],
+        "benchmark": plan["benchmark_id"],
+        "batch_id": plan["batch_id"],
+        "logical_session_id": "drl_" + secrets.token_urlsafe(24),
+        "identity": response.get("identity") if isinstance(response.get("identity"), dict) else {},
+        "limits": response.get("limits") if isinstance(response.get("limits"), dict) else {},
+        "pending_decision": None,
+        "pending_local_capacity": None,
+        "authorized_concurrency": None,
+        "created_at": datetime.now().astimezone().isoformat(),
+    }
+    path = _state_path(plan["plan_id"], home)
+    _atomic_json(path, state)
+    _cleanup_states(home)
+    return path, state
+
+
+def _state_and_client(args) -> tuple[str, Path, dict[str, Any], ApiClient]:
+    run_code = _validate_run_code(args.plan)
+    # Progress/run in two conversations can race on first use. Serialize the
+    # exchange and re-read state under the lock so only one logical session is
+    # minted for this device.
+    with _exclusive_lock(_root(HOME) / STATE_LOCK_FILE):
+        saved = _saved_state(run_code, home=HOME)
+        server = _resolve_server(getattr(args, "server", None), saved)
+        if saved is None:
+            path, state = _exchange(run_code, server, home=HOME)
+        else:
+            path, state = saved
+    token = state.get("token")
+    plan = state.get("plan")
+    if not isinstance(token, str) or not token.startswith("drp_"):
+        raise RunPlanClientError("credential_invalid", "本机运行权限无效，请回网页重新复制。")
+    _validate_plan(plan)
+    client = ApiClient(server, token, benchmark_id=plan["benchmark_id"], batch_id=plan["batch_id"])
+    return run_code, path, state, client
+
+
+def _concurrency(
+    plan: dict[str, Any], requested: int | str | None,
+) -> tuple[str, int | None, int | str]:
+    configured = plan["concurrency"]
+    plan_mode = configured.get("mode")
+    plan_value = configured.get("value")
+    selected = requested
+    if selected is None:
+        selected = "auto" if plan_mode == "auto" else plan_value
+    if selected == "auto":
+        if plan_mode == "fixed":
+            # Auto may safely use fewer local slots than the fixed ceiling.
+            return "auto", None, "auto"
+        return "auto", None, "auto"
+    try:
+        workers = int(selected)
+    except (TypeError, ValueError):
+        raise RunPlanClientError("concurrency_invalid", "同时运行数量无效。") from None
+    if not 1 <= workers <= 40:
+        raise RunPlanClientError("concurrency_invalid", "同时运行数量必须在 1 到 40 之间。")
+    if plan_mode == "fixed" and isinstance(plan_value, int) and workers > plan_value:
+        raise RunPlanClientError(
+            "concurrency_not_allowed",
+            "这个数量超过网页为本次运行设置的范围，请保持原设置。",
+        )
+    return "fixed", workers, workers
+
+
+def _capacity_snapshot(
+    client: ApiClient,
+    plan: dict[str, Any],
+    limits: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    from . import fleet
+    from .capacity import AUTO_WORKER_CAP, inspect_capacity
+
+    refill = plan["refill"]
+    requested_tasks = max(
+        len(plan["assignments"]),
+        int(refill.get("refill_to") or 0),
+        int(refill.get("max_tasks") or 0) if refill.get("enabled") else 0,
+    )
+    class PlanCapacityView:
+        def whoami(self):
+            return client.whoami()
+
+        def get_assignment(self):
+            try:
+                return client.get_assignment()
+            except ApiError as exc:
+                if exc.status_code == 404 and exc.code == "claim_batch_not_found":
+                    # The server start state machine owns the authoritative
+                    # no-remaining decision. An empty exact inventory must not
+                    # turn that friendly outcome into a local capacity error.
+                    return {"active": []}
+                raise
+
+    report = inspect_capacity(
+        PlanCapacityView(), requested_tasks=requested_tasks,
+    )
+    reserved = fleet.reserved_workers(exclude_batch_id=plan["batch_id"])
+    limits = limits if isinstance(limits, dict) else {}
+    server_limits = [
+        int(value) for value in (
+            limits.get("account_concurrency"),
+            limits.get("account_claim_limit") if refill.get("enabled") else None,
+            limits.get("plan_task_limit"),
+        )
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 1
+    ]
+    account_limit = min([report.account_limit, *server_limits])
+    safe_total = min(
+        report.cpu_limit, report.memory_limit, report.disk_limit,
+        account_limit,
+    )
+    available = max(0, safe_total - reserved)
+    auto_available = min(available, AUTO_WORKER_CAP)
+    # A continuation plan may initially contain fewer seed assignments than
+    # the safe queue target.  Its max_tasks authorization supplies future work,
+    # so use that bounded target rather than permanently pinning the pool to the
+    # seed count.  Without continuation, exact inventory remains the hard cap.
+    supply = requested_tasks
+    auto_workers = min(supply, requested_tasks, auto_available)
+    facts = {
+        "safe_total": safe_total,
+        "reserved_by_other_runs": reserved,
+        "available": available,
+        "auto_workers": auto_workers,
+        "docker_cpus": report.docker_cpus,
+        "docker_memory_gib": report.docker_memory_gib,
+        "disk_limit": report.disk_limit,
+        "account_limit": account_limit,
+        "held_tasks": report.held_tasks,
+        "automatic_cap": AUTO_WORKER_CAP,
+    }
+    facts["digest"] = hashlib.sha256(
+        json.dumps(facts, sort_keys=True, separators=(",", ":")).encode(),
+    ).hexdigest()
+    return facts
+
+
+def _local_capacity_response(
+    path: Path,
+    state: dict[str, Any],
+    *,
+    requested: int,
+    recommended: int,
+    snapshot: dict[str, Any],
+    decision: str = "local_capacity",
+    allow_keep: bool = True,
+    user_message: str | None = None,
+    server_status: dict[str, Any] | None = None,
+    server_capacity: dict[str, Any] | None = None,
+    bound_server_decision: str | None = None,
+    bound_server_decision_token: str | None = None,
+) -> dict[str, Any]:
+    token = "drlc_" + secrets.token_urlsafe(24)
+    if bound_server_decision_token:
+        encoded = base64.urlsafe_b64encode(
+            bound_server_decision_token.encode("utf-8"),
+        ).decode("ascii").rstrip("=")
+        token += "." + encoded
+    state["pending_local_capacity"] = {
+        "token_hash": hashlib.sha256(token.encode()).hexdigest(),
+        "requested": requested,
+        "recommended": recommended,
+        "capacity_digest": snapshot["digest"],
+        "decision": decision,
+        "allow_keep": allow_keep,
+        "bound_server_decision": bound_server_decision,
+        "bound_server_token_hash": (
+            hashlib.sha256(bound_server_decision_token.encode()).hexdigest()
+            if bound_server_decision_token else None
+        ),
+        "expires_at": time.time() + 5 * 60,
+    }
+    _atomic_json(path, state)
+    choices = []
+    if recommended >= 1:
+        choices.append({
+            "id": "use_recommended",
+            "label": f"按建议数量运行（{recommended} 道）",
+        })
+    if allow_keep:
+        choices.append({
+            "id": "keep_requested",
+            "label": f"仍按 {requested} 道运行",
+        })
+    choices.append({"id": "cancel", "label": "取消"})
+    agent = {
+        "plan": state["plan"],
+        "requested_concurrency": requested,
+        "recommended_concurrency": recommended,
+    }
+    if server_status is not None:
+        agent["server_status"] = server_status
+    if server_capacity is not None:
+        agent["server_capacity"] = server_capacity
+    choice_actions = {}
+    for choice in choices:
+        choice_id = choice["id"]
+        if choice_id == "cancel":
+            choice_actions[choice_id] = {"mode": "no_command", "args": []}
+            continue
+        workers = recommended if choice_id == "use_recommended" else requested
+        choice_actions[choice_id] = {
+            "mode": "replay_current_command_with_args",
+            "args": ["--concurrency", str(workers), "--decision-token", token],
+        }
+    agent["choice_actions"] = choice_actions
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "decision_required",
+        "interaction": "confirm",
+        "decision_required": True,
+        "decision": decision,
+        "decision_token": token,
+        "user_message": user_message or (
+            f"这台设备当前建议同时运行 {recommended} 道，低于你设置的 "
+            f"{requested} 道。请选择如何处理。"
+            if recommended >= 1 else
+            f"这台设备当前没有空余运行位置，低于你设置的 {requested} 道。请选择如何处理。"
+        ),
+        "agent_action": "ask_user",
+        "error_code": None,
+        "retryable": False,
+        "choices": choices,
+        "agent": agent,
+    }
+
+
+def _consume_local_capacity(
+    path: Path,
+    state: dict[str, Any],
+    *,
+    token: str,
+    selected: object,
+    snapshot: dict[str, Any],
+) -> tuple[int, str | None, str | None]:
+    pending = state.get("pending_local_capacity")
+    valid = (
+        isinstance(pending, dict)
+        and isinstance(token, str) and token.startswith("drlc_")
+        and secrets.compare_digest(
+            str(pending.get("token_hash") or ""),
+            hashlib.sha256(token.encode()).hexdigest(),
+        )
+        and float(pending.get("expires_at") or 0) > time.time()
+        and pending.get("capacity_digest") == snapshot["digest"]
+    )
+    try:
+        workers = int(selected)
+    except (TypeError, ValueError):
+        workers = 0
+    allowed = (
+        {int(pending.get("recommended") or 0)}
+        | (
+            {int(pending.get("requested") or 0)}
+            if pending.get("allow_keep") else set()
+        )
+        if isinstance(pending, dict) else set()
+    )
+    if not valid or workers not in allowed or workers < 1:
+        state["pending_local_capacity"] = None
+        _atomic_json(path, state)
+        raise RunPlanClientError(
+            "decision_invalid_or_capacity_changed",
+            "本机资源状态已经变化，我会重新检查后再请你确认。",
+            retryable=True,
+        )
+    state["pending_local_capacity"] = None
+    state["authorized_concurrency"] = {
+        "workers": workers,
+        "capacity_digest": snapshot["digest"],
+    }
+    bound_decision = pending.get("bound_server_decision")
+    bound_token = None
+    encoded = token.partition(".")[2]
+    if encoded:
+        try:
+            padded = encoded + "=" * (-len(encoded) % 4)
+            bound_token = base64.urlsafe_b64decode(padded).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            bound_token = None
+    expected_bound_hash = pending.get("bound_server_token_hash")
+    if expected_bound_hash is not None and not (
+        isinstance(bound_decision, str)
+        and isinstance(bound_token, str)
+        and secrets.compare_digest(
+            str(expected_bound_hash), hashlib.sha256(bound_token.encode()).hexdigest(),
+        )
+    ):
+        state["pending_local_capacity"] = None
+        _atomic_json(path, state)
+        raise RunPlanClientError(
+            "decision_invalid_or_capacity_changed",
+            "确认信息已经变化，我会重新检查后再请你确认。",
+            retryable=True,
+        )
+    _atomic_json(path, state)
+    return workers, bound_decision, bound_token
+
+
+def _authorized_concurrency(
+    state: dict[str, Any], selected: int, snapshot: dict[str, Any],
+) -> bool:
+    value = state.get("authorized_concurrency")
+    return bool(
+        isinstance(value, dict)
+        and value.get("workers") == selected
+        and value.get("capacity_digest") == snapshot["digest"]
+    )
+
+
+def _local_warn_response(
+    server_response: dict[str, Any], *, selected: int,
+) -> dict[str, Any]:
+    result = _local_monitor_response(server_response, selected=selected)
+    agent = dict(result.get("agent") or {})
+    result.update({
+        "status": "started",
+        "interaction": "warn",
+        "decision_required": False,
+        "user_message": (
+            f"这台设备当前适合同时运行 {selected} 道，系统已按这个数量开始，"
+            "避免任务中断。无需操作。"
+        ),
+        "agent_action": "monitor",
+        "error_code": None,
+        "retryable": False,
+        "choices": [],
+        "agent": agent,
+    })
+    result.pop("decision", None)
+    result.pop("decision_token", None)
+    return result
+
+
+def _local_monitor_response(
+    server_response: dict[str, Any], *, selected: int,
+) -> dict[str, Any]:
+    """A successful local ensure changes start_runner into monitor."""
+    result = _agent_response_from_server(server_response)
+    server_status = {
+        key: value for key, value in result.items()
+        if key not in {"schema_version", "agent"}
+    }
+    agent = dict(result.get("agent") or {})
+    agent["server_status"] = server_status
+    agent["selected_concurrency"] = selected
+    result["agent_action"] = "monitor"
+    result["agent"] = agent
+    return result
+
+
+def _remember_response(
+    path: Path,
+    state: dict[str, Any],
+    response: dict[str, Any],
+    *,
+    command: str,
+) -> None:
+    if isinstance(response.get("plan"), dict):
+        state["plan"] = _validate_plan(response["plan"])
+    envelope = _validate_envelope(response["envelope"])
+    if envelope.get("decision_required"):
+        decision = envelope.get("decision")
+        if not isinstance(decision, str) or not decision:
+            raise RunPlanClientError("protocol_invalid", "服务返回的信息不完整，请升级后重试。")
+        state["pending_decision"] = {"command": command, "decision": decision}
+    elif (
+        isinstance(state.get("pending_decision"), dict)
+        and state["pending_decision"].get("command") == command
+    ):
+        state["pending_decision"] = None
+    _atomic_json(path, state)
+
+
+def _decision_for(state: dict[str, Any], command: str, token: str | None) -> str | None:
+    if not token:
+        return None
+    pending = state.get("pending_decision")
+    if not isinstance(pending, dict) or pending.get("command") != command:
+        raise RunPlanClientError(
+            "decision_context_missing",
+            "当前确认已失效，我会重新检查状态后再询问。",
+            retryable=True,
+        )
+    decision = pending.get("decision")
+    if not isinstance(decision, str) or not decision:
+        raise RunPlanClientError("decision_context_missing", "当前确认已失效，请重新检查状态。")
+    return decision
+
+
+def _output(args, response: dict[str, Any]) -> int:
+    if not isinstance(response, dict) or response.get("schema_version") != SCHEMA_VERSION:
+        raise RunPlanClientError("protocol_invalid", "服务返回的信息不完整，请升级后重试。")
+    _validate_envelope(response)
+    if getattr(args, "json", False):
+        print(json.dumps(response, ensure_ascii=False, sort_keys=True))
+    else:
+        print(response["user_message"])
+    return 0
+
+
+def _agent_response_from_server(response: dict[str, Any]) -> dict[str, Any]:
+    """Expose exactly one decision envelope while retaining machine state."""
+    response = _validate_response(response)
+    envelope = dict(response["envelope"])
+    result = {"schema_version": SCHEMA_VERSION, **envelope}
+    agent = {
+        key: value for key, value in response.items()
+        if key not in {"schema_version", "envelope", "plan_access_token"}
+    }
+    if envelope.get("decision_required"):
+        token = envelope.get("decision_token")
+        actions = {}
+        for choice in envelope.get("choices") or []:
+            if not isinstance(choice, dict) or not isinstance(choice.get("id"), str):
+                continue
+            choice_id = choice["id"]
+            if choice_id == "cancel":
+                actions[choice_id] = {"mode": "no_command", "args": []}
+            elif isinstance(token, str) and token:
+                actions[choice_id] = {
+                    "mode": "replay_current_command_with_args",
+                    "args": ["--decision-token", token],
+                }
+        if actions:
+            agent["choice_actions"] = actions
+    if agent:
+        result["agent"] = agent
+    return result
+
+
+def _local_error_response(exc: RunPlanClientError) -> dict[str, Any]:
+    result = {
+        "schema_version": SCHEMA_VERSION,
+        "status": "error",
+        "interaction": "notify",
+        "decision_required": False,
+        "user_message": exc.user_message,
+        "agent_action": exc.agent_action,
+        "error_code": exc.code,
+        "retryable": exc.retryable,
+        "choices": [],
+    }
+    if exc.agent_details is not None:
+        result["agent"] = exc.agent_details
+    return result
+
+
+def _capacity_reservation(exc: ApiError) -> dict[str, Any] | None:
+    """Validate one atomic cross-device capacity conflict from the server."""
+    if exc.code != "concurrency_capacity_reserved":
+        return None
+    payload = exc.payload
+    if not isinstance(payload, dict):
+        raise RunPlanClientError(
+            "protocol_invalid", "服务返回的信息不完整，请升级后重试。",
+        )
+    integer_fields = (
+        "requested_concurrency", "available_concurrency",
+        "account_concurrency", "account_concurrency_in_use",
+        "plan_concurrency", "plan_concurrency_in_use",
+    )
+    if any(
+        not isinstance(payload.get(key), int)
+        or isinstance(payload.get(key), bool)
+        or payload[key] < 0
+        for key in integer_fields
+    ) or payload.get("original_concurrency_mode") not in {"auto", "fixed"} or payload.get(
+        "limiting_scope",
+    ) not in {"account", "plan"}:
+        raise RunPlanClientError(
+            "protocol_invalid", "服务返回的信息不完整，请升级后重试。",
+        )
+    server = _api_error_response(exc)
+    capacity = {key: payload[key] for key in integer_fields}
+    capacity.update({
+        "original_concurrency_mode": payload["original_concurrency_mode"],
+        "limiting_scope": payload["limiting_scope"],
+    })
+    return {"available": payload["available_concurrency"], "server": server, "capacity": capacity}
+
+
+def _api_error_response(exc: ApiError) -> dict[str, Any]:
+    payload = exc.payload
+    if isinstance(payload, dict):
+        # FastAPI may place a structured application response below `detail`.
+        candidate = payload.get("detail") if isinstance(payload.get("detail"), dict) else payload
+        if isinstance(candidate.get("envelope"), dict):
+            candidate = {**candidate, "schema_version": SCHEMA_VERSION}
+        try:
+            return _agent_response_from_server(candidate)
+        except RunPlanClientError:
+            pass
+    return _local_error_response(RunPlanClientError(
+        exc.code or "service_unavailable",
+        "暂时无法连接运行服务，请稍后重试。",
+        retryable=exc.status_code is None or exc.status_code >= 500 or exc.status_code == 429,
+    ))
+
+
+def _run_command(args, operation: Callable[[], dict[str, Any]]) -> int:
+    try:
+        response = operation()
+    except RunPlanClientError as exc:
+        _output(args, _local_error_response(exc))
+        return 1
+    except ApiError as exc:
+        response = _api_error_response(exc)
+        _output(args, response)
+        return 0 if response.get("decision_required") else 1
+    if "envelope" in response:
+        response = _agent_response_from_server(response)
+    return _output(args, response)
+
+
+def _run_with_admission(operation: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+    """Serialize local capacity admission across independent Agent dialogs."""
+    with _exclusive_lock(_root(HOME) / ADMISSION_LOCK_FILE):
+        return operation()
+
+
+def cmd_run_plan(args) -> int:
+    def operate() -> dict[str, Any]:
+        _run_code, path, state, client = _state_and_client(args)
+        plan = state["plan"]
+        requested_arg = getattr(args, "concurrency", None)
+        raw_decision_token = getattr(args, "decision_token", None)
+        local_decision_token = (
+            raw_decision_token
+            if isinstance(raw_decision_token, str)
+            and raw_decision_token.startswith("drlc_") else None
+        )
+        server_decision_token = None if local_decision_token else raw_decision_token
+        from . import fleet
+
+        current_local = fleet.batch_status(plan["batch_id"])
+        current_status = (
+            current_local.get("status") if isinstance(current_local, dict) else None
+        )
+        same_local_plan = bool(
+            isinstance(current_local, dict)
+            and current_local.get("plan_id") == plan["plan_id"]
+        )
+        if same_local_plan and current_status == "stopping":
+            raise RunPlanClientError(
+                "local_run_stopping",
+                "这台设备正在安全停止这次运行；请等待停止完成后再试。",
+                retryable=True,
+                agent_action="wait_and_retry",
+            )
+        if current_status in {"starting", "running", "stopping", "orphaned"} and not same_local_plan:
+            raise RunPlanClientError(
+                "local_run_scope_conflict",
+                "这台设备已有另一次运行占用了相同题目范围；请先检查当前运行状态。",
+                agent_action="inspect_current_run",
+            )
+        already_local = bool(
+            same_local_plan and current_status in {"starting", "running", "orphaned"}
+        )
+
+        assignments = plan["assignments"]
+        first = assignments[0]
+        refill = plan["refill"]
+
+        def ensure_local_pool(workers: int) -> dict[str, Any]:
+            return fleet.add_batch(
+                batch_id=plan["batch_id"],
+                workers=workers,
+                credentials_file=path,
+                plan_id=plan["plan_id"],
+                retry=True,
+                refill=bool(refill.get("enabled")),
+                max_tasks=refill.get("max_tasks"),
+                refill_harness=plan["harness"],
+                refill_model=first.get("model"),
+                refill_effort=first.get("effort"),
+            )
+
+        if already_local:
+            current_workers = int(current_local.get("workers") or 1)
+            if requested_arg not in {None, "auto"}:
+                _mode, requested_workers, _fleet_workers = _concurrency(
+                    plan, requested_arg,
+                )
+                if int(requested_workers or 0) != current_workers:
+                    raise RunPlanClientError(
+                        "local_concurrency_change_requires_restart",
+                        (
+                            f"这台设备已在同时运行 {current_workers} 道。要改为 "
+                            f"{requested_workers} 道，请先停止这台设备，再按新数量运行。"
+                        ),
+                        agent_action="ask_user",
+                        agent_details={
+                            "schema_version": SCHEMA_VERSION,
+                            "requires_user_action": True,
+                            "current_concurrency": current_workers,
+                            "requested_concurrency": requested_workers,
+                        },
+                    )
+            if local_decision_token:
+                state["pending_local_capacity"] = None
+                _atomic_json(path, state)
+            decision = _decision_for(state, "run", server_decision_token)
+            response = _validate_response(client.start_run_plan(
+                plan_id=plan["plan_id"],
+                logical_session_id=state["logical_session_id"],
+                concurrency_mode="fixed",
+                concurrency=current_workers,
+                decision=decision,
+                decision_token=server_decision_token,
+            ))
+            _remember_response(path, state, response, command="run")
+            envelope = response["envelope"]
+            if envelope.get("decision_required") or envelope.get("status") == "no_remaining":
+                return response
+            if envelope.get("agent_action") == "stop_runner":
+                try:
+                    fleet.stop_batch(plan["batch_id"])
+                except fleet.FleetError:
+                    pass
+                return response
+            if envelope.get("agent_action") not in {"start_runner", "monitor"}:
+                return response
+            if current_status == "orphaned":
+                # The per-batch process lock proves the worker parent is still
+                # alive during its bounded watchdog shutdown. Count it, report
+                # it idempotently, and never try to spawn a duplicate.
+                return _local_monitor_response(
+                    response, selected=current_workers,
+                )
+            try:
+                # This is intentionally called even for a known live pool. The
+                # coordinator's exact-shape add is the idempotent local ensure
+                # needed after a lost server response or stale public snapshot.
+                ensure_local_pool(current_workers)
+            except fleet.FleetError as exc:
+                raise RunPlanClientError(
+                    "local_start_failed",
+                    "这台设备暂时无法继续运行；请检查本机状态后重试。",
+                    retryable=True,
+                ) from exc
+            return _local_monitor_response(
+                response, selected=current_workers,
+            )
+
+        # Check only the Docker/runtime/tool required by this exact plan before
+        # the server marks this device active.  A missing unrelated provider is
+        # deliberately invisible here.
+        from .doctor import plan_environment_issue
+
+        environment_issue = plan_environment_issue(plan)
+        if environment_issue is not None:
+            raise RunPlanClientError(
+                environment_issue["error_code"],
+                environment_issue["user_message"],
+                agent_action=environment_issue["agent_action"],
+                agent_details=environment_issue.get("agent"),
+            )
+
+        snapshot = _capacity_snapshot(client, plan, state.get("limits"))
+        auto_downgraded = False
+        refill_policy = plan["refill"]
+        if refill_policy.get("enabled"):
+            authorized_queue = (
+                refill_policy.get("refill_to")
+                or refill_policy.get("max_tasks")
+                or snapshot["account_limit"]
+            )
+            supply_limit = min(
+                int(authorized_queue), int(snapshot["account_limit"]),
+            )
+        else:
+            supply_limit = min(
+                len(plan["assignments"]), int(snapshot["account_limit"]),
+            )
+
+        if local_decision_token:
+            (
+                selected_workers,
+                bound_server_decision,
+                bound_server_token,
+            ) = _consume_local_capacity(
+                path, state, token=local_decision_token,
+                selected=requested_arg, snapshot=snapshot,
+            )
+            if bound_server_token is not None:
+                server_decision_token = bound_server_token
+            mode, concurrency, fleet_workers = "fixed", selected_workers, selected_workers
+            automatic_intent = False
+        else:
+            bound_server_decision = None
+            mode, concurrency, fleet_workers = _concurrency(plan, requested_arg)
+            automatic_intent = mode == "auto"
+            if mode == "auto":
+                selected_workers = int(snapshot["auto_workers"])
+                if selected_workers < 1:
+                    raise RunPlanClientError(
+                        "local_capacity_unavailable",
+                        "这台设备当前没有空余运行位置；请等待其他运行结束后重试。",
+                        retryable=True,
+                        agent_action="wait_and_retry",
+                    )
+                desired = min(supply_limit, int(snapshot["automatic_cap"]))
+                auto_downgraded = selected_workers < desired
+                mode, concurrency, fleet_workers = (
+                    "fixed", selected_workers, selected_workers,
+                )
+            else:
+                selected_workers = int(concurrency)
+
+            if selected_workers > supply_limit:
+                raise RunPlanClientError(
+                    "concurrency_not_allowed",
+                    f"这次运行最多可同时处理 {supply_limit} 道，请降低数量。",
+                )
+
+            exceeds_safe_capacity = selected_workers > int(snapshot["available"])
+            if (
+                exceeds_safe_capacity
+                and not _authorized_concurrency(state, selected_workers, snapshot)
+            ):
+                recommended = min(selected_workers, int(snapshot["available"]))
+                pending_server_decision = _decision_for(
+                    state, "run", server_decision_token,
+                )
+                return _local_capacity_response(
+                    path, state,
+                    requested=selected_workers,
+                    recommended=recommended,
+                    snapshot=snapshot,
+                    bound_server_decision=pending_server_decision,
+                    bound_server_decision_token=server_decision_token,
+                )
+
+        if selected_workers > supply_limit:
+            raise RunPlanClientError(
+                "concurrency_not_allowed",
+                f"这次运行最多可同时处理 {supply_limit} 道，请降低数量。",
+            )
+
+        decision = _decision_for(state, "run", server_decision_token)
+        if bound_server_decision is not None and decision != bound_server_decision:
+            raise RunPlanClientError(
+                "decision_context_missing",
+                "运行状态已经变化，我会重新检查后再询问。",
+                retryable=True,
+            )
+        response = None
+        last_capacity_response = None
+        for _attempt in range(3):
+            try:
+                response = _validate_response(client.start_run_plan(
+                    plan_id=plan["plan_id"],
+                    logical_session_id=state["logical_session_id"],
+                    concurrency_mode=mode,
+                    concurrency=concurrency,
+                    decision=decision,
+                    decision_token=server_decision_token,
+                ))
+                break
+            except ApiError as exc:
+                reservation = _capacity_reservation(exc)
+                if reservation is None:
+                    raise
+                last_capacity_response = reservation["server"]
+                available = min(
+                    int(reservation["available"]), selected_workers,
+                    int(snapshot["available"]), supply_limit,
+                )
+                if available < 1:
+                    return reservation["server"]
+                if not automatic_intent:
+                    server_status = {
+                        key: reservation["server"][key]
+                        for key in (
+                            "status", "interaction", "decision_required",
+                            "user_message", "agent_action", "error_code",
+                            "retryable", "choices",
+                        )
+                        if key in reservation["server"]
+                    }
+                    return _local_capacity_response(
+                        path,
+                        state,
+                        requested=selected_workers,
+                        recommended=available,
+                        snapshot=snapshot,
+                        decision="server_capacity",
+                        allow_keep=False,
+                        user_message=(
+                            "其他设备刚刚占用了部分可用位置；现在最多还能同时运行 "
+                            f"{available} 道。是否改按这个数量运行？"
+                        ),
+                        server_status=server_status,
+                        server_capacity=reservation["capacity"],
+                        bound_server_decision=decision,
+                        bound_server_decision_token=server_decision_token,
+                    )
+                if available >= selected_workers:
+                    return reservation["server"]
+                selected_workers = available
+                mode, concurrency, fleet_workers = (
+                    "fixed", selected_workers, selected_workers,
+                )
+                auto_downgraded = True
+                # A capacity reservation error occurs before the server
+                # consumes a cross-device decision. Retain that exact decision
+                # while retrying the same logical device with a lower value.
+        if response is None:
+            if last_capacity_response is not None:
+                return last_capacity_response
+            raise RunPlanClientError(
+                "protocol_invalid", "服务返回的信息不完整，请升级后重试。",
+            )
+        _remember_response(path, state, response, command="run")
+        envelope = response["envelope"]
+        if envelope.get("decision_required") or envelope.get("status") == "no_remaining":
+            return response
+        if envelope.get("agent_action") == "stop_runner":
+            try:
+                fleet.stop_batch(plan["batch_id"])
+            except fleet.FleetError:
+                pass
+            return response
+        if envelope.get("agent_action") not in {"start_runner", "monitor"}:
+            return response
+
+        current = fleet.batch_status(plan["batch_id"])
+        if (
+            isinstance(current, dict)
+            and current.get("status") == "stopping"
+            and current.get("plan_id") == plan["plan_id"]
+        ):
+            try:
+                client.stop_run_plan(plan_id=plan["plan_id"], scope="this_device")
+            except ApiError:
+                pass
+            raise RunPlanClientError(
+                "local_run_stopping",
+                "这台设备正在安全停止这次运行；请等待停止完成后再试。",
+                retryable=True,
+                agent_action="wait_and_retry",
+            )
+        already_local = bool(
+            isinstance(current, dict)
+            and current.get("status") in {"starting", "running"}
+            and current.get("plan_id") == plan["plan_id"]
+        )
+        try:
+            fleet_response = (
+                {"batch": current, "already_active": True}
+                if already_local else
+                ensure_local_pool(int(fleet_workers))
+            )
+        except fleet.FleetError as exc:
+            # Admission is reversible until a local runner starts. Mark this
+            # device stopped so another machine is not asked about a phantom.
+            try:
+                client.stop_run_plan(
+                    plan_id=plan["plan_id"], scope="this_device",
+                )
+            except ApiError:
+                pass
+            raise RunPlanClientError(
+                "local_start_failed",
+                "这台设备暂时无法开始运行；已保留题目，请修复本机环境后重试。",
+                retryable=True,
+            ) from exc
+        actual_workers = int(
+            ((fleet_response.get("batch") or {}).get("workers"))
+            or selected_workers
+        )
+        if auto_downgraded:
+            return _local_warn_response(response, selected=actual_workers)
+        return _local_monitor_response(response, selected=actual_workers)
+
+    return _run_command(args, lambda: _run_with_admission(operate))
+
+
+def cmd_progress_plan(args) -> int:
+    def operate() -> dict[str, Any]:
+        _run_code, path, state, client = _state_and_client(args)
+        response = _validate_response(client.run_plan_progress(state["plan_id"]))
+        _remember_response(path, state, response, command="progress")
+        return response
+
+    return _run_command(args, operate)
+
+
+def cmd_stop_plan(args) -> int:
+    def operate() -> dict[str, Any]:
+        _run_code, path, state, client = _state_and_client(args)
+        scope = args.scope.replace("-", "_")
+        decision_token = getattr(args, "decision_token", None)
+        if decision_token:
+            _decision_for(state, "stop", decision_token)
+        response = _validate_response(client.stop_run_plan(
+            plan_id=state["plan_id"],
+            scope=scope,
+            decision_token=decision_token,
+        ))
+        _remember_response(path, state, response, command="stop")
+        if response["envelope"].get("agent_action") == "stop_runner":
+            from . import fleet
+
+            try:
+                fleet.stop_batch(state["batch_id"])
+            except fleet.FleetError:
+                # Server stop is authoritative; heartbeat propagation stops a
+                # still-live local worker even if the coordinator disappeared.
+                pass
+        return response
+
+    return _run_command(args, lambda: _run_with_admission(operate))
+
+
+__all__ = [
+    "DEFAULT_SERVER", "RunPlanClientError", "cmd_progress_plan",
+    "cmd_run_plan", "cmd_stop_plan", "stable_device", "validate_server_url",
+]
