@@ -924,6 +924,81 @@ def test_upload_uses_reconciled_kimi_provider_usage_with_audit_bundle(
     assert outcome == "submitted"
 
 
+def test_upload_prefers_complete_claude_sidecar_over_incomplete_codex_bundle(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    agent_dir = trial_dir / "agent"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    (agent_dir / "provider-usage.json").write_text(json.dumps({
+        "schema": "dradar-subscription-provider-usage-v1",
+        "provider": "claude-code",
+        "model": "claude-sonnet-5",
+        "complete": True,
+        "request_count": 2,
+        "n_input_tokens": 300,
+        "n_cache_tokens": 200,
+        "n_output_tokens": 21,
+        "cache_creation_tokens": 75,
+        "request_usage_complete": True,
+        "request_usage_observed": True,
+        "timed_usage_complete": True,
+        "usage_evidence_tier": "complete_reconciled",
+        "provider_actual_cost_observed": False,
+        "cost_semantics": "api_equivalent_only",
+        "token_usage_events": [{
+            "occurred_at": "2026-08-31T00:00:00Z",
+            "n_input_tokens": 100,
+            "n_cache_tokens": 80,
+            "n_output_tokens": 10,
+        }, {
+            "occurred_at": "2026-08-31T00:01:00Z",
+            "n_input_tokens": 200,
+            "n_cache_tokens": 120,
+            "n_output_tokens": 11,
+        }],
+    }), encoding="utf-8")
+    incomplete_bundle = {
+        "schema_version": runloop.CODEX_TRAJECTORY_BUNDLE_SCHEMA,
+        "complete": False,
+        "session_file_count": 2,
+        "agent_session_count": 2,
+        "root_session_count": 0,
+        "subagent_session_count": 0,
+        "aggregate_usage": {},
+        "timed_usage_complete": False,
+        "usage_sessions": [],
+        "sessions": [],
+    }
+    monkeypatch.setattr(
+        runloop, "build_codex_trajectory_bundle",
+        lambda _path: incomplete_bundle,
+    )
+
+    class CaptureClient(FakeClient):
+        def submit(self, assignment_id, nonce, patch, trajectory, result, meta,
+                   outcome="completed", resume_generation=None,
+                   trajectory_bundle=None):
+            assert meta["usage_aggregation"] == (
+                "dradar-subscription-provider-usage-v1"
+            )
+            assert meta["usage_aggregation_complete"] is True
+            assert meta["request_count"] == 2
+            assert meta["n_input_tokens"] == 300
+            assert meta["n_cache_tokens"] == 200
+            assert meta["n_output_tokens"] == 21
+            assert trajectory_bundle is not None
+            assert json.loads(trajectory_bundle.read_text())["complete"] is False
+            return {"submission_id": "s1", "grade_status": "pending"}
+
+    assert runloop._upload_trial(
+        CaptureClient(lambda _aid: None),
+        _entry(trial_dir, meta={"claude_cli_version": "2.1.251"}),
+    ) == "submitted"
+
+
 def test_incomplete_kimi_usage_keeps_tokens_and_cost_unavailable(
     tmp_path: Path, monkeypatch,
 ):
