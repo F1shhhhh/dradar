@@ -141,6 +141,7 @@ _POOL_RETURNED_ASSIGNMENTS_SNAPSHOT_ENV = (
     "DRADAR_POOL_RETURNED_ASSIGNMENTS_SNAPSHOT"
 )
 _POOL_WORKER_ACTIVITY_ENV = "DRADAR_POOL_WORKER_ACTIVITY_FILE"
+_POOL_CAPABILITIES_ENV = "DRADAR_POOL_CAPABILITIES_V1"
 _POOL_BACKFILL_V2_ENV = "DRADAR_POOL_BACKFILL_V2"
 _REPEAT_FAILURE_STATE_ENV = "DRADAR_REPEAT_FAILURE_STATE_FILE"
 _ASSIGNMENT_BOUNDARY_ENV = "DRADAR_ASSIGNMENT_BOUNDARY_FILE"
@@ -269,6 +270,25 @@ def _run_config(args) -> dict:
     )
     if normalized_scope and normalized_scope != getattr(args, "batch_id", None):
         sys.exit("run-plan credentials do not match the exact selected batch")
+    if getattr(args, "worker_child", False):
+        raw_capabilities = os.environ.get(_POOL_CAPABILITIES_ENV)
+        if raw_capabilities is not None:
+            try:
+                parsed = json.loads(raw_capabilities)
+            except json.JSONDecodeError:
+                sys.exit("invalid internal worker capability snapshot")
+            if (
+                not isinstance(parsed, list)
+                or len(parsed) > 64
+                or any(not isinstance(value, str) for value in parsed)
+            ):
+                sys.exit("invalid internal worker capability snapshot")
+            from .providers import normalize_capabilities
+
+            normalized = normalize_capabilities(parsed)
+            if len(normalized) != len(parsed):
+                sys.exit("invalid internal worker capability snapshot")
+            cfg["client_capabilities"] = normalized
     return cfg
 
 
@@ -4373,6 +4393,7 @@ def _run_worker_pool(args) -> int:
     if target_file is not None:
         print(f"live worker target: {target_file} (range 0..{maximum})")
     command = _worker_command(args)
+    parent_capabilities = tuple(getattr(client, "capabilities", ()) or ())
     pool_abort_file = configured_abort_file or (
         Path(tempfile.gettempdir())
         / f"dradar-pool-abort-{os.getpid()}-{time.time_ns()}"
@@ -4452,6 +4473,13 @@ def _run_worker_pool(args) -> int:
         )
         env[_POOL_WORKER_ACTIVITY_ENV] = str(activity_file)
         env[_PINNED_TASKS_ROOT_ENV] = str(worker_tasks_root)
+        # The parent has already evaluated provider readiness and used this
+        # exact capability set for its successful batch inventory request.
+        # Children inherit that snapshot instead of concurrently probing
+        # shared provider state and accidentally dropping one capability.
+        env[_POOL_CAPABILITIES_ENV] = json.dumps(
+            list(parent_capabilities), separators=(",", ":"),
+        )
         if boundary_path is not None:
             env[_ASSIGNMENT_BOUNDARY_ENV] = str(boundary_path)
         process = subprocess.Popen(command, env=env, **popen_kwargs)

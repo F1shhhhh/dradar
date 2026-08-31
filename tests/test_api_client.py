@@ -44,6 +44,17 @@ def test_version_is_always_sent_and_capabilities_remain_sparse():
     assert seen[1]["x-dradar-capabilities"] == DEEPSEEK_CAPABILITY
 
 
+def test_capability_snapshot_is_exposed_for_worker_inheritance():
+    client = ApiClient(
+        "https://api.example.com", "drt_test",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json={"ok": True})
+        ),
+        capabilities=("z-last", "a-first", "a-first"),
+    )
+    assert client.capabilities == ("a-first", "z-last")
+
+
 def test_default_client_advertises_task_package_sync_to_old_server():
     seen = []
 

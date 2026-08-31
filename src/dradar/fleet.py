@@ -44,6 +44,10 @@ from .capacity import (
     inspect_capacity,
     worker_resource_warnings,
 )
+from .codebuddy_provider import (
+    CODEBUDDY_MANAGED_HOME_ENV,
+    managed_codebuddy_home,
+)
 from .identity import _client
 from .local_config import HOME, _load_config, runtime_config
 from .machine import acquire_run_lock
@@ -53,7 +57,7 @@ SCHEMA_VERSION = 1
 # Version the machine-local controller contract independently from the public
 # state schema.  A controller with no value here predates per-request runtime
 # selection and would keep spawning pools from its own stale installation.
-CONTROLLER_PROTOCOL_VERSION = 3
+CONTROLLER_PROTOCOL_VERSION = 4
 FLEET_DIR = "fleet"
 STATE_FILE = "state.json"
 START_LOCK_FILE = "start.lock"
@@ -72,15 +76,20 @@ CONTROLLER_ID_ENV = "DRADAR_FLEET_CONTROLLER_ID"
 POOL_BATCH_ENV = "DRADAR_FLEET_BATCH_ID"
 POOL_STARTUP_FILE_ENV = "DRADAR_FLEET_STARTUP_FILE"
 
-# These values select reviewed local provider executables. They are paths, not
-# credentials. Never expand this allowlist to API keys, tokens, proxy URLs, or
-# arbitrary environment variables.
+# These values select reviewed local provider executables and owner-private
+# credential directories. They are paths, never credential contents. Never
+# expand this allowlist to API keys, tokens, proxy URLs, or arbitrary values.
 POOL_EXECUTABLE_ENV_KEYS = (
     "CODEBUDDY_CLI_PATH",
     "GROK_CLI_PATH",
     "KIMI_CLI_PATH",
     "ZCODE_CLI_PATH",
 )
+POOL_RUNTIME_ENV_PATH_KINDS = {
+    **{key: "file" for key in POOL_EXECUTABLE_ENV_KEYS},
+    CODEBUDDY_MANAGED_HOME_ENV: "directory",
+}
+POOL_RUNTIME_ENV_KEYS = tuple(POOL_RUNTIME_ENV_PATH_KINDS)
 
 START_TIMEOUT_SECONDS = 20.0
 REQUEST_TIMEOUT_SECONDS = 60.0
@@ -469,15 +478,31 @@ def _ensure_controller(home: Path = HOME) -> dict:
 def _pool_executable_environment(
     environ: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
-    """Capture only existing absolute provider executable paths."""
+    """Capture only reviewed provider runtime paths, never secret values."""
     source = os.environ if environ is None else environ
     selected: dict[str, str] = {}
-    for key in POOL_EXECUTABLE_ENV_KEYS:
-        value = source.get(key)
+    candidates = dict(source)
+    if environ is None and CODEBUDDY_MANAGED_HOME_ENV not in candidates:
+        candidates[CODEBUDDY_MANAGED_HOME_ENV] = str(managed_codebuddy_home())
+    for key, kind in POOL_RUNTIME_ENV_PATH_KINDS.items():
+        value = candidates.get(key)
         if not isinstance(value, str) or not value or len(value) > 4096:
             continue
         path = Path(value).expanduser()
-        if path.is_absolute() and path.is_file():
+        if not path.is_absolute() or path.is_symlink():
+            continue
+        if kind == "file" and path.is_file():
+            selected[key] = str(path)
+        elif kind == "directory" and path.is_dir():
+            try:
+                info = path.stat()
+            except OSError:
+                continue
+            if os.name != "nt" and (
+                info.st_mode & 0o077
+                or (hasattr(os, "getuid") and info.st_uid != os.getuid())
+            ):
+                continue
             selected[key] = str(path)
     return selected
 
@@ -759,7 +784,7 @@ def _spawn_pool(
             "--refill-effort", str(refill_effort),
         ))
     env = os.environ.copy()
-    for key in POOL_EXECUTABLE_ENV_KEYS:
+    for key in POOL_RUNTIME_ENV_KEYS:
         env.pop(key, None)
     env.update(dict(runtime_environment or {}))
     env[CONTROLLER_ID_ENV] = controller_id
@@ -1013,14 +1038,26 @@ def _handle_request(
                 raise FleetError("invalid provider runtime paths for the new local run")
             runtime_environment: dict[str, str] = {}
             for key, value in raw_runtime_environment.items():
-                if key not in POOL_EXECUTABLE_ENV_KEYS or not isinstance(value, str):
+                kind = POOL_RUNTIME_ENV_PATH_KINDS.get(key)
+                if kind is None or not isinstance(value, str):
                     raise FleetError("invalid provider runtime paths for the new local run")
                 path = Path(value)
                 if (
                     len(value) > 4096 or not path.is_absolute()
-                    or not path.is_file()
+                    or path.is_symlink()
                 ):
                     raise FleetError("invalid provider runtime paths for the new local run")
+                if kind == "file" and not path.is_file():
+                    raise FleetError("invalid provider runtime paths for the new local run")
+                if kind == "directory":
+                    if not path.is_dir():
+                        raise FleetError("invalid provider runtime paths for the new local run")
+                    info = path.stat()
+                    if os.name != "nt" and (
+                        info.st_mode & 0o077
+                        or (hasattr(os, "getuid") and info.st_uid != os.getuid())
+                    ):
+                        raise FleetError("invalid provider runtime paths for the new local run")
                 runtime_environment[key] = value
             process, log_handle = _spawn_pool(
                 home, state, batch_id, workers,

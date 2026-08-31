@@ -44,6 +44,7 @@ CODEBUDDY_CONTAINER_IMAGE = f"dradar-codebuddy:{CODEBUDDY_CLI_VERSION}"
 CODEBUDDY_SOURCE_IMAGE_ENV = "DRADAR_CODEBUDDY_SOURCE_IMAGE"
 CODEBUDDY_HOME_ENV = "CODEBUDDY_CONFIG_DIR"
 CODEBUDDY_AUTH_DIR_ENV = "DRADAR_CODEBUDDY_AUTH_DIR"
+CODEBUDDY_MANAGED_HOME_ENV = "DRADAR_CODEBUDDY_MANAGED_HOME"
 CODEBUDDY_HOME_RELATIVE_PATH = Path("providers") / "codebuddy" / "current"
 CODEBUDDY_IMAGE_LABEL = "io.codex-radar.codebuddy.version"
 CODEBUDDY_BASE_IMAGE = (
@@ -105,6 +106,10 @@ def sys_platform() -> str:
 
 
 def managed_codebuddy_home(home: Path | None = None) -> Path:
+    if home is None:
+        configured = os.environ.get(CODEBUDDY_MANAGED_HOME_ENV)
+        if configured:
+            return Path(configured).expanduser()
     root = HOME if home is None else Path(home)
     return root / CODEBUDDY_HOME_RELATIVE_PATH
 
@@ -579,6 +584,7 @@ __all__ = [name for name in globals() if name.startswith("CODEBUDDY_")] + [
     "host_codebuddy_home",
     "host_shared_auth_dir",
     "import_host_login",
+    "CODEBUDDY_MANAGED_HOME_ENV",
     "local_storage_files",
     "managed_auth_dir",
     "managed_codebuddy_home",

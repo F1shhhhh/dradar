@@ -48,7 +48,12 @@ def _client(cfg: dict, auto_register: bool = False) -> ApiClient:
             _auto_register(cfg)
         else:
             sys.exit("not logged in — run: dradar login --server <url> --token <token>")
-    client = ApiClient(cfg["server"], cfg["token"])
+    capabilities = cfg.get("client_capabilities")
+    client = (
+        ApiClient(cfg["server"], cfg["token"], capabilities=capabilities)
+        if capabilities is not None
+        else ApiClient(cfg["server"], cfg["token"])
+    )
     if cfg.get("benchmark"):
         client.benchmark_id = cfg["benchmark"]
     return client
