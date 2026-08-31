@@ -155,6 +155,13 @@ def _flaky_pier(monkeypatch, work_dir, fail_times, log_line, make_patch=True):
             pass
 
     monkeypatch.setattr(runner_mod, "build_pier_command", fake_build)
+    monkeypatch.setattr(
+        runner_mod.image_cache,
+        "prepare_trial_builder",
+        lambda *_a, **_k: runner_mod.image_cache.TrialBuilderLease(
+            "dradar-task-test", True,
+        ),
+    )
     monkeypatch.setattr(runner_mod.subprocess, "Popen", FakePopen)
     return captured
 
