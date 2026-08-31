@@ -154,6 +154,12 @@ trajectory；上传与 `retry-upload` 先读取严格校验的旁车，旁车缺
 或降级一份已完整对账的 Claude Code ATIF 用量。旁车和 trajectory 都不能通过校验时继续
 失败关闭，token、价格和榜单资格保持缺失。
 
+容器后处理写出的 trajectory 属于跨进程产物。“路径存在”不等于“内容已经稳定”：部分
+Docker 文件系统可能先暴露目录项，再补齐最终 JSON 字节。读取端应在短且有界的窗口内只对
+I/O/JSON 截断错误重试；一旦读到完整 JSON 但模型或总计不一致，立即失败关闭，不能继续等待
+并期待事实改变。生产 metadata 应记录最终采用的是 provider sidecar 还是 uploaded
+trajectory，便于金丝雀直接确认权威证据路径。
+
 ## 8. 测试分层与金丝雀门禁
 
 合并前至少完成：
