@@ -324,6 +324,12 @@ def test_capability_is_advertised_only_after_every_local_gate(
     assert CODEBUDDY_CAPABILITY not in providers.advertised_capabilities({})
 
 
+def test_managed_codebuddy_home_can_follow_one_fleet_request(monkeypatch, tmp_path):
+    requested = tmp_path / "request-codebuddy-home"
+    monkeypatch.setenv("DRADAR_CODEBUDDY_MANAGED_HOME", str(requested))
+    assert codebuddy_provider.managed_codebuddy_home() == requested
+
+
 def test_runtime_image_gate_executes_the_labeled_binary_once_per_image(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

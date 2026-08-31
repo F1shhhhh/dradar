@@ -619,6 +619,61 @@ def test_pool_prepares_once_then_starts_requested_resume_workers(monkeypatch):
     assert all("resume" in p.command and "--auto" not in p.command for p in calls)
 
 
+def test_pool_children_inherit_the_parents_exact_capability_snapshot(monkeypatch):
+    _patch_pool_setup(monkeypatch)
+    calls = []
+
+    class Client:
+        capabilities = ("public-task-package-pin-v1", "codebuddy-ready-v4")
+
+        def get_assignment(self):
+            return {"active": []}
+
+    monkeypatch.setattr(runloop, "_client", lambda *_a, **_k: Client())
+    monkeypatch.setattr(
+        runloop.subprocess, "Popen",
+        lambda command, env, **kwargs: (
+            calls.append(_Process(command, env, **kwargs)) or calls[-1]
+        ),
+    )
+
+    assert runloop._run_worker_pool(_args()) == 0
+    assert len(calls) == 3
+    assert all(
+        process.env[runloop._POOL_CAPABILITIES_ENV]
+        == '["public-task-package-pin-v1","codebuddy-ready-v4"]'
+        for process in calls
+    )
+
+
+def test_worker_child_uses_parent_capabilities_without_reprobing(monkeypatch):
+    monkeypatch.setattr(runloop, "_load_config", lambda: {
+        "server": "https://api.example.com", "token": "token",
+        "benchmark": "deep-swe",
+    })
+    monkeypatch.setenv(
+        runloop._POOL_CAPABILITIES_ENV,
+        '["public-task-package-pin-v1","codebuddy-ready-v4"]',
+    )
+    cfg = runloop._run_config(_args(worker_child=True))
+    assert cfg["client_capabilities"] == (
+        "codebuddy-ready-v4", "public-task-package-pin-v1",
+    )
+
+
+def test_worker_child_rejects_malformed_parent_capability_snapshot(monkeypatch):
+    monkeypatch.setattr(runloop, "_load_config", lambda: {
+        "server": "https://api.example.com", "token": "token",
+    })
+    monkeypatch.setenv(
+        runloop._POOL_CAPABILITIES_ENV, '["duplicate","duplicate"]',
+    )
+    with pytest.raises(
+        SystemExit, match="invalid internal worker capability snapshot",
+    ):
+        runloop._run_config(_args(worker_child=True))
+
+
 def test_pool_scopes_inventory_and_all_children_to_exact_batch(monkeypatch):
     _patch_pool_setup(monkeypatch, active_count=2)
     batch_id = "550e8400e29b41d4a716446655440000"

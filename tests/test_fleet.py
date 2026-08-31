@@ -125,6 +125,8 @@ def test_later_harness_pool_uses_only_its_requesting_agent_executable_paths(
     state["status"] = "active"
     executable = tmp_path / "codebuddy"
     executable.write_text("binary")
+    managed_home = tmp_path / "codebuddy-managed"
+    managed_home.mkdir(mode=0o700)
     captured = {}
 
     class Process:
@@ -147,13 +149,19 @@ def test_later_harness_pool_uses_only_its_requesting_agent_executable_paths(
         "controller_id": "controller-1",
         "controller_protocol_version": fleet.CONTROLLER_PROTOCOL_VERSION,
         "runtime_executable": sys.executable,
-        "runtime_environment": {"CODEBUDDY_CLI_PATH": str(executable)},
+        "runtime_environment": {
+            "CODEBUDDY_CLI_PATH": str(executable),
+            fleet.CODEBUDDY_MANAGED_HOME_ENV: str(managed_home),
+        },
         "command": "add",
         "batch_id": BATCH_A,
         "workers": 1,
     })
 
-    assert captured == {"CODEBUDDY_CLI_PATH": str(executable)}
+    assert captured == {
+        "CODEBUDDY_CLI_PATH": str(executable),
+        fleet.CODEBUDDY_MANAGED_HOME_ENV: str(managed_home),
+    }
     persisted = json.loads(fleet._state_path(tmp_path).read_text())
     assert "runtime_environment" not in json.dumps(persisted)
 
@@ -167,6 +175,20 @@ def test_provider_runtime_environment_rejects_secrets_and_unknown_keys(tmp_path)
         "UNKNOWN_PROVIDER_VALUE": str(executable),
     })
     assert selected == {"CODEBUDDY_CLI_PATH": str(executable)}
+
+
+def test_provider_runtime_environment_carries_only_private_codebuddy_home(tmp_path):
+    private = tmp_path / "private-codebuddy"
+    private.mkdir(mode=0o700)
+    public = tmp_path / "public-codebuddy"
+    public.mkdir(mode=0o755)
+
+    assert fleet._pool_executable_environment({
+        fleet.CODEBUDDY_MANAGED_HOME_ENV: str(private),
+    }) == {fleet.CODEBUDDY_MANAGED_HOME_ENV: str(private)}
+    assert fleet._pool_executable_environment({
+        fleet.CODEBUDDY_MANAGED_HOME_ENV: str(public),
+    }) == {}
 
 
 def test_fleet_tracks_separate_honeypot_batches_and_total_workers(

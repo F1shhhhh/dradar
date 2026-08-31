@@ -110,6 +110,11 @@ class ApiClient:
         active_capabilities = normalize_capabilities(
             advertised_capabilities() if capabilities is None else capabilities
         )
+        # Worker-pool parents hand this exact, already-evaluated snapshot to
+        # their child processes. Re-probing stateful provider runtimes in
+        # every child can produce a transiently different header even though
+        # the parent just passed the same server gate.
+        self.capabilities = active_capabilities
         if active_capabilities:
             headers[CLIENT_CAPABILITIES_HEADER] = ",".join(active_capabilities)
         if transport is None and not _env_proxies_set():
