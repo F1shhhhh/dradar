@@ -26,7 +26,9 @@ from .local_config import _load_config, tasks_root_from_config
 from .providers import (
     ANTIGRAVITY_AGENT,
     ANTIGRAVITY_CLI_VERSION,
+    DEFAULT_CODEX_PROVIDER,
     DEEPSEEK_API_KEY_ENV,
+    DEEPSEEK_PROVIDER,
     GROK_CLI_VERSION,
     GROK_AGENT,
     KIMI_AGENT,
@@ -244,30 +246,48 @@ def plan_environment_issue(plan: dict) -> dict | None:
         )
 
     assignments = plan.get("assignments") or []
-    provider = str(
-        assignments[0].get("provider") if assignments
-        and isinstance(assignments[0], dict) else ""
-    ).lower()
     if harness == "codex":
+        providers = {
+            assignment.get("provider") or DEFAULT_CODEX_PROVIDER
+            for assignment in assignments
+            if isinstance(assignment, dict)
+        }
+        if not providers:
+            providers = {DEFAULT_CODEX_PROVIDER}
+        unsupported = providers - {DEFAULT_CODEX_PROVIDER, DEEPSEEK_PROVIDER}
+        if unsupported:
+            return _plan_issue(
+                harness, "current_tool_unsupported",
+                "当前版本还不能准备这次运行所需的工具环境；请升级 DRadar 后重试。",
+                "upgrade_cli", requires_user_action=True,
+            )
         codex = runner._resolve_user_tool("codex")
         if not codex:
             return _plan_issue(
                 harness, "codex_not_installed",
-                "这次运行需要 Codex；请先安装 Codex，再重试。",
+                "当前运行工具尚未安装；请先完成安装，再重试。",
                 "setup_current_tool", requires_user_action=True,
             )
-        if provider == "deepseek":
-            if not deepseek_api_key() or deepseek_catalog_error() is not None:
-                return _plan_issue(
-                    harness, "current_tool_not_authenticated",
-                    "这次运行所需的模型权限尚未配置；请完成当前运行工具的登录后重试。",
-                    "authenticate_current_tool", setup_provider="deepseek",
-                )
-        elif not runner.codex_auth_path().is_file():
+        if (
+            DEFAULT_CODEX_PROVIDER in providers
+            and not runner.codex_auth_path().is_file()
+        ):
             return _plan_issue(
                 harness, "codex_not_authenticated",
-                "Codex 尚未登录；请完成 Codex 登录后重试。",
+                "当前运行工具尚未登录；请完成登录后重试。",
                 "authenticate_current_tool", codex_login=True,
+            )
+        if (
+            DEEPSEEK_PROVIDER in providers
+            and (
+                not deepseek_api_key()
+                or deepseek_catalog_error() is not None
+            )
+        ):
+            return _plan_issue(
+                harness, "current_tool_not_authenticated",
+                "这次运行所需的模型权限尚未配置；请完成当前运行工具的登录后重试。",
+                "authenticate_current_tool", setup_provider="deepseek",
             )
         return None
     if harness == "dsh-minimal":

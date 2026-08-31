@@ -113,11 +113,17 @@ def runtime_config(credentials_file: str | os.PathLike[str] | None = None) -> di
     token = payload.get("token")
     benchmark = payload.get("benchmark")
     batch_id = payload.get("batch_id")
+    logical_session_id = payload.get("logical_session_id")
+    plan = payload.get("plan")
+    points_tier = plan.get("points_tier") if isinstance(plan, dict) else None
     if (
         not isinstance(server, str) or not server
         or not isinstance(token, str) or not token.startswith("drp_")
         or not isinstance(benchmark, str) or not benchmark
         or not isinstance(batch_id, str) or not batch_id
+        or not isinstance(logical_session_id, str)
+        or not logical_session_id.startswith("drl_")
+        or points_tier not in {"plus", "pro-5x", "pro-20x"}
     ):
         raise ValueError("invalid private run-plan credentials file")
     runtime = dict(cfg)
@@ -127,5 +133,7 @@ def runtime_config(credentials_file: str | os.PathLike[str] | None = None) -> di
         "benchmark": benchmark,
         "run_plan_batch_id": batch_id,
         "run_plan_id": payload.get("plan_id"),
+        "run_plan_logical_session_id": logical_session_id,
+        "run_plan_points_tier": points_tier,
     })
     return runtime

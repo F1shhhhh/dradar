@@ -377,6 +377,7 @@ class ApiClient:
         effort: str,
         *,
         refill_campaign_id: str | None = None,
+        tier: str | None = None,
     ) -> dict[str, Any]:
         """Returns {assignment: dict, resumed: False}. Raises ApiError (409) if
         the cell went stale or the volunteer is already at the concurrent cap."""
@@ -387,6 +388,8 @@ class ApiClient:
             data["batch_id"] = self.batch_id
         if refill_campaign_id:
             data["refill_campaign_id"] = refill_campaign_id
+        if tier is not None:
+            data["tier"] = tier
         return self._post("/api/v1/assignment/claim", data=data)
 
     def configure_refill_campaign(

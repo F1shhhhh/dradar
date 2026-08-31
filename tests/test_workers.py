@@ -677,6 +677,273 @@ def test_pool_ready_count_uses_only_inventory_returned_by_scoped_client(
     ) == 0
 
 
+def _scoped_refill_args(**overrides):
+    return _args(
+        workers=2,
+        auto=None,
+        refill=True,
+        fleet_pool=True,
+        batch_id="550e8400e29b41d4a716446655440000",
+        credentials_file="/private/plan.json",
+        **overrides,
+    )
+
+
+def _ready_run_plan_envelope():
+    return {
+        "schema_version": 1,
+        "envelope": {
+            "status": "already_running",
+            "interaction": "silent",
+            "decision_required": False,
+            "user_message": "",
+            "agent_action": "monitor",
+            "error_code": None,
+            "retryable": False,
+            "choices": [],
+        },
+    }
+
+
+def test_scoped_refill_wait_refreshes_device_and_opens_after_global_seed_barrier(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    monkeypatch.setattr(runloop, "_run_config", lambda _args: {
+        "run_plan_id": "plan-a",
+        "run_plan_logical_session_id": "drl_same_device",
+    })
+    monkeypatch.setattr(runloop, "_pending_uploads_for_batch", lambda _batch: [])
+    results = iter((
+        {"status": "active", "claimed": 0, "seed_pending": 1},
+        {"status": "active", "claimed": 2},
+    ))
+    monkeypatch.setattr(
+        runloop.refill_plan, "refill_once", lambda _home, _client: next(results),
+    )
+    assignment = {"assignment_id": "new-a", "started_at": None}
+    inventories = iter(([], [assignment]))
+    monkeypatch.setattr(
+        runloop,
+        "_acquire_batch",
+        lambda *_args, **_kwargs: (next(inventories), True),
+    )
+    ready_calls = []
+    ready = iter((0, 1))
+    monkeypatch.setattr(
+        runloop,
+        "_pool_ready_work_count",
+        lambda _client, **kwargs: ready_calls.append(kwargs) or next(ready),
+    )
+    sleeps = []
+    monkeypatch.setattr(runloop.time, "sleep", sleeps.append)
+
+    class Client:
+        def __init__(self):
+            self.starts = []
+
+        def start_run_plan(self, **kwargs):
+            self.starts.append(kwargs)
+            return _ready_run_plan_envelope()
+
+    client = Client()
+    active = runloop._wait_for_scoped_refill_work(
+        _scoped_refill_args(), client, desired_workers=2,
+    )
+
+    assert active == [assignment]
+    assert client.starts == [{
+        "plan_id": "plan-a",
+        "logical_session_id": "drl_same_device",
+        "concurrency_mode": "fixed",
+        "concurrency": 2,
+    }] * 2
+    assert sleeps == [runloop._SCOPED_REFILL_WAIT_SECONDS]
+    assert runloop._SCOPED_REFILL_WAIT_SECONDS >= 30
+    # A second device's live workers belong to the server's aggregate target,
+    # not this device's local two-worker cap. The wait path counts exact local
+    # waiting inventory without subtracting global heartbeat owners.
+    assert ready_calls == [{}, {}]
+
+
+@pytest.mark.parametrize("status_code", (401, 403, 410))
+def test_scoped_refill_wait_does_not_retry_terminal_authorization_errors(
+    tmp_path, monkeypatch, status_code,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    monkeypatch.setattr(runloop, "_run_config", lambda _args: {
+        "run_plan_id": "plan-a",
+        "run_plan_logical_session_id": "drl_same_device",
+    })
+    sleeps = []
+    monkeypatch.setattr(runloop.time, "sleep", sleeps.append)
+
+    class Client:
+        calls = 0
+
+        def start_run_plan(self, **_kwargs):
+            self.calls += 1
+            raise runloop.ApiError(
+                "plan no longer authorized", status_code=status_code,
+            )
+
+    client = Client()
+    with pytest.raises(SystemExit, match="no longer authorized"):
+        runloop._wait_for_scoped_refill_work(
+            _scoped_refill_args(), client, desired_workers=2,
+        )
+
+    assert client.calls == 1
+    assert sleeps == []
+
+
+def test_scoped_refill_wait_honors_retry_after_for_transient_error(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    monkeypatch.setattr(runloop, "_run_config", lambda _args: {
+        "run_plan_id": "plan-a",
+        "run_plan_logical_session_id": "drl_same_device",
+    })
+    monkeypatch.setattr(runloop, "_pending_uploads_for_batch", lambda _batch: [])
+    monkeypatch.setattr(
+        runloop.refill_plan,
+        "refill_once",
+        lambda _home, _client: {"status": "active", "claimed": 1},
+    )
+    assignment = {"assignment_id": "new-a", "started_at": None}
+    monkeypatch.setattr(
+        runloop, "_acquire_batch", lambda *_args, **_kwargs: ([assignment], True),
+    )
+    monkeypatch.setattr(runloop, "_pool_ready_work_count", lambda _client: 1)
+    sleeps = []
+    monkeypatch.setattr(runloop.time, "sleep", sleeps.append)
+
+    class Client:
+        def __init__(self):
+            self.calls = 0
+
+        def start_run_plan(self, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise runloop.ApiError(
+                    "busy", status_code=503, retry_after=45,
+                )
+            return _ready_run_plan_envelope()
+
+    client = Client()
+    assert runloop._wait_for_scoped_refill_work(
+        _scoped_refill_args(), client, desired_workers=2,
+    ) == [assignment]
+    assert client.calls == 2
+    assert sleeps == [45]
+
+
+def test_scoped_refill_wait_retries_exact_pending_upload_until_recovered(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    monkeypatch.setattr(runloop, "_run_config", lambda _args: {
+        "run_plan_id": "plan-a",
+        "run_plan_logical_session_id": "drl_same_device",
+    })
+    pending_entries = [{
+        "assignment_id": "done-a",
+        "batch_id": "550e8400e29b41d4a716446655440000",
+    }]
+    monkeypatch.setattr(
+        runloop, "_pending_uploads_for_batch", lambda _batch: list(pending_entries),
+    )
+    retry_calls = []
+
+    def retry(_client, *, batch_id=None):
+        retry_calls.append(batch_id)
+        if len(retry_calls) == 3:
+            pending_entries.clear()
+        return ["submitted" if not pending_entries else "upload-failed"]
+
+    monkeypatch.setattr(runloop, "_retry_pending_uploads", retry)
+    monkeypatch.setattr(
+        runloop.refill_plan,
+        "refill_once",
+        lambda _home, _client: {"status": "active", "seed_pending": 1},
+    )
+    assignment = {"assignment_id": "new-a", "started_at": None}
+    inventories = iter(([assignment], [assignment], [assignment]))
+    monkeypatch.setattr(
+        runloop,
+        "_acquire_batch",
+        lambda *_args, **_kwargs: (next(inventories), True),
+    )
+    ready = iter((1, 1, 1))
+    monkeypatch.setattr(
+        runloop, "_pool_ready_work_count", lambda _client: next(ready),
+    )
+    monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        runloop,
+        "_run_and_submit",
+        lambda *_args, **_kwargs: pytest.fail("pending replay must not rerun a model"),
+    )
+
+    class Client:
+        def start_run_plan(self, **_kwargs):
+            return _ready_run_plan_envelope()
+
+    active = runloop._wait_for_scoped_refill_work(
+        _scoped_refill_args(), Client(), desired_workers=2,
+    )
+
+    assert active == [assignment]
+    assert retry_calls == [
+        "550e8400e29b41d4a716446655440000",
+    ] * 3
+
+
+def test_scoped_refill_wait_exposes_blocked_upload_instead_of_waiting_forever(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    monkeypatch.setattr(runloop, "_run_config", lambda _args: {
+        "run_plan_id": "plan-a",
+        "run_plan_logical_session_id": "drl_same_device",
+    })
+    monkeypatch.setattr(runloop, "_pending_uploads_for_batch", lambda _batch: [{
+        "assignment_id": "done-a",
+        "upload_blocked": "owner_superseded",
+    }])
+    monkeypatch.setattr(
+        runloop.refill_plan,
+        "refill_once",
+        lambda *_args: pytest.fail("blocked upload must stop before refill"),
+    )
+
+    class Client:
+        def start_run_plan(self, **_kwargs):
+            return _ready_run_plan_envelope()
+
+    with pytest.raises(SystemExit, match="needs upload review"):
+        runloop._wait_for_scoped_refill_work(
+            _scoped_refill_args(), Client(), desired_workers=2,
+        )
+
+
+def test_scoped_device_ready_count_does_not_subtract_other_device_workers():
+    class Client:
+        def get_assignment(self):
+            return {"active": [
+                {"assignment_id": "a-live", "started_at": "earlier",
+                 "heartbeat_running": True},
+                {"assignment_id": "b-live", "started_at": "earlier",
+                 "heartbeat_running": True},
+                {"assignment_id": "c-wait", "started_at": None},
+                {"assignment_id": "d-wait", "started_at": None},
+            ]}
+
+    assert runloop._pool_ready_work_count(Client(), desired_workers=2) == 0
+    assert runloop._pool_ready_work_count(Client()) == 2
+
+
 def test_pool_live_target_scales_up_without_restarting_existing_workers(
         tmp_path, monkeypatch, capsys):
     _patch_pool_setup(monkeypatch, active_count=4)
@@ -1443,6 +1710,70 @@ def test_pool_drain_keeps_active_siblings_running_without_backfill(
     out = capsys.readouterr().out
     assert "active workers will finish" in out
     assert "drained cleanly" in out
+
+
+def test_scoped_plan_drain_with_lost_upload_settles_as_recoverable_failure(
+    tmp_path, monkeypatch, capsys,
+):
+    """A stop never turns a lost first upload response into a clean stop."""
+
+    _patch_pool_setup(monkeypatch, active_count=1)
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    monkeypatch.setattr(runloop.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        runloop, "_run_config", lambda _args: {
+            "benchmark": runloop.DEFAULT_BENCHMARK,
+            "run_plan_id": "plan-a",
+            "run_plan_logical_session_id": "drl_same_device",
+        },
+    )
+    monkeypatch.setattr(runloop, "_pool_ready_work_count", lambda *_a, **_k: 1)
+    monkeypatch.setattr(
+        runloop, "_signal_workers",
+        lambda _processes: pytest.fail("a plan drain must not signal paid work"),
+    )
+    batch_id = "550e8400e29b41d4a716446655440000"
+    pending_entries = []
+    monkeypatch.setattr(
+        runloop, "_pending_uploads_for_batch",
+        lambda selected: list(pending_entries) if selected == batch_id else [],
+    )
+    retry_calls = []
+
+    def retry(_client, *, batch_id=None):
+        retry_calls.append(batch_id)
+        return ["upload-failed"] if pending_entries else []
+
+    monkeypatch.setattr(runloop, "_retry_pending_uploads", retry)
+    calls = []
+
+    def popen(command, env, **kwargs):
+        def finish_after_stop():
+            runloop.Path(env[runloop._POOL_WORKER_ACTIVITY_ENV]).write_text(
+                "done-a",
+            )
+            pending_entries.append({
+                "assignment_id": "done-a",
+                "batch_id": batch_id,
+            })
+            runloop.Path(env[runloop._POOL_ABORT_ENV]).write_text(
+                "drain:stopped on this device",
+            )
+
+        process = _ScriptedProcess(
+            command, env, [1], on_poll=finish_after_stop, **kwargs,
+        )
+        calls.append(process)
+        return process
+
+    monkeypatch.setattr(runloop.subprocess, "Popen", popen)
+
+    args = _scoped_refill_args()
+    args.workers = 1
+    assert runloop._run_worker_pool(args) == 1
+    assert len(calls) == 1
+    assert retry_calls == [batch_id, batch_id]
+    assert "completed result still waiting to upload" in capsys.readouterr().out
 
 
 def test_eight_worker_quota_drain_never_starts_replacements_before_reset(

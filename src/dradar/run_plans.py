@@ -21,9 +21,11 @@ import os
 import platform
 import re
 import secrets
+import sys
 import tempfile
+import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -45,6 +47,11 @@ MAX_CREDENTIAL_STATES = 64
 MAX_AUDIT_SUMMARIES = 64
 AUDIT_RETENTION_SECONDS = 30 * 24 * 60 * 60
 _SAFE_PLAN_ID = re.compile(r"[A-Za-z0-9_-]{8,160}\Z")
+_JSON_STDOUT_LOCK = threading.RLock()
+_STALE_SERVER_DECISION_CODES = {
+    "decision_already_used",
+    "decision_invalid_or_state_changed",
+}
 
 
 class RunPlanClientError(RuntimeError):
@@ -405,6 +412,8 @@ def _validate_plan(value: object) -> dict[str, Any]:
     required_strings = ("plan_id", "batch_id", "benchmark_id", "harness")
     if any(not isinstance(value.get(key), str) or not value[key] for key in required_strings):
         raise RunPlanClientError("plan_response_invalid", "运行信息无效，请回网页重新复制。")
+    if value.get("points_tier") not in {"plus", "pro-5x", "pro-20x"}:
+        raise RunPlanClientError("plan_response_invalid", "运行信息无效，请回网页重新复制。")
     try:
         normalize_batch_id(value["batch_id"])
     except ValueError:
@@ -495,6 +504,8 @@ def _exchange(
         "limits": response.get("limits") if isinstance(response.get("limits"), dict) else {},
         "pending_decision": None,
         "pending_local_capacity": None,
+        "intent_generation": 0,
+        "pending_recheck_generation": None,
         "authorized_concurrency": None,
         "created_at": datetime.now().astimezone().isoformat(),
     }
@@ -575,10 +586,14 @@ def _capacity_snapshot(
             try:
                 return client.get_assignment()
             except ApiError as exc:
-                if exc.status_code == 404 and exc.code == "claim_batch_not_found":
+                if exc.status_code == 404:
                     # The server start state machine owns the authoritative
-                    # no-remaining decision. An empty exact inventory must not
-                    # turn that friendly outcome into a local capacity error.
+                    # no-remaining/future-budget decision. This view is used
+                    # only after a private credential and its exact plan batch
+                    # have been validated, so both the newer structured error
+                    # and the older bare "active batch not found" 404 safely
+                    # mean zero current inventory here. Ordinary resume keeps
+                    # its stricter 404 behavior.
                     return {"active": []}
                 raise
 
@@ -840,6 +855,344 @@ def _local_monitor_response(
     return result
 
 
+def _exact_pending_uploads(batch_id: str) -> list[dict[str, Any]]:
+    """Read only durable completed results belonging to one exact plan batch."""
+
+    from . import pending
+
+    try:
+        expected = normalize_batch_id(batch_id)
+    except ValueError:
+        return []
+    matches = []
+    for entry in pending.load(HOME):
+        try:
+            actual = normalize_batch_id(entry.get("batch_id"))
+        except ValueError:
+            continue
+        if actual == expected:
+            matches.append(entry)
+    return matches
+
+
+def _upload_recovery_action() -> dict[str, Any]:
+    return {
+        "id": "recover_completed_result",
+        "mode": "replay_plan_command",
+        "command": "run",
+        "args": ["--upload-only", "--json"],
+        "inherit": ["--plan", "--server"],
+        "interactive": False,
+    }
+
+
+def _intent_generation(state: dict[str, Any]) -> int:
+    value = state.get("intent_generation", 0)
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < 0
+        or value >= 2 ** 63 - 1
+    ):
+        raise RunPlanClientError(
+            "local_state_invalid",
+            "本机运行信息无效；为避免误启动，请重新从网页获取运行说明。",
+        )
+    return value
+
+
+def _advance_intent_generation(
+    path: Path,
+    state: dict[str, Any],
+    *,
+    pending_recheck: bool = False,
+) -> int:
+    """Linearize a new explicit intent or one one-use automatic recheck."""
+
+    generation = _intent_generation(state) + 1
+    state["intent_generation"] = generation
+    state["pending_recheck_generation"] = generation if pending_recheck else None
+    _atomic_json(path, state)
+    return generation
+
+
+def _consume_recheck_generation(
+    path: Path,
+    state: dict[str, Any],
+    expected: object,
+) -> None:
+    """Consume one exact automatic generation, failing closed on stale state."""
+
+    current = _intent_generation(state)
+    valid = (
+        isinstance(expected, int)
+        and not isinstance(expected, bool)
+        and expected >= 1
+        and expected == current
+        and state.get("pending_recheck_generation") == expected
+    )
+    if not valid:
+        # Never let an older action erase a newer pending generation.
+        if state.get("pending_recheck_generation") == expected:
+            state["pending_recheck_generation"] = None
+            _atomic_json(path, state)
+        raise RunPlanClientError(
+            "recheck_invalid_or_state_changed",
+            "运行状态已经变化；旧的自动检查不会继续，也不会重新启动题目。",
+            agent_action="notify_only",
+        )
+    state["pending_recheck_generation"] = None
+    _atomic_json(path, state)
+
+
+def _plan_recheck_action(command: str, generation: int) -> dict[str, Any]:
+    """Describe a safe base-command replay without stale local choices."""
+
+    return {
+        "id": "recheck_current_plan",
+        "mode": "replay_plan_command",
+        "command": command,
+        "args": ["--recheck-generation", str(generation), "--json"],
+        "inherit": ["--plan", "--server"],
+        "interactive": False,
+    }
+
+
+def _plan_recheck_response(
+    *,
+    path: Path,
+    state: dict[str, Any],
+    error_code: str,
+    user_message: str,
+    command: str = "run",
+    poll_after_seconds: int = 30,
+    server_status: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return an executable bounded wait instead of promising hidden work."""
+
+    generation = _advance_intent_generation(
+        path, state, pending_recheck=True,
+    )
+    agent: dict[str, Any] = {
+        "next_commands": [_plan_recheck_action(command, generation)],
+    }
+    if server_status is not None:
+        agent["server_status"] = server_status
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "waiting",
+        "interaction": "notify",
+        "decision_required": False,
+        "user_message": user_message,
+        "agent_action": "recheck_plan",
+        "error_code": error_code,
+        "retryable": True,
+        "choices": [],
+        "poll_after_seconds": poll_after_seconds,
+        "user_message_policy": "on_change_or_heartbeat",
+        "agent": agent,
+    }
+
+
+def _progress_state_changed_response() -> dict[str, Any]:
+    """Avoid publishing or persisting a progress snapshot older than intent."""
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "updating",
+        "interaction": "silent",
+        "decision_required": False,
+        "user_message": "运行状态刚刚发生变化；下一次检查会显示最新进度。无需操作。",
+        "agent_action": "monitor",
+        "error_code": "progress_state_changed",
+        "retryable": True,
+        "choices": [],
+        "poll_after_seconds": 30,
+        "user_message_policy": "on_change_or_heartbeat",
+    }
+
+
+def _recover_plan_uploads(
+    state: dict[str, Any], client: ApiClient,
+) -> dict[str, Any]:
+    """Replay this plan's completed local uploads without starting a runner."""
+
+    batch_id = state["batch_id"]
+    before = _exact_pending_uploads(batch_id)
+    if not before:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "status": "completed",
+            "interaction": "silent",
+            "decision_required": False,
+            "user_message": "这台设备没有需要补交的完成结果。无需操作。",
+            "agent_action": "done",
+            "error_code": None,
+            "retryable": False,
+            "choices": [],
+        }
+    from . import runloop
+
+    runloop._retry_pending_uploads(client, batch_id=batch_id)
+    remaining = _exact_pending_uploads(batch_id)
+    if not remaining:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "status": "completed",
+            "interaction": "notify",
+            "decision_required": False,
+            "user_message": "这台设备已完成结果补交，没有重新运行题目。无需操作。",
+            "agent_action": "done",
+            "error_code": None,
+            "retryable": False,
+            "choices": [],
+        }
+    blocked = [entry for entry in remaining if entry.get("upload_blocked")]
+    if blocked and len(blocked) == len(remaining):
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "status": "review_required",
+            "interaction": "warn",
+            "decision_required": False,
+            "user_message": (
+                "这台设备有已完成结果需要人工检查后再补交；不会重新运行题目。"
+            ),
+            "agent_action": "notify_only",
+            "error_code": "completed_result_review_required",
+            "retryable": False,
+            "choices": [],
+            "agent": {
+                "requires_user_action": True,
+                "completed_result_count": len(blocked),
+            },
+        }
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "waiting",
+        "interaction": "notify",
+        "decision_required": False,
+        "user_message": (
+            "这台设备有已完成结果尚未补交成功；网络恢复后只需继续补交，"
+            "不会重新运行题目。"
+        ),
+        "agent_action": "recover_upload",
+        "error_code": "completed_result_upload_pending",
+        "retryable": True,
+        "choices": [],
+        "poll_after_seconds": 30,
+        "user_message_policy": "on_change_or_heartbeat",
+        "agent": {"next_commands": [_upload_recovery_action()]},
+    }
+
+
+def _local_progress_fault_response(
+    server_response: dict[str, Any], local_item: dict[str, Any] | None,
+    *, pending_upload_count: int = 0, blocked_upload_count: int = 0,
+) -> dict[str, Any]:
+    """Make a dead local runner visible without misreporting remote devices."""
+
+    result = _agent_response_from_server(server_response)
+    server_status = {
+        key: value for key, value in result.items()
+        if key not in {"schema_version", "agent"}
+    }
+    state = server_response.get("state")
+    healthy_others = 0
+    if isinstance(state, dict):
+        public_count = state.get("healthy_other_devices")
+        raw_devices = state.get("other_healthy")
+        if isinstance(public_count, int) and not isinstance(public_count, bool):
+            healthy_others = max(0, public_count)
+        elif isinstance(raw_devices, list):
+            healthy_others = len(raw_devices)
+    agent = dict(result.get("agent") or {})
+    agent["server_status"] = server_status
+    if isinstance(local_item, dict):
+        agent["local_runner"] = {
+            "status": str(local_item.get("status") or "interrupted"),
+            "returncode": local_item.get("returncode"),
+        }
+    agent["next_commands"] = [{
+        "id": "inspect_local_runner",
+        "argv": ["dradar", "fleet", "status"],
+        "interactive": False,
+    }]
+    if pending_upload_count:
+        if blocked_upload_count == pending_upload_count:
+            agent.update({
+                "requires_user_action": True,
+                "completed_result_count": pending_upload_count,
+                "next_commands": [],
+            })
+            result.update({
+                "status": "review_required",
+                "interaction": "warn",
+                "decision_required": False,
+                "user_message": (
+                    "这台设备有已完成结果需要人工检查后再补交；"
+                    "不会重新运行题目。"
+                ),
+                "agent_action": "notify_only",
+                "error_code": "completed_result_review_required",
+                "retryable": False,
+                "choices": [],
+                "poll_after_seconds": None,
+                "agent": agent,
+            })
+            return result
+        agent.update({
+            "completed_result_count": pending_upload_count,
+            "next_commands": [_upload_recovery_action()],
+        })
+        result.update({
+            "status": "waiting",
+            "interaction": "warn",
+            "decision_required": False,
+            "user_message": (
+                "这台设备有已完成结果尚未补交成功；接下来只会补交结果，"
+                "不会重新运行题目。"
+            ),
+            "agent_action": "recover_upload",
+            "error_code": "completed_result_upload_pending",
+            "retryable": True,
+            "choices": [],
+            "poll_after_seconds": 30,
+            "user_message_policy": "on_change_or_heartbeat",
+            "agent": agent,
+        })
+        return result
+    if healthy_others:
+        result.update({
+            "interaction": "warn",
+            "decision_required": False,
+            "user_message": (
+                "这台设备的运行已中断，其他设备仍在继续处理。"
+                "本机不会再开始新题；我会继续跟进整体进度。"
+            ),
+            "agent_action": "monitor",
+            "error_code": "local_runner_interrupted",
+            "retryable": True,
+            "choices": [],
+        })
+    else:
+        result.update({
+            "status": "paused",
+            "interaction": "warn",
+            "decision_required": False,
+            "user_message": (
+                "这台设备的运行已中断，目前没有其他设备继续处理。"
+                "请检查本机后，再次使用原运行说明即可继续。"
+            ),
+            "agent_action": "notify_only",
+            "error_code": "local_runner_interrupted",
+            "retryable": True,
+            "choices": [],
+            "poll_after_seconds": None,
+        })
+    result["agent"] = agent
+    return result
+
+
 def _remember_response(
     path: Path,
     state: dict[str, Any],
@@ -990,8 +1343,51 @@ def _api_error_response(exc: ApiError) -> dict[str, Any]:
 
 
 def _run_command(args, operation: Callable[[], dict[str, Any]]) -> int:
+    @contextmanager
+    def isolated_operation_stdout():
+        """Keep Agent JSON stdout valid even when a dependency prints.
+
+        ``redirect_stdout`` catches Python output while the fd-level redirect
+        also catches installers and other child processes that inherit fd 1.
+        JSON mode intentionally suppresses these diagnostics: forwarding raw
+        dependency output could expose a capability or turn one JSON document
+        into an unparsable mixed stream. Non-JSON invocations are unchanged.
+        """
+
+        if not getattr(args, "json", False):
+            yield
+            return
+        with _JSON_STDOUT_LOCK:
+            try:
+                with tempfile.TemporaryFile(mode="w+b") as sink:
+                    saved_stdout = os.dup(1)
+                    try:
+                        try:
+                            sys.stdout.flush()
+                        except (AttributeError, OSError):
+                            pass
+                        os.dup2(sink.fileno(), 1)
+                        with os.fdopen(
+                            os.dup(sink.fileno()),
+                            "w",
+                            encoding="utf-8",
+                            errors="replace",
+                        ) as text_sink, redirect_stdout(text_sink):
+                            yield
+                            text_sink.flush()
+                    finally:
+                        os.dup2(saved_stdout, 1)
+                        os.close(saved_stdout)
+            except OSError as exc:
+                raise RunPlanClientError(
+                    "json_output_isolation_failed",
+                    "本机暂时无法安全生成运行状态，请稍后重试。",
+                    retryable=True,
+                ) from exc
+
     try:
-        response = operation()
+        with isolated_operation_stdout():
+            response = operation()
     except RunPlanClientError as exc:
         _output(args, _local_error_response(exc))
         return 1
@@ -1011,11 +1407,54 @@ def _run_with_admission(operation: Callable[[], dict[str, Any]]) -> dict[str, An
 
 
 def cmd_run_plan(args) -> int:
-    def operate() -> dict[str, Any]:
+    def operate(*, authoritative_recheck: bool = False) -> dict[str, Any]:
+        recheck_generation = getattr(args, "recheck_generation", None)
+        if getattr(args, "upload_only", False):
+            if (
+                getattr(args, "concurrency", None) is not None
+                or getattr(args, "decision_token", None) is not None
+                or recheck_generation is not None
+            ):
+                raise RunPlanClientError(
+                    "upload_only_argument_conflict",
+                    "补交完成结果时不能同时更改运行数量或执行其他确认。",
+                )
+        if recheck_generation is not None and (
+            getattr(args, "concurrency", None) is not None
+            or getattr(args, "decision_token", None) is not None
+        ):
+            raise RunPlanClientError(
+                "recheck_argument_conflict",
+                "自动检查不能沿用之前的运行数量或确认信息。",
+                agent_action="notify_only",
+            )
         _run_code, path, state, client = _state_and_client(args)
+        if getattr(args, "upload_only", False):
+            return _recover_plan_uploads(state, client)
+        if not authoritative_recheck:
+            if recheck_generation is None:
+                # Any explicit run is a newer user/Agent intent and invalidates
+                # an older capacity recheck before server or Fleet state can
+                # change.  The admission lock linearizes this with stop.
+                _advance_intent_generation(path, state)
+            else:
+                _consume_recheck_generation(
+                    path, state, recheck_generation,
+                )
         plan = state["plan"]
-        requested_arg = getattr(args, "concurrency", None)
-        raw_decision_token = getattr(args, "decision_token", None)
+        # A stale one-use local decision is re-evaluated from the saved plan,
+        # never by replaying its old token or carrying forward the old local
+        # concurrency choice.  The second pass can only return a fresh
+        # confirmation/current state; it cannot silently preserve stale
+        # authority.
+        requested_arg = (
+            None if authoritative_recheck
+            else getattr(args, "concurrency", None)
+        )
+        raw_decision_token = (
+            None if authoritative_recheck
+            else getattr(args, "decision_token", None)
+        )
         local_decision_token = (
             raw_decision_token
             if isinstance(raw_decision_token, str)
@@ -1032,12 +1471,23 @@ def cmd_run_plan(args) -> int:
             isinstance(current_local, dict)
             and current_local.get("plan_id") == plan["plan_id"]
         )
+        if (
+            recheck_generation is not None
+            and same_local_plan
+            and current_status in {
+                "stopping", "stopped", "failed", "interrupted", "completed",
+            }
+        ):
+            raise RunPlanClientError(
+                "recheck_cancelled_by_newer_state",
+                "这台设备的运行状态已经变化；旧的自动检查不会重新启动题目。",
+                agent_action="notify_only",
+            )
         if same_local_plan and current_status == "stopping":
             raise RunPlanClientError(
                 "local_run_stopping",
-                "这台设备正在安全停止这次运行；请等待停止完成后再试。",
-                retryable=True,
-                agent_action="wait_and_retry",
+                "这台设备正在安全停止这次运行；不会自动重新开始。",
+                agent_action="notify_only",
             )
         if current_status in {"starting", "running", "stopping", "orphaned"} and not same_local_plan:
             raise RunPlanClientError(
@@ -1067,6 +1517,41 @@ def cmd_run_plan(args) -> int:
                 refill_effort=first.get("effort"),
             )
 
+        def start_with_authoritative_recheck(
+            *,
+            concurrency_mode: str,
+            concurrency: int,
+            decision: str | None,
+            decision_token: str | None,
+        ) -> dict[str, Any]:
+            """Consume a server decision once, then re-read without it once.
+
+            Assignment/device state may change while a person is deciding.
+            Replaying the old token would loop forever, while treating it as
+            success could start work without current authority.  On the two
+            explicit stale-token codes, discard both decision fields and make
+            exactly one authoritative request.  Any second error propagates.
+            """
+
+            request = {
+                "plan_id": plan["plan_id"],
+                "logical_session_id": state["logical_session_id"],
+                "concurrency_mode": concurrency_mode,
+                "concurrency": concurrency,
+                "decision": decision,
+                "decision_token": decision_token,
+            }
+            try:
+                return _validate_response(client.start_run_plan(**request))
+            except ApiError as exc:
+                if (
+                    not decision_token
+                    or exc.code not in _STALE_SERVER_DECISION_CODES
+                ):
+                    raise
+                request.update({"decision": None, "decision_token": None})
+                return _validate_response(client.start_run_plan(**request))
+
         if already_local:
             current_workers = int(current_local.get("workers") or 1)
             if requested_arg not in {None, "auto"}:
@@ -1092,14 +1577,12 @@ def cmd_run_plan(args) -> int:
                 state["pending_local_capacity"] = None
                 _atomic_json(path, state)
             decision = _decision_for(state, "run", server_decision_token)
-            response = _validate_response(client.start_run_plan(
-                plan_id=plan["plan_id"],
-                logical_session_id=state["logical_session_id"],
+            response = start_with_authoritative_recheck(
                 concurrency_mode="fixed",
                 concurrency=current_workers,
                 decision=decision,
                 decision_token=server_decision_token,
-            ))
+            )
             _remember_response(path, state, response, command="run")
             envelope = response["envelope"]
             if envelope.get("decision_required") or envelope.get("status") == "no_remaining":
@@ -1166,14 +1649,22 @@ def cmd_run_plan(args) -> int:
             )
 
         if local_decision_token:
-            (
-                selected_workers,
-                bound_server_decision,
-                bound_server_token,
-            ) = _consume_local_capacity(
-                path, state, token=local_decision_token,
-                selected=requested_arg, snapshot=snapshot,
-            )
+            try:
+                (
+                    selected_workers,
+                    bound_server_decision,
+                    bound_server_token,
+                ) = _consume_local_capacity(
+                    path, state, token=local_decision_token,
+                    selected=requested_arg, snapshot=snapshot,
+                )
+            except RunPlanClientError as exc:
+                if (
+                    exc.code == "decision_invalid_or_capacity_changed"
+                    and not authoritative_recheck
+                ):
+                    return operate(authoritative_recheck=True)
+                raise
             if bound_server_token is not None:
                 server_decision_token = bound_server_token
             mode, concurrency, fleet_workers = "fixed", selected_workers, selected_workers
@@ -1185,11 +1676,14 @@ def cmd_run_plan(args) -> int:
             if mode == "auto":
                 selected_workers = int(snapshot["auto_workers"])
                 if selected_workers < 1:
-                    raise RunPlanClientError(
-                        "local_capacity_unavailable",
-                        "这台设备当前没有空余运行位置；请等待其他运行结束后重试。",
-                        retryable=True,
-                        agent_action="wait_and_retry",
+                    return _plan_recheck_response(
+                        path=path,
+                        state=state,
+                        error_code="local_capacity_unavailable",
+                        user_message=(
+                            "这台设备当前没有空余运行位置；会按建议间隔重新检查。"
+                            "无需手动更改设置。"
+                        ),
                     )
                 desired = min(supply_limit, int(snapshot["automatic_cap"]))
                 auto_downgraded = selected_workers < desired
@@ -1240,14 +1734,12 @@ def cmd_run_plan(args) -> int:
         last_capacity_response = None
         for _attempt in range(3):
             try:
-                response = _validate_response(client.start_run_plan(
-                    plan_id=plan["plan_id"],
-                    logical_session_id=state["logical_session_id"],
+                response = start_with_authoritative_recheck(
                     concurrency_mode=mode,
                     concurrency=concurrency,
                     decision=decision,
                     decision_token=server_decision_token,
-                ))
+                )
                 break
             except ApiError as exc:
                 reservation = _capacity_reservation(exc)
@@ -1259,7 +1751,16 @@ def cmd_run_plan(args) -> int:
                     int(snapshot["available"]), supply_limit,
                 )
                 if available < 1:
-                    return reservation["server"]
+                    return _plan_recheck_response(
+                        path=path,
+                        state=state,
+                        error_code="concurrency_capacity_reserved",
+                        user_message=(
+                            "当前暂时没有空余运行位置；会按建议间隔重新检查。"
+                            "无需手动更改设置。"
+                        ),
+                        server_status=reservation["server"],
+                    )
                 if not automatic_intent:
                     server_status = {
                         key: reservation["server"][key]
@@ -1288,7 +1789,16 @@ def cmd_run_plan(args) -> int:
                         bound_server_decision_token=server_decision_token,
                     )
                 if available >= selected_workers:
-                    return reservation["server"]
+                    return _plan_recheck_response(
+                        path=path,
+                        state=state,
+                        error_code="concurrency_capacity_reserved",
+                        user_message=(
+                            "可用运行位置刚刚发生变化；会按建议间隔重新检查。"
+                            "无需手动更改设置。"
+                        ),
+                        server_status=reservation["server"],
+                    )
                 selected_workers = available
                 mode, concurrency, fleet_workers = (
                     "fixed", selected_workers, selected_workers,
@@ -1299,7 +1809,16 @@ def cmd_run_plan(args) -> int:
                 # while retrying the same logical device with a lower value.
         if response is None:
             if last_capacity_response is not None:
-                return last_capacity_response
+                return _plan_recheck_response(
+                    path=path,
+                    state=state,
+                    error_code="concurrency_capacity_reserved",
+                    user_message=(
+                        "可用运行位置仍在变化；会按建议间隔重新检查。"
+                        "无需手动更改设置。"
+                    ),
+                    server_status=last_capacity_response,
+                )
             raise RunPlanClientError(
                 "protocol_invalid", "服务返回的信息不完整，请升级后重试。",
             )
@@ -1328,9 +1847,8 @@ def cmd_run_plan(args) -> int:
                 pass
             raise RunPlanClientError(
                 "local_run_stopping",
-                "这台设备正在安全停止这次运行；请等待停止完成后再试。",
-                retryable=True,
-                agent_action="wait_and_retry",
+                "这台设备正在安全停止这次运行；不会自动重新开始。",
+                agent_action="notify_only",
             )
         already_local = bool(
             isinstance(current, dict)
@@ -1371,10 +1889,67 @@ def cmd_run_plan(args) -> int:
 def cmd_progress_plan(args) -> int:
     def operate() -> dict[str, Any]:
         _run_code, path, state, client = _state_and_client(args)
+        snapshot_generation = _intent_generation(state)
         response = _validate_response(client.run_plan_progress(state["plan_id"]))
-        _remember_response(path, state, response, command="progress")
+
+        def merge_current_state() -> dict[str, Any] | None:
+            current = _read_private_json(path)
+            if (
+                not isinstance(current, dict)
+                or current.get("schema_version") != SCHEMA_VERSION
+                or current.get("credential_kind") != "run_plan_v1"
+                or current.get("plan_id") != state.get("plan_id")
+                or current.get("batch_id") != state.get("batch_id")
+                or current.get("server") != state.get("server")
+            ):
+                raise RunPlanClientError(
+                    "local_state_invalid",
+                    "本机运行信息已经变化；为避免覆盖新状态，本次进度未保存。",
+                    agent_action="notify_only",
+                )
+            if _intent_generation(current) != snapshot_generation:
+                return None
+            # Merge only into the freshly re-read state.  Never write the old
+            # pre-network snapshot back over a newer run/stop intent.
+            _remember_response(path, current, response, command="progress")
+            return current
+
+        current = _run_with_admission(merge_current_state)
+        if current is None:
+            return _progress_state_changed_response()
+        state = current
+        from . import fleet
+
+        local_item = fleet.batch_status(state["batch_id"])
+        pending_uploads = _exact_pending_uploads(state["batch_id"])
+        same_local_plan = bool(
+            isinstance(local_item, dict)
+            and local_item.get("plan_id") == state["plan_id"]
+        )
+        local_status = local_item.get("status") if same_local_plan else None
+        local_fault = local_status in {"failed", "interrupted"}
+        if pending_uploads:
+            return _local_progress_fault_response(
+                response,
+                local_item if same_local_plan else None,
+                pending_upload_count=len(pending_uploads),
+                blocked_upload_count=sum(
+                    bool(entry.get("upload_blocked"))
+                    for entry in pending_uploads
+                ),
+            )
+        if (
+            same_local_plan
+            and local_fault
+            and response["envelope"].get("agent_action") == "monitor"
+        ):
+            return _local_progress_fault_response(
+                response, local_item,
+            )
         return response
 
+    # The potentially slow server read stays outside the global admission
+    # lock.  Only the fresh-state comparison and merge take the lock.
     return _run_command(args, operate)
 
 
@@ -1385,11 +1960,31 @@ def cmd_stop_plan(args) -> int:
         decision_token = getattr(args, "decision_token", None)
         if decision_token:
             _decision_for(state, "stop", decision_token)
-        response = _validate_response(client.stop_run_plan(
-            plan_id=state["plan_id"],
-            scope=scope,
-            decision_token=decision_token,
-        ))
+        if scope == "this_device" or decision_token:
+            # A concrete stop is a newer local intent even when this device
+            # has no Fleet item yet.  Invalidate an outstanding automatic
+            # capacity recheck before contacting the server, so a lost stop
+            # response still cannot let the older action restart work.
+            _advance_intent_generation(path, state)
+        request = {
+            "plan_id": state["plan_id"],
+            "scope": scope,
+            "decision_token": decision_token,
+        }
+        try:
+            response = _validate_response(client.stop_run_plan(**request))
+        except ApiError as exc:
+            if (
+                not decision_token
+                or exc.code not in _STALE_SERVER_DECISION_CODES
+            ):
+                raise
+            # The all-device stop confirmation changed while the user was
+            # deciding.  Re-read exactly once without the stale capability;
+            # this can return a fresh confirmation/current state, but cannot
+            # authorize the destructive stop by itself.
+            request["decision_token"] = None
+            response = _validate_response(client.stop_run_plan(**request))
         _remember_response(path, state, response, command="stop")
         if response["envelope"].get("agent_action") == "stop_runner":
             from . import fleet

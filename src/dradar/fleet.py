@@ -636,6 +636,55 @@ def _stop_item_refill(item: dict, batch_id: str, reason: str) -> str | None:
     return _stop_remote_refill(batch_id, reason)
 
 
+def _is_run_plan_item(item: dict) -> bool:
+    return bool(
+        isinstance(item.get("plan_id"), str) and item.get("plan_id")
+        and isinstance(item.get("credentials_file"), str)
+        and item.get("credentials_file")
+    )
+
+
+def _request_pool_drain(home: Path, batch_id: str, reason: str) -> str | None:
+    """Stop new checkout/backfill without interrupting active model/upload work."""
+
+    try:
+        directory = _root(home) / ABORT_DIR
+        _private_dir(directory)
+        path = directory / f"{batch_id}.stop"
+        temporary = directory / f".{batch_id}.{os.getpid()}.{time.time_ns()}.tmp"
+        safe_reason = " ".join(str(reason).split())[:300] or "this device was stopped"
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(f"drain:{safe_reason}")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except OSError as exc:
+        return f"could not publish the local safe-stop marker for {batch_id}: {exc}"
+    finally:
+        if "temporary" in locals():
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return None
+
+
+def _stop_run_plan_device(item: dict, reason: str) -> str | None:
+    """Idempotently retire only this credential's device after a local fault."""
+
+    try:
+        cfg = runtime_config(item["credentials_file"])
+        plan_id = cfg.get("run_plan_id")
+        if not isinstance(plan_id, str) or not plan_id:
+            raise ValueError("missing run plan ID")
+        remote = _client(cfg)
+        remote.stop_run_plan(plan_id=plan_id, scope="this_device")
+    except (ApiError, KeyError, OSError, ValueError) as exc:
+        return f"could not confirm this device stopped after {reason}: {exc}"
+    return None
+
+
 def _response(home: Path, request_id: str, payload: dict) -> None:
     _atomic_json(
         _root(home) / RESPONSE_DIR / f"{request_id}.json",
@@ -808,14 +857,30 @@ def _handle_request(
             if process is None or process.poll() is not None:
                 continue
             item = state["batches"].get(batch_id) or {}
-            if item.get("refill"):
+            run_plan_item = _is_run_plan_item(item)
+            if run_plan_item:
+                warning = _stop_run_plan_device(
+                    item, "a machine-local stop request",
+                )
+                if warning:
+                    warnings.append(warning)
+                    item.setdefault("warnings", []).append(warning)
+                drain_warning = _request_pool_drain(
+                    home, batch_id,
+                    "this device was asked to stop; active work will finish",
+                )
+                if drain_warning:
+                    warnings.append(drain_warning)
+                    item.setdefault("warnings", []).append(drain_warning)
+            elif item.get("refill"):
                 warning = _stop_item_refill(
                     item, batch_id, "stopped by the machine-local Fleet",
                 )
                 if warning:
                     warnings.append(warning)
                     item.setdefault("warnings", []).append(warning)
-            _send_interrupt(process)
+            if not run_plan_item:
+                _send_interrupt(process)
             item["status"] = "stopping"
             item["updated_at"] = _now()
             stopped.append(batch_id)
@@ -853,10 +918,17 @@ def _settle_pool(
     batch_id: str,
     returncode: int,
 ) -> None:
-    """Persist one child exit and close a global refill campaign on failure."""
+    """Persist one child exit without widening a run-plan device failure."""
     item = state["batches"][batch_id]
     requested_stop = item.get("status") == "stopping"
-    if item.get("refill") and returncode != 0:
+    run_plan_item = _is_run_plan_item(item)
+    if run_plan_item and returncode != 0 and not requested_stop:
+        warning = _stop_run_plan_device(
+            item, f"local runner exit code {returncode}",
+        )
+        if warning:
+            item.setdefault("warnings", []).append(warning)
+    elif item.get("refill") and returncode != 0 and not run_plan_item:
         warning = _stop_item_refill(
             item, batch_id,
             (
@@ -869,9 +941,14 @@ def _settle_pool(
             item.setdefault("warnings", []).append(warning)
     item["returncode"] = returncode
     item["status"] = (
+        "interrupted" if requested_stop and run_plan_item and returncode != 0 else
         "stopped" if requested_stop else
         "completed" if returncode == 0 else "failed"
     )
+    if requested_stop and run_plan_item and returncode != 0:
+        item["detail"] = (
+            "active work stopped with a local recovery item still requiring attention"
+        )
     item["updated_at"] = _now()
     log_handle = logs.pop(batch_id, None)
     if log_handle is not None:

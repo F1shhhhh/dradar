@@ -148,6 +148,7 @@ _POOL_BACKFILL_ERROR_RETRY_SECONDS = 10.0
 _POOL_BACKFILL_MAX_ATTEMPTS = 3
 _POOL_BACKFILL_RETRY_BASE_SECONDS = 2.0
 _POOL_BACKFILL_RETRY_MAX_SECONDS = 30.0
+_SCOPED_REFILL_WAIT_SECONDS = 30.0
 # A runner-session admission conflict is different from a broken executable or
 # provider preflight: another fresh/stale session may temporarily occupy the
 # batch's observation capacity while the held assignment is still safe and
@@ -2750,6 +2751,11 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
     upload_outcome = _upload_trial(client, {
         "assignment_id": assignment["assignment_id"], "nonce": assignment["nonce"],
         "task_id": assignment["task_id"], "trial_dir": str(art.trial_dir),
+        # A private run-plan credential may replay only its exact claim batch.
+        # Persist this public scope with the durable result so a fresh plan-only
+        # machine can retry the upload without re-running the model or touching
+        # another concurrently active Honeypot.
+        "batch_id": assignment.get("batch_id"),
         "meta": meta, "outcome": outcome,
         "job_dir": str(art.job_dir) if art.job_dir else None, "keep": args.keep,
         "archive_session": getattr(args, "archive_session", False),
@@ -2781,12 +2787,31 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
     return terminal_outcome or upload_outcome
 
 
-def _retry_pending_uploads(client: ApiClient) -> list[str]:
+def _pending_uploads_for_batch(batch_id: str) -> list[dict]:
+    try:
+        exact_batch = normalize_batch_id(batch_id)
+    except ValueError:
+        return []
+
+    def belongs(entry: dict) -> bool:
+        try:
+            return normalize_batch_id(entry.get("batch_id")) == exact_batch
+        except ValueError:
+            return False
+
+    return [entry for entry in pending.load(HOME) if belongs(entry)]
+
+
+def _retry_pending_uploads(
+    client: ApiClient, *, batch_id: str | None = None,
+) -> list[str]:
     """Auto-heal at the top of every `dradar go`/`resume`: flush anything a
     previous run couldn't upload before doing anything else. Silent no-op
     when the ledger is empty — this must never surprise a volunteer who has
     nothing pending."""
     entries = pending.load(HOME)
+    if batch_id is not None:
+        entries = _pending_uploads_for_batch(batch_id)
     if not entries:
         return []
     print(f"checking {len(entries)} pending upload(s) left over from a previous run...")
@@ -4045,10 +4070,25 @@ def _run_worker_pool(args) -> int:
             _ensure_egress_runtime()
     except RunnerError as exc:
         sys.exit(str(exc))
-    if not fleet_pool:
+    if fleet_pool:
+        _retry_pending_uploads(client, batch_id=args.batch_id)
+    else:
         _retry_pending_uploads(client)
 
+    maximum = args.workers
+    target_file = _pool_target_file(args)
+    target = _read_pool_target(target_file, default=maximum, maximum=maximum)
     active, _free_pick = _prepare_batch(args, client)
+    if _scoped_fleet_refill(args):
+        pending_now = _pending_uploads_for_batch(args.batch_id)
+        ready_now = (
+            _pool_ready_work_count(client)
+            if active else 0
+        )
+        if pending_now or not active or not ready_now:
+            active = _wait_for_scoped_refill_work(
+                args, client, desired_workers=target,
+            )
     if not active:
         return 0
     boundary_path = _assignment_boundary_path(args)
@@ -4056,10 +4096,24 @@ def _run_worker_pool(args) -> int:
         boundary_path = _prepare_assignment_boundary(
             args, client, cfg["benchmark"], active,
         )
-    maximum = args.workers
-    target_file = _pool_target_file(args)
-    target = _read_pool_target(target_file, default=maximum, maximum=maximum)
-    count = min(target, len(active))
+    ready_now = (
+        _pool_ready_work_count(client)
+        if _scoped_fleet_refill(args) else len(active)
+    )
+    count = min(target, len(active), int(ready_now or 0))
+    if count == 0 and _scoped_fleet_refill(args):
+        active = _wait_for_scoped_refill_work(
+            args, client, desired_workers=target,
+        )
+        if not active:
+            return 0
+        count = min(
+            target,
+            len(active),
+            int(_pool_ready_work_count(client) or 0),
+        )
+    if count == 0:
+        return 0
     if count < target:
         print(f"only {len(active)} task(s) are currently held; starting {count} worker(s)")
     print(f"starting {count} worker(s); server-side checkout assigns each task exactly once")
@@ -4351,7 +4405,9 @@ def _run_worker_pool(args) -> int:
                     and current_time >= next_backfill_check):
                 ready = _pool_ready_work_count(
                     client, claimed_after=failure_cutoff,
-                    desired_workers=target,
+                    desired_workers=(
+                        None if _scoped_fleet_refill(args) else target
+                    ),
                     returned_assignment_ids=returned_assignment_ids,
                 )
                 next_backfill_check = (
@@ -4412,6 +4468,13 @@ def _run_worker_pool(args) -> int:
                         if not retryable_slots:
                             break
                 elif ready == 0 and not active_processes:
+                    if _scoped_fleet_refill(args):
+                        waiting_active = _wait_for_scoped_refill_work(
+                            args, client, desired_workers=target,
+                        )
+                        if waiting_active:
+                            next_backfill_check = 0.0
+                            continue
                     break
                 elif ready is None and not active_processes:
                     zero_live_inventory_failures += 1
@@ -4455,6 +4518,20 @@ def _run_worker_pool(args) -> int:
     if not boundary_safe:
         return 1
     if abort_reason is not None:
+        if _scoped_fleet_refill(args):
+            # A drain must let active model/upload work finish. If the first
+            # upload response was lost, make one immediate exact-scope replay
+            # before settling. A remaining durable entry turns the pool into
+            # an interrupted (recoverable) local state instead of a false clean
+            # stop; the Agent can later invoke run --upload-only without
+            # re-enrolling this device or starting another model.
+            _retry_pending_uploads(client, batch_id=args.batch_id)
+            if _pending_uploads_for_batch(args.batch_id):
+                print(
+                    "worker pool stopped with a completed result still waiting "
+                    "to upload; no model work will be repeated"
+                )
+                return 1
         if abort_interrupts_siblings:
             print(f"worker pool stopped cleanly by circuit breaker: {abort_reason}")
         else:
@@ -4532,7 +4609,11 @@ def _align_refill_target_with_workers(args) -> None:
 
 
 def _acquire_batch(
-    client: ApiClient, yes: bool, *, allow_new_claims: bool = True,
+    client: ApiClient,
+    yes: bool,
+    *,
+    allow_new_claims: bool = True,
+    allow_empty_exact_campaign: bool = False,
 ) -> tuple[list[dict], bool]:
     """The volunteer's held batch, plus whether this is a free-pick instance.
     Free-pick: the batch is whatever they claimed on the web. Menu mode
@@ -4542,7 +4623,14 @@ def _acquire_batch(
     try:
         data = client.get_assignment()
     except ApiError as exc:
-        _exit_for(exc)
+        if allow_empty_exact_campaign and exc.status_code == 404:
+            # A run-plan continuation may legitimately have no live assignment
+            # between its selected seed batch and the next server-budgeted
+            # claim.  Only the exact scoped caller opts into this interpretation;
+            # ordinary resume keeps treating the same 404 as a terminal lookup.
+            data = {"active": [], "free_pick": True}
+        else:
+            _exit_for(exc)
     active = data.get("active")
     if active is None:
         one = data.get("assignment")
@@ -5042,6 +5130,7 @@ def _setup_refill(args, client: ApiClient, active: list[dict], free_pick: bool) 
             return active
 
     server_campaign_id = None
+    points_tier = None
     if getattr(args, "fleet_pool", False):
         if not getattr(args, "batch_id", None):
             raise refill_plan.RefillError(
@@ -5054,6 +5143,13 @@ def _setup_refill(args, client: ApiClient, active: list[dict], free_pick: bool) 
             raise refill_plan.RefillError(
                 "Fleet refill requires exact Harness, model, and effort scope"
             )
+        runtime = _run_config(args)
+        if getattr(args, "credentials_file", None):
+            points_tier = runtime.get("run_plan_points_tier")
+            if points_tier not in refill_plan.TIERS:
+                raise refill_plan.RefillError(
+                    "private run-plan credentials lack an authorized points tier"
+                )
         try:
             configured = client.configure_refill_campaign(
                 batch_id=args.batch_id,
@@ -5087,6 +5183,7 @@ def _setup_refill(args, client: ApiClient, active: list[dict], free_pick: bool) 
         refill_effort=getattr(args, "refill_effort", None),
         refill_order=getattr(args, "refill_order", None) or "cost",
         server_campaign_id=server_campaign_id,
+        points_tier=points_tier,
         # A normal parent owns the exclusive per-machine run lock here, so no
         # live local campaign can be displaced. Manual --parallel sessions do
         # not own that proof and must keep the fail-closed conflict behavior.
@@ -5113,19 +5210,188 @@ def _setup_refill(args, client: ApiClient, active: list[dict], free_pick: bool) 
         raise refill_plan.RefillError(result.get("reason") or "refill plan stopped")
     # Return the authoritative post-refill batch, including claims accepted by
     # another local worker while this process waited for the shared plan lock.
-    refreshed, _ = _acquire_batch(client, True)
+    refreshed, _ = _acquire_batch(
+        client,
+        True,
+        allow_empty_exact_campaign=server_campaign_id is not None,
+    )
     return refreshed
+
+
+def _scoped_fleet_refill(args) -> bool:
+    return bool(
+        getattr(args, "fleet_pool", False)
+        and getattr(args, "refill", False)
+        and getattr(args, "batch_id", None)
+        and getattr(args, "credentials_file", None)
+    )
+
+
+def _wait_for_scoped_refill_work(
+    args,
+    client: ApiClient,
+    *,
+    desired_workers: int,
+) -> list[dict]:
+    """Keep one exact run-plan device healthy across an empty refill gap.
+
+    No model child exists during this phase. A normal runner heartbeat is not
+    sufficient because the exact batch may contain zero live assignments and
+    the server deliberately avoids creating an empty runner session. Instead,
+    replay the same logical device's idempotent run-plan start at the bounded
+    polling cadence. This refreshes device liveness without reserving another
+    worker or widening the plan. The shared drain marker remains authoritative
+    for a local stop request.
+    """
+
+    if not _scoped_fleet_refill(args):
+        return []
+    announced = False
+    while True:
+        reason = _pool_abort_reason()
+        if reason:
+            print(f"continuation wait stopped: {reason}")
+            return []
+        try:
+            runtime = _run_config(args)
+            plan_id = runtime.get("run_plan_id")
+            logical_session_id = runtime.get("run_plan_logical_session_id")
+            if (
+                not isinstance(plan_id, str) or not plan_id
+                or not isinstance(logical_session_id, str)
+                or not logical_session_id.startswith("drl_")
+            ):
+                raise refill_plan.RefillError(
+                    "private run-plan credentials lack a stable device session"
+                )
+            refresh = client.start_run_plan(
+                plan_id=plan_id,
+                logical_session_id=logical_session_id,
+                concurrency_mode="fixed",
+                concurrency=desired_workers,
+            )
+            envelope = refresh.get("envelope") if isinstance(refresh, dict) else None
+            if not isinstance(envelope, dict):
+                raise refill_plan.RefillError(
+                    "server returned an invalid run-plan device status"
+                )
+            if envelope.get("decision_required"):
+                raise refill_plan.RefillError(
+                    "the server unexpectedly requires a new device decision"
+                )
+            if envelope.get("agent_action") in {"stop_runner", "done"}:
+                return []
+
+            scoped_pending = _pending_uploads_for_batch(args.batch_id)
+            blocked_pending = [
+                entry for entry in scoped_pending if entry.get("upload_blocked")
+            ]
+            if blocked_pending:
+                raise SystemExit(
+                    "a completed result on this device needs upload review; "
+                    "no new model work will start until it is resolved"
+                )
+            if scoped_pending:
+                _retry_pending_uploads(client, batch_id=args.batch_id)
+                pending_after_retry = _pending_uploads_for_batch(args.batch_id)
+                blocked_after_retry = [
+                    entry for entry in pending_after_retry
+                    if entry.get("upload_blocked")
+                ]
+                if blocked_after_retry:
+                    raise SystemExit(
+                        "a completed result on this device needs upload review; "
+                        "no new model work will start until it is resolved"
+                    )
+                if pending_after_retry:
+                    if not announced:
+                        print(
+                            "a completed result is waiting to upload; this "
+                            "device will retry it before starting another task"
+                        )
+                        announced = True
+                    time.sleep(_SCOPED_REFILL_WAIT_SECONDS)
+                    continue
+            result = refill_plan.refill_once(HOME, client)
+
+            status = result.get("status")
+            active, _ = _acquire_batch(
+                client,
+                True,
+                allow_new_claims=False,
+                allow_empty_exact_campaign=True,
+            )
+            # Exact plan inventory already distinguishes waiting assignments
+            # from work owned by another device. Do not subtract the other
+            # device's live workers from this device's local target: the server
+            # has separately reserved each device's concurrency and atomic
+            # checkout remains the final partitioning boundary.
+            ready = _pool_ready_work_count(client)
+            if active and ready:
+                return active
+            if status in {"stopped", "completed"} or (
+                status == "draining" and not active
+            ):
+                return []
+            if not announced:
+                if result.get("seed_pending"):
+                    print(
+                        "selected work is still finishing across the active "
+                        "devices; this device will wait for the shared queue"
+                    )
+                else:
+                    print(
+                        "no matching task is open right now; this device will "
+                        "stay ready and continue automatically"
+                    )
+                announced = True
+            time.sleep(_SCOPED_REFILL_WAIT_SECONDS)
+        except ApiError as exc:
+            # Retry only transport failures and explicitly retryable HTTP
+            # responses. Authentication, scope, expiry and other 4xx failures
+            # are terminal so an invalid device cannot look healthy forever.
+            transient = (
+                exc.status_code is None
+                or exc.status_code in {408, 425, 429}
+                or (exc.status_code is not None and exc.status_code >= 500)
+            )
+            if not transient:
+                raise SystemExit(
+                    "the exact continuation is no longer authorized on "
+                    f"this device ({exc}); no model was started"
+                ) from exc
+            if not announced:
+                print(
+                    "the next matching task is temporarily unavailable "
+                    f"({exc}); this device will keep waiting safely"
+                )
+                announced = True
+            retry_after = getattr(exc, "retry_after", None)
+            delay = _SCOPED_REFILL_WAIT_SECONDS
+            if isinstance(retry_after, (int, float)) and retry_after > delay:
+                delay = min(float(retry_after), 600.0)
+            time.sleep(delay)
+        except refill_plan.RefillError as exc:
+            raise SystemExit(
+                "the exact continuation status was invalid; no model was "
+                f"started ({exc})"
+            ) from exc
 
 
 def _prepare_batch(args, client: ApiClient) -> tuple[list[dict], bool]:
     """Claim/configure once, shared by the serial and supervised run paths."""
     allow_new_claims = getattr(args, "allow_new_claims", True)
+    wants_refill = getattr(args, "refill", False)
     active, free_pick = _acquire_batch(
         client, args.yes, allow_new_claims=allow_new_claims,
+        allow_empty_exact_campaign=(
+            bool(getattr(args, "fleet_pool", False))
+            and bool(wants_refill)
+            and bool(getattr(args, "batch_id", None))
+        ),
     )
     wants_pick = getattr(args, "pick", None)
     auto_target = getattr(args, "auto", None)
-    wants_refill = getattr(args, "refill", False)
     wants = wants_pick or auto_target is not None
     if not allow_new_claims and wants:
         print("disk safety floor reached — not claiming new tasks; already held work "
@@ -5189,9 +5455,15 @@ def _prepare_batch(args, client: ApiClient) -> tuple[list[dict], bool]:
         saved_refill = refill_plan.load(HOME) if wants_refill else None
         if (saved_refill and saved_refill.get("status") == "active"
                 and saved_refill.get("refill_harness")):
-            print("no open cells match the refill scope right now; no other "
-                  "harness was claimed. The plan is saved; run the same "
-                  "`dradar resume` command later to continue.")
+            if _scoped_fleet_refill(args):
+                print(
+                    "no matching task is open yet; the supervised device will "
+                    "stay ready for this exact continuation"
+                )
+            else:
+                print("no open cells match the refill scope right now; no other "
+                      "harness was claimed. The plan is saved; run the same "
+                      "`dradar resume` command later to continue.")
         elif free_pick and wants:
             print("nothing claimed — try again, or pick on the radar page instead.")
         elif free_pick:

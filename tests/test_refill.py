@@ -128,6 +128,23 @@ def test_server_fault_stops_scoped_local_refill_plan(tmp_path: Path):
     batch_id = "550e8400e29b41d4a716446655440000"
 
     class FaultClient(RefillClient):
+        def refill_campaign_status(self, requested_batch_id):
+            return {
+                "campaign": {
+                    "batch_id": requested_batch_id,
+                    "status": "active",
+                    "harness": "codex",
+                    "model": "m",
+                    "effort": "e",
+                    "refill_to": 2,
+                    "max_tasks": 5,
+                    "planned": 0,
+                    "held": 0,
+                    "seed_pending": 0,
+                    "stop_reason": None,
+                },
+            }
+
         def table(self):
             return {
                 "combos": [{"model": "m", "effort": "e"}],
@@ -137,6 +154,7 @@ def test_server_fault_stops_scoped_local_refill_plan(tmp_path: Path):
 
         def claim_assignment(
             self, task_id, model, effort, *, refill_campaign_id=None,
+            tier=None,
         ):
             raise ApiError(
                 "campaign assignment failed", status_code=409,
@@ -155,6 +173,169 @@ def test_server_fault_stops_scoped_local_refill_plan(tmp_path: Path):
     assert result["claimed"] == 0
     assert "campaign assignment failed" in result["reason"]
     assert refill.load(tmp_path)["status"] == "stopped"
+
+
+@pytest.mark.parametrize("points_tier", refill.TIERS)
+def test_shared_campaign_uses_global_seed_barrier_and_authorized_points_tier(
+    tmp_path: Path, monkeypatch, points_tier: str,
+):
+    batch_id = "550e8400e29b41d4a716446655440000"
+    monkeypatch.setenv(refill.PLAN_SCOPE_ENV, batch_id)
+    seeds = [
+        {**_assignment("seed-a"), "batch_id": batch_id},
+        {**_assignment("seed-b"), "batch_id": batch_id},
+    ]
+
+    class SharedCampaignClient:
+        def __init__(self):
+            self.active = list(seeds)
+            self.campaign = {
+                "batch_id": batch_id,
+                "status": "active",
+                "harness": "codex",
+                "model": "m",
+                "effort": "e",
+                "refill_to": 2,
+                "max_tasks": 4,
+                "planned": 2,
+                "held": 2,
+                "seed_pending": 1,
+                "stop_reason": None,
+            }
+            self.claim_tiers = []
+
+        def get_assignment(self):
+            return {"active": list(self.active), "free_pick": True}
+
+        def refill_campaign_status(self, requested_batch_id):
+            assert requested_batch_id == batch_id
+            return {"campaign": dict(self.campaign)}
+
+        def table(self):
+            return {
+                "combos": [{"agent": "codex", "model": "m", "effort": "e"}],
+                "cells": {
+                    "new-a|m|e": {"st": "open", "cost": 1.0},
+                    "new-b|m|e": {"st": "open", "cost": 2.0},
+                },
+                "tier_windows_usd": WINDOWS,
+            }
+
+        def claim_assignment(
+            self, task_id, model, effort, *, refill_campaign_id=None, tier=None,
+        ):
+            assert refill_campaign_id == batch_id
+            self.claim_tiers.append(tier)
+            assignment = {
+                **_assignment(f"claimed-{task_id}"),
+                "task_id": task_id,
+                "model": model,
+                "effort": effort,
+                "batch_id": batch_id,
+            }
+            self.active.append(assignment)
+            self.campaign["planned"] += 1
+            self.campaign["held"] += 1
+            return {"assignment": assignment}
+
+    client = SharedCampaignClient()
+    homes = (tmp_path / "machine-a", tmp_path / "machine-b")
+    for home in homes:
+        refill.configure(
+            home,
+            volunteer_id="v1",
+            refill_to=2,
+            max_tasks=4,
+            quota_tier="plus",
+            max_estimated_quota_pct=None,
+            active=seeds,
+            refill_harness="codex",
+            refill_model="m",
+            refill_effort="e",
+            server_campaign_id=batch_id,
+            points_tier=points_tier,
+        )
+        saved = refill.load(home)
+        assert saved["seed_barrier"] == "server"
+        assert saved["seed_assignment_ids"] == []
+
+    # Neither machine has a complete local seed ledger. The shared server
+    # barrier alone keeps refill closed until the other device submits too.
+    waiting = refill.refill_once(homes[1], client)
+    assert waiting["seed_pending"] == 1
+    assert client.claim_tiers == []
+
+    client.active = []
+    client.campaign.update(held=0, seed_pending=0)
+    result = refill.refill_once(homes[1], client)
+
+    assert result["claimed"] == 2
+    assert client.claim_tiers == [points_tier, points_tier]
+    assert client.campaign["planned"] == 4
+
+
+def test_shared_campaign_status_mismatch_fails_closed(tmp_path: Path, monkeypatch):
+    batch_id = "550e8400e29b41d4a716446655440000"
+    monkeypatch.setenv(refill.PLAN_SCOPE_ENV, batch_id)
+    refill.configure(
+        tmp_path,
+        volunteer_id="v1",
+        refill_to=1,
+        max_tasks=2,
+        quota_tier="plus",
+        max_estimated_quota_pct=None,
+        active=[],
+        refill_harness="codex",
+        refill_model="m",
+        refill_effort="e",
+        server_campaign_id=batch_id,
+        points_tier="pro-20x",
+    )
+
+    class Client:
+        def get_assignment(self):
+            return {"active": [], "free_pick": True}
+
+        def refill_campaign_status(self, _batch_id):
+            return {"campaign": {
+                "batch_id": batch_id,
+                "status": "active",
+                "harness": "grok",
+            }}
+
+    with pytest.raises(refill.RefillError, match="invalid exact refill campaign"):
+        refill.refill_once(tmp_path, Client())
+
+
+def test_shared_campaign_accepts_server_dsh_wire_alias_for_local_scope():
+    batch_id = "550e8400e29b41d4a716446655440000"
+    plan = {
+        "server_campaign_id": batch_id,
+        "refill_harness": "dsh-minimal",
+        "refill_model": "dsh-deepseek-v4-flash",
+        "refill_effort": "high",
+    }
+
+    class Client:
+        def refill_campaign_status(self, requested_batch_id):
+            assert requested_batch_id == batch_id
+            return {"campaign": {
+                "batch_id": batch_id,
+                "status": "active",
+                "harness": "dsh",
+                "model": "dsh-deepseek-v4-flash",
+                "effort": "high",
+                "refill_to": 1,
+                "max_tasks": 2,
+                "planned": 1,
+                "held": 1,
+                "seed_pending": 0,
+                "stop_reason": None,
+            }}
+
+    snapshot = refill._authoritative_campaign_snapshot(plan, Client())
+
+    assert snapshot["harness"] == "dsh"
 
 
 def test_live_resize_updates_refill_target_without_resetting_budget(
@@ -386,6 +567,23 @@ def test_fleet_setup_registers_server_authoritative_seed_campaign(
         def configure_refill_campaign(self, **values):
             self.configured.append(values)
             return {"campaign": {"batch_id": values["batch_id"]}}
+
+        def refill_campaign_status(self, requested_batch_id):
+            return {
+                "campaign": {
+                    "batch_id": requested_batch_id,
+                    "status": "active",
+                    "harness": "kimi-code",
+                    "model": "k3",
+                    "effort": "high",
+                    "refill_to": 1,
+                    "max_tasks": 3,
+                    "planned": 1,
+                    "held": 1,
+                    "seed_pending": 1,
+                    "stop_reason": None,
+                },
+            }
 
     client = Client()
     monkeypatch.setattr(runloop, "HOME", tmp_path)

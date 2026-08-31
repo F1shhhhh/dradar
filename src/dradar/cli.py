@@ -148,7 +148,14 @@ def main(argv: list[str] | None = None) -> int:
         help="tasks to run at once, or auto (default: the website choice)",
     )
     p_run_plan.add_argument(
+        "--upload-only", action="store_true",
+        help="retry completed results for this run without starting task work",
+    )
+    p_run_plan.add_argument(
         "--decision-token", help="short-lived confirmation returned by the previous check",
+    )
+    p_run_plan.add_argument(
+        "--recheck-generation", type=int, help=argparse.SUPPRESS,
     )
     p_run_plan.add_argument(
         "--json", action="store_true", help="emit the versioned Agent response",

@@ -24,6 +24,7 @@ def _argument(
     conflicts_with: list[str] | None = None,
     idempotency: str,
     failure_codes: list[str] | None = None,
+    agent_only: bool = False,
 ) -> dict:
     return {
         "name": name,
@@ -35,6 +36,7 @@ def _argument(
         "conflicts_with": conflicts_with or [],
         "idempotency": idempotency,
         "failure_codes": failure_codes or [],
+        "agent_only": agent_only,
         "user_message": "以命令结果中的版本化 user_message 为准，不解析终端自由文本",
     }
 
@@ -45,6 +47,8 @@ COMMAND_SCHEMAS = {
         "environment_contract": {
             "wire_harness_aliases": {"dsh": "dsh-minimal"},
             "scope": "only_the_current_plan_tool",
+            "capability_set": "all_unique_assignment_capabilities",
+            "unknown_capability": "fail_closed_before_server_start",
             "recovery_commands": "agent.next_commands",
         },
         "interaction_rules": {
@@ -57,7 +61,9 @@ COMMAND_SCHEMAS = {
             "fixed_capacity_shortfall": "confirm_before_server_start",
             "capacity_changed_during_start_auto": "retry_lower_then_warn",
             "capacity_changed_during_start_fixed": "confirm_lower_or_cancel",
+            "capacity_temporarily_zero": "poll_then_replay_base_run_without_old_choices",
             "missing_current_tool": "notify_before_server_start",
+            "completed_result_upload_recovery": "exact_batch_upload_only_no_runner_start",
         },
         "arguments": [
             _argument(
@@ -88,6 +94,23 @@ COMMAND_SCHEMAS = {
                 ],
             ),
             _argument(
+                "--upload-only",
+                user_intent="只补交这台设备已经完成、但尚未成功上传的结果",
+                allowed_when="进度响应的 agent_action=recover_upload",
+                default=False,
+                state_change="只重放当前计划精确范围内的本机完成结果；不登记设备、不启动题目",
+                decision_required=False,
+                conflicts_with=[
+                    "--concurrency", "--decision-token", "--recheck-generation",
+                ],
+                idempotency="没有待补交结果时直接成功；已上传结果不会重复运行模型",
+                failure_codes=[
+                    "completed_result_upload_pending",
+                    "completed_result_review_required",
+                    "upload_only_argument_conflict",
+                ],
+            ),
+            _argument(
                 "--server",
                 user_intent="使用网页所属站点的 API 交换并执行这次领取",
                 allowed_when="HTTPS；本地开发仅允许 localhost/loopback HTTP",
@@ -110,6 +133,22 @@ COMMAND_SCHEMAS = {
                     "decision_context_missing", "decision_invalid_or_state_changed",
                     "decision_invalid_or_capacity_changed",
                 ],
+            ),
+            _argument(
+                "--recheck-generation",
+                user_intent="按 CLI 刚返回的代际安全重查当前计划",
+                allowed_when="agent_action=recheck_plan 的 next_commands 精确给出该值",
+                default=None,
+                state_change="只在代际仍为当前值时继续；显式 run/stop 会使旧代际失效",
+                decision_required=False,
+                conflicts_with=["--concurrency", "--decision-token", "--upload-only"],
+                idempotency="single_use_generation",
+                failure_codes=[
+                    "recheck_argument_conflict",
+                    "recheck_invalid_or_state_changed",
+                    "recheck_cancelled_by_newer_state",
+                ],
+                agent_only=True,
             ),
             _argument(
                 "--json",
@@ -236,6 +275,15 @@ def command_schema(command: str) -> dict:
             "environment_recovery": (
                 "环境错误可在 agent.next_commands 给出非秘密 argv 数组；"
                 "requires_user_action=true 时只能提示用户完成交互"
+            ),
+            "plan_recovery": (
+                "agent.next_commands 中 mode=replay_plan_command 时，保留当前任务已知的"
+                "--plan/--server，仅替换为给定 command 并追加 args；不得把运行码回显给用户"
+            ),
+            "recheck_plan": (
+                "agent_action=recheck_plan 时，等待 poll_after_seconds 后只执行"
+                "agent.next_commands 给出的带 intent generation 的 base command；"
+                "不得继承旧 decision-token 或 concurrency"
             ),
         },
         **body,

@@ -365,6 +365,35 @@ def test_exact_batch_is_sent_and_broader_inventory_is_filtered_locally():
     assert f"batch_id={selected}".encode() in seen[2][2]
 
 
+@pytest.mark.parametrize("tier", ("plus", "pro-5x", "pro-20x"))
+def test_scoped_refill_claim_sends_authorized_points_tier(tier):
+    seen = {}
+
+    def handler(request):
+        seen["form"] = urllib.parse.parse_qs(request.read().decode())
+        return httpx.Response(200, json={"assignment": {}})
+
+    client = ApiClient(
+        "https://api.example.com",
+        "drp_plan_scoped",
+        transport=httpx.MockTransport(handler),
+        benchmark_id="deep-swe",
+        batch_id="550e8400e29b41d4a716446655440000",
+    )
+    client.claim_assignment(
+        "p1",
+        "gpt-5.6-sol",
+        "xhigh",
+        refill_campaign_id="550e8400e29b41d4a716446655440000",
+        tier=tier,
+    )
+
+    assert seen["form"]["tier"] == [tier]
+    assert seen["form"]["refill_campaign_id"] == [
+        "550e8400e29b41d4a716446655440000",
+    ]
+
+
 def test_exact_batch_missing_from_inventory_fails_closed_as_404():
     selected = "550e8400e29b41d4a716446655440000"
 

@@ -515,3 +515,148 @@ def test_failed_refill_pool_stops_server_campaign(tmp_path, monkeypatch):
 
     assert state["batches"][BATCH_A]["status"] == "failed"
     assert stopped == [(BATCH_A, "local Fleet pool exited with code 7")]
+
+
+def test_run_plan_device_stop_drains_without_interrupting_or_stopping_campaign(
+    tmp_path, monkeypatch,
+):
+    fleet._prepare_dirs(tmp_path)
+    state = fleet._initial_state("controller-1", None)
+    state["status"] = "active"
+    state["batches"][BATCH_A] = {
+        "batch_id": BATCH_A,
+        "workers": 2,
+        "status": "running",
+        "refill": True,
+        "plan_id": "plan-a",
+        "credentials_file": str(tmp_path / "plan-a.json"),
+    }
+    signals = []
+
+    class Process:
+        def poll(self):
+            return None
+
+        def send_signal(self, value):
+            signals.append(value)
+
+    stopped_devices = []
+    monkeypatch.setattr(
+        fleet,
+        "_stop_run_plan_device",
+        lambda item, reason: stopped_devices.append((item["plan_id"], reason)),
+    )
+    monkeypatch.setattr(
+        fleet,
+        "_stop_item_refill",
+        lambda *_args: pytest.fail("a plan-local stop must not stop the shared campaign"),
+    )
+
+    fleet._handle_request(
+        tmp_path,
+        state,
+        {BATCH_A: Process()},
+        {BATCH_A: io.StringIO()},
+        {
+            "request_id": "stop-plan-a",
+            "controller_id": "controller-1",
+            "command": "stop",
+            "batch_id": BATCH_A,
+        },
+    )
+
+    assert signals == []
+    assert stopped_devices == [("plan-a", "a machine-local stop request")]
+    assert state["batches"][BATCH_A]["status"] == "stopping"
+    marker = fleet._root(tmp_path) / fleet.ABORT_DIR / f"{BATCH_A}.stop"
+    assert marker.read_text().startswith("drain:")
+    response = json.loads(
+        (fleet._root(tmp_path) / fleet.RESPONSE_DIR / "stop-plan-a.json").read_text()
+    )
+    assert response["ok"] is True
+    assert response["stopping"] == [BATCH_A]
+    assert response["warnings"] == []
+
+
+def test_failed_run_plan_pool_stops_only_its_device_not_shared_campaign(
+    tmp_path, monkeypatch,
+):
+    fleet._prepare_dirs(tmp_path)
+    state = fleet._initial_state("controller-1", None)
+    state["status"] = "active"
+    state["batches"][BATCH_A] = {
+        "batch_id": BATCH_A,
+        "workers": 2,
+        "status": "running",
+        "refill": True,
+        "plan_id": "plan-a",
+        "credentials_file": str(tmp_path / "plan-a.json"),
+    }
+    stopped_devices = []
+    monkeypatch.setattr(
+        fleet,
+        "_stop_run_plan_device",
+        lambda item, reason: stopped_devices.append((item["plan_id"], reason)),
+    )
+    monkeypatch.setattr(
+        fleet,
+        "_stop_item_refill",
+        lambda *_args: pytest.fail("one failed device must not stop the shared campaign"),
+    )
+
+    fleet._settle_pool(
+        tmp_path,
+        state,
+        {BATCH_A: object()},
+        {BATCH_A: io.StringIO()},
+        BATCH_A,
+        7,
+    )
+
+    assert state["batches"][BATCH_A]["status"] == "failed"
+    assert stopped_devices == [("plan-a", "local runner exit code 7")]
+
+
+@pytest.mark.parametrize(
+    "returncode,expected_status",
+    [(0, "stopped"), (1, "interrupted")],
+)
+def test_run_plan_stop_is_clean_only_when_active_work_settles_cleanly(
+    tmp_path, monkeypatch, returncode, expected_status,
+):
+    fleet._prepare_dirs(tmp_path)
+    state = fleet._initial_state("controller-1", None)
+    state["status"] = "active"
+    state["batches"][BATCH_A] = {
+        "batch_id": BATCH_A,
+        "workers": 1,
+        "status": "stopping",
+        "refill": True,
+        "plan_id": "plan-a",
+        "credentials_file": str(tmp_path / "plan-a.json"),
+    }
+    monkeypatch.setattr(
+        fleet,
+        "_stop_item_refill",
+        lambda *_args: pytest.fail("settling a plan stop must not stop the campaign"),
+    )
+    monkeypatch.setattr(
+        fleet,
+        "_stop_run_plan_device",
+        lambda *_args: pytest.fail("the requested stop was already sent"),
+    )
+
+    fleet._settle_pool(
+        tmp_path,
+        state,
+        {BATCH_A: object()},
+        {BATCH_A: io.StringIO()},
+        BATCH_A,
+        returncode,
+    )
+
+    assert state["batches"][BATCH_A]["status"] == expected_status
+    if returncode:
+        assert "recovery" in state["batches"][BATCH_A]["detail"]
+    else:
+        assert "detail" not in state["batches"][BATCH_A]

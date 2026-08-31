@@ -95,6 +95,8 @@ def test_private_run_plan_credentials_overlay_without_replacing_user_config(home
         "benchmark": "deep-swe",
         "batch_id": "12345678123456781234567812345678",
         "plan_id": "plan-example",
+        "logical_session_id": "drl_logical_session_example",
+        "plan": {"points_tier": "pro-20x"},
     }))
     credentials.chmod(0o600)
 
@@ -103,6 +105,7 @@ def test_private_run_plan_credentials_overlay_without_replacing_user_config(home
     assert runtime["server"] == "https://api.codexradar.com"
     assert runtime["token"] == "drp_scoped"
     assert runtime["run_plan_batch_id"] == "12345678123456781234567812345678"
+    assert runtime["run_plan_logical_session_id"] == "drl_logical_session_example"
     assert runtime["tasks_root"] == "/kept/tasks"
     assert local_config._load_config()["token"] == "drt_ordinary"
 
@@ -134,6 +137,8 @@ def test_private_run_plan_does_not_require_a_valid_long_term_login_config(home):
         "benchmark": "deep-swe",
         "batch_id": "12345678123456781234567812345678",
         "plan_id": "plan-example",
+        "logical_session_id": "drl_logical_session_example",
+        "plan": {"points_tier": "pro-5x"},
     }))
     credentials.chmod(0o600)
 

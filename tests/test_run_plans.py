@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from dradar import cli, doctor, fleet, run_plans
+from dradar import cli, doctor, fleet, pending, run_plans, runloop
 from dradar.api_client import ApiClient, ApiError
 
 
@@ -55,6 +55,7 @@ def _plan(
     max_tasks=None,
     harness="codex",
     provider=None,
+    points_tier="pro-20x",
 ):
     assignments = []
     for index in range(task_count):
@@ -74,6 +75,7 @@ def _plan(
         "batch_id": BATCH_ID,
         "benchmark_id": "deep-swe",
         "harness": harness,
+        "points_tier": points_tier,
         "assignments": assignments,
         "concurrency": {"mode": mode, "value": concurrency},
         "refill": {
@@ -119,19 +121,26 @@ def _state(tmp_path, plan):
         },
         "pending_decision": None,
         "pending_local_capacity": None,
+        "intent_generation": 0,
+        "pending_recheck_generation": None,
         "authorized_concurrency": None,
     }
     run_plans._atomic_json(path, state)
     return path, state
 
 
-def _args(*, concurrency=None, decision_token=None, scope=None):
+def _args(
+    *, concurrency=None, decision_token=None, scope=None, upload_only=False,
+    recheck_generation=None,
+):
     return SimpleNamespace(
         plan=RUN_CODE,
         server="https://api.codexradar.com",
         concurrency=concurrency,
         decision_token=decision_token,
         scope=scope,
+        upload_only=upload_only,
+        recheck_generation=recheck_generation,
         json=True,
     )
 
@@ -198,6 +207,15 @@ def _capacity_error(*, requested, available, original_mode):
         status_code=409,
         code="concurrency_capacity_reserved",
         payload=payload,
+    )
+
+
+def _stale_decision_error(code="decision_invalid_or_state_changed"):
+    return ApiError(
+        "unsafe stale decision detail",
+        status_code=409,
+        code=code,
+        payload={"detail": "unsafe stale decision detail", "code": code},
     )
 
 
@@ -269,7 +287,7 @@ def test_cli_parses_user_intent_run_progress_and_stop_commands(monkeypatch):
     assert cli.main([
         "run", "--plan", RUN_CODE,
         "--server", "https://api.claudecoderadar.com",
-        "--concurrency", "auto", "--json",
+        "--upload-only", "--json",
     ]) == 0
     assert cli.main([
         "progress", "--plan", RUN_CODE,
@@ -280,12 +298,18 @@ def test_cli_parses_user_intent_run_progress_and_stop_commands(monkeypatch):
         "--server", "https://api.claudecoderadar.com",
         "--scope", "all-devices", "--decision-token", "drd_once", "--json",
     ]) == 0
+    assert cli.main([
+        "run", "--plan", RUN_CODE,
+        "--server", "https://api.claudecoderadar.com",
+        "--recheck-generation", "7", "--json",
+    ]) == 0
 
-    assert seen[0][1].concurrency == "auto"
+    assert seen[0][1].upload_only is True
     assert seen[0][1].server == "https://api.claudecoderadar.com"
     assert seen[1][1].plan == RUN_CODE
     assert seen[2][1].scope == "all-devices"
     assert seen[2][1].decision_token == "drd_once"
+    assert seen[3][1].recheck_generation == 7
 
 
 def test_exchange_keeps_run_code_out_of_state_and_uses_private_files(
@@ -715,8 +739,349 @@ def test_capacity_reservation_with_zero_available_waits_without_phantom_pool(
     assert run_plans.cmd_run_plan(_args()) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == "waiting"
-    assert payload["agent_action"] == "wait_and_retry"
+    assert payload["agent_action"] == "recheck_plan"
+    assert payload["poll_after_seconds"] == 30
+    assert payload["agent"]["next_commands"] == [{
+        "id": "recheck_current_plan",
+        "mode": "replay_plan_command",
+        "command": "run",
+        "args": ["--recheck-generation", "2", "--json"],
+        "inherit": ["--plan", "--server"],
+        "interactive": False,
+    }]
+    assert payload["agent"]["server_status"]["agent_action"] == "wait_and_retry"
     assert len(client.start_calls) == 1
+
+
+def test_local_zero_capacity_returns_bounded_machine_recheck_before_server_start(
+    tmp_path, monkeypatch, capsys,
+):
+    plan = _plan(refill=True, max_tasks=20, task_count=4)
+    client = FakeClient(starts=[_server_response(plan)])
+    _prepare_run(
+        monkeypatch, tmp_path, plan=plan, client=client,
+        snapshot=_snapshot(available=0, auto_workers=0),
+    )
+    monkeypatch.setattr(
+        fleet, "add_batch", lambda **_kwargs: pytest.fail("zero capacity cannot start"),
+    )
+
+    assert run_plans.cmd_run_plan(_args()) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["agent_action"] == "recheck_plan"
+    assert payload["error_code"] == "local_capacity_unavailable"
+    assert payload["poll_after_seconds"] == 30
+    assert payload["agent"]["next_commands"][0]["args"] == [
+        "--recheck-generation", "2", "--json",
+    ]
+    assert client.start_calls == []
+
+
+def test_stop_without_local_pool_invalidates_old_capacity_recheck_generation(
+    tmp_path, monkeypatch, capsys,
+):
+    plan = _plan(refill=True, max_tasks=20, task_count=4)
+    stopped = _server_response(plan, _envelope(
+        status="stopped",
+        user_message="已停止这台设备。",
+        agent_action="stop_runner",
+    ))
+    client = FakeClient(starts=[_server_response(plan)], stops=[stopped])
+    path, state = _prepare_run(
+        monkeypatch, tmp_path, plan=plan, client=client,
+        snapshot=_snapshot(available=0, auto_workers=0),
+    )
+    monkeypatch.setattr(fleet, "stop_batch", lambda _batch: None)
+    monkeypatch.setattr(
+        fleet, "add_batch", lambda **_kwargs: pytest.fail("stale recheck cannot start"),
+    )
+
+    assert run_plans.cmd_run_plan(_args()) == 0
+    waiting = json.loads(capsys.readouterr().out)
+    recheck_args = waiting["agent"]["next_commands"][0]["args"]
+    generation = int(recheck_args[1])
+    assert state["intent_generation"] == generation
+    assert state["pending_recheck_generation"] == generation
+    assert client.start_calls == []
+
+    # Stop must advance the intent even though no local Fleet item exists.
+    assert run_plans.cmd_stop_plan(_args(scope="this-device")) == 0
+    json.loads(capsys.readouterr().out)
+    assert state["intent_generation"] == generation + 1
+    assert state["pending_recheck_generation"] is None
+
+    monkeypatch.setattr(
+        run_plans,
+        "_capacity_snapshot",
+        lambda *_args, **_kwargs: _snapshot(available=2, auto_workers=2),
+    )
+    assert run_plans.cmd_run_plan(
+        _args(recheck_generation=generation),
+    ) == 1
+    stale = json.loads(capsys.readouterr().out)
+
+    assert stale["error_code"] == "recheck_invalid_or_state_changed"
+    assert stale["agent_action"] == "notify_only"
+    assert "next_commands" not in stale.get("agent", {})
+    assert client.start_calls == []
+    assert state["intent_generation"] == generation + 1
+
+
+def test_valid_capacity_recheck_never_reopens_a_completed_local_run(
+    tmp_path, monkeypatch, capsys,
+):
+    plan = _plan(refill=True, max_tasks=20, task_count=4)
+    client = FakeClient(starts=[_server_response(plan)])
+    _path, state = _prepare_run(
+        monkeypatch, tmp_path, plan=plan, client=client,
+        snapshot=_snapshot(available=0, auto_workers=0),
+    )
+    monkeypatch.setattr(
+        fleet, "add_batch", lambda **_kwargs: pytest.fail("completed run cannot reopen"),
+    )
+
+    assert run_plans.cmd_run_plan(_args()) == 0
+    waiting = json.loads(capsys.readouterr().out)
+    generation = int(waiting["agent"]["next_commands"][0]["args"][1])
+    monkeypatch.setattr(fleet, "batch_status", lambda _batch: {
+        "status": "completed",
+        "plan_id": plan["plan_id"],
+        "workers": 0,
+    })
+    monkeypatch.setattr(
+        doctor,
+        "plan_environment_issue",
+        lambda _plan: pytest.fail("terminal recheck stops before preflight"),
+    )
+
+    assert run_plans.cmd_run_plan(
+        _args(recheck_generation=generation),
+    ) == 1
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["error_code"] == "recheck_cancelled_by_newer_state"
+    assert payload["agent_action"] == "notify_only"
+    assert "next_commands" not in payload.get("agent", {})
+    assert client.start_calls == []
+    assert state["pending_recheck_generation"] is None
+    assert state["intent_generation"] == generation
+
+
+def test_stop_and_old_recheck_are_linearized_by_shared_admission_lock(
+    tmp_path, monkeypatch, capsys,
+):
+    plan = _plan(refill=True, max_tasks=20, task_count=4)
+    client = FakeClient(starts=[_server_response(plan)])
+    _path, state = _prepare_run(
+        monkeypatch, tmp_path, plan=plan, client=client,
+        snapshot=_snapshot(available=0, auto_workers=0),
+    )
+    monkeypatch.setattr(fleet, "stop_batch", lambda _batch: None)
+    monkeypatch.setattr(
+        fleet, "add_batch", lambda **_kwargs: pytest.fail("old recheck cannot start"),
+    )
+
+    assert run_plans.cmd_run_plan(_args()) == 0
+    waiting = json.loads(capsys.readouterr().out)
+    generation = int(waiting["agent"]["next_commands"][0]["args"][1])
+
+    stop_entered = threading.Event()
+    allow_stop = threading.Event()
+
+    def stop_run_plan(**kwargs):
+        client.stop_calls.append(kwargs)
+        stop_entered.set()
+        assert allow_stop.wait(timeout=3)
+        return _server_response(plan, _envelope(
+            status="stopped", agent_action="stop_runner",
+        ))
+
+    client.stop_run_plan = stop_run_plan
+    outputs = []
+    monkeypatch.setattr(
+        run_plans, "_output",
+        lambda _args, response: outputs.append(response) or 0,
+    )
+    stop_args = _args(scope="this-device")
+    stop_args.json = False
+    recheck_args = _args(recheck_generation=generation)
+    recheck_args.json = False
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        stopping = pool.submit(run_plans.cmd_stop_plan, stop_args)
+        assert stop_entered.wait(timeout=3)
+        rechecking = pool.submit(run_plans.cmd_run_plan, recheck_args)
+        time.sleep(0.05)
+        assert client.start_calls == []
+        allow_stop.set()
+        assert stopping.result(timeout=5) == 0
+        assert rechecking.result(timeout=5) == 1
+
+    stale = next(
+        item for item in outputs
+        if item.get("error_code") == "recheck_invalid_or_state_changed"
+    )
+    assert stale["agent_action"] == "notify_only"
+    assert state["pending_recheck_generation"] is None
+
+
+def test_progress_cannot_restore_a_recheck_generation_after_stop(
+    tmp_path, monkeypatch, capsys,
+):
+    plan = _plan(refill=True, max_tasks=20, task_count=4)
+    client = FakeClient(starts=[_server_response(plan)])
+    _path, state = _prepare_run(
+        monkeypatch, tmp_path, plan=plan, client=client,
+        snapshot=_snapshot(available=0, auto_workers=0),
+    )
+    monkeypatch.setattr(fleet, "stop_batch", lambda _batch: None)
+    monkeypatch.setattr(
+        fleet, "add_batch", lambda **_kwargs: pytest.fail("old recheck cannot start"),
+    )
+
+    assert run_plans.cmd_run_plan(_args()) == 0
+    waiting = json.loads(capsys.readouterr().out)
+    generation = int(waiting["agent"]["next_commands"][0]["args"][1])
+
+    progress_entered = threading.Event()
+    allow_progress = threading.Event()
+
+    def progress(_plan_id):
+        client.progress_calls.append(_plan_id)
+        progress_entered.set()
+        assert allow_progress.wait(timeout=3)
+        return _server_response(plan, _envelope(
+            status="waiting", agent_action="monitor",
+        ))
+
+    client.run_plan_progress = progress
+    client.stop_results = [_server_response(plan, _envelope(
+        status="stopped", agent_action="stop_runner",
+    ))]
+    outputs = []
+    monkeypatch.setattr(
+        run_plans, "_output",
+        lambda _args, response: outputs.append(response) or 0,
+    )
+    progress_args = _args()
+    progress_args.json = False
+    stop_args = _args(scope="this-device")
+    stop_args.json = False
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        reading = pool.submit(run_plans.cmd_progress_plan, progress_args)
+        assert progress_entered.wait(timeout=3)
+        stopping = pool.submit(run_plans.cmd_stop_plan, stop_args)
+        # The slow HTTP read does not own the admission lock. Stop becomes the
+        # newer intent and completes before the old progress response arrives.
+        assert stopping.result(timeout=3) == 0
+        assert len(client.stop_calls) == 1
+        allow_progress.set()
+        assert reading.result(timeout=5) == 0
+
+    assert state["intent_generation"] == generation + 1
+    assert state["pending_recheck_generation"] is None
+    changed = next(
+        item for item in outputs
+        if item.get("error_code") == "progress_state_changed"
+    )
+    assert changed["agent_action"] == "monitor"
+    recheck_args = _args(recheck_generation=generation)
+    recheck_args.json = False
+    assert run_plans.cmd_run_plan(recheck_args) == 1
+    stale = outputs[-1]
+    assert stale["error_code"] == "recheck_invalid_or_state_changed"
+    assert state["intent_generation"] == generation + 1
+
+
+def test_slow_progress_does_not_block_another_plan_start(
+    tmp_path, monkeypatch,
+):
+    plan_a = _plan()
+    plan_b = json.loads(json.dumps(_plan()))
+    plan_b["plan_id"] = "plan_progress_other_123456"
+    plan_b["batch_id"] = "99999999999999999999999999999999"
+    path_a, state_a = _state(tmp_path, plan_a)
+    path_b, state_b = _state(tmp_path, plan_b)
+    client_a = FakeClient()
+    client_b = FakeClient(starts=[_server_response(plan_b)])
+    contexts = {
+        "progress_plan_a": (path_a, state_a, client_a),
+        "run_plan_b": (path_b, state_b, client_b),
+    }
+    progress_entered = threading.Event()
+    allow_progress = threading.Event()
+
+    def slow_progress(_plan_id):
+        progress_entered.set()
+        assert allow_progress.wait(timeout=3)
+        return _server_response(plan_a, _envelope(
+            status="running", agent_action="monitor",
+        ))
+
+    client_a.run_plan_progress = slow_progress
+    monkeypatch.setattr(run_plans, "HOME", tmp_path)
+    monkeypatch.setattr(
+        run_plans,
+        "_state_and_client",
+        lambda args: (args.plan, *contexts[args.plan]),
+    )
+    monkeypatch.setattr(doctor, "plan_environment_issue", lambda _plan: None)
+    monkeypatch.setattr(
+        run_plans,
+        "_capacity_snapshot",
+        lambda *_args, **_kwargs: _snapshot(available=2, auto_workers=2),
+    )
+    local = {}
+    monkeypatch.setattr(fleet, "batch_status", lambda batch: local.get(batch))
+    monkeypatch.setattr(
+        fleet,
+        "add_batch",
+        lambda **kwargs: local.setdefault(kwargs["batch_id"], {
+            "status": "running",
+            "plan_id": kwargs["plan_id"],
+            "workers": kwargs["workers"],
+        }) or {"batch": local[kwargs["batch_id"]]},
+    )
+    monkeypatch.setattr(run_plans, "_output", lambda _args, _response: 0)
+    progress_args = _args()
+    progress_args.plan = "progress_plan_a"
+    progress_args.json = False
+    run_args = _args()
+    run_args.plan = "run_plan_b"
+    run_args.json = False
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        reading = pool.submit(run_plans.cmd_progress_plan, progress_args)
+        assert progress_entered.wait(timeout=3)
+        starting = pool.submit(run_plans.cmd_run_plan, run_args)
+        assert starting.result(timeout=3) == 0
+        assert len(client_b.start_calls) == 1
+        allow_progress.set()
+        assert reading.result(timeout=5) == 0
+
+
+def test_corrupt_intent_generation_fails_closed_before_server_or_fleet(
+    tmp_path, monkeypatch, capsys,
+):
+    plan = _plan()
+    client = FakeClient(starts=[_server_response(plan)])
+    path, state = _prepare_run(
+        monkeypatch, tmp_path, plan=plan, client=client,
+        snapshot=_snapshot(available=2, auto_workers=2),
+    )
+    state["intent_generation"] = "rolled-back-or-corrupt"
+    run_plans._atomic_json(path, state)
+    monkeypatch.setattr(
+        fleet, "add_batch", lambda **_kwargs: pytest.fail("corrupt state cannot start"),
+    )
+
+    assert run_plans.cmd_run_plan(_args()) == 1
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["error_code"] == "local_state_invalid"
+    assert client.start_calls == []
 
 
 def test_server_stopped_start_response_never_launches_a_local_pool(
@@ -782,9 +1147,11 @@ def test_fixed_capacity_decision_precedes_server_start_and_is_one_use(
 
     assert run_plans.cmd_run_plan(
         _args(concurrency=2, decision_token=token),
-    ) == 1
+    ) == 0
     reused = json.loads(capsys.readouterr().out)
-    assert reused["error_code"] == "decision_invalid_or_capacity_changed"
+    assert reused["decision_required"] is True
+    assert reused["decision"] == "local_capacity"
+    assert reused["decision_token"] != token
     assert len(client.start_calls) == 1
 
 
@@ -871,6 +1238,97 @@ def test_other_device_confirmation_is_server_authoritative_and_starts_nothing(
     assert state["pending_decision"] == {
         "command": "run", "decision": "join_existing",
     }
+
+
+def test_stale_join_decision_is_rechecked_once_without_old_token_and_never_starts(
+    tmp_path, monkeypatch, capsys,
+):
+    plan = _plan()
+    fresh_confirm = _server_response(plan, _envelope(
+        status="decision_required",
+        interaction="confirm",
+        decision_required=True,
+        user_message="运行状态已变化，请确认是否让这台设备一起处理。",
+        agent_action="ask_user",
+        decision="join_existing",
+        decision_token="drd_fresh_join_once",
+        choices=[
+            {"id": "join_existing", "label": "一起运行"},
+            {"id": "cancel", "label": "取消"},
+        ],
+    ))
+    client = FakeClient(starts=[_stale_decision_error(), fresh_confirm])
+    _path, state = _prepare_run(
+        monkeypatch, tmp_path, plan=plan, client=client,
+        snapshot=_snapshot(available=2, auto_workers=2),
+    )
+    state["pending_decision"] = {
+        "command": "run", "decision": "join_existing",
+    }
+    monkeypatch.setattr(
+        fleet,
+        "add_batch",
+        lambda **_kwargs: pytest.fail("fresh confirmation cannot start Fleet"),
+    )
+
+    assert run_plans.cmd_run_plan(
+        _args(decision_token="drd_stale_join_once"),
+    ) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["decision_required"] is True
+    assert payload["decision_token"] == "drd_fresh_join_once"
+    assert len(client.start_calls) == 2
+    assert client.start_calls[0]["decision"] == "join_existing"
+    assert client.start_calls[0]["decision_token"] == "drd_stale_join_once"
+    assert client.start_calls[1]["decision"] is None
+    assert client.start_calls[1]["decision_token"] is None
+    assert state["pending_decision"] == {
+        "command": "run", "decision": "join_existing",
+    }
+
+
+def test_used_join_decision_rechecks_once_and_ensures_lost_success_pool(
+    tmp_path, monkeypatch, capsys,
+):
+    plan = _plan()
+    already_running = _server_response(plan, _envelope(
+        status="already_running",
+        user_message="这台设备已经在运行，正在继续监控。无需操作。",
+        agent_action="monitor",
+    ))
+    client = FakeClient(starts=[
+        _stale_decision_error("decision_already_used"),
+        already_running,
+    ])
+    _path, state = _prepare_run(
+        monkeypatch, tmp_path, plan=plan, client=client,
+        snapshot=_snapshot(available=2, auto_workers=2),
+    )
+    state["pending_decision"] = {
+        "command": "run", "decision": "join_existing",
+    }
+    added = []
+    monkeypatch.setattr(
+        fleet,
+        "add_batch",
+        lambda **kwargs: added.append(kwargs) or {
+            "batch": {"workers": kwargs["workers"]},
+        },
+    )
+
+    assert run_plans.cmd_run_plan(
+        _args(decision_token="drd_used_join_once"),
+    ) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["status"] == "already_running"
+    assert payload["agent_action"] == "monitor"
+    assert len(client.start_calls) == 2
+    assert client.start_calls[1]["decision"] is None
+    assert client.start_calls[1]["decision_token"] is None
+    assert len(added) == 1
+    assert state["pending_decision"] is None
 
 
 def test_join_confirmation_then_fixed_capacity_lowering_does_not_reask_join(
@@ -1013,14 +1471,14 @@ def test_same_device_with_live_local_pool_is_idempotently_ensured(
 
 
 @pytest.mark.parametrize(
-    "status,expected_code",
+    "status,expected_code,expected_rc",
     [
-        ("running", "local_concurrency_change_requires_restart"),
-        ("stopping", "local_run_stopping"),
+        ("running", "local_concurrency_change_requires_restart", 1),
+        ("stopping", "local_run_stopping", 1),
     ],
 )
 def test_active_local_pool_is_not_silently_resized_or_reactivated(
-    status, expected_code, tmp_path, monkeypatch, capsys,
+    status, expected_code, expected_rc, tmp_path, monkeypatch, capsys,
 ):
     plan = _plan()
     client = FakeClient(starts=[_server_response(plan)])
@@ -1039,10 +1497,56 @@ def test_active_local_pool_is_not_silently_resized_or_reactivated(
         fleet, "add_batch", lambda **_kwargs: pytest.fail("must not resize or restart"),
     )
 
-    assert run_plans.cmd_run_plan(_args(concurrency=1)) == 1
+    assert run_plans.cmd_run_plan(_args(concurrency=1)) == expected_rc
     payload = json.loads(capsys.readouterr().out)
     assert payload["error_code"] == expected_code
+    if status == "stopping":
+        assert payload["agent_action"] == "notify_only"
+        assert "next_commands" not in payload.get("agent", {})
     assert client.start_calls == []
+
+
+def test_stop_winning_after_server_start_is_not_replayed_as_a_new_run(
+    tmp_path, monkeypatch, capsys,
+):
+    plan = _plan()
+    client = FakeClient(
+        starts=[_server_response(plan)],
+        stops=[_server_response(plan, _envelope(
+            status="stopped", agent_action="stop_runner",
+        ))],
+    )
+    path, state = _state(tmp_path, plan)
+    monkeypatch.setattr(
+        run_plans,
+        "_state_and_client",
+        lambda _args: (RUN_CODE, path, state, client),
+    )
+    monkeypatch.setattr(doctor, "plan_environment_issue", lambda _plan: None)
+    monkeypatch.setattr(
+        run_plans,
+        "_capacity_snapshot",
+        lambda *_args, **_kwargs: _snapshot(available=2, auto_workers=2),
+    )
+    statuses = iter([
+        None,
+        {"status": "stopping", "plan_id": plan["plan_id"], "workers": 2},
+    ])
+    monkeypatch.setattr(fleet, "batch_status", lambda _batch: next(statuses))
+    monkeypatch.setattr(
+        fleet, "add_batch", lambda **_kwargs: pytest.fail("stopping cannot restart"),
+    )
+
+    assert run_plans.cmd_run_plan(_args()) == 1
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["error_code"] == "local_run_stopping"
+    assert payload["agent_action"] == "notify_only"
+    assert "next_commands" not in payload.get("agent", {})
+    assert len(client.start_calls) == 1
+    assert client.stop_calls == [{
+        "plan_id": plan["plan_id"], "scope": "this_device",
+    }]
 
 
 def test_orphaned_live_pool_is_counted_and_never_spawned_twice(
@@ -1143,10 +1647,19 @@ def test_concurrent_auto_plans_share_one_atomic_local_admission_budget(
         second = pool.submit(run_plans.cmd_run_plan, args("run_concurrent_plan_b"))
         results = [first.result(timeout=5), second.result(timeout=5)]
 
-    assert sorted(results) == [0, 1]
+    assert results == [0, 0]
     assert sum(item["workers"] for item in reservations.values()) == 4
     assert len(client_a.start_calls) + len(client_b.start_calls) == 1
-    assert outputs["run_concurrent_plan_b"]["error_code"] == "local_capacity_unavailable"
+    waiting = outputs["run_concurrent_plan_b"]
+    assert waiting["error_code"] == "local_capacity_unavailable"
+    assert waiting["agent_action"] == "recheck_plan"
+    assert waiting["poll_after_seconds"] == 30
+    action = waiting["agent"]["next_commands"][0]
+    assert action["args"] == ["--recheck-generation", "2", "--json"]
+    assert action["inherit"] == ["--plan", "--server"]
+    serialized = json.dumps(action)
+    assert "decision-token" not in serialized
+    assert "concurrency" not in serialized
 
 
 def test_fixed_plan_rechecks_capacity_after_concurrent_plan_reservation(
@@ -1332,6 +1845,119 @@ def test_codex_plan_does_not_probe_unrelated_grok_or_kimi_credentials(
     assert doctor.plan_environment_issue(_plan(harness="codex")) is None
 
 
+@pytest.mark.parametrize(
+    "providers",
+    [
+        ["openai", "deepseek"],
+        ["deepseek", "openai"],
+    ],
+)
+def test_codex_mixed_provider_plan_checks_every_required_capability_once(
+    providers, tmp_path, monkeypatch,
+):
+    auth = tmp_path / "auth.json"
+    auth.write_text("{}")
+    plan = _plan(harness="codex", task_count=len(providers))
+    for assignment, provider in zip(plan["assignments"], providers):
+        assignment["provider"] = provider
+    calls = {"key": 0, "catalog": 0}
+
+    monkeypatch.setattr(
+        doctor.shutil, "which",
+        lambda name: "/usr/bin/docker" if name == "docker" else None,
+    )
+    monkeypatch.setattr(doctor, "_probe", lambda _command: True)
+    monkeypatch.setattr(doctor.runner, "ensure_pier", lambda: None)
+    monkeypatch.setattr(
+        doctor.runner, "_resolve_user_tool",
+        lambda name: "/usr/bin/codex" if name == "codex" else None,
+    )
+    monkeypatch.setattr(doctor.runner, "codex_auth_path", lambda: auth)
+
+    def deepseek_key():
+        calls["key"] += 1
+        return "configured"
+
+    def catalog_error():
+        calls["catalog"] += 1
+        return None
+
+    monkeypatch.setattr(doctor, "deepseek_api_key", deepseek_key)
+    monkeypatch.setattr(doctor, "deepseek_catalog_error", catalog_error)
+    monkeypatch.setattr(
+        doctor, "grok_auth_error", lambda: pytest.fail("Grok is unrelated"),
+    )
+    monkeypatch.setattr(
+        doctor, "kimi_auth_error", lambda: pytest.fail("Kimi is unrelated"),
+    )
+
+    assert doctor.plan_environment_issue(plan) is None
+    assert calls == {"key": 1, "catalog": 1}
+
+
+@pytest.mark.parametrize(
+    "providers",
+    [
+        ["openai", "deepseek"],
+        ["deepseek", "openai"],
+    ],
+)
+def test_codex_mixed_provider_plan_requires_native_and_supplemental_auth(
+    providers, tmp_path, monkeypatch,
+):
+    missing_auth = tmp_path / "missing-auth.json"
+    plan = _plan(harness="codex", task_count=len(providers))
+    for assignment, provider in zip(plan["assignments"], providers):
+        assignment["provider"] = provider
+    monkeypatch.setattr(
+        doctor.shutil, "which",
+        lambda name: "/usr/bin/docker" if name == "docker" else None,
+    )
+    monkeypatch.setattr(doctor, "_probe", lambda _command: True)
+    monkeypatch.setattr(doctor.runner, "ensure_pier", lambda: None)
+    monkeypatch.setattr(
+        doctor.runner, "_resolve_user_tool",
+        lambda name: "/usr/bin/codex" if name == "codex" else None,
+    )
+    monkeypatch.setattr(
+        doctor.runner, "codex_auth_path", lambda: missing_auth,
+    )
+    monkeypatch.setattr(doctor, "deepseek_api_key", lambda: "configured")
+    monkeypatch.setattr(doctor, "deepseek_catalog_error", lambda: None)
+
+    native_issue = doctor.plan_environment_issue(plan)
+    assert native_issue["error_code"] == "codex_not_authenticated"
+    assert native_issue["user_message"] == "当前运行工具尚未登录；请完成登录后重试。"
+
+    missing_auth.write_text("{}")
+    monkeypatch.setattr(doctor, "deepseek_api_key", lambda: None)
+    supplemental_issue = doctor.plan_environment_issue(plan)
+    assert supplemental_issue["error_code"] == "current_tool_not_authenticated"
+    assert "provider" not in supplemental_issue["user_message"].lower()
+
+
+def test_codex_plan_with_unknown_provider_fails_closed_before_probing_auth(
+    monkeypatch,
+):
+    plan = _plan(harness="codex", provider="future-provider")
+    monkeypatch.setattr(
+        doctor.shutil, "which",
+        lambda name: "/usr/bin/docker" if name == "docker" else None,
+    )
+    monkeypatch.setattr(doctor, "_probe", lambda _command: True)
+    monkeypatch.setattr(doctor.runner, "ensure_pier", lambda: None)
+    monkeypatch.setattr(
+        doctor.runner, "_resolve_user_tool",
+        lambda _name: pytest.fail("unsupported scope must fail before auth probes"),
+    )
+
+    issue = doctor.plan_environment_issue(plan)
+
+    assert issue["error_code"] == "current_tool_unsupported"
+    assert issue["agent_action"] == "upgrade_cli"
+    assert "provider" not in issue["user_message"].lower()
+
+
 def test_server_wire_dsh_harness_maps_to_local_dsh_minimal_preflight(
     tmp_path, monkeypatch,
 ):
@@ -1498,6 +2124,452 @@ def test_progress_and_stop_reuse_saved_plan_access_without_exchange(
     assert stopped_batches == [BATCH_ID]
 
 
+def test_stale_stop_all_decision_rechecks_once_without_stopping(
+    tmp_path, monkeypatch, capsys,
+):
+    plan = _plan()
+    path, state = _state(tmp_path, plan)
+    state["pending_decision"] = {
+        "command": "stop", "decision": "stop_all_devices",
+    }
+    fresh_confirm = _server_response(plan, _envelope(
+        status="decision_required",
+        interaction="confirm",
+        decision_required=True,
+        user_message="运行状态已变化，请再次确认是否停止所有设备。",
+        agent_action="ask_user",
+        decision="stop_all_devices",
+        decision_token="drd_fresh_stop_once",
+        choices=[
+            {"id": "stop_all_devices", "label": "停止所有设备"},
+            {"id": "cancel", "label": "取消"},
+        ],
+    ))
+    client = FakeClient(stops=[_stale_decision_error(), fresh_confirm])
+    monkeypatch.setattr(
+        run_plans,
+        "_state_and_client",
+        lambda _args: (RUN_CODE, path, state, client),
+    )
+    monkeypatch.setattr(
+        fleet, "stop_batch", lambda _batch: pytest.fail("confirmation cannot stop"),
+    )
+
+    assert run_plans.cmd_stop_plan(_args(
+        scope="all-devices", decision_token="drd_stale_stop_once",
+    )) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["decision_required"] is True
+    assert payload["decision_token"] == "drd_fresh_stop_once"
+    assert len(client.stop_calls) == 2
+    assert client.stop_calls[0]["decision_token"] == "drd_stale_stop_once"
+    assert client.stop_calls[1]["decision_token"] is None
+
+
+@pytest.mark.parametrize(
+    "healthy_other_devices,expected_action",
+    [(1, "monitor"), (0, "notify_only")],
+)
+def test_progress_surfaces_local_runner_failure_without_stopping_remote_devices(
+    tmp_path, monkeypatch, capsys, healthy_other_devices, expected_action,
+):
+    plan = _plan()
+    path, state = _state(tmp_path, plan)
+    progress = _server_response(
+        plan,
+        _envelope(
+            status="running",
+            user_message="整体运行仍在进行。",
+            agent_action="monitor",
+        ),
+        state={
+            "healthy_other_devices": healthy_other_devices,
+            "other_healthy": (
+                [{"name": "另一台设备"}] if healthy_other_devices else []
+            ),
+        },
+        progress={"running": healthy_other_devices, "waiting": 1, "submitted": 1},
+    )
+    client = FakeClient(progress=[progress])
+    monkeypatch.setattr(
+        run_plans,
+        "_state_and_client",
+        lambda _args: (RUN_CODE, path, state, client),
+    )
+    monkeypatch.setattr(fleet, "batch_status", lambda _batch_id: {
+        "batch_id": BATCH_ID,
+        "plan_id": plan["plan_id"],
+        "status": "failed",
+        "returncode": 7,
+    })
+
+    assert run_plans.cmd_progress_plan(_args()) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["error_code"] == "local_runner_interrupted"
+    assert payload["agent_action"] == expected_action
+    assert payload["decision_required"] is False
+    assert payload["agent"]["local_runner"] == {
+        "status": "failed",
+        "returncode": 7,
+    }
+    assert payload["agent"]["server_status"]["agent_action"] == "monitor"
+    assert payload["agent"]["next_commands"] == [{
+        "id": "inspect_local_runner",
+        "argv": ["dradar", "fleet", "status"],
+        "interactive": False,
+    }]
+    assert "retry_action" not in payload.get("agent", {})
+    if healthy_other_devices:
+        assert "其他设备仍在继续" in payload["user_message"]
+    else:
+        assert payload["poll_after_seconds"] is None
+        assert "目前没有其他设备继续" in payload["user_message"]
+
+
+def test_upload_only_replays_exact_completed_result_before_any_runner_action(
+    tmp_path, monkeypatch, capsys,
+):
+    plan = _plan()
+    path, state = _state(tmp_path, plan)
+    other_batch = "550e8400e29b41d4a716446655440000"
+    pending.record(tmp_path, {
+        "assignment_id": "done-this-plan",
+        "batch_id": BATCH_ID,
+    })
+    pending.record(tmp_path, {
+        "assignment_id": "done-other-plan",
+        "batch_id": other_batch,
+    })
+    client = FakeClient()
+    monkeypatch.setattr(run_plans, "HOME", tmp_path)
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    monkeypatch.setattr(
+        run_plans,
+        "_state_and_client",
+        lambda _args: (RUN_CODE, path, state, client),
+    )
+    replayed = []
+
+    def retry(_client, *, batch_id=None):
+        replayed.append(batch_id)
+        pending.remove(tmp_path, "done-this-plan")
+        return ["submitted"]
+
+    monkeypatch.setattr(runloop, "_retry_pending_uploads", retry)
+    monkeypatch.setattr(
+        doctor,
+        "plan_environment_issue",
+        lambda _plan: pytest.fail("upload-only must run before model preflight"),
+    )
+    monkeypatch.setattr(
+        fleet,
+        "add_batch",
+        lambda **_kwargs: pytest.fail("upload-only must not add a local runner"),
+    )
+
+    assert run_plans.cmd_run_plan(_args(upload_only=True)) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["status"] == "completed"
+    assert payload["agent_action"] == "done"
+    assert replayed == [BATCH_ID]
+    assert client.start_calls == []
+    assert {entry["assignment_id"] for entry in pending.load(tmp_path)} == {
+        "done-other-plan",
+    }
+
+    # No exact result left is an idempotent success, not a reason to start.
+    assert run_plans.cmd_run_plan(_args(upload_only=True)) == 0
+    no_op = json.loads(capsys.readouterr().out)
+    assert no_op["status"] == "completed"
+    assert replayed == [BATCH_ID]
+    assert client.start_calls == []
+
+
+def test_upload_only_argument_conflict_fails_before_plan_exchange(
+    monkeypatch, capsys,
+):
+    monkeypatch.setattr(
+        run_plans,
+        "_state_and_client",
+        lambda _args: pytest.fail("conflicting arguments must not exchange a plan"),
+    )
+
+    assert run_plans.cmd_run_plan(
+        _args(upload_only=True, concurrency=1),
+    ) == 1
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["error_code"] == "upload_only_argument_conflict"
+    assert payload["agent_action"] == "stop"
+
+
+@pytest.mark.parametrize(
+    "blocked,expected_action,expected_code,expected_retryable",
+    [
+        (False, "recover_upload", "completed_result_upload_pending", True),
+        (True, "notify_only", "completed_result_review_required", False),
+    ],
+)
+def test_upload_only_distinguishes_retryable_and_review_required_results(
+    tmp_path, monkeypatch, capsys,
+    blocked, expected_action, expected_code, expected_retryable,
+):
+    plan = _plan()
+    path, state = _state(tmp_path, plan)
+    entry = {"assignment_id": "done", "batch_id": BATCH_ID}
+    if blocked:
+        entry["upload_blocked"] = "owner_superseded"
+    pending.record(tmp_path, entry)
+    client = FakeClient()
+    monkeypatch.setattr(run_plans, "HOME", tmp_path)
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    monkeypatch.setattr(
+        run_plans,
+        "_state_and_client",
+        lambda _args: (RUN_CODE, path, state, client),
+    )
+    monkeypatch.setattr(
+        runloop,
+        "_retry_pending_uploads",
+        lambda _client, *, batch_id=None: [
+            "upload-blocked" if blocked else "upload-failed"
+        ],
+    )
+
+    assert run_plans.cmd_run_plan(_args(upload_only=True)) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["agent_action"] == expected_action
+    assert payload["error_code"] == expected_code
+    assert payload["retryable"] is expected_retryable
+    assert client.start_calls == []
+    assert "pending" not in payload["user_message"]
+    assert "batch" not in payload["user_message"]
+    assert "Fleet" not in payload["user_message"]
+    if blocked:
+        assert payload["agent"]["requires_user_action"] is True
+    else:
+        action = payload["agent"]["next_commands"][0]
+        assert action["command"] == "run"
+        assert action["args"] == ["--upload-only", "--json"]
+        assert action["inherit"] == ["--plan", "--server"]
+
+
+def test_upload_only_json_stdout_is_one_document_with_real_retry_diagnostics(
+    tmp_path, monkeypatch, capsys,
+):
+    plan = _plan()
+    path, state = _state(tmp_path, plan)
+    pending.record(tmp_path, {
+        "assignment_id": "done",
+        "batch_id": BATCH_ID,
+        "upload_blocked": "owner_superseded",
+    })
+    client = FakeClient()
+    monkeypatch.setattr(run_plans, "HOME", tmp_path)
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    monkeypatch.setattr(
+        run_plans,
+        "_state_and_client",
+        lambda _args: (RUN_CODE, path, state, client),
+    )
+
+    # Use the real retry scanner and blocked-upload path: both normally print
+    # human diagnostics before the final Agent response.
+    assert run_plans.cmd_run_plan(_args(upload_only=True)) == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert payload["status"] == "review_required"
+    assert captured.out.count("\n") == 1
+    assert "checking " not in captured.out
+    assert RUN_CODE not in captured.err
+    assert PLAN_TOKEN not in captured.err
+    assert "drp_" not in captured.err
+
+
+def test_json_command_isolates_python_fd_and_child_process_stdout(
+    capsys,
+):
+    diagnostic = f"diagnostic-{RUN_CODE}-{PLAN_TOKEN}"
+
+    def noisy_operation():
+        print(diagnostic)
+        os.write(1, (diagnostic + "\n").encode())
+        subprocess.run(
+            [sys.executable, "-c", f"print({diagnostic!r})"],
+            check=True,
+        )
+        return {
+            "schema_version": 1,
+            **_envelope(status="running", agent_action="monitor"),
+        }
+
+    assert run_plans._run_command(_args(), noisy_operation) == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert payload["status"] == "running"
+    assert captured.out.count("\n") == 1
+    assert diagnostic not in captured.out
+    assert RUN_CODE not in captured.err
+    assert PLAN_TOKEN not in captured.err
+
+
+@pytest.mark.parametrize(
+    "server_status,server_action,local_status",
+    [
+        ("running", "monitor", "interrupted"),
+        ("completed", "done", "interrupted"),
+        ("stopped", "done", "stopped"),
+        ("incomplete", "review_failure", None),
+    ],
+)
+def test_progress_routes_exact_completed_result_to_upload_only_recovery(
+    server_status, server_action, local_status, tmp_path, monkeypatch, capsys,
+):
+    plan = _plan()
+    path, state = _state(tmp_path, plan)
+    pending.record(tmp_path, {
+        "assignment_id": "done",
+        "batch_id": BATCH_ID,
+    })
+    progress = _server_response(
+        plan,
+        _envelope(status=server_status, agent_action=server_action),
+        state={"healthy_other_devices": 0, "other_healthy": []},
+    )
+    client = FakeClient(progress=[progress])
+    monkeypatch.setattr(run_plans, "HOME", tmp_path)
+    monkeypatch.setattr(
+        run_plans,
+        "_state_and_client",
+        lambda _args: (RUN_CODE, path, state, client),
+    )
+    local_item = None if local_status is None else {
+        "batch_id": BATCH_ID,
+        "plan_id": plan["plan_id"],
+        "status": local_status,
+        "returncode": 1,
+    }
+    monkeypatch.setattr(fleet, "batch_status", lambda _batch_id: local_item)
+
+    assert run_plans.cmd_progress_plan(_args()) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["agent_action"] == "recover_upload"
+    assert payload["error_code"] == "completed_result_upload_pending"
+    assert payload["agent"]["completed_result_count"] == 1
+    assert payload["agent"]["server_status"]["agent_action"] == server_action
+    if local_status is None:
+        assert "local_runner" not in payload["agent"]
+    assert payload["agent"]["next_commands"][0]["args"] == [
+        "--upload-only", "--json",
+    ]
+    for forbidden in ("pending", "batch", "Fleet", "provider", "refill"):
+        assert forbidden not in payload["user_message"]
+
+
+def test_progress_does_not_misreport_clean_local_stop_as_upload_recovery(
+    tmp_path, monkeypatch, capsys,
+):
+    plan = _plan()
+    path, state = _state(tmp_path, plan)
+    progress = _server_response(
+        plan,
+        _envelope(status="running", agent_action="monitor"),
+        state={"other_healthy": [{"name": "另一台设备"}]},
+    )
+    client = FakeClient(progress=[progress])
+    monkeypatch.setattr(run_plans, "HOME", tmp_path)
+    monkeypatch.setattr(
+        run_plans,
+        "_state_and_client",
+        lambda _args: (RUN_CODE, path, state, client),
+    )
+    monkeypatch.setattr(fleet, "batch_status", lambda _batch_id: {
+        "batch_id": BATCH_ID,
+        "plan_id": plan["plan_id"],
+        "status": "stopped",
+        "returncode": 0,
+    })
+
+    assert run_plans.cmd_progress_plan(_args()) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["agent_action"] == "monitor"
+    assert payload["error_code"] is None
+
+
+def test_progress_keeps_terminal_server_result_without_completed_local_result(
+    tmp_path, monkeypatch, capsys,
+):
+    plan = _plan()
+    path, state = _state(tmp_path, plan)
+    progress = _server_response(
+        plan,
+        _envelope(status="completed", agent_action="done"),
+        state={"other_healthy": []},
+    )
+    client = FakeClient(progress=[progress])
+    monkeypatch.setattr(run_plans, "HOME", tmp_path)
+    monkeypatch.setattr(
+        run_plans,
+        "_state_and_client",
+        lambda _args: (RUN_CODE, path, state, client),
+    )
+    monkeypatch.setattr(fleet, "batch_status", lambda _batch_id: {
+        "batch_id": BATCH_ID,
+        "plan_id": plan["plan_id"],
+        "status": "interrupted",
+        "returncode": 1,
+    })
+
+    assert run_plans.cmd_progress_plan(_args()) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["status"] == "completed"
+    assert payload["agent_action"] == "done"
+    assert payload["error_code"] is None
+
+
+def test_progress_surfaces_completed_result_that_requires_review(
+    tmp_path, monkeypatch, capsys,
+):
+    plan = _plan()
+    path, state = _state(tmp_path, plan)
+    pending.record(tmp_path, {
+        "assignment_id": "done",
+        "batch_id": BATCH_ID,
+        "upload_blocked": "owner_superseded",
+    })
+    progress = _server_response(
+        plan,
+        _envelope(status="completed", agent_action="done"),
+        state={"other_healthy": []},
+    )
+    client = FakeClient(progress=[progress])
+    monkeypatch.setattr(run_plans, "HOME", tmp_path)
+    monkeypatch.setattr(
+        run_plans,
+        "_state_and_client",
+        lambda _args: (RUN_CODE, path, state, client),
+    )
+    monkeypatch.setattr(fleet, "batch_status", lambda _batch_id: None)
+
+    assert run_plans.cmd_progress_plan(_args()) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["status"] == "review_required"
+    assert payload["agent_action"] == "notify_only"
+    assert payload["error_code"] == "completed_result_review_required"
+    assert payload["agent"]["requires_user_action"] is True
+    assert payload["agent"]["server_status"]["agent_action"] == "done"
+
+
 def test_plan_scoped_capacity_uses_identity_and_exact_inventory_not_whoami(
     monkeypatch,
 ):
@@ -1550,8 +2622,9 @@ def test_plan_scoped_capacity_uses_identity_and_exact_inventory_not_whoami(
     assert snapshot["auto_workers"] == 4
 
 
+@pytest.mark.parametrize("structured", (True, False))
 def test_empty_exact_inventory_is_left_for_server_no_remaining_decision(
-    monkeypatch,
+    monkeypatch, structured,
 ):
     paths = []
 
@@ -1562,9 +2635,10 @@ def test_empty_exact_inventory_is_left_for_server_no_remaining_decision(
                 "nickname": "测试用户", "concurrent_limit": 4, "claim_limit": 4,
             })
         if request.url.path == "/api/v1/assignment":
-            return httpx.Response(404, json={
-                "detail": "not found", "code": "claim_batch_not_found",
-            })
+            payload = {"detail": "active batch not found"}
+            if structured:
+                payload["code"] = "claim_batch_not_found"
+            return httpx.Response(404, json=payload)
         return httpx.Response(404)
 
     client = ApiClient(
@@ -1599,6 +2673,11 @@ def test_invalid_plan_or_nested_schema_version_fails_closed():
     invalid["assignments"] = ["not-an-assignment"]
     with pytest.raises(run_plans.RunPlanClientError) as raised:
         run_plans._validate_plan(invalid)
+    assert raised.value.code == "plan_response_invalid"
+
+    invalid_tier = _plan(points_tier="operator-private-tier")
+    with pytest.raises(run_plans.RunPlanClientError) as raised:
+        run_plans._validate_plan(invalid_tier)
     assert raised.value.code == "plan_response_invalid"
 
     unsupported_plan = _plan()
