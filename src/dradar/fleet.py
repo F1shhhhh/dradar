@@ -13,7 +13,10 @@ open TCP port, stores no credentials, and uses atomic rename for every public
 state transition.  Request/response files are user-private and contain only
 batch IDs, worker targets, bounded control flags, and (for run plans) the path
 to a mode-0600 credential file. Credential values never enter Fleet state,
-requests, environment variables, or process arguments.
+requests or process arguments. A request may carry a small allowlist of
+absolute executable paths (never credential values) so a pool for a second
+Harness inherits the environment of the Agent conversation that requested it,
+instead of the unrelated conversation that happened to start the coordinator.
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -49,7 +53,7 @@ SCHEMA_VERSION = 1
 # Version the machine-local controller contract independently from the public
 # state schema.  A controller with no value here predates per-request runtime
 # selection and would keep spawning pools from its own stale installation.
-CONTROLLER_PROTOCOL_VERSION = 2
+CONTROLLER_PROTOCOL_VERSION = 3
 FLEET_DIR = "fleet"
 STATE_FILE = "state.json"
 START_LOCK_FILE = "start.lock"
@@ -67,6 +71,16 @@ _LAUNCH_ID_ENV = "DRADAR_FLEET_LAUNCH_ID"
 CONTROLLER_ID_ENV = "DRADAR_FLEET_CONTROLLER_ID"
 POOL_BATCH_ENV = "DRADAR_FLEET_BATCH_ID"
 POOL_STARTUP_FILE_ENV = "DRADAR_FLEET_STARTUP_FILE"
+
+# These values select reviewed local provider executables. They are paths, not
+# credentials. Never expand this allowlist to API keys, tokens, proxy URLs, or
+# arbitrary environment variables.
+POOL_EXECUTABLE_ENV_KEYS = (
+    "CODEBUDDY_CLI_PATH",
+    "GROK_CLI_PATH",
+    "KIMI_CLI_PATH",
+    "ZCODE_CLI_PATH",
+)
 
 START_TIMEOUT_SECONDS = 20.0
 REQUEST_TIMEOUT_SECONDS = 60.0
@@ -452,6 +466,22 @@ def _ensure_controller(home: Path = HOME) -> dict:
         raise FleetError(message)
 
 
+def _pool_executable_environment(
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Capture only existing absolute provider executable paths."""
+    source = os.environ if environ is None else environ
+    selected: dict[str, str] = {}
+    for key in POOL_EXECUTABLE_ENV_KEYS:
+        value = source.get(key)
+        if not isinstance(value, str) or not value or len(value) > 4096:
+            continue
+        path = Path(value).expanduser()
+        if path.is_absolute() and path.is_file():
+            selected[key] = str(path)
+    return selected
+
+
 def _request(command: str, payload: dict, *, home: Path = HOME) -> dict:
     state = _ensure_controller(home)
     controller_id = state.get("controller_id")
@@ -463,6 +493,7 @@ def _request(command: str, payload: dict, *, home: Path = HOME) -> dict:
         "controller_protocol_version": CONTROLLER_PROTOCOL_VERSION,
         "client_version": __version__,
         "runtime_executable": os.path.abspath(sys.executable),
+        "runtime_environment": _pool_executable_environment(),
         "request_id": request_id,
         "controller_id": controller_id,
         "command": command,
@@ -705,6 +736,7 @@ def _spawn_pool(
     refill_effort: str | None = None,
     credentials_file: str | None = None,
     runtime_executable: str | None = None,
+    runtime_environment: Mapping[str, str] | None = None,
 ) -> tuple[subprocess.Popen, object]:
     controller_id = str(state["controller_id"])
     log_path = _root(home) / LOG_DIR / f"batch-{batch_id}.log"
@@ -727,6 +759,9 @@ def _spawn_pool(
             "--refill-effort", str(refill_effort),
         ))
     env = os.environ.copy()
+    for key in POOL_EXECUTABLE_ENV_KEYS:
+        env.pop(key, None)
+    env.update(dict(runtime_environment or {}))
     env[CONTROLLER_ID_ENV] = controller_id
     env[POOL_BATCH_ENV] = batch_id
     startup_path = _pool_startup_path(home, batch_id)
@@ -973,6 +1008,20 @@ def _handle_request(
             runtime_executable = request.get("runtime_executable")
             if not isinstance(runtime_executable, str):
                 raise FleetError("invalid DRadar runtime for the new local run")
+            raw_runtime_environment = request.get("runtime_environment", {})
+            if not isinstance(raw_runtime_environment, dict):
+                raise FleetError("invalid provider runtime paths for the new local run")
+            runtime_environment: dict[str, str] = {}
+            for key, value in raw_runtime_environment.items():
+                if key not in POOL_EXECUTABLE_ENV_KEYS or not isinstance(value, str):
+                    raise FleetError("invalid provider runtime paths for the new local run")
+                path = Path(value)
+                if (
+                    len(value) > 4096 or not path.is_absolute()
+                    or not path.is_file()
+                ):
+                    raise FleetError("invalid provider runtime paths for the new local run")
+                runtime_environment[key] = value
             process, log_handle = _spawn_pool(
                 home, state, batch_id, workers,
                 refill=refill,
@@ -982,6 +1031,7 @@ def _handle_request(
                 refill_effort=refill_effort,
                 credentials_file=credentials_file,
                 runtime_executable=runtime_executable,
+                runtime_environment=runtime_environment,
             )
             try:
                 item = {
