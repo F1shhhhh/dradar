@@ -5104,6 +5104,13 @@ def _run_checkout_loop(args, client: ApiClient, tasks_root: Path,
                       "checked out (another session?) or submitted. "
                       "`dradar leases` shows exactly what is still held.")
             break
+        if telemetry:
+            # Checkout has already bound this assignment to the exact runner
+            # session.  Preserve that fence immediately, before any local
+            # provider/runtime preparation can fail.  Waiting until the model
+            # process starts leaves pre-model failures unable to call the
+            # owner-fenced stopped endpoint, stranding a phantom running cell.
+            assignment["_runner_session_id"] = telemetry.session_id
         if assignment["assignment_id"] in checkout_exclusions:
             # Compatibility with an older server that ignores the exclusion
             # field: checkout just stamped this cell started again. Undo that
