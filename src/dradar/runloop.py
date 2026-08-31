@@ -36,6 +36,7 @@ from .codebuddy_provider import (
     CODEBUDDY_RUN_CONFIG_VERSION,
     CODEBUDDY_RUNTIME_PROFILE,
 )
+from .claude_usage import claude_usage_facts
 from .identity import _client
 from .local_config import (
     DEFAULT_BENCHMARK, HOME, _load_config, runtime_config,
@@ -1196,6 +1197,29 @@ def _subscription_trial_usage(trial_dir: Path, meta: dict) -> dict | None:
     }
 
 
+def _claude_trial_usage_from_trajectory(
+    trial_dir: Path, expected_model: str,
+) -> dict | None:
+    """Rebuild Claude usage from the exact ATIF artifact being uploaded.
+
+    The Pier adapter normally writes ``provider-usage.json`` next to the
+    trajectory.  That sidecar is a convenience, not the authority: retry and
+    cleanup paths are required to remain able to derive the same fail-closed
+    ledger from the preserved trajectory itself.
+    """
+
+    if not expected_model:
+        return None
+    _patch, trajectory_path, _result = trial_artifact_paths(trial_dir)
+    if trajectory_path is None:
+        return None
+    try:
+        trajectory = json.loads(trajectory_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return claude_usage_facts(trajectory, expected_model)
+
+
 def _dsh_completed_outcome(
     trial_dir: Path, patch: Path, result: Path | None,
 ) -> dict | None:
@@ -1645,6 +1669,10 @@ def _upload_trial(
         if upload_meta.get("claude_cli_version")
         else None
     )
+    if claude_usage is None and upload_meta.get("claude_cli_version"):
+        claude_usage = _claude_trial_usage_from_trajectory(
+            trial_dir, str(upload_meta.get("claude_model") or ""),
+        )
     trajectory_bundle = None
     if not upload_meta.get("codebuddy_cli_version"):
         trajectory_bundle = build_codex_trajectory_bundle(trial_dir)
@@ -2751,6 +2779,7 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             ),
             "subscription_oauth_coordination": "shared-setup-token-v1",
             "claude_cli_version": CLAUDE_CLI_VERSION,
+            "claude_model": assignment["model"],
             "claude_native_efforts": ["low", "medium", "high", "xhigh", "max"],
             "claude_credential_mode": "private-file-process-env-v1",
             "claude_customizations": "disabled-isolated-config-v1",
