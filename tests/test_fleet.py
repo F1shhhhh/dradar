@@ -904,6 +904,78 @@ def test_failed_run_plan_pool_stops_only_its_device_not_shared_campaign(
     assert stopped_devices == [("plan-a", "local runner exit code 7")]
 
 
+def test_direct_ctrl_c_is_stopped_when_server_acknowledges_device_stop(
+    tmp_path, monkeypatch,
+):
+    fleet._prepare_dirs(tmp_path)
+    state = fleet._initial_state("controller-1", None)
+    state["status"] = "active"
+    state["batches"][BATCH_A] = {
+        "batch_id": BATCH_A,
+        "workers": 2,
+        "status": "running",
+        "refill": True,
+        "plan_id": "plan-a",
+        "credentials_file": str(tmp_path / "plan-a.json"),
+    }
+    stopped_devices = []
+    monkeypatch.setattr(
+        fleet,
+        "_stop_run_plan_device",
+        lambda item, reason: stopped_devices.append((item["plan_id"], reason)),
+    )
+
+    fleet._settle_pool(
+        tmp_path,
+        state,
+        {BATCH_A: object()},
+        {BATCH_A: io.StringIO()},
+        BATCH_A,
+        130,
+    )
+
+    item = state["batches"][BATCH_A]
+    assert item["status"] == "stopped"
+    assert item["returncode"] == 130
+    assert item["detail"] == "stopped by user; server acknowledged the device stop"
+    assert stopped_devices == [("plan-a", "local runner exit code 130")]
+
+
+def test_direct_ctrl_c_needs_attention_when_device_stop_is_not_acknowledged(
+    tmp_path, monkeypatch,
+):
+    fleet._prepare_dirs(tmp_path)
+    state = fleet._initial_state("controller-1", None)
+    state["status"] = "active"
+    state["batches"][BATCH_A] = {
+        "batch_id": BATCH_A,
+        "workers": 1,
+        "status": "running",
+        "refill": True,
+        "plan_id": "plan-a",
+        "credentials_file": str(tmp_path / "plan-a.json"),
+    }
+    monkeypatch.setattr(
+        fleet,
+        "_stop_run_plan_device",
+        lambda *_args: "server stop was not acknowledged",
+    )
+
+    fleet._settle_pool(
+        tmp_path,
+        state,
+        {BATCH_A: object()},
+        {BATCH_A: io.StringIO()},
+        BATCH_A,
+        -signal.SIGINT,
+    )
+
+    item = state["batches"][BATCH_A]
+    assert item["status"] == "interrupted"
+    assert item["warnings"] == ["server stop was not acknowledged"]
+    assert "recovery" in item["detail"]
+
+
 @pytest.mark.parametrize(
     "returncode,expected_status",
     [(0, "stopped"), (1, "interrupted")],

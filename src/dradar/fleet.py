@@ -1248,16 +1248,17 @@ def _settle_pool(
     requested_stop = item.get("status") == "stopping"
     startup_failed = item.get("startup_status") == "failed"
     run_plan_item = _is_run_plan_item(item)
+    device_stop_warning: str | None = None
     if run_plan_item and (returncode != 0 or startup_failed) and not requested_stop:
-        warning = _stop_run_plan_device(
+        device_stop_warning = _stop_run_plan_device(
             item,
             (
                 f"local startup failed ({item.get('startup_error_code')})"
                 if startup_failed else f"local runner exit code {returncode}"
             ),
         )
-        if warning:
-            item.setdefault("warnings", []).append(warning)
+        if device_stop_warning:
+            item.setdefault("warnings", []).append(device_stop_warning)
     elif item.get("refill") and returncode != 0 and not run_plan_item:
         warning = _stop_item_refill(
             item, batch_id,
@@ -1269,14 +1270,26 @@ def _settle_pool(
         )
         if warning:
             item.setdefault("warnings", []).append(warning)
+    user_interrupt = (
+        run_plan_item
+        and not startup_failed
+        and returncode in {130, -signal.SIGINT}
+    )
+    clean_user_interrupt = (
+        user_interrupt and not requested_stop and device_stop_warning is None
+    )
     item["returncode"] = returncode
     item["status"] = (
+        "stopped" if clean_user_interrupt else
         "interrupted" if requested_stop and run_plan_item and returncode != 0 else
+        "interrupted" if user_interrupt else
         "stopped" if requested_stop else
         "failed" if startup_failed else
         "completed" if returncode == 0 else "failed"
     )
-    if requested_stop and run_plan_item and returncode != 0:
+    if clean_user_interrupt:
+        item["detail"] = "stopped by user; server acknowledged the device stop"
+    elif (requested_stop and run_plan_item and returncode != 0) or user_interrupt:
         item["detail"] = (
             "active work stopped with a local recovery item still requiring attention"
         )
