@@ -1404,10 +1404,16 @@ def test_successful_mark_stopped_records_exact_returned_assignment(
         def mark_stopped(self, assignment_id, **kwargs):
             assert assignment_id == "assignment-1"
             assert kwargs["defer_seconds"] == 300
+            assert kwargs["owner_epoch"] == 4
+            assert kwargs["session_id"] == "session-1"
             return {"ok": True}
 
     assert runloop._mark_stopped_quietly(
-        Client(), {"assignment_id": "assignment-1"},
+        Client(), {
+            "assignment_id": "assignment-1",
+            "owner_epoch": 4,
+            "_runner_session_id": "session-1",
+        },
     )
     assert marker.read_text() == "waiting:assignment-1"
 

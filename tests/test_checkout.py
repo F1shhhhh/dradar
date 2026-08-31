@@ -97,6 +97,32 @@ def test_checkout_flushes_and_passes_session_id_before_server_stamps_cell(
     assert ("preparing", "a1", None) in telemetry.phases
 
 
+def test_checkout_preserves_session_fence_before_provider_preparation(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(runloop, "_check_version_pin", lambda *a, **kw: None)
+    seen = []
+
+    def fail_before_model(_client, assignment, *_args, **_kwargs):
+        seen.append(assignment.get("_runner_session_id"))
+        return "failed"
+
+    monkeypatch.setattr(runloop, "_run_and_submit", fail_before_model)
+    telemetry = StubTelemetry()
+    assignment = {**_cell("a1"), "owner_epoch": 7}
+    client = CheckoutClient(
+        {"active": [assignment], "free_pick": True},
+        [
+            {"assignment": assignment, "held": 1, "unstarted": 0},
+            {"assignment": None, "held": 1, "unstarted": 0},
+        ],
+    )
+
+    assert runloop._go_menu(
+        _args(), {}, client, tmp_path, telemetry=telemetry,
+    ) == 1
+    assert seen == ["session-test"]
+
+
 def test_checkout_surfaces_heartbeat_capacity_error_without_calling_checkout(
         monkeypatch, tmp_path):
     _patch_run(monkeypatch)

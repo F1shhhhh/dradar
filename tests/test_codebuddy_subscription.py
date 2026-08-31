@@ -181,6 +181,35 @@ def test_concurrent_sessions_keep_the_newest_oauth_refresh(tmp_path: Path) -> No
     assert not (second_work / "codebuddy-login").exists()
 
 
+def test_concurrent_sessions_in_one_worker_directory_are_isolated(
+    tmp_path: Path,
+) -> None:
+    source_home = tmp_path / "host-codebuddy"
+    source_auth = tmp_path / "host-auth"
+    dradar_home = tmp_path / "dradar-home"
+    _write_login(source_home, source_auth)
+    import_host_login(
+        source_home=source_home, source_auth=source_auth, home=dradar_home,
+    )
+    shared_work = tmp_path / "shared-work"
+    shared_work.mkdir()
+
+    with codebuddy_subscription_session(
+        shared_work, home=dradar_home,
+    ) as first_login:
+        with codebuddy_subscription_session(
+            shared_work, home=dradar_home,
+        ) as second_login:
+            assert first_login != second_login
+            assert first_login.parent != second_login.parent
+            assert first_login.parent.parent == shared_work
+            assert second_login.parent.parent == shared_work
+            assert (first_login / "auth" / "account.info").is_file()
+            assert (second_login / "auth" / "account.info").is_file()
+
+    assert not list(shared_work.glob(".codebuddy-session-*"))
+
+
 def test_login_import_rejects_symlinked_records(tmp_path: Path) -> None:
     source_home = tmp_path / "host-codebuddy"
     source_auth = tmp_path / "host-auth"

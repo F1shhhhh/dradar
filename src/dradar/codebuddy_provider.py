@@ -425,42 +425,43 @@ def codebuddy_subscription_session(
     refresh produced by another worker.
     """
 
-    with _exclusive_provider_lock(home, blocking=True):
-        canonical = managed_codebuddy_home(home)
-        storage = _validated_storage_files(canonical / "local_storage")
-        auth = _validated_auth_files(canonical / "auth")
-        run_home = directory / "codebuddy-login"
-        if run_home.exists():
-            raise ValueError(
-                f"temporary CodeBuddy login path already exists: {run_home}"
-            )
-        _replace_login_snapshot(storage, auth, run_home)
+    directory.mkdir(parents=True, exist_ok=True)
+    session_root = Path(tempfile.mkdtemp(
+        prefix=".codebuddy-session-", dir=directory,
+    ))
+    run_home = session_root / "codebuddy-login"
     body_failed = False
     try:
-        yield run_home
-    except BaseException:
-        body_failed = True
-        raise
-    finally:
+        with _exclusive_provider_lock(home, blocking=True):
+            canonical = managed_codebuddy_home(home)
+            storage = _validated_storage_files(canonical / "local_storage")
+            auth = _validated_auth_files(canonical / "auth")
+            _replace_login_snapshot(storage, auth, run_home)
         try:
-            refreshed_storage = _validated_storage_files(
-                run_home / "local_storage"
-            )
-            refreshed_auth = _validated_auth_files(run_home / "auth")
-            with _exclusive_provider_lock(home, blocking=True):
-                current_auth = _validated_auth_files(canonical / "auth")
-                if (
-                    _credential_freshness(refreshed_auth)
-                    > _credential_freshness(current_auth)
-                ):
-                    _replace_login_snapshot(
-                        refreshed_storage, refreshed_auth, canonical,
-                    )
-        except (OSError, ValueError):
-            if not body_failed:
-                raise
+            yield run_home
+        except BaseException:
+            body_failed = True
+            raise
         finally:
-            shutil.rmtree(run_home, ignore_errors=True)
+            try:
+                refreshed_storage = _validated_storage_files(
+                    run_home / "local_storage"
+                )
+                refreshed_auth = _validated_auth_files(run_home / "auth")
+                with _exclusive_provider_lock(home, blocking=True):
+                    current_auth = _validated_auth_files(canonical / "auth")
+                    if (
+                        _credential_freshness(refreshed_auth)
+                        > _credential_freshness(current_auth)
+                    ):
+                        _replace_login_snapshot(
+                            refreshed_storage, refreshed_auth, canonical,
+                        )
+            except (OSError, ValueError):
+                if not body_failed:
+                    raise
+    finally:
+        shutil.rmtree(session_root, ignore_errors=True)
 
 
 def codebuddy_runtime_image_error(docker: str | None = None) -> str | None:
