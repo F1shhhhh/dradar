@@ -2068,12 +2068,57 @@ def test_missing_current_tool_on_second_machine_has_actionable_issue(
     ]
 
 
+def test_claude_plan_accepts_ready_subscription_runtime(monkeypatch):
+    monkeypatch.setattr(
+        doctor.shutil, "which",
+        lambda name: f"/usr/bin/{name}" if name in {"docker", "claude"} else None,
+    )
+    monkeypatch.setattr(doctor, "_probe", lambda _command: True)
+    monkeypatch.setattr(doctor.runner, "ensure_pier", lambda: None)
+    monkeypatch.setattr(doctor, "claude_oauth_error", lambda: None)
+
+    assert doctor.plan_environment_issue(
+        _plan(harness="claude-code", task_count=1),
+    ) is None
+
+
+@pytest.mark.parametrize("missing", ["cli", "oauth"])
+def test_claude_plan_fails_closed_with_actionable_setup(missing, monkeypatch):
+    monkeypatch.setattr(
+        doctor.shutil, "which",
+        lambda name: (
+            "/usr/bin/docker" if name == "docker" else
+            (None if missing == "cli" else "/usr/bin/claude")
+        ),
+    )
+    monkeypatch.setattr(doctor, "_probe", lambda _command: True)
+    monkeypatch.setattr(doctor.runner, "ensure_pier", lambda: None)
+    monkeypatch.setattr(
+        doctor, "claude_oauth_error",
+        lambda: "missing OAuth" if missing == "oauth" else None,
+    )
+
+    issue = doctor.plan_environment_issue(
+        _plan(harness="claude-code", task_count=1),
+    )
+
+    assert issue["error_code"] == "current_tool_not_ready"
+    assert issue["agent_action"] == "setup_current_tool"
+    assert issue["agent"]["requires_user_action"] is True
+    assert [item["argv"] for item in issue["agent"]["next_commands"]] == [
+        ["dradar", "provider", "setup", "claude"],
+        ["dradar", "provider", "status", "claude", "--live"],
+        ["dradar", "doctor", "--agent", "claude-code"],
+    ]
+
+
 @pytest.mark.parametrize(
     "harness,provider",
     [
         ("dsh-minimal", "deepseek"),
         ("grok-build", "grok"),
         ("kimi-code", "kimi"),
+        ("claude-code", "claude"),
         ("zcode", "zcode"),
         ("antigravity", "antigravity"),
         ("codebuddy", "codebuddy"),
