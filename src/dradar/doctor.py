@@ -175,7 +175,7 @@ def _plan_agent_recovery(
             },
         ))
     if harness in {
-        "codex", "dsh-minimal", GROK_AGENT, KIMI_AGENT, ZCODE_AGENT,
+        "codex", "dsh-minimal", GROK_AGENT, KIMI_AGENT, CLAUDE_AGENT, ZCODE_AGENT,
         ANTIGRAVITY_AGENT, CODEBUDDY_AGENT,
     }:
         commands.append({
@@ -321,6 +321,16 @@ def plan_environment_issue(plan: dict) -> dict | None:
                 harness, "current_tool_not_ready",
                 "这次运行需要 Kimi；请完成 Kimi 的安装和登录后重试。",
                 "setup_current_tool", setup_provider="kimi",
+            )
+        return None
+    if harness == CLAUDE_AGENT:
+        executable = shutil.which("claude")
+        ready = bool(executable) and claude_oauth_error() is None
+        if not ready:
+            return _plan_issue(
+                harness, "current_tool_not_ready",
+                "这次运行需要 Claude Code；请完成 Claude Code 的安装和登录后重试。",
+                "setup_current_tool", setup_provider="claude",
             )
         return None
     if harness == ZCODE_AGENT:
