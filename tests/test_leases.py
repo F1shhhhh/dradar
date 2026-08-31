@@ -68,6 +68,30 @@ def test_leases_lists_waiting_and_running_with_recovery_hint(monkeypatch, capsys
     assert "--force" in out
 
 
+def test_leases_prefers_observational_account_inventory(monkeypatch, capsys):
+    class InventoryClient(FakeClient):
+        def __init__(self):
+            super().__init__([_cell("must-not-use")])
+            self.inventory_calls = 0
+
+        def get_assignment_inventory(self):
+            self.inventory_calls += 1
+            return {
+                "active": [_cell("machine-a"), _cell("machine-b")],
+                "recent_inactive": [],
+                "free_pick": True,
+            }
+
+    client = InventoryClient()
+    _wire(monkeypatch, client)
+
+    assert leases.cmd_leases(Namespace()) == 0
+    out = capsys.readouterr().out
+    assert client.inventory_calls == 1
+    assert "machine-a" in out and "machine-b" in out
+    assert "must-not-use" not in out
+
+
 def test_leases_json_preserves_exact_batch_evidence(monkeypatch, capsys):
     waiting = _cell("a1")
     waiting["batch_id"] = "550e8400e29b41d4a716446655440000"

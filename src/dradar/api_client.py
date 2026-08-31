@@ -392,6 +392,16 @@ class ApiClient:
         scoped["resumed"] = True
         return scoped
 
+    def get_assignment_inventory(self) -> dict[str, Any]:
+        """Read account inventory without asserting local provider readiness.
+
+        This is only for observational commands such as ``dradar leases``.
+        Run, checkout, and start paths continue to use ``get_assignment`` and
+        the server's exact per-assignment capability gate.
+        """
+        path = self._benchmark_path("/api/v1/assignment")
+        return self._get(self._query_path(path, "inventory", "true"))
+
     def claim_assignment(
         self,
         task_id: str,

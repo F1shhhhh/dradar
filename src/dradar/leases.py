@@ -17,7 +17,8 @@ from .local_config import _load_config
 
 
 def _inventory(client) -> tuple[list[dict], list[dict]]:
-    data = client.get_assignment()
+    get_inventory = getattr(client, "get_assignment_inventory", None)
+    data = get_inventory() if get_inventory is not None else client.get_assignment()
     active = data.get("active")
     if active is None:
         one = data.get("assignment")

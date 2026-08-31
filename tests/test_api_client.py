@@ -403,6 +403,24 @@ def test_exact_batch_is_sent_and_broader_inventory_is_filtered_locally():
     assert f"batch_id={selected}".encode() in seen[2][2]
 
 
+def test_account_inventory_read_is_explicit_and_not_batch_scoped():
+    seen = []
+
+    def handler(request):
+        seen.append(str(request.url))
+        return httpx.Response(200, json={"active": []})
+
+    client = ApiClient(
+        "https://api.example.com", "drt_test",
+        transport=httpx.MockTransport(handler),
+        benchmark_id="deep-swe",
+    )
+    assert client.get_assignment_inventory() == {"active": []}
+    assert "benchmark=deep-swe" in seen[0]
+    assert "inventory=true" in seen[0]
+    assert "batch_id=" not in seen[0]
+
+
 @pytest.mark.parametrize("tier", ("plus", "pro-5x", "pro-20x"))
 def test_scoped_refill_claim_sends_authorized_points_tier(tier):
     seen = {}
