@@ -127,6 +127,10 @@ def test_later_harness_pool_uses_only_its_requesting_agent_executable_paths(
     executable.write_text("binary")
     managed_home = tmp_path / "codebuddy-managed"
     managed_home.mkdir(mode=0o700)
+    kimi_credential = tmp_path / "kcode" / "credentials" / "kimi-code.json"
+    kimi_credential.parent.mkdir(parents=True)
+    kimi_credential.write_text("{}")
+    kimi_credential.chmod(0o600)
     captured = {}
 
     class Process:
@@ -152,6 +156,7 @@ def test_later_harness_pool_uses_only_its_requesting_agent_executable_paths(
         "runtime_environment": {
             "CODEBUDDY_CLI_PATH": str(executable),
             fleet.CODEBUDDY_MANAGED_HOME_ENV: str(managed_home),
+            fleet.KIMI_CREDENTIAL_PATH_ENV: str(kimi_credential),
         },
         "command": "add",
         "batch_id": BATCH_A,
@@ -161,6 +166,7 @@ def test_later_harness_pool_uses_only_its_requesting_agent_executable_paths(
     assert captured == {
         "CODEBUDDY_CLI_PATH": str(executable),
         fleet.CODEBUDDY_MANAGED_HOME_ENV: str(managed_home),
+        fleet.KIMI_CREDENTIAL_PATH_ENV: str(kimi_credential),
     }
     persisted = json.loads(fleet._state_path(tmp_path).read_text())
     assert "runtime_environment" not in json.dumps(persisted)
@@ -188,6 +194,31 @@ def test_provider_runtime_environment_carries_only_private_codebuddy_home(tmp_pa
     }) == {fleet.CODEBUDDY_MANAGED_HOME_ENV: str(private)}
     assert fleet._pool_executable_environment({
         fleet.CODEBUDDY_MANAGED_HOME_ENV: str(public),
+    }) == {}
+
+
+def test_provider_runtime_environment_carries_only_private_kimi_credential(
+    tmp_path,
+):
+    private = tmp_path / "kcode" / "credentials" / "kimi-code.json"
+    private.parent.mkdir(parents=True)
+    private.write_text("{}")
+    private.chmod(0o600)
+
+    assert fleet._pool_executable_environment({
+        fleet.KIMI_CREDENTIAL_PATH_ENV: str(private),
+    }) == {fleet.KIMI_CREDENTIAL_PATH_ENV: str(private)}
+
+    private.chmod(0o644)
+    assert fleet._pool_executable_environment({
+        fleet.KIMI_CREDENTIAL_PATH_ENV: str(private),
+    }) == {}
+
+    private.chmod(0o600)
+    link = tmp_path / "credential-link.json"
+    link.symlink_to(private)
+    assert fleet._pool_executable_environment({
+        fleet.KIMI_CREDENTIAL_PATH_ENV: str(link),
     }) == {}
 
 

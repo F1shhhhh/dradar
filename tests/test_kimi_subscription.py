@@ -27,13 +27,16 @@ from dradar.providers import (
     KIMI_CAPABILITY,
     KIMI_LEGACY_CAPABILITY,
     KIMI_CLI_VERSION,
+    KIMI_CREDENTIAL_PATH_ENV,
     KIMI_MODEL,
     KIMI_PROVIDER,
     advertised_capabilities,
     kimi_auth_error,
     kimi_auth_path,
+    kimi_home,
     kimi_live_error,
     kimi_subscription_session,
+    managed_kimi_cli_path,
     parse_kimi_cli_version,
 )
 from dradar.runner import RunnerError
@@ -82,6 +85,37 @@ def test_official_kimi_version_banner_is_parsed() -> None:
 def test_kimi_oauth_validator_rejects_api_key_shaped_auth(tmp_path: Path) -> None:
     path = _write_auth(tmp_path / "auth.json", {"api_key": "secret"})
     assert "not a refreshable subscription OAuth" in (kimi_auth_error(path) or "")
+
+
+def test_kimi_accepts_account_bureau_credential_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account_home = tmp_path / "account-bureau" / "kcode"
+    credential = _write_auth(
+        account_home / "credentials" / "kimi-code.json"
+    )
+    dradar_home = tmp_path / "campaign-home"
+    monkeypatch.setenv(KIMI_CREDENTIAL_PATH_ENV, str(credential))
+    monkeypatch.setenv("DRADAR_HOME", str(dradar_home))
+
+    assert kimi_auth_path() == credential
+    assert kimi_home() == account_home
+    assert kimi_auth_error() is None
+    assert managed_kimi_cli_path().is_relative_to(
+        dradar_home / "providers" / "kimi"
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["relative/credentials/kimi-code.json", "/private/kimi-auth.json"],
+)
+def test_kimi_rejects_malformed_account_bureau_binding(
+    value: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(KIMI_CREDENTIAL_PATH_ENV, value)
+
+    assert KIMI_CREDENTIAL_PATH_ENV in (kimi_auth_error() or "")
 
 
 def test_kimi_oauth_validator_rejects_symlink_and_broad_mode(
