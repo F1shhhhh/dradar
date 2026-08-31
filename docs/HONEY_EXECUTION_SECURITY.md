@@ -6,7 +6,8 @@ DRadar 用 Honey 驱动不同模型完成同一类 benchmark。模型能力评�
 工具审批、文件权限和子代理开关造成的人为降分。因此，Honey 的统一原则是：
 
 > 模型及其子代理在一次性任务容器内获得完整、无人值守的编码权限；可信边界位于
-> Docker、挂载、网络出口和凭证生命周期，而不位于模型可见的工具审批层。
+> Docker、挂载、网络出口和凭证生命周期，而不位于模型可见的编码工具审批层。基准测试
+> 禁止的外部 Web 搜索/抓取能力必须在 Harness 配置层显式移除，并以执行前策略作后备拦截。
 
 本契约适用于当前七个 Honey：Codex、Claude Code、DeepSeek Harness（DSH）、ZCode、
 Kimi Code、Google Antigravity 和 Grok。以后接入任何新 Honey，设计评审、实现、测试和金丝雀都必须逐项
@@ -37,7 +38,8 @@ Kimi Code、Google Antigravity 和 Grok。以后接入任何新 Honey，设计�
 2. 只挂载完成题目所需的 `/app`、受控日志/产物目录及该 provider 的最小凭证状态；禁止
    把宿主 HOME 或通用密钥目录整体挂入。
 3. 网络默认拒绝，只允许模型 provider、认证刷新及固定运行时下载所需的精确域名。
-   Honey 内的 Web、URL、MCP 或 shell 即使获得批准，也不能突破这一出口策略。
+   该边界能阻断容器直接访问任意互联网目标，但不能替代对 provider 托管 Web 工具的显式
+   禁用；Web 搜索/抓取必须同时从 Harness 工具面移除。
 4. 任务结束、取消、超时和异常退出都必须销毁容器并清理临时凭证、HOME、运行时配置和
    子代理状态；checkpoint 只保存明确白名单中的会话/工作区状态。
 5. 补丁、trajectory、stderr、provider usage 和 checkpoint 在离开容器前必须执行凭证
@@ -73,7 +75,7 @@ Codex 的做法是基准：宿主先校验私有凭证，按题把它放入容�
 | Claude Code | `--permission-mode=bypassPermissions` + `--safe-mode` 等价环境开关 | 保留内置 Agent/后台任务；safe mode 只禁用外来定制 | `claude setup-token` 的订阅 OAuth 存于宿主 `0600` 私有文件，仅注入一次性 provider 进程，退出清理 | `api.anthropic.com` |
 | DSH | `DSH_PERMISSION_MODE=danger-full-access`（审批 `never`） | 启用原生 spawn/fork/control/report/workflow | key 转成私有 credentials 文档，读入后 unlink | `api.deepseek.com` |
 | ZCode | Protocol `mode=yolo`，不传工具 allow/deny 列表 | 保留原生 `Agent` 与任务工具 | key 在 session 建立后、首个模型工具前 unlink | `open.bigmodel.cn`、`zcode.z.ai` |
-| Kimi Code | `--auto` | 保留 Agent/AgentSwarm，不设适配器并发上限 | 独立 KIMI_CODE_HOME，OAuth 私有回写，退出清理 | `auth.kimi.com`、`api.kimi.com` |
+| Kimi Code | `--auto`，仅禁用 `WebSearch`/`FetchURL` | 保留 Agent/AgentSwarm，不设适配器并发上限 | 独立 KIMI_CODE_HOME，OAuth 私有回写，退出清理 | `auth.kimi.com`、`api.kimi.com` |
 | Antigravity | `--dangerously-skip-permissions`，不启用内层 terminal sandbox | 权限模式传递到原生子代理 | 独立 `.gemini` OAuth 树，私有权限与运行后复核 | Google OAuth/Antigravity 精确域名 |
 | Grok | `--auto-approve`，保留编码工具 | 当前官方 CLI 不提供子代理工具，不做适配器伪造 | 独立 `.grok` OAuth 树，使用官方共享锁，退出复核 | xAI/Grok OAuth 与模型精确域名 |
 
@@ -97,7 +99,8 @@ Codex 的做法是基准：宿主先校验私有凭证，按题把它放入容�
 - [ ] 在模型付费请求前验证 `/app` 可读写、shell/测试可执行、临时文件可创建和删除。
 - [ ] CLI 支持子代理时，金丝雀至少完成一次子代理创建、工作区读取和结果回传；子代理可用
       工具不得窄于同类根代理工具。
-- [ ] 自动化测试证明适配器没有私有 tool allowlist/denylist 隐藏编码或协作工具。
+- [ ] 自动化测试证明适配器没有隐藏编码或协作工具；若 Harness 自带 Web 搜索/抓取，必须
+      使用精确 denylist 禁用并验证执行前策略会失败关闭。
 - [ ] Docker 测试证明无 Docker socket、无宿主 HOME/凭证目录、无跨任务工作区挂载。
 - [ ] egress 测试证明 provider 域名可达而任意互联网目标不可达。
 - [ ] 凭证不出现在 argv、模型环境、日志、patch、trajectory、checkpoint 和上传请求中；

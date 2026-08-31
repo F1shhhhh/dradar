@@ -178,8 +178,8 @@ KIMI_CLI_VERSION = "0.39.1"
 KIMI_SUPPORTED_EFFORTS = frozenset({"low", "high", "max"})
 KIMI_CAPABILITY = "kimi-code-k3-subscription-oauth-node-concurrent-v3"
 KIMI_LEGACY_CAPABILITY = "kimi-code-k3-subscription-oauth-node-concurrent-v2"
-KIMI_RUN_CONFIG_VERSION = "kimi-code-k3-subscription-oauth-full-container-v4"
-KIMI_RUNTIME_PROFILE = "pier-kimi-code-k3-shared-oauth-full-container-v4"
+KIMI_RUN_CONFIG_VERSION = "kimi-code-k3-subscription-oauth-web-disabled-v5"
+KIMI_RUNTIME_PROFILE = "pier-kimi-code-k3-shared-oauth-web-disabled-v5"
 KIMI_BINARY_BASE_URL = "https://code.kimi.com/kimi-code/binaries/0.39.1"
 KIMI_BINARY_SHA256 = {
     "linux-x64": "585547e082f2f3a32dd80825626a1c8dd4e82f55b4d6a8aa14e6397c00758eca",
