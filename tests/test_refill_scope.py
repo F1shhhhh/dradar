@@ -8,10 +8,16 @@ import pytest
 
 from dradar import cli, refill, runloop
 from dradar.api_client import ApiError
+from dradar.codebuddy_provider import (
+    CODEBUDDY_AGENT,
+    CODEBUDDY_MODEL,
+    CODEBUDDY_PROVIDER,
+)
 from dradar.providers import (
     GROK_AGENT,
     KIMI_AGENT,
     KIMI_PROVIDER,
+    REFILL_HARNESS_PROVIDERS,
     ZCODE_AGENT,
     ZCODE_PROVIDER,
     normalize_refill_harness,
@@ -49,6 +55,10 @@ def _table(*cells):
         {"agent": GROK_AGENT, "model": "grok-4.6", "effort": effort,
          "billing_mode": "subscription", "manual_only": True}
         for effort in ("low", "medium", "high", "xhigh")
+    ] + [
+        {"agent": CODEBUDDY_AGENT, "model": CODEBUDDY_MODEL, "effort": effort,
+         "billing_mode": "subscription", "manual_only": True}
+        for effort in ("low", "high", "max")
     ] + [{"model": "gpt-5.6-sol", "effort": "low"}]
     rows = {}
     for task_id, agent, model, effort, state in cells:
@@ -245,6 +255,7 @@ def test_server_cannot_silently_return_a_cross_harness_assignment(tmp_path: Path
     ("alias", "agent"),
     [("kimi", KIMI_AGENT), ("KIMI_CODE", KIMI_AGENT),
      ("grok", GROK_AGENT), ("grok-build", GROK_AGENT),
+     ("codebuddy", CODEBUDDY_AGENT), ("HY4", CODEBUDDY_AGENT),
      ("zcode", ZCODE_AGENT)],
 )
 def test_harness_aliases_resolve_to_provider_wire_values(alias, agent):
@@ -255,7 +266,9 @@ def test_harness_aliases_resolve_to_provider_wire_values(alias, agent):
     ("harness", "model", "effort", "message"),
     [("kimi-code", "glm-5.3", "low", "supports model"),
      ("zcode", "glm-5.3", "xhigh", "supports effort"),
-     ("grok", "grok-4.6", "max", "supports effort")],
+     ("grok", "grok-4.6", "max", "supports effort"),
+     ("codebuddy", "hy4", "low", "supports model"),
+     ("codebuddy", CODEBUDDY_MODEL, "medium", "supports effort")],
 )
 def test_subscription_scope_rejects_model_or_effort_mismatch(
     harness, model, effort, message,
@@ -276,6 +289,27 @@ def test_zcode_and_grok_scoped_refill(harness, model, effort, agent, tmp_path):
 
     assert refill.refill_once(tmp_path, client)["claimed"] == 1
     assert client.claimed == [("wanted", model, effort)]
+
+
+@pytest.mark.parametrize("effort", ["low", "high", "max"])
+def test_codebuddy_scoped_refill_claims_only_codebuddy(
+    effort: str, tmp_path: Path,
+):
+    client = ScopedClient(_table(
+        ("wanted", CODEBUDDY_AGENT, CODEBUDDY_MODEL, effort, "open"),
+        ("other", KIMI_AGENT, "k3", effort, "open"),
+    ))
+    _configure(
+        tmp_path, harness="codebuddy", model=CODEBUDDY_MODEL,
+        effort=effort, refill_to=1,
+    )
+
+    result = refill.refill_once(tmp_path, client)
+
+    assert result["claimed"] == 1
+    assert client.claimed == [("wanted", CODEBUDDY_MODEL, effort)]
+    assert refill.load(tmp_path)["refill_harness"] == CODEBUDDY_AGENT
+    assert REFILL_HARNESS_PROVIDERS[CODEBUDDY_AGENT] == CODEBUDDY_PROVIDER
 
 
 def test_parallel_scoped_workers_share_one_atomic_target(tmp_path: Path):
@@ -596,6 +630,7 @@ def test_resume_help_documents_stable_scope_flags(capsys):
     for flag in ("--refill-harness", "--refill-model", "--refill-effort",
                  "--refill-order", "--max-tasks"):
         assert flag in output
+    assert "codebuddy" in output
 
 
 def test_worker_command_forwards_complete_scoped_plan():
@@ -636,6 +671,15 @@ def test_subscription_scoped_refill_requires_explicit_total_task_limit():
     with pytest.raises(SystemExit, match="explicit --max-tasks"):
         runloop.cmd_go(_run_args(
             max_tasks=None, max_estimated_quota_pct=10,
+        ))
+
+
+def test_codebuddy_scoped_refill_requires_explicit_total_task_limit():
+    with pytest.raises(SystemExit, match="explicit --max-tasks"):
+        runloop.cmd_go(_run_args(
+            refill_harness="codebuddy", refill_model=CODEBUDDY_MODEL,
+            refill_effort="low", max_tasks=None,
+            max_estimated_quota_pct=10,
         ))
 
 
