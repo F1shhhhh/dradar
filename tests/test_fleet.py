@@ -679,6 +679,115 @@ def test_plan_token_stays_in_private_file_not_fleet_argv_env_or_state(
     assert str(credentials) in persisted
 
 
+def test_retry_reuses_saved_run_plan_identity_when_raw_cli_omits_it(
+    tmp_path, monkeypatch,
+):
+    fleet._prepare_dirs(tmp_path)
+    credentials = tmp_path / "run-plans" / "plan-retry.json"
+    credentials.parent.mkdir(parents=True)
+    credentials.write_text("{}")
+    credentials.chmod(0o600)
+    state = fleet._initial_state("controller-1", None)
+    state["status"] = "active"
+    state["batches"][BATCH_A] = {
+        "batch_id": BATCH_A,
+        "status": "failed",
+        "workers": 2,
+        "plan_id": "plan-retry",
+        "credentials_file": str(credentials),
+    }
+    captured = {}
+
+    class Process:
+        pid = 654
+
+        def poll(self):
+            return None
+
+    def resolve(_workers, _batch_id, _state, credentials_file):
+        captured["resolved_credentials"] = credentials_file
+        return 2, [], {"account_limit": 4}
+
+    def spawn(*_args, **kwargs):
+        captured["spawned_credentials"] = kwargs["credentials_file"]
+        return Process(), io.StringIO()
+
+    monkeypatch.setattr(fleet, "_resolve_workers", resolve)
+    monkeypatch.setattr(fleet, "_spawn_pool", spawn)
+    fleet._handle_request(
+        tmp_path,
+        state,
+        {},
+        {},
+        {
+            "request_id": "retry-plan-request",
+            "controller_id": "controller-1",
+            "controller_protocol_version": fleet.CONTROLLER_PROTOCOL_VERSION,
+            "runtime_executable": sys.executable,
+            "runtime_environment": {},
+            "command": "add",
+            "batch_id": BATCH_A,
+            "workers": 2,
+            "retry": True,
+        },
+    )
+
+    response = json.loads(
+        (fleet._root(tmp_path) / fleet.RESPONSE_DIR
+         / "retry-plan-request.json").read_text()
+    )
+    assert response["ok"] is True
+    assert captured == {
+        "resolved_credentials": str(credentials),
+        "spawned_credentials": str(credentials),
+    }
+    assert state["batches"][BATCH_A]["plan_id"] == "plan-retry"
+    assert state["batches"][BATCH_A]["credentials_file"] == str(credentials)
+
+
+def test_retry_rejects_incomplete_saved_run_plan_identity(tmp_path, monkeypatch):
+    fleet._prepare_dirs(tmp_path)
+    state = fleet._initial_state("controller-1", None)
+    state["status"] = "active"
+    state["batches"][BATCH_A] = {
+        "batch_id": BATCH_A,
+        "status": "failed",
+        "workers": 2,
+        "plan_id": "plan-retry",
+        "credentials_file": None,
+    }
+    monkeypatch.setattr(
+        fleet,
+        "_spawn_pool",
+        lambda *_args, **_kwargs: pytest.fail("incomplete identity must fail closed"),
+    )
+
+    fleet._handle_request(
+        tmp_path,
+        state,
+        {},
+        {},
+        {
+            "request_id": "retry-incomplete-plan",
+            "controller_id": "controller-1",
+            "controller_protocol_version": fleet.CONTROLLER_PROTOCOL_VERSION,
+            "runtime_executable": sys.executable,
+            "runtime_environment": {},
+            "command": "add",
+            "batch_id": BATCH_A,
+            "workers": 2,
+            "retry": True,
+        },
+    )
+
+    response = json.loads(
+        (fleet._root(tmp_path) / fleet.RESPONSE_DIR
+         / "retry-incomplete-plan.json").read_text()
+    )
+    assert response["ok"] is False
+    assert "saved run-plan identity is incomplete" in response["error"]
+
+
 def test_pool_lock_rejects_duplicate_parent_and_dies_with_process(tmp_path):
     source = Path(__file__).parent.parent / "src"
     holder = subprocess.Popen(

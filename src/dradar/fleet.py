@@ -1013,6 +1013,33 @@ def _handle_request(
             refill_effort = request.get("refill_effort")
             credentials_file = request.get("credentials_file")
             plan_id = request.get("plan_id")
+            if (
+                current
+                and current.get("status") in {
+                    "completed", "failed", "interrupted",
+                }
+                and request.get("retry")
+                and credentials_file is None
+                and plan_id is None
+                and (
+                    current.get("credentials_file") is not None
+                    or current.get("plan_id") is not None
+                )
+            ):
+                saved_credentials = current.get("credentials_file")
+                saved_plan_id = current.get("plan_id")
+                if (
+                    not isinstance(saved_credentials, str)
+                    or not saved_credentials
+                    or not isinstance(saved_plan_id, str)
+                    or not saved_plan_id
+                ):
+                    raise FleetError(
+                        "saved run-plan identity is incomplete; use the "
+                        "original website run instructions to recover safely"
+                    )
+                credentials_file = saved_credentials
+                plan_id = saved_plan_id
             if credentials_file is not None and not isinstance(credentials_file, str):
                 raise FleetError("invalid private run-plan credentials file")
             if plan_id is not None and (
