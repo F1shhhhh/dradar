@@ -31,8 +31,11 @@ def platform_family() -> str:
     return "other"
 
 
+PREPARATION_HEARTBEAT_SEC = 30
+
+
 class RunnerTelemetry:
-    """A daemon heartbeat with adaptive 60/120-second cadence.
+    """A daemon heartbeat with a fast preparation cadence.
 
     Background telemetry is best effort and can never abort a running trial.
     The synchronous pre-checkout registration path is strict because checkout
@@ -63,7 +66,10 @@ class RunnerTelemetry:
         self._batch_id: str | None = None
         self._seq = 0
         self._progress_counter = 0
-        self._interval = 120
+        # The first heartbeat is sent immediately by ``start``.  Keep the
+        # fallback short while cloning/building/queuing so a stalled setup is
+        # noticed quickly even when the server response is unavailable.
+        self._interval = PREPARATION_HEARTBEAT_SEC
         self._failures = 0
         self._warned = False
         self._disabled = False
@@ -222,7 +228,16 @@ class RunnerTelemetry:
                     self._batch_id = response["batch_id"]
             requested = response.get("next_heartbeat_sec", self._interval)
             try:
-                self._interval = min(600, max(30, int(requested)))
+                requested_interval = min(600, max(30, int(requested)))
+                with self._lock:
+                    phase = self._phase
+                if phase in {"preparing", "queued"}:
+                    # Preparation has no model output to act as a liveness
+                    # signal. Do not let an adaptive server interval stretch
+                    # this phase beyond the operator-visible 30s cadence.
+                    self._interval = PREPARATION_HEARTBEAT_SEC
+                else:
+                    self._interval = requested_interval
             except (TypeError, ValueError):
                 pass
             return self._interval

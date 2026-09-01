@@ -574,8 +574,8 @@ dradar resume --assignment <ASSIGNMENT_ID>
 | `--allow-task-drift` | 显式允许本地 benchmark 版本或任务内容与服务端不一致；这类运行不可可靠比较，默认会在消耗模型额度前停止 |
 | `--workers N` | 由一个父进程管理 N 个并发 worker，范围 1–40，默认 1 |
 | `--workers auto` | 检测 Docker、磁盘和账号限制后选择保守并发数 |
-| `--environment-build-timeout-multiplier N` | 将 Pier 的环境构建超时乘以 N，范围 1–8，默认 2 |
-| `--build-cache-mode {isolated,shared}` | 本次运行覆盖构建缓存策略；默认读取 `dradar config`，未配置时为 `isolated` |
+| `--environment-build-timeout-multiplier N` | 将 Pier 的环境构建超时乘以 N，范围 1–8，默认 3 |
+| `--build-cache-mode {isolated,shared}` | 本次运行覆盖构建缓存策略；默认读取 `dradar config`；未配置时单 worker 为 `isolated`，多 worker 自动为 `shared` |
 | `--parallel` | 高级选项：允许手工启动另一个独立 DRadar 会话；隐含 `-y` |
 | `--refill` | 显式开启持续自动补题；必须同时给出额度或题数硬上限 |
 | `--refill-to N` | 持有/运行队列目标；传入时自动启用 `--refill`，但仍需硬上限 |
@@ -793,13 +793,14 @@ dradar cleanup --docker --shared-build-cache -y
 上传失败只保留 Docker 外部的待补传结果，不需要保留整套题目环境。`--keep` 可以保留
 本地诊断文件和题目镜像，但仍会停止容器并删除临时构建空间。
 
-默认每道题使用独立、一次性的 Docker 构建空间，题目结束时直接删除该构建空间，因此
-不会清理或占用用户其他项目的 BuildKit 缓存。需要多 worker 并发、且希望复用相同基础层
-时，可以显式启用同一操作系统用户范围内的共享 BuildKit 缓存：
+默认每道题使用独立、一次性的 Docker 构建空间，单 worker 题目结束时直接删除该构建空间，
+因此不会清理或占用用户其他项目的 BuildKit 缓存。多 worker 并发时，如果没有显式配置，CLI
+会自动启用同一操作系统用户范围内的共享 BuildKit 缓存，以便公共基础镜像和依赖层只下载/构建
+一次；也可以显式指定策略：
 
 ```bash
 dradar config set build-cache-mode shared
-dradar config set environment-build-timeout-multiplier 2
+dradar config set environment-build-timeout-multiplier 3
 dradar config show
 ```
 
@@ -811,7 +812,9 @@ dradar config show
 `docker system prune`、`docker image prune` 或默认 builder 的全局缓存清理。任何一步无法
 确认时，本题结果仍会保存，但该 worker 会停止继续领取或运行下一题，并显示可操作的原因。
 
-共享 builder 不会在每道题结束时删除，否则无法复用公共层；使用
+共享 builder 在首次使用时只做一次受锁保护的 BuildKit bootstrap，并在就绪戳有效时复用，
+避免八个 worker 重复拉起构建守护进程；Docker 守护进程重启、builder 被删除或就绪戳过期后会
+自动重新预热。共享 builder 不会在每道题结束时删除，否则无法复用公共层；使用
 `cleanup --docker --shared-build-cache` 可按当前 image-cache 上限显式回收它。`--dry-run`
 只展示目标 builder 和上限，`-y` 才执行 BuildKit GC；只要服务端仍有活动或可恢复租约，
 命令会保护并跳过共享缓存，避免打断在途构建。该选项只命中当前操作系统用户的

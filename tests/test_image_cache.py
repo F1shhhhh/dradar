@@ -113,12 +113,19 @@ def test_trial_builder_is_assignment_scoped_and_never_selected_globally(
 def test_shared_trial_builder_is_bootstrapped_and_reusable(
     tmp_path: Path, monkeypatch,
 ):
+    monkeypatch.setenv("DRADAR_SHARED_BUILDER_STATE_DIR", str(tmp_path / "shared-state"))
     calls = []
+    builder_exists = False
 
     def run(command, **_kwargs):
+        nonlocal builder_exists
         calls.append(command)
         if command[:2] == ["buildx", "inspect"] and "--bootstrap" not in command:
-            return subprocess.CompletedProcess(command, 1, "", "not found")
+            if not builder_exists:
+                return subprocess.CompletedProcess(command, 1, "", "not found")
+            return subprocess.CompletedProcess(command, 0, "Name: shared\nStatus: running\n", "")
+        if command[:2] == ["buildx", "create"]:
+            builder_exists = True
         return subprocess.CompletedProcess(command, 0, "ok", "")
 
     monkeypatch.setattr(image_cache, "_run_docker", run)
@@ -132,11 +139,17 @@ def test_shared_trial_builder_is_bootstrapped_and_reusable(
     # intentionally crosses those paths within one OS user's Docker context.
     assert image_cache.shared_builder_name(tmp_path / "other-harness") == lease.name
     assert calls[-1] == ["buildx", "inspect", lease.name, "--bootstrap"]
+    calls.clear()
+    second = image_cache.prepare_trial_builder(
+        tmp_path / "other-harness", assignment_id="a2", runtime={}, mode="shared",
+    )
+    assert second.name == lease.name and second.reusable
+    assert [command for command in calls if "--bootstrap" in command] == []
     assert image_cache.remove_trial_builder(
         tmp_path, "a1", mode="shared",
     ) == (True, None)
     # Shared cleanup must not remove the persistent BuildKit cache.
-    assert calls[-1] == ["buildx", "inspect", lease.name, "--bootstrap"]
+    assert calls[-1] == ["buildx", "inspect", lease.name]
 
 
 def test_shared_build_cache_prune_targets_only_dradar_builder(

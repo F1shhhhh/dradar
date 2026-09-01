@@ -509,14 +509,15 @@ def main(argv: list[str] | None = None) -> int:
             default=None,
             metavar="N",
             help="multiply each task's Docker environment build timeout "
-                 "(default: 2; allowed range 1..8)",
+                 "(default: 3; allowed range 1..8)",
         )
         p.add_argument(
             "--build-cache-mode",
             choices=("isolated", "shared"),
             default=None,
             help="use an assignment-only BuildKit cache or an OS-user-scoped "
-                 "shared immutable cache (default: saved setting, isolated)",
+                 "shared immutable cache (default: shared for multi-worker "
+                 "runs, isolated for one worker unless configured)",
         )
         p.add_argument(
             "--batch-id", type=_batch_id_value, metavar="UUID",

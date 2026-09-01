@@ -223,6 +223,10 @@ def test_task_agent_timeout_sec_none_when_malformed(tmp_path):
     assert runner_mod._task_agent_timeout_sec(task) is None
 
 
+def test_environment_build_timeout_default_is_three_windows():
+    assert runner_mod.resolve_environment_build_timeout_multiplier() == 3.0
+
+
 def test_multiplier_stretches_pier_to_match_drader_outer_cap(tmp_path):
     # est_minutes=68 -> outer = max(1800, 68*60*4) = 16320s; base 5400s ->
     # pier must be stretched so its own timeout is >= outer, plus slack.
