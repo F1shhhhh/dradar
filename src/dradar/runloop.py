@@ -301,11 +301,38 @@ def _run_config(args) -> dict:
         )
     except RunnerError as exc:
         sys.exit(str(exc))
-    args._build_cache_mode = image_cache.normalize_build_cache_mode(
-        getattr(args, "build_cache_mode", None)
-        or image_cache.configured_build_cache_mode(cfg)
-    )
+    args._build_cache_mode = _resolve_build_cache_mode(args, cfg)
     return cfg
+
+
+def _resolve_build_cache_mode(args, cfg: dict) -> str:
+    """Select a safe cache policy for this invocation.
+
+    Explicit CLI/config values always win.  If neither is present, a pool
+    with more than one local worker uses the host-user-scoped shared BuildKit
+    cache so immutable base/install layers are downloaded once; a single
+    worker keeps the historical assignment-isolated default.  ``auto`` is
+    resolved again after capacity inspection, because its final worker count
+    is not known when ``_run_config`` first runs.
+    """
+    cli_value = getattr(args, "build_cache_mode", None)
+    if cli_value is not None:
+        return image_cache.normalize_build_cache_mode(cli_value)
+    if "build_cache_mode" in cfg:
+        return image_cache.configured_build_cache_mode(cfg)
+    workers = getattr(args, "workers", 1)
+    if workers != "auto":
+        try:
+            if int(workers) > 1:
+                return "shared"
+        except (TypeError, ValueError):
+            pass
+    return image_cache.DEFAULT_BUILD_CACHE_MODE
+
+
+def _refresh_build_cache_mode(args, cfg: dict) -> None:
+    """Re-evaluate the dynamic multi-worker default after ``auto`` sizing."""
+    args._build_cache_mode = _resolve_build_cache_mode(args, cfg)
 
 
 def _is_trajectory_bundle_rejection(exc: ApiError) -> bool:
@@ -4365,6 +4392,11 @@ def _run_worker_pool(args) -> int:
         print_report(report)
         args.workers = report.recommended_workers
         _align_refill_target_with_workers(args)
+        # ``auto`` did not know the final pool size when _run_config first
+        # resolved defaults. Re-evaluate now so a multi-worker pool shares
+        # immutable BuildKit layers unless the user/config explicitly chose a
+        # different policy.
+        _refresh_build_cache_mode(args, cfg)
     elif not fleet_pool:
         from .capacity import docker_resources, worker_resource_warnings
 

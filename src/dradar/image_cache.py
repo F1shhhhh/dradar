@@ -19,6 +19,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 import urllib.parse
 from contextlib import contextmanager
@@ -34,6 +35,14 @@ LOCK_NAME = "image-cache.lock"
 MAINTENANCE_STAMP_NAME = "image-cache-maintenance.stamp"
 BUILDER_PREFIX = "dradar-task-"
 SHARED_BUILDER_PREFIX = "dradar-cache-"
+SHARED_BUILDER_LOCK_NAME = "shared-build-cache.lock"
+SHARED_BUILDER_READY_STAMP_NAME = "shared-build-cache.ready.json"
+SHARED_BUILDER_READY_STAMP_VERSION = 1
+# A fresh stamp avoids repeating the expensive BuildKit daemon/bootstrap work
+# for every harness, but it is deliberately finite so a daemon restart or a
+# manually removed builder is revalidated and warmed again.
+SHARED_BUILDER_READY_MAX_AGE_SEC = 6 * 60 * 60
+SHARED_BUILDER_STATE_DIR_ENV = "DRADAR_SHARED_BUILDER_STATE_DIR"
 BUILD_CACHE_MODES = frozenset({"isolated", "shared"})
 DEFAULT_BUILD_CACHE_MODE = "isolated"
 GIB = 1024 ** 3
@@ -248,6 +257,200 @@ def configured_build_cache_mode(cfg: dict | None) -> str:
     )
 
 
+def _shared_builder_state_dir() -> Path:
+    """Return the host-user state directory for the persistent builder.
+
+    Fleet workers intentionally use different ``DRADAR_HOME`` directories,
+    so this state must live outside those per-harness homes.  The optional
+    environment override exists for tests and for an explicitly managed
+    alternate local state root; it never carries credentials.
+    """
+
+    raw = os.environ.get(SHARED_BUILDER_STATE_DIR_ENV)
+    if raw:
+        return Path(raw).expanduser()
+    return Path.home() / ".dradar" / "build-cache"
+
+
+def _shared_builder_ready_path() -> Path:
+    return _shared_builder_state_dir() / SHARED_BUILDER_READY_STAMP_NAME
+
+
+def _shared_builder_is_ready(name: str, *, now: float | None = None) -> bool:
+    """Whether the bounded, non-sensitive bootstrap stamp is still fresh."""
+
+    try:
+        payload = json.loads(_shared_builder_ready_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != SHARED_BUILDER_READY_STAMP_VERSION
+        or payload.get("builder") != name
+    ):
+        return False
+    try:
+        bootstrapped_at = float(payload["bootstrapped_at"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    current = time.time() if now is None else float(now)
+    age = current - bootstrapped_at
+    return 0 <= age <= SHARED_BUILDER_READY_MAX_AGE_SEC
+
+
+def _mark_shared_builder_ready(name: str) -> None:
+    """Atomically write a tiny readiness stamp without any secret material."""
+
+    state_dir = _shared_builder_state_dir()
+    state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = _shared_builder_ready_path()
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{time.time_ns()}"
+    )
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(
+                {
+                    "schema_version": SHARED_BUILDER_READY_STAMP_VERSION,
+                    "builder": name,
+                    "bootstrapped_at": time.time(),
+                },
+                stream,
+            )
+            stream.write("\n")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _buildx_inspect_is_usable(result: subprocess.CompletedProcess) -> bool:
+    """Treat an explicit non-running BuildKit status as needing bootstrap."""
+
+    output = "\n".join((result.stdout or "", result.stderr or "")).lower()
+    if "status:" not in output:
+        # Older Docker/buildx versions and test doubles omit the status line;
+        # a successful inspect is the best evidence available there.
+        return True
+    return bool(re.search(r"status:\s*running\b", output))
+
+
+@contextmanager
+def _shared_builder_lock() -> Iterator[None]:
+    """Serialize shared-builder creation/bootstrap across all harness homes."""
+
+    state_dir = _shared_builder_state_dir()
+    state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = state_dir / SHARED_BUILDER_LOCK_NAME
+    fh = open(path, "a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() == 0:
+                fh.write(b"\0")
+                fh.flush()
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            fh.close()
+
+
+def _ensure_named_builder(name: str, *, reusable: bool) -> str | None:
+    """Create/refresh one builder and return a bounded failure reason."""
+
+    existing = _run_docker(
+        ["buildx", "inspect", name], timeout=30, allow_fail=True,
+    )
+    if existing.returncode == 0:
+        # Assignment builders are disposable residue from a crashed attempt;
+        # the shared builder is retained so its content-addressed cache
+        # survives between tasks.
+        if not reusable:
+            _run_docker(["buildx", "rm", name], timeout=180)
+            existing = subprocess.CompletedProcess(["buildx", "inspect", name], 1)
+        elif _shared_builder_is_ready(name) and _buildx_inspect_is_usable(existing):
+            return None
+
+    if existing.returncode != 0:
+        created = _run_docker([
+            "buildx", "create", "--name", name,
+            "--driver", "docker-container",
+        ], timeout=120, allow_fail=True)
+        if created.returncode != 0:
+            # This is normally a harmless create race.  The shared lock makes
+            # it rare, but the bounded inspect proves whether Docker already
+            # has the named builder before reporting a real failure.
+            if reusable:
+                raced = None
+                for _ in range(8):
+                    raced = _run_docker(
+                        ["buildx", "inspect", name],
+                        timeout=10,
+                        allow_fail=True,
+                    )
+                    if raced.returncode == 0:
+                        existing = raced
+                        break
+                    time.sleep(0.5)
+                if raced is None or raced.returncode != 0:
+                    detail = (created.stderr or created.stdout or "").strip()
+                    return (
+                        "无法创建共享构建缓存空间"
+                        + (f"：{detail[:160]}" if detail else "")
+                    )
+            else:
+                detail = (created.stderr or created.stdout or "").strip()
+                return (
+                    "无法创建隔离的临时构建空间"
+                    + (f"：{detail[:160]}" if detail else "")
+                )
+
+    if reusable:
+        # Bootstrap only when the stamp is absent/stale or the builder was
+        # recreated.  The host-user lock prevents eight workers from all
+        # downloading the same BuildKit daemon/image metadata at once.
+        if not _shared_builder_is_ready(name) or not _buildx_inspect_is_usable(
+            existing,
+        ):
+            bootstrapped = _run_docker(
+                ["buildx", "inspect", name, "--bootstrap"],
+                timeout=180,
+                allow_fail=True,
+            )
+            if bootstrapped.returncode != 0:
+                detail = (bootstrapped.stderr or bootstrapped.stdout or "").strip()
+                return (
+                    "共享构建缓存空间未能启动"
+                    + (f"：{detail[:160]}" if detail else "")
+                )
+            try:
+                _mark_shared_builder_ready(name)
+            except OSError as exc:
+                # A missing readiness stamp is safe (the next worker will
+                # bootstrap again), but never turn a successful Docker start
+                # into a false runner failure because local bookkeeping could
+                # not be written.
+                print(
+                    f"warning: shared BuildKit readiness stamp unavailable: {exc}",
+                    file=sys.stderr,
+                )
+    return None
+
+
 def _builder_proxy_is_safe(runtime: dict[str, str]) -> tuple[bool, str | None]:
     """Whether a dedicated bridge builder can use the configured build proxy.
 
@@ -299,72 +502,22 @@ def prepare_trial_builder(
             return TrialBuilderLease(
                 None, False, "Docker 的临时构建空间功能不可用",
             )
-        existing = _run_docker(
-            ["buildx", "inspect", name], timeout=30, allow_fail=True,
-        )
-        if existing.returncode == 0:
-            # The assignment lock proves this same home cannot be running the
-            # A matching assignment builder is stale residue from a crashed
-            # prior attempt and is safe to replace exactly.  The shared
-            # builder is deliberately retained so its content-addressed cache
-            # survives between tasks.
-            if not reusable:
-                _run_docker(["buildx", "rm", name], timeout=180)
-        if existing.returncode != 0:
-            created = _run_docker([
-                "buildx", "create", "--name", name,
-                "--driver", "docker-container",
-            ], timeout=120, allow_fail=True)
-            if created.returncode != 0:
-                # Two workers can race to create the same shared builder.  A
-                # short bounded inspect loop proves whether the first worker
-                # won; only a genuinely unavailable builder falls back.  This
-                # avoids turning a harmless create race into a missing lane in
-                # an eight-worker pool.
-                if reusable:
-                    raced = None
-                    for _ in range(8):
-                        raced = _run_docker(
-                            ["buildx", "inspect", name],
-                            timeout=10,
-                            allow_fail=True,
-                        )
-                        if raced.returncode == 0:
-                            break
-                        time.sleep(0.5)
-                    if raced is None or raced.returncode != 0:
-                        detail = (created.stderr or created.stdout or "").strip()
-                        return TrialBuilderLease(
-                            None, False,
-                            "无法创建共享构建缓存空间"
-                            + (f"：{detail[:160]}" if detail else ""),
-                        )
-                else:
-                    detail = (created.stderr or created.stdout or "").strip()
-                    return TrialBuilderLease(
-                        None, False,
-                        "无法创建隔离的临时构建空间"
-                        + (f"：{detail[:160]}" if detail else ""),
-                    )
         if reusable:
-            # Bootstrap once before Pier starts its full environment timeout.
-            # This moves BuildKit image download/daemon startup out of the
-            # critical task build and amortizes it across all workers.
-            bootstrapped = _run_docker(
-                ["buildx", "inspect", name, "--bootstrap"],
-                timeout=180,
-                allow_fail=True,
-            )
-            if bootstrapped.returncode != 0:
-                detail = (bootstrapped.stderr or bootstrapped.stdout or "").strip()
-                return TrialBuilderLease(
-                    None, False,
-                    "共享构建缓存空间未能启动"
-                    + (f"：{detail[:160]}" if detail else ""),
-                )
+            # All harness homes converge on this host-user lock.  This keeps
+            # builder creation/bootstrap outside the per-assignment lock but
+            # still prevents a parallel cold-start herd.
+            with _shared_builder_lock():
+                failure = _ensure_named_builder(name, reusable=True)
+        else:
+            failure = _ensure_named_builder(name, reusable=False)
+        if failure is not None:
+            return TrialBuilderLease(None, False, failure)
     except DockerUnavailable as exc:
         label = "共享构建缓存空间" if reusable else "临时构建空间"
         return TrialBuilderLease(None, False, f"{label}不可用：{exc}")
+    except OSError as exc:
+        label = "共享构建缓存空间" if reusable else "临时构建空间"
+        return TrialBuilderLease(None, False, f"{label}本地锁不可用：{exc}")
     if reusable:
         return TrialBuilderLease(
             name, True, "共享 BuildKit 缓存已预热；仅限当前 OS 用户的 Docker 环境", True,
@@ -1334,11 +1487,16 @@ def cmd_config_show(args) -> int:
     print(f"  limit: {policy.limit_bytes / GIB:.1f} GiB ({source})")
     print(f"  cleanup target: {policy.target_bytes / GIB:.1f} GiB")
     print(f"  minimum free disk: {policy.min_free_bytes / GIB:.0f} GiB")
-    print(f"  build cache mode: {configured_build_cache_mode(cfg)}")
+    configured_build_cache = cfg.get("build_cache_mode")
+    if configured_build_cache is None:
+        build_cache_display = "auto (isolated for 1 worker; shared for multi-worker)"
+    else:
+        build_cache_display = configured_build_cache_mode(cfg)
+    print(f"  build cache mode: {build_cache_display}")
     build_timeout = cfg.get("environment_build_timeout_multiplier")
     print(
         "  environment build timeout multiplier: "
-        f"{build_timeout if build_timeout is not None else '2 (default)'}"
+        f"{build_timeout if build_timeout is not None else '3 (default)'}"
     )
     print(f"  proxy environment detected: {'yes' if proxy_detected() else 'no'}")
     return 0
@@ -1404,5 +1562,6 @@ __all__ = [
     "prune_shared_build_cache",
     "trial_builder_name", "shared_builder_name", "normalize_build_cache_mode",
     "configured_build_cache_mode", "BUILD_CACHE_MODES", "DEFAULT_BUILD_CACHE_MODE",
+    "SHARED_BUILDER_READY_MAX_AGE_SEC", "SHARED_BUILDER_READY_STAMP_NAME",
     "wsl_host_disk_free_bytes", "cmd_config_set", "cmd_config_show",
 ]

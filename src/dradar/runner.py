@@ -219,7 +219,12 @@ CODEBUDDY_AGENT_IMPORT_PATH = (
 )
 CODEBUDDY_AGENT_MODULE_FILENAME = "_dradar_pier_codebuddy.py"
 BETA_SUBSCRIPTION_TRIAL_TIMEOUT_FLOOR_SEC = 120 * 60
-DEFAULT_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER = 2.0
+# A cold multi-worker BuildKit start can spend tens of minutes pulling base
+# images and package layers.  Three task windows (90 minutes for the common
+# 1800s task declaration) gives slow mirrors room to recover while the
+# bounded 1..8 override and two-attempt Pier retry still prevent a wedged
+# daemon from holding a lease forever.
+DEFAULT_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER = 3.0
 DEFAULT_ENVIRONMENT_BUILD_TIMEOUT_SEC = 600.0
 PIER_ENVIRONMENT_START_ATTEMPTS = 2
 ENVIRONMENT_BUILD_WATCHDOG_SLACK_SEC = 120
@@ -1102,8 +1107,8 @@ def _task_environment_build_timeout_sec(task_path: Path) -> float | None:
 def resolve_environment_build_timeout_multiplier(value: object = None) -> float:
     """Return a bounded environment-build timeout multiplier.
 
-    A default of two gives slow mirrors and cold builders another window while
-    keeping the upper bound finite. Passing ``1`` explicitly restores the
+    A default of three gives slow mirrors and cold builders a long recovery
+    window while keeping the upper bound finite. Passing ``1`` explicitly restores the
     previous behavior; values above eight are refused so a wedged daemon
     cannot keep a paid lease alive indefinitely.
     """
@@ -2737,7 +2742,10 @@ def _tail(log_path: Path, n: int = 15) -> str:
     return "\n".join(lines[-n:])
 
 
-HEARTBEAT_SEC = 60
+# Keep the local progress signal aligned with the preparation heartbeat.  A
+# build can be silent while Docker pulls layers, so a one-minute cadence made
+# a healthy cold start look abandoned in the radar UI.
+HEARTBEAT_SEC = 30
 TRIAL_TIMEOUT_RETURNCODE = 124
 LIVE_ACCOUNT_ERROR_CONFIRMATIONS = 3
 _LIVE_ACCOUNT_TERMINAL_KINDS = {

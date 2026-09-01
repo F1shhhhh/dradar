@@ -65,11 +65,14 @@ def test_target_worker_count_is_bounded():
 def test_server_can_slow_cadence_but_not_make_it_pathological():
     client = FakeClient([
         {"next_heartbeat_sec": 99999},
-        {"next_heartbeat_sec": 1},
+        {"next_heartbeat_sec": 99999},
     ])
     telemetry = RunnerTelemetry(client, jitter=False)
-    assert telemetry._send_once() == 600
+    # Preparation/queueing is operator-visible and must stay on the fast
+    # cadence even if the server asks for a much slower interval.
     assert telemetry._send_once() == 30
+    telemetry.set_phase("running")
+    assert telemetry._send_once() == 600
 
 
 def test_server_notices_are_bounded_validated_and_printed_once(capsys):

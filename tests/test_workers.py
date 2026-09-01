@@ -661,6 +661,34 @@ def test_worker_child_uses_parent_capabilities_without_reprobing(monkeypatch):
     )
 
 
+def test_multi_worker_pool_defaults_to_shared_build_cache(monkeypatch):
+    monkeypatch.setattr(runloop, "_load_config", lambda: {
+        "server": "https://api.example.com", "token": "token",
+    })
+    args = _args(workers=8)
+    runloop._run_config(args)
+    assert args._build_cache_mode == "shared"
+
+
+def test_single_worker_keeps_isolated_build_cache_default(monkeypatch):
+    monkeypatch.setattr(runloop, "_load_config", lambda: {
+        "server": "https://api.example.com", "token": "token",
+    })
+    args = _args(workers=1)
+    runloop._run_config(args)
+    assert args._build_cache_mode == "isolated"
+
+
+def test_explicit_build_cache_setting_wins_over_multi_worker_default(monkeypatch):
+    monkeypatch.setattr(runloop, "_load_config", lambda: {
+        "server": "https://api.example.com", "token": "token",
+        "build_cache_mode": "isolated",
+    })
+    args = _args(workers=8)
+    runloop._run_config(args)
+    assert args._build_cache_mode == "isolated"
+
+
 def test_worker_child_rejects_malformed_parent_capability_snapshot(monkeypatch):
     monkeypatch.setattr(runloop, "_load_config", lambda: {
         "server": "https://api.example.com", "token": "token",
