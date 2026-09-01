@@ -577,7 +577,7 @@ dradar resume --assignment <ASSIGNMENT_ID>
 | `--parallel` | 高级选项：允许手工启动另一个独立 DRadar 会话；隐含 `-y` |
 | `--refill` | 显式开启持续自动补题；必须同时给出额度或题数硬上限 |
 | `--refill-to N` | 持有/运行队列目标；传入时自动启用 `--refill`，但仍需硬上限 |
-| `--refill-harness HARNESS` | 将后续自动补领严格限定为一个 Harness；订阅补领支持 `kimi-code`、`zcode`、`grok-build` 及其短别名；`codex` 仍排除一次性 API 格子 |
+| `--refill-harness HARNESS` | 将后续自动补领严格限定为一个 Harness；订阅补领支持 `kimi-code`、`zcode`、`grok-build`、`codebuddy` 及其短别名；`codex` 仍排除一次性 API 格子 |
 | `--refill-model MODEL` | 在指定 Harness 内进一步限定模型；必须与 `--refill-harness` 一起使用 |
 | `--refill-effort EFFORT` | 在指定 Harness 内进一步限定档位；必须与 `--refill-harness` 一起使用 |
 | `--max-estimated-quota-pct PCT` | 预计 7 天模型额度占用上限 |
