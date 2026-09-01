@@ -5362,13 +5362,6 @@ def _prompt_positive_int(prompt: str, default: int) -> int:
 def _setup_refill(args, client: ApiClient, active: list[dict], free_pick: bool) -> list[dict]:
     """Configure a plan that drains its initial selected batch before refill."""
     explicit = getattr(args, "refill", False)
-    if any(item.get("agent") == CODEBUDDY_AGENT for item in active):
-        if explicit:
-            raise refill_plan.RefillError(
-                "CodeBuddy HY4 canary assignments cannot use continuous refill; "
-                "run only the explicitly claimed batch"
-            )
-        return active
     if any(item.get("billing_mode") == "api" for item in active):
         if explicit:
             raise refill_plan.RefillError(
