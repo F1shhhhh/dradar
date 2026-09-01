@@ -25,7 +25,7 @@ from dradar.codebuddy_provider import (
     managed_auth_dir,
     managed_codebuddy_home,
 )
-from dradar.runloop import _setup_refill, _subscription_trial_usage
+from dradar.runloop import _subscription_trial_usage
 from dradar.runner import (
     RunnerError,
     _pier_process_env,
@@ -399,12 +399,6 @@ def test_runtime_image_gate_executes_the_labeled_binary_once_per_image(
     assert codebuddy_provider.codebuddy_runtime_image_error("docker") is None
     assert codebuddy_provider.codebuddy_runtime_image_error("docker") is None
     assert sum(command[1] == "run" for command in calls) == 1
-
-
-def test_codebuddy_batch_rejects_continuous_refill() -> None:
-    args = SimpleNamespace(refill=True)
-    with pytest.raises(RuntimeError, match="cannot use continuous refill"):
-        _setup_refill(args, object(), [_valid_assignment()], True)
 
 
 def test_usage_reconciles_request_ledger_and_terminal_aggregate() -> None:

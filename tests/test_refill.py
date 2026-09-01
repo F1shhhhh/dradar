@@ -7,6 +7,11 @@ import pytest
 
 from dradar import refill, runloop
 from dradar.api_client import ApiError
+from dradar.codebuddy_provider import (
+    CODEBUDDY_AGENT,
+    CODEBUDDY_MODEL,
+    CODEBUDDY_PROVIDER,
+)
 
 
 WINDOWS = {"plus": 10.0, "pro-5x": 50.0, "pro-20x": 200.0}
@@ -545,6 +550,41 @@ def test_setup_clamps_target_to_server_claim_limit(tmp_path: Path, monkeypatch, 
     plan = refill.load(tmp_path)
     assert plan["refill_to"] == 3
     assert "using 3" in capsys.readouterr().out
+
+
+def test_setup_allows_bounded_exact_codebuddy_refill(
+    tmp_path: Path, monkeypatch,
+):
+    selected = {
+        **_assignment("hy4-seed"),
+        "agent": CODEBUDDY_AGENT,
+        "provider": CODEBUDDY_PROVIDER,
+        "model": CODEBUDDY_MODEL,
+        "effort": "high",
+        "billing_mode": "subscription",
+    }
+    client = RefillClient([selected])
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    args = argparse.Namespace(
+        refill=True, refill_to=1, auto=None, yes=True, max_tasks=5,
+        quota_tier="plus", max_estimated_quota_pct=None,
+        refill_harness=CODEBUDDY_AGENT, refill_model=CODEBUDDY_MODEL,
+        refill_effort="high", refill_order="cost", parallel=False,
+        fleet_pool=False,
+    )
+
+    active = runloop._setup_refill(args, client, [selected], True)
+
+    assert active == [selected]
+    assert client.claimed == []
+    plan = refill.load(tmp_path)
+    assert plan["status"] == "active"
+    assert plan["seed_assignment_ids"] == [selected["assignment_id"]]
+    assert plan["submitted_seed_assignment_ids"] == []
+    assert plan["max_tasks"] == 5
+    assert (
+        plan["refill_harness"], plan["refill_model"], plan["refill_effort"]
+    ) == (CODEBUDDY_AGENT, CODEBUDDY_MODEL, "high")
 
 
 def test_fleet_setup_registers_server_authoritative_seed_campaign(
