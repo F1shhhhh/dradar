@@ -691,7 +691,7 @@ def test_retry_reuses_saved_run_plan_identity_when_raw_cli_omits_it(
     state["status"] = "active"
     state["batches"][BATCH_A] = {
         "batch_id": BATCH_A,
-        "status": "failed",
+        "status": "stopped",
         "workers": 2,
         "plan_id": "plan-retry",
         "credentials_file": str(credentials),
@@ -786,6 +786,20 @@ def test_retry_rejects_incomplete_saved_run_plan_identity(tmp_path, monkeypatch)
     )
     assert response["ok"] is False
     assert "saved run-plan identity is incomplete" in response["error"]
+
+
+def test_missing_config_is_one_fleet_request_error_not_controller_exit(monkeypatch):
+    monkeypatch.setattr(fleet, "_load_config", lambda: {})
+    monkeypatch.setattr(
+        fleet,
+        "_client",
+        lambda _cfg: (_ for _ in ()).throw(
+            SystemExit("not configured — run: dradar login")
+        ),
+    )
+
+    with pytest.raises(fleet.FleetError, match="not configured"):
+        fleet._resolve_workers(1, BATCH_A, {"batches": {}})
 
 
 def test_pool_lock_rejects_duplicate_parent_and_dies_with_process(tmp_path):
