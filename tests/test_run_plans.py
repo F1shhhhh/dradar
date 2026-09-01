@@ -1259,6 +1259,77 @@ def test_fixed_capacity_decision_precedes_server_start_and_is_one_use(
     assert len(client.start_calls) == 1
 
 
+def test_keep_requested_confirmation_survives_nonworsening_capacity_churn(
+    tmp_path, monkeypatch, capsys,
+):
+    plan = _plan(mode="fixed", concurrency=1, task_count=1)
+    client = FakeClient(starts=[_server_response(plan)])
+    current = {"snapshot": _snapshot(available=0, auto_workers=0)}
+    current["snapshot"]["digest"] = "before-sibling-startup"
+    _prepare_run(monkeypatch, tmp_path, plan=plan, client=client)
+    monkeypatch.setattr(
+        run_plans, "_capacity_snapshot",
+        lambda *_args, **_kwargs: current["snapshot"],
+    )
+    added = []
+    monkeypatch.setattr(
+        fleet, "add_batch",
+        lambda **kwargs: added.append(kwargs) or {
+            "batch": {"status": "running", "workers": kwargs["workers"]},
+        },
+    )
+
+    assert run_plans.cmd_run_plan(_args()) == 0
+    decision = json.loads(capsys.readouterr().out)
+    assert decision["decision"] == "local_capacity"
+    token = decision["decision_token"]
+
+    # A sibling Harness completed startup, changing telemetry but not the
+    # zero-slot recommendation the user explicitly chose to override.
+    current["snapshot"] = _snapshot(available=0, auto_workers=0)
+    current["snapshot"]["digest"] = "after-sibling-startup"
+    assert run_plans.cmd_run_plan(
+        _args(concurrency=1, decision_token=token),
+    ) == 0
+    started = json.loads(capsys.readouterr().out)
+
+    assert started["decision_required"] is False
+    assert client.start_calls[0]["concurrency"] == 1
+    assert added[0]["workers"] == 1
+
+
+def test_keep_requested_reasks_when_capacity_recommendation_worsens(
+    tmp_path, monkeypatch, capsys,
+):
+    plan = _plan(mode="fixed", concurrency=4, task_count=4)
+    client = FakeClient(starts=[_server_response(plan)])
+    current = {"snapshot": _snapshot(available=2, auto_workers=2)}
+    current["snapshot"]["digest"] = "two-slots"
+    _prepare_run(monkeypatch, tmp_path, plan=plan, client=client)
+    monkeypatch.setattr(
+        run_plans, "_capacity_snapshot",
+        lambda *_args, **_kwargs: current["snapshot"],
+    )
+    monkeypatch.setattr(
+        fleet, "add_batch", lambda **_kwargs: pytest.fail("must re-confirm"),
+    )
+
+    assert run_plans.cmd_run_plan(_args()) == 0
+    first = json.loads(capsys.readouterr().out)
+    current["snapshot"] = _snapshot(available=1, auto_workers=1)
+    current["snapshot"]["digest"] = "one-slot"
+
+    assert run_plans.cmd_run_plan(
+        _args(concurrency=4, decision_token=first["decision_token"]),
+    ) == 0
+    second = json.loads(capsys.readouterr().out)
+
+    assert second["decision_required"] is True
+    assert second["decision"] == "local_capacity"
+    assert second["agent"]["recommended_concurrency"] == 1
+    assert client.start_calls == []
+
+
 def test_explicit_safe_lower_fixed_count_needs_no_redundant_confirmation(
     tmp_path, monkeypatch, capsys,
 ):

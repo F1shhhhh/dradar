@@ -741,7 +741,7 @@ def _consume_local_capacity(
     snapshot: dict[str, Any],
 ) -> tuple[int, str | None, str | None]:
     pending = state.get("pending_local_capacity")
-    valid = (
+    token_valid = (
         isinstance(pending, dict)
         and isinstance(token, str) and token.startswith("drlc_")
         and secrets.compare_digest(
@@ -749,7 +749,6 @@ def _consume_local_capacity(
             hashlib.sha256(token.encode()).hexdigest(),
         )
         and float(pending.get("expires_at") or 0) > time.time()
-        and pending.get("capacity_digest") == snapshot["digest"]
     )
     try:
         workers = int(selected)
@@ -762,6 +761,44 @@ def _consume_local_capacity(
             if pending.get("allow_keep") else set()
         )
         if isinstance(pending, dict) else set()
+    )
+    # Docker/task telemetry can change while a person is answering even when
+    # the recommendation has not become less safe (for example, the first
+    # sibling Harness finishes preparing its container).  Do not trap the
+    # user in a confirmation loop for non-worsening churn.  A changed snapshot
+    # is accepted only when the selected recommendation is still safe, or when
+    # an explicit over-capacity choice is no worse than the situation the user
+    # already approved.  A genuinely lower recommendation still requires a
+    # fresh confirmation.
+    current_available = snapshot.get("available")
+    pending_requested = pending.get("requested") if isinstance(pending, dict) else None
+    pending_recommended = (
+        pending.get("recommended") if isinstance(pending, dict) else None
+    )
+    comparable_capacity = all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        for value in (
+            current_available, pending_requested, pending_recommended,
+        )
+    )
+    capacity_not_worse = bool(
+        comparable_capacity
+        and (
+            (workers == pending_recommended and current_available >= workers)
+            or (
+                bool(pending.get("allow_keep"))
+                and workers == pending_requested
+                and min(pending_requested, current_available)
+                >= pending_recommended
+            )
+        )
+    )
+    valid = bool(
+        token_valid
+        and (
+            pending.get("capacity_digest") == snapshot["digest"]
+            or capacity_not_worse
+        )
     )
     if not valid or workers not in allowed or workers < 1:
         state["pending_local_capacity"] = None
