@@ -2905,8 +2905,36 @@ def _effective_run_timeout_sec(
     if current <= 0:
         return current
     if assignment.get("benchmark_id") == POMPEII_BENCHMARK_ID:
-        return current + build_allowance
-    return max(current, build_allowance)
+        # ``current`` already includes Pompeii's hard agent deadline plus its
+        # finalization slack.  Keep that complete budget, then add the build
+        # allowance before the outer watchdog is armed.
+        agent_budget = current
+    else:
+        # For ordinary tasks Pier's inner watchdog is the task timeout scaled
+        # by _agent_timeout_multiplier.  The old outer watchdog may be either
+        # below that declared timeout (short server estimate) or above it
+        # (long estimate), so account for the actual inner budget rather than
+        # merely taking max(current, build_allowance).
+        declared = _task_agent_timeout_sec(task_path)
+        if (
+            isinstance(declared, (int, float))
+            and not isinstance(declared, bool)
+            and math.isfinite(float(declared))
+            and float(declared) > 0
+        ):
+            multiplier = _agent_timeout_multiplier(assignment, task_path)
+            agent_budget = max(
+                float(current),
+                math.ceil(float(declared) * multiplier),
+            )
+        else:
+            # If task metadata cannot prove an inner budget, retain the old
+            # outer watchdog as the conservative model-time allowance.
+            agent_budget = float(current)
+    return max(
+        current,
+        int(math.ceil(agent_budget + build_allowance)),
+    )
 
 
 def _zcode_runtime_diagnostic(jobs_dir: Path, job_name: str) -> dict[str, object]:

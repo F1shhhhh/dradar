@@ -391,6 +391,13 @@ def main(argv: list[str] | None = None) -> int:
         "--all-task-images", action="store_true",
         help="with --docker, also include legacy label-validated Pier task images",
     )
+    p_cleanup.add_argument(
+        "--shared-build-cache", action="store_true",
+        help=(
+            "with --docker, inspect/prune only this OS user's DRadar shared "
+            "BuildKit cache (blocked while active assignments exist)"
+        ),
+    )
     p_cleanup.add_argument("-y", "--yes", action="store_true", help="skip confirmation")
     p_cleanup.set_defaults(func=cmd_cleanup)
 
@@ -508,7 +515,7 @@ def main(argv: list[str] | None = None) -> int:
             "--build-cache-mode",
             choices=("isolated", "shared"),
             default=None,
-            help="use an assignment-only BuildKit cache or a DRadar-home-scoped "
+            help="use an assignment-only BuildKit cache or an OS-user-scoped "
                  "shared immutable cache (default: saved setting, isolated)",
         )
         p.add_argument(

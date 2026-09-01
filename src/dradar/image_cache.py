@@ -98,9 +98,10 @@ class TrialBuilderLease:
     name: str | None
     isolated: bool
     note: str | None = None
-    # A shared builder is scoped to this DRadar home and is selected only in
-    # the child Pier environment, but it intentionally survives one trial so
-    # BuildKit can reuse immutable layers for the next task.
+    # A shared builder is scoped to the current OS user's Docker context and
+    # is selected only in the child Pier environment. It intentionally
+    # survives one trial so BuildKit can reuse immutable layers for the next
+    # task, even when Fleet gives each harness a separate DRADAR_HOME.
     reusable: bool = False
 
 
@@ -209,22 +210,23 @@ def trial_builder_name(home: Path, assignment_id: str) -> str:
 
 
 def shared_builder_name(home: Path) -> str:
-    """Return the persistent BuildKit builder scoped to one host cache root.
+    """Return the persistent BuildKit builder scoped to one OS user.
 
     The name is deterministic so concurrent workers converge on one builder,
-    while the hash prevents a user's shared cache from colliding with another
-    host cache root on the same Docker daemon.  It is never selected globally;
-    callers pass it through ``BUILDX_BUILDER`` only to the Pier child.
+    while the hash prevents a different OS user's builder from colliding on a
+    shared Docker daemon.  It is never selected globally; callers pass it
+    through ``BUILDX_BUILDER`` only to the Pier child. ``home`` remains in the
+    signature for compatibility with the assignment-scoped helper, but is not
+    the scope: Fleet deliberately uses separate DRADAR_HOME paths per harness.
     """
 
-    # A Fleet uses one DRADAR_HOME per harness.  Deliberately scope the shared
-    # builder to the host user's cache root (or an explicit operator-provided
-    # root) rather than that per-harness directory, otherwise eight cars would
-    # still download the same immutable layers eight times.  The Docker daemon
-    # already enforces the OS user's boundary; task credentials never enter
-    # this name or the BuildKit cache.
-    configured = os.environ.get("DRADAR_SHARED_BUILDER_SCOPE", "").strip()
-    scope = Path(configured).expanduser() if configured else Path.home()
+    # A Fleet uses one DRADAR_HOME per harness. Deliberately scope the shared
+    # builder to the host OS user rather than that per-harness directory,
+    # otherwise eight cars would still download the same immutable layers
+    # eight times. Do not accept an arbitrary environment override here: the
+    # OS user's home and Docker socket are the auditable isolation boundary;
+    # task credentials never enter this name or the BuildKit cache.
+    scope = Path.home()
     identity = f"{scope.resolve()}\0shared-build-cache".encode(
         "utf-8", "surrogatepass",
     )
@@ -365,7 +367,7 @@ def prepare_trial_builder(
         return TrialBuilderLease(None, False, f"{label}不可用：{exc}")
     if reusable:
         return TrialBuilderLease(
-            name, True, "共享 BuildKit 缓存已预热；仅限当前 DRadar 主目录", True,
+            name, True, "共享 BuildKit 缓存已预热；仅限当前 OS 用户的 Docker 环境", True,
         )
     return TrialBuilderLease(name, True)
 
@@ -393,6 +395,49 @@ def remove_trial_builder(
         detail = (removed.stderr or removed.stdout or "Docker 拒绝清理").strip()
         return False, detail[:300]
     return True, None
+
+
+def prune_shared_build_cache(
+    home: Path, *, max_used_bytes: int,
+) -> tuple[bool, str | None]:
+    """Prune only DRadar's persistent shared builder to a bounded cap.
+
+    The shared builder is intentionally retained between tasks, but it must
+    have an explicit lifecycle. This helper never touches the default builder
+    or another named builder: it first proves the deterministic, OS-user
+    scoped name exists, then invokes BuildKit's own GC with a byte cap. The
+    caller is responsible for refusing the operation while active assignments
+    are running and for asking the user before the destructive invocation.
+    """
+
+    if (
+        not isinstance(max_used_bytes, int)
+        or isinstance(max_used_bytes, bool)
+        or max_used_bytes <= 0
+    ):
+        return False, "共享构建缓存上限必须是正整数"
+    name = shared_builder_name(home)
+    try:
+        inspected = _run_docker(
+            ["buildx", "inspect", name], timeout=30, allow_fail=True,
+        )
+        if inspected.returncode != 0:
+            return True, "共享 builder 尚未创建，无需清理"
+        pruned = _run_docker(
+            [
+                "buildx", "prune", "--builder", name, "--force", "--all",
+                "--max-used-space", str(max_used_bytes),
+            ],
+            timeout=600,
+            allow_fail=True,
+        )
+    except DockerUnavailable as exc:
+        return False, str(exc)
+    if pruned.returncode != 0:
+        detail = (pruned.stderr or pruned.stdout or "BuildKit 拒绝清理").strip()
+        return False, detail[:300]
+    detail = (pruned.stdout or "").strip().replace("\n", " ")
+    return True, detail[:300] if detail else "共享构建缓存已按上限回收"
 
 
 def _parse_size(value: object) -> int:
@@ -1356,6 +1401,7 @@ __all__ = [
     "effective_policy", "is_wsl", "load", "plan_cleanup",
     "prepare_trial_builder", "proxy_detected", "record_trial_images",
     "remove_assignment_images", "remove_images", "remove_trial_builder",
+    "prune_shared_build_cache",
     "trial_builder_name", "shared_builder_name", "normalize_build_cache_mode",
     "configured_build_cache_mode", "BUILD_CACHE_MODES", "DEFAULT_BUILD_CACHE_MODE",
     "wsl_host_disk_free_bytes", "cmd_config_set", "cmd_config_show",

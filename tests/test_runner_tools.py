@@ -1,4 +1,5 @@
 import os
+import math
 import tomllib
 
 import dradar.runner as runner_mod
@@ -394,12 +395,36 @@ def test_effective_run_timeout_adds_two_attempt_build_allowance(tmp_path):
         "[environment]\nbuild_timeout_sec = 5400.0\n",
     )
     assignment = {"agent": "codex", "est_minutes": 5}
-    expected = max(
-        runner_mod._effective_trial_timeout_sec(assignment),
-        5400 * 2 * runner_mod.PIER_ENVIRONMENT_START_ATTEMPTS
-        + runner_mod.ENVIRONMENT_BUILD_WATCHDOG_SLACK_SEC,
+    expected = (
+        5400
+        + 5400 * 2 * runner_mod.PIER_ENVIRONMENT_START_ATTEMPTS
+        + runner_mod.ENVIRONMENT_BUILD_WATCHDOG_SLACK_SEC
     )
     assert runner_mod._effective_run_timeout_sec(assignment, task, 2) == expected
+
+
+def test_effective_run_timeout_preserves_scaled_inner_agent_budget(tmp_path):
+    task = _task_with_toml(
+        tmp_path, task_id="build-timeout-scaled", timeout_sec=5400.0,
+    )
+    (task / "task.toml").write_text(
+        "[agent]\ntimeout_sec = 5400.0\n"
+        "[environment]\nbuild_timeout_sec = 600.0\n",
+    )
+    assignment = {"agent": "codex", "est_minutes": 40}
+    current = runner_mod._effective_trial_timeout_sec(assignment)
+    inner = int(
+        math.ceil(
+            5400.0 * runner_mod._agent_timeout_multiplier(assignment, task)
+        )
+    )
+    allowance = (
+        600 * 2 * runner_mod.PIER_ENVIRONMENT_START_ATTEMPTS
+        + runner_mod.ENVIRONMENT_BUILD_WATCHDOG_SLACK_SEC
+    )
+    assert runner_mod._effective_run_timeout_sec(assignment, task, 2) == max(
+        current, inner + allowance,
+    )
 
 
 

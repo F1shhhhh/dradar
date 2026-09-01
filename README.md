@@ -774,6 +774,8 @@ dradar cleanup --include-kept
 dradar cleanup --docker --dry-run
 dradar cleanup --docker
 dradar cleanup --docker --all-task-images  # 一次性处理升级前遗留镜像
+dradar cleanup --docker --shared-build-cache --dry-run
+dradar cleanup --docker --shared-build-cache -y
 ```
 
 清理前必须成功从服务端取得当前租约列表；网络失败时什么都不删除。以下内容默认保护：
@@ -793,7 +795,7 @@ dradar cleanup --docker --all-task-images  # 一次性处理升级前遗留镜�
 
 默认每道题使用独立、一次性的 Docker 构建空间，题目结束时直接删除该构建空间，因此
 不会清理或占用用户其他项目的 BuildKit 缓存。需要多 worker 并发、且希望复用相同基础层
-时，可以显式启用同一 DRadar 用户范围内的共享 BuildKit 缓存：
+时，可以显式启用同一操作系统用户范围内的共享 BuildKit 缓存：
 
 ```bash
 dradar config set build-cache-mode shared
@@ -801,13 +803,19 @@ dradar config set environment-build-timeout-multiplier 2
 dradar config show
 ```
 
-共享模式只复用 BuildKit 的不可变基础/依赖层；每道题的容器、网络、卷、任务镜像和
-工作目录仍按精确归属清理，凭据不会进入共享缓存。共享 builder 只在 Pier 子进程的
-`BUILDX_BUILDER` 环境中选择，不改变用户的全局 builder；恢复默认隔离模式可执行
-`dradar config set build-cache-mode isolated`。容器、网络、卷和镜像仍须同时通过精确
-任务目录、Compose 标签、镜像引用和镜像 ID 校验；不会运行全局 `docker system prune`、
-`docker image prune` 或默认 builder 的全局缓存清理。任何一步无法确认时，本题结果仍会
-保存，但该 worker 会停止继续领取或运行下一题，并显示可操作的原因。
+共享模式重点复用 BuildKit 的不可变基础/依赖层；每道题的容器、网络、卷、任务镜像和
+工作目录仍按精确归属清理，凭据不会进入共享缓存。共享 builder 以当前操作系统用户为
+边界，只在 Pier 子进程的 `BUILDX_BUILDER` 环境中选择，不改变用户的全局 builder；
+恢复默认隔离模式可执行 `dradar config set build-cache-mode isolated`。容器、网络、卷和
+镜像仍须同时通过精确任务目录、Compose 标签、镜像引用和镜像 ID 校验；不会运行全局
+`docker system prune`、`docker image prune` 或默认 builder 的全局缓存清理。任何一步无法
+确认时，本题结果仍会保存，但该 worker 会停止继续领取或运行下一题，并显示可操作的原因。
+
+共享 builder 不会在每道题结束时删除，否则无法复用公共层；使用
+`cleanup --docker --shared-build-cache` 可按当前 image-cache 上限显式回收它。`--dry-run`
+只展示目标 builder 和上限，`-y` 才执行 BuildKit GC；只要服务端仍有活动或可恢复租约，
+命令会保护并跳过共享缓存，避免打断在途构建。该选项只命中当前操作系统用户的
+`dradar-cache-*` builder，不会执行全局 prune。
 
 升级前已经积累的 Pier 镜像必须显式使用 `--all-task-images`，仍会经过标签、容器和本地
 恢复状态校验；旧版本写入默认 builder 的历史缓存无法证明只属于 DRadar，因此不会在
