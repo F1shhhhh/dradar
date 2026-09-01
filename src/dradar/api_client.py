@@ -6,6 +6,7 @@ import random
 import time
 import urllib.parse
 import uuid
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,9 @@ from .submission_intent import (
 _RATE_LIMIT_RETRIES = 5
 _DEFAULT_RETRY_AFTER_SEC = 1.0
 _MAX_RETRY_AFTER_SEC = 60.0
+_SUBMISSION_MAINTENANCE_RETRY_BUDGET_SEC = 360.0
+_DEFAULT_MAINTENANCE_RETRY_AFTER_SEC = 1.0
+_MAX_SUBMISSION_MAINTENANCE_WAIT_SEC = 60.0
 CLIENT_VERSION_HEADER = "X-DRadar-Client-Version"
 CLIENT_CAPABILITIES_HEADER = "X-DRadar-Capabilities"
 
@@ -129,6 +133,12 @@ class ApiClient:
         # ordinary callers care about clocks or jitter.
         self._sleep = time.sleep
         self._jitter = random.uniform
+        self._monotonic = time.monotonic
+        self._wall_time = time.time
+        self._submission_maintenance_retry_budget = (
+            _SUBMISSION_MAINTENANCE_RETRY_BUDGET_SEC
+        )
+        self._submission_maintenance_deadlines: dict[str, float] = {}
 
     def _get(self, path: str) -> dict[str, Any]:
         return self._check(self._request("GET", path))
@@ -182,6 +192,114 @@ class ApiClient:
             value = _DEFAULT_RETRY_AFTER_SEC
         return min(_MAX_RETRY_AFTER_SEC, max(_DEFAULT_RETRY_AFTER_SEC, value))
 
+    def _maintenance_retry_after(self, resp: httpx.Response) -> float:
+        """Return the server-directed maintenance delay without shortening it.
+
+        Unlike the ordinary 429 backoff, a deployment fence is a promise that
+        submission writes are temporarily unavailable.  Retrying before its
+        HTTP ``Retry-After`` would defeat that fence, so a large delay is not
+        capped here; the separate total retry budget decides whether it can be
+        waited safely.  Both RFC HTTP-date and delta-seconds forms are accepted.
+        """
+        raw = resp.headers.get("Retry-After", "").strip()
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            try:
+                retry_at = parsedate_to_datetime(raw)
+                value = retry_at.timestamp() - self._wall_time()
+            except (TypeError, ValueError, OverflowError):
+                value = _DEFAULT_MAINTENANCE_RETRY_AFTER_SEC
+        if not value >= 0:  # also rejects NaN without importing math
+            value = _DEFAULT_MAINTENANCE_RETRY_AFTER_SEC
+        return max(_DEFAULT_MAINTENANCE_RETRY_AFTER_SEC, value)
+
+    @staticmethod
+    def _is_deployment_maintenance(exc: ApiError) -> bool:
+        return (
+            exc.status_code == 503
+            and exc.code == "deployment_maintenance"
+        )
+
+    def _post_submission_write(
+        self,
+        path: str,
+        *,
+        maintenance_key: str | None = None,
+        retain_maintenance_deadline: bool = False,
+        **kw,
+    ) -> dict[str, Any]:
+        """Retry only an explicitly fenced submission write.
+
+        The exact form/multipart payload (including session/owner/content
+        fences) is replayed; no claim or model execution is reachable from
+        this helper.  All other 5xx responses remain single-attempt failures.
+        """
+        deadline = (
+            self._submission_maintenance_deadlines.get(maintenance_key)
+            if maintenance_key is not None
+            else None
+        )
+        if deadline is None:
+            deadline = (
+                self._monotonic()
+                + self._submission_maintenance_retry_budget
+            )
+        while True:
+            try:
+                response = self._post(path, **kw)
+            except ApiError as exc:
+                if not self._is_deployment_maintenance(exc):
+                    if maintenance_key is not None:
+                        self._submission_maintenance_deadlines.pop(
+                            maintenance_key, None,
+                        )
+                    raise
+                retry_after = exc.retry_after
+                if retry_after is None:
+                    # _check supplies this for the structured maintenance
+                    # envelope. Fail closed if a synthetic/custom client ever
+                    # violates that invariant.
+                    if maintenance_key is not None:
+                        self._submission_maintenance_deadlines.pop(
+                            maintenance_key, None,
+                        )
+                    raise
+                remaining = max(0.0, deadline - self._monotonic())
+                if (
+                    retry_after > remaining
+                    or retry_after > _MAX_SUBMISSION_MAINTENANCE_WAIT_SEC
+                ):
+                    if maintenance_key is not None:
+                        self._submission_maintenance_deadlines.pop(
+                            maintenance_key, None,
+                        )
+                    reason = (
+                        "safe single-wait limit exceeded"
+                        if retry_after > _MAX_SUBMISSION_MAINTENANCE_WAIT_SEC
+                        else "retry budget exhausted"
+                    )
+                    raise ApiError(
+                        f"{exc} (deployment maintenance {reason})",
+                        status_code=exc.status_code,
+                        code=exc.code,
+                        retry_after=retry_after,
+                        required_capability=exc.required_capability,
+                        payload=exc.payload,
+                    ) from exc
+                self._sleep(retry_after)
+                continue
+            if maintenance_key is not None:
+                if retain_maintenance_deadline:
+                    self._submission_maintenance_deadlines[
+                        maintenance_key
+                    ] = deadline
+                else:
+                    self._submission_maintenance_deadlines.pop(
+                        maintenance_key, None,
+                    )
+            return response
+
     def _check(self, resp: httpx.Response) -> dict[str, Any]:
         if resp.status_code >= 400:
             detail: Any = resp.text
@@ -206,7 +324,16 @@ class ApiClient:
                 status_code=resp.status_code,
                 code=code,
                 retry_after=(
-                    self._retry_after(resp) if resp.status_code == 429 else None
+                    self._retry_after(resp)
+                    if resp.status_code == 429
+                    else (
+                        self._maintenance_retry_after(resp)
+                        if (
+                            resp.status_code == 503
+                            and code == "deployment_maintenance"
+                        )
+                        else None
+                    )
                 ),
                 required_capability=required_capability,
                 payload=payload,
@@ -633,8 +760,9 @@ class ApiClient:
             data["resume_generation"] = str(resume_generation)
         if upload_intent_id is not None:
             data["upload_intent_id"] = upload_intent_id
-        return self._post(
+        return self._post_submission_write(
             "/api/v1/submissions",
+            maintenance_key=upload_intent_id,
             data=data,
             files=files,
         )
@@ -662,8 +790,10 @@ class ApiClient:
             data["owner_epoch"] = str(owner_epoch)
         if resume_generation is not None:
             data["resume_generation"] = str(resume_generation)
-        self._post(
+        self._post_submission_write(
             "/api/v1/submission-upload-intents",
+            maintenance_key=upload_intent_id,
+            retain_maintenance_deadline=True,
             data=data,
         )
         return upload_intent_id
