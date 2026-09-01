@@ -98,6 +98,7 @@ REQUEST_TIMEOUT_SECONDS = 60.0
 HEARTBEAT_SECONDS = 1.0
 HEARTBEAT_STALE_SECONDS = 60.0
 IDLE_EXIT_SECONDS = 30.0
+SETTLED_BATCH_STATUSES = {"completed", "failed", "interrupted", "stopped"}
 STARTUP_OBSERVE_SECONDS = 3.0
 
 _pool_lock_handles: dict[str, object] = {}
@@ -573,9 +574,9 @@ def _resolve_workers(
             runtime_config(credentials_file)
             if credentials_file else _load_config()
         )
-    except ValueError as exc:
+        client = _client(cfg)
+    except (SystemExit, ValueError) as exc:
         raise FleetError(str(exc)) from exc
-    client = _client(cfg)
     client.set_batch_id(batch_id)
     try:
         report = inspect_capacity(client)
@@ -994,9 +995,7 @@ def _handle_request(
                 return
             if (
                 current
-                and current.get("status") in {
-                    "completed", "failed", "interrupted",
-                }
+                and current.get("status") in SETTLED_BATCH_STATUSES
                 and not request.get("retry")
             ):
                 _response(home, request_id, {
@@ -1015,9 +1014,7 @@ def _handle_request(
             plan_id = request.get("plan_id")
             if (
                 current
-                and current.get("status") in {
-                    "completed", "failed", "interrupted",
-                }
+                and current.get("status") in SETTLED_BATCH_STATUSES
                 and request.get("retry")
                 and credentials_file is None
                 and plan_id is None
