@@ -80,6 +80,13 @@ def _nonnegative_float(value: str) -> float:
     return parsed
 
 
+def _environment_build_timeout_multiplier(value: str) -> float:
+    parsed = _nonnegative_float(value)
+    if not 1.0 <= parsed <= 8.0:
+        raise argparse.ArgumentTypeError("must be between 1 and 8")
+    return parsed
+
+
 def _pass_rate(value: str) -> float:
     parsed = _nonnegative_float(value)
     if parsed > 1:
@@ -393,7 +400,10 @@ def main(argv: list[str] | None = None) -> int:
     p_config_show.set_defaults(func=cmd_config_show)
     p_config_set = config_sub.add_parser("set", help="change a supported local setting")
     p_config_set.add_argument(
-        "key", choices=("image-cache-mode", "image-cache-limit-gb"),
+        "key", choices=(
+            "image-cache-mode", "image-cache-limit-gb", "build-cache-mode",
+            "environment-build-timeout-multiplier",
+        ),
     )
     p_config_set.add_argument("value")
     p_config_set.set_defaults(func=cmd_config_set)
@@ -485,6 +495,21 @@ def main(argv: list[str] | None = None) -> int:
             "--workers", type=_workers_value, default=1, metavar="N|auto",
             help="run up to N tasks concurrently, or use 'auto' for a "
                  "conservative Docker-based recommendation (default: 1; maximum: 40)",
+        )
+        p.add_argument(
+            "--environment-build-timeout-multiplier",
+            type=_environment_build_timeout_multiplier,
+            default=None,
+            metavar="N",
+            help="multiply each task's Docker environment build timeout "
+                 "(default: 2; allowed range 1..8)",
+        )
+        p.add_argument(
+            "--build-cache-mode",
+            choices=("isolated", "shared"),
+            default=None,
+            help="use an assignment-only BuildKit cache or a DRadar-home-scoped "
+                 "shared immutable cache (default: saved setting, isolated)",
         )
         p.add_argument(
             "--batch-id", type=_batch_id_value, metavar="UUID",

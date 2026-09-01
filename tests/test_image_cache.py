@@ -110,6 +110,32 @@ def test_trial_builder_is_assignment_scoped_and_never_selected_globally(
     assert "--use" not in calls[-1]
 
 
+def test_shared_trial_builder_is_bootstrapped_and_reusable(
+    tmp_path: Path, monkeypatch,
+):
+    calls = []
+
+    def run(command, **_kwargs):
+        calls.append(command)
+        if command[:2] == ["buildx", "inspect"] and "--bootstrap" not in command:
+            return subprocess.CompletedProcess(command, 1, "", "not found")
+        return subprocess.CompletedProcess(command, 0, "ok", "")
+
+    monkeypatch.setattr(image_cache, "_run_docker", run)
+    lease = image_cache.prepare_trial_builder(
+        tmp_path, assignment_id="a1", runtime={}, mode="shared",
+    )
+
+    assert lease.isolated and lease.reusable
+    assert lease.name == image_cache.shared_builder_name(tmp_path)
+    assert calls[-1] == ["buildx", "inspect", lease.name, "--bootstrap"]
+    assert image_cache.remove_trial_builder(
+        tmp_path, "a1", mode="shared",
+    ) == (True, None)
+    # Shared cleanup must not remove the persistent BuildKit cache.
+    assert calls[-1] == ["buildx", "inspect", lease.name, "--bootstrap"]
+
+
 def test_trial_builder_falls_back_without_exposing_loopback_proxy(
     tmp_path: Path, monkeypatch,
 ):

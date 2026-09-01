@@ -368,6 +368,40 @@ def test_build_pier_command_stretches_90_minute_pompeii_pack(tmp_path, monkeypat
     assert cmd[index + 1] == "1.333333"
 
 
+def test_build_pier_command_passes_environment_build_timeout_multiplier(
+    tmp_path, monkeypatch,
+):
+    _stub_pier(monkeypatch)
+    _task_with_toml(
+        tmp_path, task_id="abs-module-cache-flags", timeout_sec=5400.0,
+    )
+    auth = _claude_auth(tmp_path)
+    cmd = build_pier_command(
+        _claude_assignment(), tmp_path, tmp_path / "jobs", "j", tmp_path / "home",
+        provider_auth_path=auth,
+        environment_build_timeout_multiplier=2,
+    )
+    index = cmd.index("--environment-build-timeout-multiplier")
+    assert cmd[index + 1] == "2.000000"
+
+
+def test_effective_run_timeout_adds_two_attempt_build_allowance(tmp_path):
+    task = _task_with_toml(
+        tmp_path, task_id="build-timeout", timeout_sec=5400.0,
+    )
+    (task / "task.toml").write_text(
+        "[agent]\ntimeout_sec = 5400.0\n"
+        "[environment]\nbuild_timeout_sec = 5400.0\n",
+    )
+    assignment = {"agent": "codex", "est_minutes": 5}
+    expected = max(
+        runner_mod._effective_trial_timeout_sec(assignment),
+        5400 * 2 * runner_mod.PIER_ENVIRONMENT_START_ATTEMPTS
+        + runner_mod.ENVIRONMENT_BUILD_WATCHDOG_SLACK_SEC,
+    )
+    assert runner_mod._effective_run_timeout_sec(assignment, task, 2) == expected
+
+
 
 # --- self-bootstrap (ensure_pier / ensure_tasks_root) ------------------------
 import subprocess
@@ -1152,6 +1186,10 @@ def _prepare_fake_antigravity(monkeypatch, tmp_path):
     monkeypatch.setattr(
         runner_mod, "_antigravity_tasks_overlay", passthrough_overlay,
     )
+    # The runner now performs the same structural OAuth preflight that the
+    # real provider session performs.  These tests exercise process/artifact
+    # cleanup, so make the provider credential check an explicit no-op.
+    monkeypatch.setattr(runner_mod, "prepare_antigravity_auth", lambda: None)
 
 
 def test_antigravity_rc0_reaps_live_exact_job_runtime_and_keeps_patch(

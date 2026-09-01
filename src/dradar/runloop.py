@@ -98,6 +98,7 @@ from .runner import (
     local_deep_swe_commit,
     prepare_pinned_deep_swe_tasks,
     pompeii_agent_timeout_sec, run_trial,
+    resolve_environment_build_timeout_multiplier,
     summarize_result, task_content_mismatch_diagnostic,
     trial_artifact_paths,
 )
@@ -289,6 +290,21 @@ def _run_config(args) -> dict:
             if len(normalized) != len(parsed):
                 sys.exit("invalid internal worker capability snapshot")
             cfg["client_capabilities"] = normalized
+    try:
+        args._environment_build_timeout_multiplier = (
+            resolve_environment_build_timeout_multiplier(
+                getattr(args, "environment_build_timeout_multiplier", None)
+                if getattr(args, "environment_build_timeout_multiplier", None)
+                is not None
+                else cfg.get("environment_build_timeout_multiplier")
+            )
+        )
+    except RunnerError as exc:
+        sys.exit(str(exc))
+    args._build_cache_mode = image_cache.normalize_build_cache_mode(
+        getattr(args, "build_cache_mode", None)
+        or image_cache.configured_build_cache_mode(cfg)
+    )
     return cfg
 
 
@@ -2499,15 +2515,38 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             try:
                 art = run_trial(
                     assignment, tasks_root, work_dir, dev_agent=args.dev_agent,
-                    on_started=bind_owner)
-            finally:
-                # A per-assignment builder owns only this trial's BuildKit
-                # state. Remove it as soon as Pier exits, including exception
-                # paths; task images/runtime objects are handled after the
-                # durable patch has been staged below.
-                builder_removed, builder_note = image_cache.remove_trial_builder(
-                    HOME, assignment["assignment_id"],
+                    on_started=bind_owner,
+                    environment_build_timeout_multiplier=(
+                        getattr(
+                            args, "_environment_build_timeout_multiplier", None,
+                        )
+                    ),
+                    build_cache_mode=(
+                        getattr(args, "_build_cache_mode", None)
+                        or getattr(args, "build_cache_mode", None)
+                        or image_cache.DEFAULT_BUILD_CACHE_MODE
+                    ),
                 )
+            finally:
+                # Assignment-scoped builders own only this trial's BuildKit
+                # state and are removed on every exit path. A shared builder
+                # is deliberately retained so its immutable layers serve the
+                # next worker; image/runtime objects are still cleaned below.
+                cache_mode = (
+                    getattr(args, "_build_cache_mode", None)
+                    or getattr(args, "build_cache_mode", None)
+                    or image_cache.DEFAULT_BUILD_CACHE_MODE
+                )
+                if cache_mode == "shared":
+                    builder_removed, builder_note = (
+                        image_cache.remove_trial_builder(
+                            HOME, assignment["assignment_id"], mode="shared",
+                        )
+                    )
+                else:
+                    builder_removed, builder_note = image_cache.remove_trial_builder(
+                        HOME, assignment["assignment_id"],
+                    )
                 if not builder_removed:
                     args._docker_cleanup_blocked = (
                         "临时构建空间未能删除："
@@ -2655,6 +2694,8 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         job_dir=art.job_dir,
         trial_name=art.trial_dir.name,
         builder_isolated=art.builder_isolated,
+        builder_reusable=art.builder_reusable,
+        builder_name=art.builder_name,
         keep_images=bool(args.keep),
     )
     removed_objects = (
@@ -3856,6 +3897,16 @@ def _worker_command(args) -> list[str]:
         command.extend(("--benchmark", args.benchmark))
     if getattr(args, "batch_id", None):
         command.extend(("--batch-id", args.batch_id))
+    build_timeout = getattr(
+        args, "_environment_build_timeout_multiplier", None,
+    )
+    if build_timeout is not None:
+        command.extend((
+            "--environment-build-timeout-multiplier", f"{build_timeout:g}",
+        ))
+    build_cache_mode = getattr(args, "_build_cache_mode", None)
+    if build_cache_mode:
+        command.extend(("--build-cache-mode", build_cache_mode))
     if getattr(args, "credentials_file", None):
         command.extend(("--credentials-file", args.credentials_file))
     if getattr(args, "refill", False):

@@ -97,14 +97,17 @@ from .providers import (
     deepseek_catalog_error,
     deepseek_catalog_path,
     grok_cli_path,
+    grok_live_error,
     grok_subscription_session,
     kimi_auth_path,
     kimi_cli_path,
     kimi_home,
+    kimi_live_error,
     kimi_subscription_session,
     parse_kimi_cli_version,
     parse_grok_cli_version,
     parse_zcode_cli_version,
+    prepare_antigravity_auth,
     zcode_cli_error,
     zcode_cli_path,
     zcode_cli_version_is_compatible,
@@ -216,6 +219,10 @@ CODEBUDDY_AGENT_IMPORT_PATH = (
 )
 CODEBUDDY_AGENT_MODULE_FILENAME = "_dradar_pier_codebuddy.py"
 BETA_SUBSCRIPTION_TRIAL_TIMEOUT_FLOOR_SEC = 120 * 60
+DEFAULT_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER = 2.0
+DEFAULT_ENVIRONMENT_BUILD_TIMEOUT_SEC = 600.0
+PIER_ENVIRONMENT_START_ATTEMPTS = 2
+ENVIRONMENT_BUILD_WATCHDOG_SLACK_SEC = 120
 BETA_SUBSCRIPTION_AGENTS = frozenset({
     CLAUDE_AGENT, GROK_AGENT, KIMI_AGENT, ZCODE_AGENT, ANTIGRAVITY_AGENT,
     CODEBUDDY_AGENT,
@@ -334,6 +341,8 @@ class TrialArtifacts:
     # always sets this explicitly from prepare_trial_builder.
     builder_isolated: bool = True
     builder_note: str | None = None
+    builder_reusable: bool = False
+    builder_name: str | None = None
 
 
 class RunnerError(RuntimeError):
@@ -1065,6 +1074,57 @@ def _task_agent_timeout_sec(task_path: Path) -> float | None:
     return data.get("agent", {}).get("timeout_sec")
 
 
+def _task_environment_build_timeout_sec(task_path: Path) -> float | None:
+    """Read the task's declared Pier environment build timeout.
+
+    This value is used only to size DRadar's outer watchdog when the longer
+    build profile is enabled.  Pier remains the source of truth for the actual
+    environment timeout; malformed task metadata never weakens the historical
+    watchdog.
+    """
+
+    try:
+        with (task_path / "task.toml").open("rb") as f:
+            data = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    value = data.get("environment", {}).get("build_timeout_sec")
+    if (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        and float(value) > 0
+    ):
+        return float(value)
+    return None
+
+
+def resolve_environment_build_timeout_multiplier(value: object = None) -> float:
+    """Return a bounded environment-build timeout multiplier.
+
+    A default of two gives slow mirrors and cold builders another window while
+    keeping the upper bound finite. Passing ``1`` explicitly restores the
+    previous behavior; values above eight are refused so a wedged daemon
+    cannot keep a paid lease alive indefinitely.
+    """
+
+    if value is None:
+        return DEFAULT_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER
+    try:
+        multiplier = float(value)
+    except (TypeError, ValueError) as exc:
+        raise RunnerError(
+            "environment build timeout multiplier must be a finite number "
+            "between 1 and 8"
+        ) from exc
+    if not math.isfinite(multiplier) or not 1.0 <= multiplier <= 8.0:
+        raise RunnerError(
+            "environment build timeout multiplier must be a finite number "
+            "between 1 and 8"
+        )
+    return multiplier
+
+
 def pompeii_agent_timeout_sec(assignment: dict) -> int:
     """Return the hard agent budget for one Pompeii assignment."""
     if assignment.get("agent") == KIMI_AGENT:
@@ -1116,6 +1176,9 @@ def build_pier_command(
     dev_agent: str | None = None,
     provider_auth_path: Path | None = None,
     provider_cli_path: Path | None = None,
+    environment_build_timeout_multiplier: float | None = (
+        DEFAULT_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER
+    ),
 ) -> list[str]:
     task_path = tasks_root / assignment["task_id"]
     if not task_path.is_dir():
@@ -1233,6 +1296,15 @@ def build_pier_command(
     multiplier = _agent_timeout_multiplier(assignment, task_path)
     if not math.isclose(multiplier, 1.0):
         cmd += ["--agent-timeout-multiplier", f"{multiplier:.6f}"]
+    if environment_build_timeout_multiplier is not None:
+        build_multiplier = resolve_environment_build_timeout_multiplier(
+            environment_build_timeout_multiplier,
+        )
+        if not math.isclose(build_multiplier, 1.0):
+            cmd += [
+                "--environment-build-timeout-multiplier",
+                f"{build_multiplier:.6f}",
+            ]
     # Task containers ship no git identity, so an agent's final `git commit`
     # dies with "Author identity unknown" unless the model thinks to configure
     # one (volunteer report, 2026-07-13). These ride pier's --ae into the
@@ -1540,6 +1612,37 @@ def _validated_zcode_cli_path(*, model: str | None = None) -> tuple[Path, str]:
     ):
         raise RunnerError("could not determine a compatible ZCode CLI version")
     return cli, version
+
+
+def _preflight_subscription_before_build(
+    agent: str,
+    *,
+    grok_cli: Path | None = None,
+    kimi_cli: Path | None = None,
+) -> None:
+    """Run a bounded, no-prompt provider check before any Docker build.
+
+    Subscription OAuth failures are account/setup failures, not environment
+    failures.  Running the provider's existing live check first prevents a
+    worker from spending tens of minutes pulling/building an image only to
+    discover an invalid refresh grant.  The helpers use their normal
+    account-scoped locks and redacted diagnostics; no prompt/model turn is
+    started here.
+    """
+
+    issue: str | None = None
+    if agent == GROK_AGENT:
+        if grok_cli is None:
+            raise RunnerError("Grok CLI was not prepared for provider preflight")
+        issue = grok_live_error(grok_cli)
+    elif agent == KIMI_AGENT:
+        if kimi_cli is None:
+            raise RunnerError("Kimi CLI was not prepared for provider preflight")
+        issue = kimi_live_error(kimi_cli)
+    if issue is not None:
+        raise RunnerError(
+            f"{agent} provider preflight failed before Docker build: {issue}"
+        )
 
 
 def locate_artifacts(jobs_dir: Path, job_name: str) -> tuple[Path, Path]:
@@ -2773,6 +2876,39 @@ def _effective_trial_timeout_sec(assignment: dict) -> int:
     return _trial_timeout_sec(assignment)
 
 
+def _effective_run_timeout_sec(
+    assignment: dict,
+    task_path: Path,
+    environment_build_timeout_multiplier: float,
+) -> int:
+    """Include the bounded two-attempt build allowance in DRadar's watchdog.
+
+    Pier retries ``EnvironmentStartTimeoutError`` once.  The old outer
+    watchdog started before image setup and could therefore kill a run while
+    Pier was still within its enlarged build window.  Account for both build
+    attempts, then retain the task/agent budget as the minimum.  For Pompeii
+    the model's hard deadline and the setup allowance are additive: a full
+    build must not steal the agent's promised execution time.
+    """
+
+    base = _task_environment_build_timeout_sec(task_path)
+    if base is None:
+        base = DEFAULT_ENVIRONMENT_BUILD_TIMEOUT_SEC
+    build_allowance = int(math.ceil(
+        base * environment_build_timeout_multiplier
+        * PIER_ENVIRONMENT_START_ATTEMPTS
+    )) + ENVIRONMENT_BUILD_WATCHDOG_SLACK_SEC
+    current = _effective_trial_timeout_sec(assignment)
+    # Test/integration adapters may deliberately return a non-positive
+    # watchdog to force the first heartbeat path.  Preserve that explicit
+    # override rather than replacing it with the normal build allowance.
+    if current <= 0:
+        return current
+    if assignment.get("benchmark_id") == POMPEII_BENCHMARK_ID:
+        return current + build_allowance
+    return max(current, build_allowance)
+
+
 def _zcode_runtime_diagnostic(jobs_dir: Path, job_name: str) -> dict[str, object]:
     """Read the adapter's allowlisted lifecycle snapshot, never its raw logs."""
     try:
@@ -3513,6 +3649,8 @@ def run_trial(
     work_dir: Path,
     dev_agent: str | None = None,
     on_started: Callable[[], None] | None = None,
+    environment_build_timeout_multiplier: float | None = None,
+    build_cache_mode: str = image_cache.DEFAULT_BUILD_CACHE_MODE,
 ) -> TrialArtifacts:
     effective_assignment = assignment
     codex_cli_version = None
@@ -3524,6 +3662,10 @@ def run_trial(
     codebuddy_cli_version = None
     codex_provider = None
     effective_agent = dev_agent or assignment["agent"]
+    environment_build_timeout_multiplier = resolve_environment_build_timeout_multiplier(
+        environment_build_timeout_multiplier,
+    )
+    build_cache_mode = image_cache.normalize_build_cache_mode(build_cache_mode)
     if effective_agent == "codex":
         codex_provider = (
             assignment_codex_provider(assignment) or DEFAULT_CODEX_PROVIDER
@@ -3623,6 +3765,32 @@ def run_trial(
         print(f"verified pinned CodeBuddy CLI: {codebuddy_cli_version}")
 
     work_dir.mkdir(parents=True, exist_ok=True)
+    provider_auth_path = None
+    provider_cli_path = None
+    provider_stack = ExitStack()
+    # Resolve subscription credentials before touching Docker.  A rejected
+    # OAuth grant is an account problem and must not consume a full image
+    # build window before it becomes visible to the worker.
+    if effective_agent == GROK_AGENT:
+        provider_cli_path = _validated_grok_cli_path()
+        _preflight_subscription_before_build(
+            effective_agent, grok_cli=provider_cli_path,
+        )
+        print("Grok provider preflight passed before Docker build")
+    elif effective_agent == KIMI_AGENT:
+        provider_cli_path = _validated_kimi_cli_path()
+        _preflight_subscription_before_build(
+            effective_agent, kimi_cli=provider_cli_path,
+        )
+        print("Kimi provider preflight passed before Docker build")
+    elif effective_agent == ANTIGRAVITY_AGENT:
+        issue = prepare_antigravity_auth()
+        if issue is not None:
+            raise RunnerError(
+                "antigravity provider preflight failed before Docker build: "
+                + issue
+            )
+        print("Antigravity provider preflight passed before Docker build")
     try:
         egress_environment = egress.prepare_egress_proxy_runtime(announce=True)
     except egress.EgressProxyError as exc:
@@ -3635,9 +3803,13 @@ def run_trial(
         work_dir.parent,
         assignment_id=str(assignment["assignment_id"]),
         runtime=egress_environment,
+        mode=build_cache_mode,
     )
     if builder_lease.isolated:
-        print("已为本题准备独立的临时运行环境")
+        if builder_lease.reusable:
+            print("已为本题准备共享的 DRadar BuildKit 缓存")
+        else:
+            print("已为本题准备独立的临时运行环境")
     else:
         print(
             "提示：本题可以继续运行，但临时环境暂时无法安全隔离；"
@@ -3654,7 +3826,11 @@ def run_trial(
     # A mid-task rate-limit death just ends the run (no sleep-and-resume) --
     # it surfaces as a nonzero pier rc, which _run_and_submit reports as
     # `interrupted` -> the server marks it invalid and the cell reopens.
-    timeout_sec = _effective_trial_timeout_sec(effective_assignment)
+    timeout_sec = _effective_run_timeout_sec(
+        effective_assignment,
+        tasks_root / str(effective_assignment["task_id"]),
+        environment_build_timeout_multiplier,
+    )
     terminal_error: RunnerError | None = None
     live_error_offsets: dict[Path, int] = {}
     live_error_counts: dict[str, int] = {}
@@ -3665,9 +3841,6 @@ def run_trial(
         )
     )
 
-    provider_auth_path = None
-    provider_cli_path = None
-    provider_stack = ExitStack()
     try:
         if codex_provider == DEEPSEEK_PROVIDER:
             try:
@@ -3688,7 +3861,7 @@ def run_trial(
                 raise RunnerError(str(exc)) from exc
         elif effective_agent == GROK_AGENT:
             try:
-                provider_cli_path = _validated_grok_cli_path()
+                provider_cli_path = provider_cli_path or _validated_grok_cli_path()
                 provider_auth_path = provider_stack.enter_context(
                     grok_subscription_session(work_dir)
                 )
@@ -3696,7 +3869,7 @@ def run_trial(
                 raise RunnerError(str(exc)) from exc
         elif effective_agent == KIMI_AGENT:
             try:
-                provider_cli_path = _validated_kimi_cli_path()
+                provider_cli_path = provider_cli_path or _validated_kimi_cli_path()
                 provider_auth_path = provider_stack.enter_context(
                     kimi_subscription_session(work_dir)
                 )
@@ -3782,9 +3955,21 @@ def run_trial(
                     job_name,
                 )
             )
+        build_options = dict(provider_kwargs)
+        # Keep the default path compatible with small embedders/test doubles
+        # that still implement the historical positional builder signature;
+        # build_pier_command itself carries the production default. Explicit
+        # non-default policies are forwarded so operators can tune them.
+        if not math.isclose(
+            environment_build_timeout_multiplier,
+            DEFAULT_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER,
+        ):
+            build_options[
+                "environment_build_timeout_multiplier"
+            ] = environment_build_timeout_multiplier
         cmd = build_pier_command(
             effective_assignment, pier_tasks_root, jobs_dir, job_name, work_dir,
-            dev_agent, **provider_kwargs,
+            dev_agent, **build_options,
         )
         env = _pier_process_env(
             effective_assignment,
@@ -3819,6 +4004,20 @@ def run_trial(
         started = time.time()
         with log_path.open("w") as log:
             log.write("cmd=" + " ".join(cmd) + "\n")
+            log.write(
+                "build_cache_mode="
+                + ("shared" if builder_lease.reusable else "isolated")
+                + "\n"
+            )
+            log.write(
+                "build_cache_builder="
+                + (builder_lease.name or "default-fallback")
+                + "\n"
+            )
+            log.write(
+                "environment_build_timeout_multiplier="
+                + f"{environment_build_timeout_multiplier:g}\n"
+            )
             log.flush()
             # Heartbeat loop instead of a blocking run: image build + a long
             # agent turn can be silent for many minutes, and volunteers couldn't
@@ -4080,6 +4279,8 @@ def run_trial(
         dsh_artifact_binding=dsh_artifact_binding,
         builder_isolated=builder_lease.isolated,
         builder_note=builder_lease.note,
+        builder_reusable=builder_lease.reusable,
+        builder_name=builder_lease.name,
     )
 
 
