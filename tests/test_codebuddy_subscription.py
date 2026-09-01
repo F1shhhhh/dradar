@@ -105,6 +105,45 @@ def test_codebuddy_public_contract_is_pinned_to_three_efforts() -> None:
     )
 
 
+@pytest.mark.parametrize("version", ["2.137.1", "2.143.0", "2.999.0"])
+def test_compatible_newer_host_cli_can_supply_login_without_changing_runtime(
+    version: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        codebuddy_provider, "codebuddy_version", lambda _executable: version,
+    )
+
+    assert codebuddy_provider.codebuddy_host_cli_status("/usr/bin/codebuddy") == (
+        None, version,
+    )
+    assert codebuddy_provider.CODEBUDDY_CONTAINER_IMAGE == (
+        "dradar-codebuddy:2.137.1"
+    )
+
+
+@pytest.mark.parametrize(
+    "executable,version,expected",
+    [
+        (None, None, ("missing", None)),
+        ("/usr/bin/codebuddy", None, ("unrecognized", None)),
+        ("/usr/bin/codebuddy", "2.136.9", ("incompatible", "2.136.9")),
+        ("/usr/bin/codebuddy", "1.999.0", ("incompatible", "1.999.0")),
+        ("/usr/bin/codebuddy", "3.0.0", ("incompatible", "3.0.0")),
+    ],
+)
+def test_host_cli_status_fails_closed_for_missing_unknown_or_incompatible_versions(
+    executable: str | None,
+    version: str | None,
+    expected: tuple[str | None, str | None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        codebuddy_provider, "codebuddy_version", lambda _executable: version,
+    )
+
+    assert codebuddy_provider.codebuddy_host_cli_status(executable) == expected
+
+
 def test_login_import_is_private_atomic_and_refreshable(tmp_path: Path) -> None:
     source_home = tmp_path / "host-codebuddy"
     source_auth = tmp_path / "host-auth"
@@ -309,7 +348,7 @@ def test_capability_is_advertised_only_after_every_local_gate(
         providers, "codebuddy_executable", lambda _env: "/bin/codebuddy",
     )
     monkeypatch.setattr(
-        providers, "codebuddy_version", lambda _path: CODEBUDDY_CLI_VERSION,
+        codebuddy_provider, "codebuddy_version", lambda _path: "2.143.0",
     )
     monkeypatch.setattr(
         providers, "codebuddy_credential_status", lambda: (True, "ready"),

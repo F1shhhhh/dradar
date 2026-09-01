@@ -152,6 +152,29 @@ def codebuddy_version(executable: str | None = None) -> str | None:
     return match.group(1) if result.returncode == 0 and match else None
 
 
+def codebuddy_host_cli_status(
+    executable: str | None,
+) -> tuple[str | None, str | None]:
+    """Validate only the host CLI used as the login source.
+
+    The benchmark runtime remains the separately attested, pinned container at
+    ``CODEBUDDY_CLI_VERSION``.  A user's newer compatible 2.x host CLI may
+    still provide its login snapshot; it must not be mistaken for the task
+    runtime or force users to downgrade an already-working installation.
+    """
+
+    if not executable:
+        return "missing", None
+    version = codebuddy_version(executable)
+    if version is None:
+        return "unrecognized", None
+    parsed = tuple(int(part) for part in version.split("."))
+    minimum = tuple(int(part) for part in CODEBUDDY_CLI_VERSION.split("."))
+    if parsed[0] != minimum[0] or parsed < minimum:
+        return "incompatible", version
+    return None, version
+
+
 def _validated_directory(
     root: Path, label: str, *, require_private: bool,
 ) -> None:

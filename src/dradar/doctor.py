@@ -17,7 +17,7 @@ from .codebuddy_provider import (
     CODEBUDDY_MODEL,
     codebuddy_executable,
     codebuddy_runtime_image_error,
-    codebuddy_version,
+    codebuddy_host_cli_status,
     credential_status as codebuddy_credential_status,
     managed_codebuddy_home,
 )
@@ -382,17 +382,38 @@ def plan_environment_issue(plan: dict) -> dict | None:
         return None
     if harness == CODEBUDDY_AGENT:
         executable = codebuddy_executable()
+        cli_issue, cli_version = codebuddy_host_cli_status(executable)
         credentials_ready, _detail = codebuddy_credential_status()
         image_issue = codebuddy_runtime_image_error(docker)
-        if (
-            not executable
-            or codebuddy_version(executable) != CODEBUDDY_CLI_VERSION
-            or not credentials_ready
-            or image_issue is not None
-        ):
+        if cli_issue == "missing":
             return _plan_issue(
-                harness, "current_tool_not_ready",
-                "这次运行需要 CodeBuddy；请完成 CodeBuddy 的安装和登录后重试。",
+                harness, "current_tool_not_installed",
+                "这台设备尚未安装 CodeBuddy；请安装后重试。",
+                "setup_current_tool", setup_provider="codebuddy",
+            )
+        if cli_issue == "unrecognized":
+            return _plan_issue(
+                harness, "current_tool_version_unknown",
+                "无法识别这台设备上的 CodeBuddy 版本；请更新或重新安装后重试。",
+                "setup_current_tool", setup_provider="codebuddy",
+            )
+        if cli_issue == "incompatible":
+            return _plan_issue(
+                harness, "current_tool_version_incompatible",
+                f"这台设备上的 CodeBuddy {cli_version} 与当前运行方式不兼容；"
+                "请更新后重试。",
+                "setup_current_tool", setup_provider="codebuddy",
+            )
+        if not credentials_ready:
+            return _plan_issue(
+                harness, "current_tool_not_authenticated",
+                "这台设备上的 CodeBuddy 尚未登录；请完成登录后重试。",
+                "setup_current_tool", setup_provider="codebuddy",
+            )
+        if image_issue is not None:
+            return _plan_issue(
+                harness, "current_tool_runtime_not_ready",
+                "CodeBuddy 的隔离运行环境尚未准备好；请完成准备后重试。",
                 "setup_current_tool", setup_provider="codebuddy",
             )
         return None
@@ -750,10 +771,11 @@ def cmd_doctor(args) -> int:
         selected_agent is None and managed_codebuddy_home().exists()
     )
     codebuddy_cli = codebuddy_executable() if codebuddy_requested else None
-    codebuddy_cli_ready = bool(
-        codebuddy_cli
-        and codebuddy_version(codebuddy_cli) == CODEBUDDY_CLI_VERSION
+    codebuddy_cli_issue, codebuddy_cli_version = (
+        codebuddy_host_cli_status(codebuddy_cli)
+        if codebuddy_requested else ("missing", None)
     )
+    codebuddy_cli_ready = codebuddy_cli_issue is None
     codebuddy_credentials_ready, codebuddy_credential_detail = (
         codebuddy_credential_status()
         if codebuddy_requested else (False, "not configured")
@@ -865,10 +887,16 @@ def cmd_doctor(args) -> int:
                 )
         if codebuddy_requested:
             all_ok &= _check(
-                f"CodeBuddy CLI {CODEBUDDY_CLI_VERSION} — subscription setup source",
+                "CodeBuddy CLI "
+                f"{codebuddy_cli_version or 'unknown'} — subscription login source",
                 codebuddy_cli_ready,
-                "install the reviewed official CLI and run "
-                "`dradar provider setup codebuddy`",
+                {
+                    "missing": "install CodeBuddy and run `dradar provider setup codebuddy`",
+                    "unrecognized": "update or reinstall CodeBuddy, then run "
+                                    "`dradar provider setup codebuddy`",
+                    "incompatible": f"update CodeBuddy to {CODEBUDDY_CLI_VERSION} or newer "
+                                    "within the compatible 2.x series",
+                }.get(codebuddy_cli_issue, "run `dradar provider setup codebuddy`"),
             )
             all_ok &= _check(
                 "CodeBuddy subscription login — isolated DRadar copy",
