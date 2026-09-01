@@ -98,6 +98,7 @@ from .runner import (
     local_deep_swe_commit,
     prepare_pinned_deep_swe_tasks,
     pompeii_agent_timeout_sec, run_trial,
+    resolve_environment_build_timeout_multiplier,
     summarize_result, task_content_mismatch_diagnostic,
     trial_artifact_paths,
 )
@@ -289,6 +290,21 @@ def _run_config(args) -> dict:
             if len(normalized) != len(parsed):
                 sys.exit("invalid internal worker capability snapshot")
             cfg["client_capabilities"] = normalized
+    try:
+        args._environment_build_timeout_multiplier = (
+            resolve_environment_build_timeout_multiplier(
+                getattr(args, "environment_build_timeout_multiplier", None)
+                if getattr(args, "environment_build_timeout_multiplier", None)
+                is not None
+                else cfg.get("environment_build_timeout_multiplier")
+            )
+        )
+    except RunnerError as exc:
+        sys.exit(str(exc))
+    args._build_cache_mode = image_cache.normalize_build_cache_mode(
+        getattr(args, "build_cache_mode", None)
+        or image_cache.configured_build_cache_mode(cfg)
+    )
     return cfg
 
 
@@ -2499,15 +2515,38 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
             try:
                 art = run_trial(
                     assignment, tasks_root, work_dir, dev_agent=args.dev_agent,
-                    on_started=bind_owner)
-            finally:
-                # A per-assignment builder owns only this trial's BuildKit
-                # state. Remove it as soon as Pier exits, including exception
-                # paths; task images/runtime objects are handled after the
-                # durable patch has been staged below.
-                builder_removed, builder_note = image_cache.remove_trial_builder(
-                    HOME, assignment["assignment_id"],
+                    on_started=bind_owner,
+                    environment_build_timeout_multiplier=(
+                        getattr(
+                            args, "_environment_build_timeout_multiplier", None,
+                        )
+                    ),
+                    build_cache_mode=(
+                        getattr(args, "_build_cache_mode", None)
+                        or getattr(args, "build_cache_mode", None)
+                        or image_cache.DEFAULT_BUILD_CACHE_MODE
+                    ),
                 )
+            finally:
+                # Assignment-scoped builders own only this trial's BuildKit
+                # state and are removed on every exit path. A shared builder
+                # is deliberately retained so its immutable layers serve the
+                # next worker; image/runtime objects are still cleaned below.
+                cache_mode = (
+                    getattr(args, "_build_cache_mode", None)
+                    or getattr(args, "build_cache_mode", None)
+                    or image_cache.DEFAULT_BUILD_CACHE_MODE
+                )
+                if cache_mode == "shared":
+                    builder_removed, builder_note = (
+                        image_cache.remove_trial_builder(
+                            HOME, assignment["assignment_id"], mode="shared",
+                        )
+                    )
+                else:
+                    builder_removed, builder_note = image_cache.remove_trial_builder(
+                        HOME, assignment["assignment_id"],
+                    )
                 if not builder_removed:
                     args._docker_cleanup_blocked = (
                         "临时构建空间未能删除："
@@ -2655,6 +2694,8 @@ def _run_and_submit(client: ApiClient, assignment: dict, tasks_root: Path,
         job_dir=art.job_dir,
         trial_name=art.trial_dir.name,
         builder_isolated=art.builder_isolated,
+        builder_reusable=art.builder_reusable,
+        builder_name=art.builder_name,
         keep_images=bool(args.keep),
     )
     removed_objects = (
@@ -3295,11 +3336,15 @@ def cmd_cleanup(args) -> int:
     lease list, a local job may be a finished trial that crashed immediately
     before its upload ledger was recorded.
     """
+    shared_cache_requested = bool(getattr(args, "shared_build_cache", False))
     docker_requested = bool(
         getattr(args, "docker", False) or getattr(args, "all_task_images", False)
     )
     if getattr(args, "all_task_images", False) and not getattr(args, "docker", False):
         print("--all-task-images requires --docker")
+        return 1
+    if shared_cache_requested and not getattr(args, "docker", False):
+        print("--shared-build-cache requires --docker")
         return 1
     cfg = _load_config()
     client = _client(cfg)
@@ -3378,13 +3423,40 @@ def cmd_cleanup(args) -> int:
             print(f"  protected {image_plan.protected} image tag(s) used by a "
                   "container, active/pending task, or kept job")
 
+    shared_cache_limit = image_cache.effective_policy(HOME, cfg).limit_bytes
+    if shared_cache_requested:
+        shared_name = image_cache.shared_builder_name(HOME)
+        print("Shared BuildKit cache:")
+        if args.dry_run:
+            print(
+                f"  would prune builder {shared_name} to "
+                f"{_format_size(shared_cache_limit)} maximum"
+            )
+        elif active_ids:
+            print(
+                f"  protected while {len(active_ids)} active/resumable assignment(s) "
+                "exist; no shared cache was pruned"
+            )
+        else:
+            print(
+                f"  ready to prune builder {shared_name} to "
+                f"{_format_size(shared_cache_limit)} maximum"
+            )
+
     has_images = bool(
         image_plan and image_plan.docker_available and image_plan.candidates
     )
-    if (not candidates and not has_images) or args.dry_run:
+    if (not candidates and not has_images and not shared_cache_requested) or args.dry_run:
         return 1 if docker_requested and image_plan and not image_plan.docker_available else 0
     if not args.yes:
-        subject = "settled local files and Docker task images" if has_images else "settled local task files"
+        subjects = []
+        if candidates:
+            subjects.append("settled local files")
+        if has_images:
+            subjects.append("Docker task images")
+        if shared_cache_requested:
+            subjects.append("the DRadar shared BuildKit cache")
+        subject = " and ".join(subjects)
         answer = input(f"remove these {subject}? [Y/n] ").strip().lower()
         if answer not in ("", "y", "yes"):
             print("nothing was deleted")
@@ -3401,7 +3473,16 @@ def cmd_cleanup(args) -> int:
         if removed != len(image_plan.candidates):
             image_failed = True
             print("some images changed or became active during cleanup and were safely skipped")
-    return 1 if image_failed else 0
+    shared_failed = False
+    if shared_cache_requested and not active_ids:
+        shared_ok, shared_note = image_cache.prune_shared_build_cache(
+            HOME, max_used_bytes=shared_cache_limit,
+        )
+        print(f"  {shared_note or 'shared BuildKit cache cleanup finished'}")
+        shared_failed = not shared_ok
+    elif shared_cache_requested:
+        shared_failed = True
+    return 1 if image_failed or shared_failed else 0
 
 
 def _maintain_image_cache(client: ApiClient, cfg: dict, *, phase: str) -> bool:
@@ -3856,6 +3937,16 @@ def _worker_command(args) -> list[str]:
         command.extend(("--benchmark", args.benchmark))
     if getattr(args, "batch_id", None):
         command.extend(("--batch-id", args.batch_id))
+    build_timeout = getattr(
+        args, "_environment_build_timeout_multiplier", None,
+    )
+    if build_timeout is not None:
+        command.extend((
+            "--environment-build-timeout-multiplier", f"{build_timeout:g}",
+        ))
+    build_cache_mode = getattr(args, "_build_cache_mode", None)
+    if build_cache_mode:
+        command.extend(("--build-cache-mode", build_cache_mode))
     if getattr(args, "credentials_file", None):
         command.extend(("--credentials-file", args.credentials_file))
     if getattr(args, "refill", False):

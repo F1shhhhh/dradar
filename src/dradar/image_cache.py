@@ -33,6 +33,9 @@ LEDGER_NAME = "image-cache.json"
 LOCK_NAME = "image-cache.lock"
 MAINTENANCE_STAMP_NAME = "image-cache-maintenance.stamp"
 BUILDER_PREFIX = "dradar-task-"
+SHARED_BUILDER_PREFIX = "dradar-cache-"
+BUILD_CACHE_MODES = frozenset({"isolated", "shared"})
+DEFAULT_BUILD_CACHE_MODE = "isolated"
 GIB = 1024 ** 3
 DEFAULT_MIN_FREE_GIB = 25.0
 _PROJECT_RE = re.compile(r"[a-z0-9][a-z0-9-]*__[a-z0-9]{6,8}$")
@@ -95,6 +98,11 @@ class TrialBuilderLease:
     name: str | None
     isolated: bool
     note: str | None = None
+    # A shared builder is scoped to the current OS user's Docker context and
+    # is selected only in the child Pier environment. It intentionally
+    # survives one trial so BuildKit can reuse immutable layers for the next
+    # task, even when Fleet gives each harness a separate DRADAR_HOME.
+    reusable: bool = False
 
 
 @dataclass
@@ -201,6 +209,45 @@ def trial_builder_name(home: Path, assignment_id: str) -> str:
     return BUILDER_PREFIX + hashlib.sha256(identity).hexdigest()[:20]
 
 
+def shared_builder_name(home: Path) -> str:
+    """Return the persistent BuildKit builder scoped to one OS user.
+
+    The name is deterministic so concurrent workers converge on one builder,
+    while the hash prevents a different OS user's builder from colliding on a
+    shared Docker daemon.  It is never selected globally; callers pass it
+    through ``BUILDX_BUILDER`` only to the Pier child. ``home`` remains in the
+    signature for compatibility with the assignment-scoped helper, but is not
+    the scope: Fleet deliberately uses separate DRADAR_HOME paths per harness.
+    """
+
+    # A Fleet uses one DRADAR_HOME per harness. Deliberately scope the shared
+    # builder to the host OS user rather than that per-harness directory,
+    # otherwise eight cars would still download the same immutable layers
+    # eight times. Do not accept an arbitrary environment override here: the
+    # OS user's home and Docker socket are the auditable isolation boundary;
+    # task credentials never enter this name or the BuildKit cache.
+    scope = Path.home()
+    identity = f"{scope.resolve()}\0shared-build-cache".encode(
+        "utf-8", "surrogatepass",
+    )
+    return SHARED_BUILDER_PREFIX + hashlib.sha256(identity).hexdigest()[:20]
+
+
+def normalize_build_cache_mode(value: object) -> str:
+    """Normalize the local build-cache policy without widening its scope."""
+
+    mode = str(value or DEFAULT_BUILD_CACHE_MODE).strip().lower()
+    return mode if mode in BUILD_CACHE_MODES else DEFAULT_BUILD_CACHE_MODE
+
+
+def configured_build_cache_mode(cfg: dict | None) -> str:
+    """Resolve the persisted policy; malformed config fails closed to isolated."""
+
+    return normalize_build_cache_mode(
+        (cfg or {}).get("build_cache_mode"),
+    )
+
+
 def _builder_proxy_is_safe(runtime: dict[str, str]) -> tuple[bool, str | None]:
     """Whether a dedicated bridge builder can use the configured build proxy.
 
@@ -227,18 +274,25 @@ def _builder_proxy_is_safe(runtime: dict[str, str]) -> tuple[bool, str | None]:
 
 def prepare_trial_builder(
     home: Path, *, assignment_id: str, runtime: dict[str, str] | None = None,
+    mode: str = DEFAULT_BUILD_CACHE_MODE,
 ) -> TrialBuilderLease:
-    """Create an isolated BuildKit builder for exactly one assignment.
+    """Create a BuildKit builder for one assignment or a scoped shared cache.
 
     The builder is never selected globally. ``BUILDX_BUILDER`` is applied only
-    to Pier's child environment, and deleting the builder removes its dedicated
-    BuildKit state volume without touching the user's default builder cache.
+    to Pier's child environment.  ``isolated`` keeps the historical
+    assignment-scoped lifecycle; ``shared`` keeps one host-user-scoped
+    BuildKit state volume so immutable base/install layers can be reused by
+    concurrent tasks.  No credential or task worktree is placed in that cache.
     """
+    mode = normalize_build_cache_mode(mode)
     runtime = runtime or {}
     safe, note = _builder_proxy_is_safe(runtime)
     if not safe:
         return TrialBuilderLease(None, False, note)
-    name = trial_builder_name(home, assignment_id)
+    reusable = mode == "shared"
+    name = shared_builder_name(home) if reusable else trial_builder_name(
+        home, assignment_id,
+    )
     try:
         version = _run_docker(["buildx", "version"], timeout=30, allow_fail=True)
         if version.returncode != 0:
@@ -250,27 +304,81 @@ def prepare_trial_builder(
         )
         if existing.returncode == 0:
             # The assignment lock proves this same home cannot be running the
-            # assignment concurrently. A matching builder is stale residue
-            # from a crashed prior attempt and is safe to replace exactly.
-            _run_docker(["buildx", "rm", name], timeout=180)
-        created = _run_docker([
-            "buildx", "create", "--name", name,
-            "--driver", "docker-container",
-        ], timeout=120, allow_fail=True)
-        if created.returncode != 0:
-            detail = (created.stderr or created.stdout or "").strip()
-            return TrialBuilderLease(
-                None, False,
-                "无法创建隔离的临时构建空间"
-                + (f"：{detail[:160]}" if detail else ""),
+            # A matching assignment builder is stale residue from a crashed
+            # prior attempt and is safe to replace exactly.  The shared
+            # builder is deliberately retained so its content-addressed cache
+            # survives between tasks.
+            if not reusable:
+                _run_docker(["buildx", "rm", name], timeout=180)
+        if existing.returncode != 0:
+            created = _run_docker([
+                "buildx", "create", "--name", name,
+                "--driver", "docker-container",
+            ], timeout=120, allow_fail=True)
+            if created.returncode != 0:
+                # Two workers can race to create the same shared builder.  A
+                # short bounded inspect loop proves whether the first worker
+                # won; only a genuinely unavailable builder falls back.  This
+                # avoids turning a harmless create race into a missing lane in
+                # an eight-worker pool.
+                if reusable:
+                    raced = None
+                    for _ in range(8):
+                        raced = _run_docker(
+                            ["buildx", "inspect", name],
+                            timeout=10,
+                            allow_fail=True,
+                        )
+                        if raced.returncode == 0:
+                            break
+                        time.sleep(0.5)
+                    if raced is None or raced.returncode != 0:
+                        detail = (created.stderr or created.stdout or "").strip()
+                        return TrialBuilderLease(
+                            None, False,
+                            "无法创建共享构建缓存空间"
+                            + (f"：{detail[:160]}" if detail else ""),
+                        )
+                else:
+                    detail = (created.stderr or created.stdout or "").strip()
+                    return TrialBuilderLease(
+                        None, False,
+                        "无法创建隔离的临时构建空间"
+                        + (f"：{detail[:160]}" if detail else ""),
+                    )
+        if reusable:
+            # Bootstrap once before Pier starts its full environment timeout.
+            # This moves BuildKit image download/daemon startup out of the
+            # critical task build and amortizes it across all workers.
+            bootstrapped = _run_docker(
+                ["buildx", "inspect", name, "--bootstrap"],
+                timeout=180,
+                allow_fail=True,
             )
+            if bootstrapped.returncode != 0:
+                detail = (bootstrapped.stderr or bootstrapped.stdout or "").strip()
+                return TrialBuilderLease(
+                    None, False,
+                    "共享构建缓存空间未能启动"
+                    + (f"：{detail[:160]}" if detail else ""),
+                )
     except DockerUnavailable as exc:
-        return TrialBuilderLease(None, False, f"临时构建空间不可用：{exc}")
+        label = "共享构建缓存空间" if reusable else "临时构建空间"
+        return TrialBuilderLease(None, False, f"{label}不可用：{exc}")
+    if reusable:
+        return TrialBuilderLease(
+            name, True, "共享 BuildKit 缓存已预热；仅限当前 OS 用户的 Docker 环境", True,
+        )
     return TrialBuilderLease(name, True)
 
 
-def remove_trial_builder(home: Path, assignment_id: str) -> tuple[bool, str | None]:
-    """Remove only the deterministic builder owned by one assignment."""
+def remove_trial_builder(
+    home: Path, assignment_id: str, *, mode: str = DEFAULT_BUILD_CACHE_MODE,
+) -> tuple[bool, str | None]:
+    """Remove only an assignment builder; retain a scoped shared cache."""
+
+    if normalize_build_cache_mode(mode) == "shared":
+        return True, None
     name = trial_builder_name(home, assignment_id)
     try:
         inspected = _run_docker(
@@ -287,6 +395,49 @@ def remove_trial_builder(home: Path, assignment_id: str) -> tuple[bool, str | No
         detail = (removed.stderr or removed.stdout or "Docker 拒绝清理").strip()
         return False, detail[:300]
     return True, None
+
+
+def prune_shared_build_cache(
+    home: Path, *, max_used_bytes: int,
+) -> tuple[bool, str | None]:
+    """Prune only DRadar's persistent shared builder to a bounded cap.
+
+    The shared builder is intentionally retained between tasks, but it must
+    have an explicit lifecycle. This helper never touches the default builder
+    or another named builder: it first proves the deterministic, OS-user
+    scoped name exists, then invokes BuildKit's own GC with a byte cap. The
+    caller is responsible for refusing the operation while active assignments
+    are running and for asking the user before the destructive invocation.
+    """
+
+    if (
+        not isinstance(max_used_bytes, int)
+        or isinstance(max_used_bytes, bool)
+        or max_used_bytes <= 0
+    ):
+        return False, "共享构建缓存上限必须是正整数"
+    name = shared_builder_name(home)
+    try:
+        inspected = _run_docker(
+            ["buildx", "inspect", name], timeout=30, allow_fail=True,
+        )
+        if inspected.returncode != 0:
+            return True, "共享 builder 尚未创建，无需清理"
+        pruned = _run_docker(
+            [
+                "buildx", "prune", "--builder", name, "--force", "--all",
+                "--max-used-space", str(max_used_bytes),
+            ],
+            timeout=600,
+            allow_fail=True,
+        )
+    except DockerUnavailable as exc:
+        return False, str(exc)
+    if pruned.returncode != 0:
+        detail = (pruned.stderr or pruned.stdout or "BuildKit 拒绝清理").strip()
+        return False, detail[:300]
+    detail = (pruned.stdout or "").strip().replace("\n", " ")
+    return True, detail[:300] if detail else "共享构建缓存已按上限回收"
 
 
 def _parse_size(value: object) -> int:
@@ -1010,7 +1161,8 @@ def _remove_project_runtime(project: str, job_dir: Path) -> tuple[int, int, int]
 
 def cleanup_trial_resources(
     home: Path, *, assignment_id: str, job_dir: Path, trial_name: str,
-    builder_isolated: bool, keep_images: bool = False,
+    builder_isolated: bool, builder_reusable: bool = False,
+    builder_name: str | None = None, keep_images: bool = False,
 ) -> TaskCleanupResult:
     """Delete one settled task's exact Docker resources before any refill.
 
@@ -1051,7 +1203,14 @@ def cleanup_trial_resources(
                 result.success = False
                 notes.append(image_note)
 
-    builder_removed, builder_note = remove_trial_builder(home, assignment_id)
+    if builder_reusable:
+        builder_removed, builder_note = remove_trial_builder(
+            home, assignment_id, mode="shared",
+        )
+    else:
+        # Preserve the narrow legacy call shape for embedders that provide a
+        # small test double around the assignment-scoped cleanup helper.
+        builder_removed, builder_note = remove_trial_builder(home, assignment_id)
     result.builder_removed = builder_removed
     if not builder_isolated:
         result.success = False
@@ -1059,6 +1218,8 @@ def cleanup_trial_resources(
     elif not builder_removed:
         result.success = False
         notes.append(f"临时构建空间清理失败：{builder_note or 'unknown error'}")
+    # A host-user-scoped shared builder is intentionally retained for the next
+    # task; only this task's Compose objects/images are cleaned above.
     result.note = "；".join(notes) if notes else None
     return result
 
@@ -1173,6 +1334,12 @@ def cmd_config_show(args) -> int:
     print(f"  limit: {policy.limit_bytes / GIB:.1f} GiB ({source})")
     print(f"  cleanup target: {policy.target_bytes / GIB:.1f} GiB")
     print(f"  minimum free disk: {policy.min_free_bytes / GIB:.0f} GiB")
+    print(f"  build cache mode: {configured_build_cache_mode(cfg)}")
+    build_timeout = cfg.get("environment_build_timeout_multiplier")
+    print(
+        "  environment build timeout multiplier: "
+        f"{build_timeout if build_timeout is not None else '2 (default)'}"
+    )
     print(f"  proxy environment detected: {'yes' if proxy_detected() else 'no'}")
     return 0
 
@@ -1181,7 +1348,27 @@ def cmd_config_set(args) -> int:
     from . import local_config
 
     cfg = local_config._load_config()
-    if args.key == "image-cache-mode":
+    if args.key == "environment-build-timeout-multiplier":
+        try:
+            value = float(args.value.strip())
+        except (TypeError, ValueError) as exc:
+            raise SystemExit(
+                "environment-build-timeout-multiplier must be between 1 and 8"
+            ) from exc
+        if not (value == value and value not in (float("inf"), float("-inf"))
+                and 1.0 <= value <= 8.0):
+            raise SystemExit(
+                "environment-build-timeout-multiplier must be between 1 and 8"
+            )
+        cfg["environment_build_timeout_multiplier"] = value
+        shown = f"{value:g}"
+    elif args.key == "build-cache-mode":
+        value = args.value.strip().lower()
+        if value not in BUILD_CACHE_MODES:
+            raise SystemExit("build-cache-mode must be isolated or shared")
+        cfg["build_cache_mode"] = value
+        shown = value
+    elif args.key == "image-cache-mode":
         value = args.value.strip().lower()
         if value not in {"balanced", "metered", "disk"}:
             raise SystemExit("image-cache-mode must be balanced, metered, or disk")
@@ -1214,6 +1401,8 @@ __all__ = [
     "effective_policy", "is_wsl", "load", "plan_cleanup",
     "prepare_trial_builder", "proxy_detected", "record_trial_images",
     "remove_assignment_images", "remove_images", "remove_trial_builder",
-    "trial_builder_name",
+    "prune_shared_build_cache",
+    "trial_builder_name", "shared_builder_name", "normalize_build_cache_mode",
+    "configured_build_cache_mode", "BUILD_CACHE_MODES", "DEFAULT_BUILD_CACHE_MODE",
     "wsl_host_disk_free_bytes", "cmd_config_set", "cmd_config_show",
 ]
