@@ -4,6 +4,7 @@ the submit() multipart shape, and the Authorization header rules."""
 
 import json
 import urllib.parse
+from email.utils import formatdate
 
 import httpx
 import pytest
@@ -215,6 +216,112 @@ def test_multipart_submission_can_retry_after_429(tmp_path):
     assert ack["submission_id"] == "s1"
     assert len(bodies) == 2
     assert all(b'name="patch"' in body for body in bodies)
+
+
+def test_submission_maintenance_honors_http_date_retry_after(tmp_path):
+    calls = []
+    wall_time = 1_700_000_000.0
+
+    def handler(request):
+        calls.append(request.read())
+        if len(calls) == 1:
+            return httpx.Response(
+                503,
+                headers={
+                    "Retry-After": formatdate(wall_time + 7, usegmt=True),
+                },
+                json={
+                    "detail": "deployment in progress",
+                    "code": "deployment_maintenance",
+                },
+            )
+        return httpx.Response(
+            200, json={"submission_id": "s1", "grade_status": "pending"},
+        )
+
+    patch = tmp_path / "model.patch"
+    patch.write_text("diff")
+    client = _client(handler)
+    now = [0.0]
+    waits = []
+    client._wall_time = lambda: wall_time
+    client._monotonic = lambda: now[0]
+
+    def sleep(seconds):
+        waits.append(seconds)
+        now[0] += seconds
+
+    client._sleep = sleep
+
+    ack = client.submit("a1", "nonce", patch, None, None, {})
+    assert ack["submission_id"] == "s1"
+    assert waits == [7.0]
+    assert len(calls) == 2
+    assert all(b'name="assignment_id"' in body for body in calls)
+    assert all(b'name="patch"' in body and b"diff" in body for body in calls)
+
+
+def test_submission_write_does_not_retry_unrelated_503(tmp_path):
+    calls = 0
+
+    def handler(_request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            503,
+            headers={"Retry-After": "1"},
+            json={
+                "detail": "upstream unavailable",
+                "code": "upstream_unavailable",
+            },
+        )
+
+    patch = tmp_path / "model.patch"
+    patch.write_text("diff")
+    client = _client(handler)
+    waits = []
+    client._sleep = waits.append
+
+    with pytest.raises(ApiError) as raised:
+        client.submit("a1", "nonce", patch, None, None, {})
+
+    assert raised.value.status_code == 503
+    assert raised.value.code == "upstream_unavailable"
+    assert calls == 1
+    assert waits == []
+
+
+def test_submission_maintenance_refuses_retry_after_above_single_wait_limit(
+    tmp_path,
+):
+    calls = 0
+
+    def handler(_request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            503,
+            headers={"Retry-After": "61"},
+            json={
+                "detail": "deployment in progress",
+                "code": "deployment_maintenance",
+            },
+        )
+
+    patch = tmp_path / "model.patch"
+    patch.write_text("diff")
+    client = _client(handler)
+    waits = []
+    client._sleep = waits.append
+
+    with pytest.raises(ApiError, match="safe single-wait limit exceeded") as raised:
+        client.submit("a1", "nonce", patch, None, None, {})
+
+    assert raised.value.status_code == 503
+    assert raised.value.code == "deployment_maintenance"
+    assert raised.value.retry_after == 61.0
+    assert calls == 1
+    assert waits == []
 
 
 def test_submission_upload_intent_and_submit_share_exact_content_hash(tmp_path):

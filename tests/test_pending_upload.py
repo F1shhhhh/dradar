@@ -3,12 +3,15 @@ disk and be retryable without re-running, via a local pending-upload ledger.
 """
 
 import json
+import urllib.parse
 from pathlib import Path
+from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from dradar import local_jobs, pending, runloop
-from dradar.api_client import ApiError
+from dradar.api_client import ApiClient, ApiError
 
 
 # --- pending.py: the ledger itself ------------------------------------------
@@ -214,6 +217,236 @@ def test_plan_pending_upload_replays_closed_exact_session_without_model_rerun(
     assert pending.load(tmp_path) == []
     assert client.calls == ["a1"]
     assert len(client.intent_calls) == 2
+
+
+def test_maintenance_intent_waits_then_submits_pending_without_model_rerun(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    entry = _entry(
+        trial_dir,
+        runner_session_id="session-1234",
+        owner_epoch=7,
+        resume_generation=2,
+        ledger_version=3,
+    )
+    pending.record(tmp_path, entry)
+    requests = []
+    intent_attempts = 0
+
+    def handler(request):
+        nonlocal intent_attempts
+        body = request.read()
+        requests.append((request.url.path, body))
+        saved = pending.load(tmp_path)
+        assert len(saved) == 1
+        assert saved[0]["runner_session_id"] == "session-1234"
+        assert saved[0]["owner_epoch"] == 7
+        if request.url.path.endswith("submission-upload-intents"):
+            intent_attempts += 1
+            form = urllib.parse.parse_qs(body.decode())
+            assert form["session_id"] == ["session-1234"]
+            assert form["owner_epoch"] == ["7"]
+            if intent_attempts == 1:
+                return httpx.Response(
+                    503,
+                    headers={"Retry-After": "2"},
+                    json={
+                        "detail": "deployment in progress",
+                        "code": "deployment_maintenance",
+                    },
+                )
+            return httpx.Response(200, json={"ok": True})
+        assert request.url.path.endswith("submissions")
+        assert b'name="owner_epoch"' in body
+        assert b"\r\n7\r\n" in body
+        return httpx.Response(
+            200, json={"submission_id": "s1", "grade_status": "pending"},
+        )
+
+    client = ApiClient(
+        "https://api.example.com", "drt_test",
+        transport=httpx.MockTransport(handler), capabilities=(),
+    )
+    now = [0.0]
+    waits = []
+    client._monotonic = lambda: now[0]
+
+    def sleep(seconds):
+        waits.append(seconds)
+        now[0] += seconds
+
+    client._sleep = sleep
+    monkeypatch.setattr(
+        runloop,
+        "_run_and_submit",
+        lambda *_a, **_k: pytest.fail("pending upload must not rerun the model"),
+    )
+
+    assert runloop._retry_pending_uploads(client) == ["submitted"]
+    assert [path for path, _body in requests] == [
+        "/api/v1/submission-upload-intents",
+        "/api/v1/submission-upload-intents",
+        "/api/v1/submissions",
+    ]
+    assert requests[0][1] == requests[1][1]
+    assert waits == [2.0]
+    assert pending.load(tmp_path) == []
+
+
+def test_maintenance_total_budget_exhaustion_keeps_ledger_and_exits_nonzero(
+    tmp_path: Path, monkeypatch, capsys,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    entry = _entry(
+        trial_dir,
+        runner_session_id="session-1234",
+        owner_epoch=7,
+        ledger_version=3,
+    )
+    pending.record(tmp_path, entry)
+    paths = []
+    intent_attempts = 0
+
+    def handler(request):
+        nonlocal intent_attempts
+        paths.append(request.url.path)
+        if request.url.path.endswith("submission-upload-intents"):
+            intent_attempts += 1
+            if intent_attempts == 1:
+                return httpx.Response(
+                    503,
+                    headers={"Retry-After": "2"},
+                    json={
+                        "detail": "deployment in progress",
+                        "code": "deployment_maintenance",
+                    },
+                )
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(
+            503,
+            headers={"Retry-After": "2"},
+            json={
+                "detail": "deployment still in progress",
+                "code": "deployment_maintenance",
+            },
+        )
+
+    client = ApiClient(
+        "https://api.example.com", "drt_test",
+        transport=httpx.MockTransport(handler), capabilities=(),
+    )
+    now = [0.0]
+    waits = []
+    client._submission_maintenance_retry_budget = 3.0
+    client._monotonic = lambda: now[0]
+
+    def sleep(seconds):
+        waits.append(seconds)
+        now[0] += seconds
+
+    client._sleep = sleep
+    monkeypatch.setattr(runloop, "_load_config", lambda: {})
+    monkeypatch.setattr(runloop, "_client", lambda _cfg: client)
+    monkeypatch.setattr(
+        runloop,
+        "_run_and_submit",
+        lambda *_a, **_k: pytest.fail("retry-upload must not run the model"),
+    )
+
+    exit_code = runloop.cmd_retry_upload(
+        SimpleNamespace(request_salvage=None, yes=True),
+    )
+
+    assert exit_code == 1
+    assert paths == [
+        "/api/v1/submission-upload-intents",
+        "/api/v1/submission-upload-intents",
+        "/api/v1/submissions",
+    ]
+    assert waits == [2.0]
+    saved = pending.load(tmp_path)
+    assert len(saved) == 1
+    assert saved[0]["runner_session_id"] == "session-1234"
+    assert saved[0]["owner_epoch"] == 7
+    assert "upload_blocked" not in saved[0]
+    output = capsys.readouterr().out
+    assert "deployment maintenance retry budget exhausted" in output
+    assert "still pending and retryable" in output
+
+
+def test_maintenance_retry_preserves_owner_superseded_fail_closed(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(runloop, "HOME", tmp_path)
+    trial_dir = _make_trial_dir(tmp_path)
+    entry = _entry(
+        trial_dir,
+        runner_session_id="session-1234",
+        owner_epoch=7,
+        ledger_version=3,
+    )
+    pending.record(tmp_path, entry)
+    paths = []
+
+    def handler(request):
+        body = request.read()
+        paths.append(request.url.path)
+        assert request.url.path.endswith("submission-upload-intents")
+        form = urllib.parse.parse_qs(body.decode())
+        assert form["session_id"] == ["session-1234"]
+        assert form["owner_epoch"] == ["7"]
+        if len(paths) == 1:
+            return httpx.Response(
+                503,
+                headers={"Retry-After": "1"},
+                json={
+                    "detail": "deployment in progress",
+                    "code": "deployment_maintenance",
+                },
+            )
+        return httpx.Response(
+            409,
+            json={
+                "detail": "upload owner superseded",
+                "code": "upload_owner_superseded",
+            },
+        )
+
+    client = ApiClient(
+        "https://api.example.com", "drt_test",
+        transport=httpx.MockTransport(handler), capabilities=(),
+    )
+    now = [0.0]
+    client._monotonic = lambda: now[0]
+    client._sleep = lambda seconds: now.__setitem__(0, now[0] + seconds)
+    monkeypatch.setattr(
+        runloop,
+        "_run_and_submit",
+        lambda *_a, **_k: pytest.fail("owner conflict must not rerun the model"),
+    )
+
+    assert runloop._retry_pending_uploads(client) == ["upload-blocked"]
+    assert paths == [
+        "/api/v1/submission-upload-intents",
+        "/api/v1/submission-upload-intents",
+    ]
+    saved = pending.load(tmp_path)
+    assert len(saved) == 1
+    assert saved[0]["upload_blocked"] == "owner_superseded"
+    assert pending.assignment_ids(tmp_path) == {"a1"}
+
+    def must_not_contact_server(_request):
+        pytest.fail("blocked owner must remain local on automatic retry")
+
+    blocked_client = ApiClient(
+        "https://api.example.com", "drt_test",
+        transport=httpx.MockTransport(must_not_contact_server), capabilities=(),
+    )
+    assert runloop._retry_pending_uploads(blocked_client) == ["upload-blocked"]
+    assert pending.assignment_ids(tmp_path) == {"a1"}
 
 
 def test_plan_pending_replay_is_exact_batch_scoped(tmp_path: Path, monkeypatch):
