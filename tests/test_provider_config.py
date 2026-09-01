@@ -758,3 +758,86 @@ def test_kimi_login_uses_node_code_home_contract(
     assert seen["env"]["KIMI_CODE_HOME"] == str(provider_config.kimi_home())
     assert seen["env"]["HTTPS_PROXY"] == "http://127.0.0.1:18080"
     assert "KIMI_API_KEY" not in seen["env"]
+
+
+def test_codebuddy_setup_accepts_newer_compatible_host_as_login_source(
+    tmp_path, monkeypatch, capsys,
+):
+    managed = tmp_path / "managed-codebuddy"
+    monkeypatch.setattr(
+        provider_config, "codebuddy_executable", lambda: "/usr/bin/codebuddy",
+    )
+    monkeypatch.setattr(
+        provider_config,
+        "codebuddy_host_cli_status",
+        lambda _executable: (None, "2.143.0"),
+    )
+    monkeypatch.setattr(provider_config, "import_host_login", lambda: managed)
+    monkeypatch.setattr(
+        provider_config, "codebuddy_credential_status", lambda: (True, "ready"),
+    )
+    monkeypatch.setattr(
+        provider_config.shutil,
+        "which",
+        lambda name: "/usr/bin/docker" if name == "docker" else None,
+    )
+    monkeypatch.setattr(
+        provider_config,
+        "ensure_codebuddy_runtime_image",
+        lambda _docker: "dradar-codebuddy:2.137.1",
+    )
+
+    assert provider_config._setup_codebuddy_subscription() == 0
+    output = capsys.readouterr().out
+    assert str(managed) in output
+    assert "dradar-codebuddy:2.137.1" in output
+
+
+def test_codebuddy_status_distinguishes_host_login_source_from_pinned_runtime(
+    tmp_path, monkeypatch, capsys,
+):
+    monkeypatch.setattr(
+        provider_config, "codebuddy_executable", lambda: "/usr/bin/codebuddy",
+    )
+    monkeypatch.setattr(
+        provider_config,
+        "codebuddy_host_cli_status",
+        lambda _executable: (None, "2.143.0"),
+    )
+    monkeypatch.setattr(
+        provider_config, "codebuddy_credential_status", lambda: (True, "ready"),
+    )
+    monkeypatch.setattr(
+        provider_config, "codebuddy_runtime_image_error", lambda: None,
+    )
+    monkeypatch.setattr(
+        provider_config, "managed_codebuddy_home", lambda: tmp_path / "managed",
+    )
+
+    assert provider_config._status_codebuddy_subscription(live=False) == 0
+    output = capsys.readouterr().out
+    assert "host CLI 2.143.0 as login source" in output
+    assert "runtime CLI 2.137.1" in output
+
+
+def test_codebuddy_setup_rejects_other_major_without_importing_login(
+    monkeypatch, capsys,
+):
+    monkeypatch.setattr(
+        provider_config, "codebuddy_executable", lambda: "/usr/bin/codebuddy",
+    )
+    monkeypatch.setattr(
+        provider_config,
+        "codebuddy_host_cli_status",
+        lambda _executable: ("incompatible", "3.0.0"),
+    )
+    monkeypatch.setattr(
+        provider_config,
+        "import_host_login",
+        lambda: (_ for _ in ()).throw(AssertionError("must not import login")),
+    )
+
+    assert provider_config._setup_codebuddy_subscription() == 1
+    output = capsys.readouterr().out
+    assert "3.0.0 is incompatible" in output
+    assert "runtime 2.137.1" in output

@@ -11,7 +11,16 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from dradar import cli, doctor, fleet, pending, provider_config, run_plans, runloop
+from dradar import (
+    cli,
+    codebuddy_provider,
+    doctor,
+    fleet,
+    pending,
+    provider_config,
+    run_plans,
+    runloop,
+)
 from dradar.api_client import ApiClient, ApiError
 
 
@@ -2189,6 +2198,78 @@ def test_claude_plan_accepts_ready_subscription_runtime(monkeypatch):
     assert doctor.plan_environment_issue(
         _plan(harness="claude-code", task_count=1),
     ) is None
+
+
+@pytest.mark.parametrize("version", ["2.137.1", "2.143.0"])
+def test_codebuddy_plan_accepts_compatible_host_login_source(
+    version, monkeypatch,
+):
+    monkeypatch.setattr(
+        doctor.shutil, "which",
+        lambda name: "/usr/bin/docker" if name == "docker" else None,
+    )
+    monkeypatch.setattr(doctor, "_probe", lambda _command: True)
+    monkeypatch.setattr(doctor.runner, "ensure_pier", lambda: None)
+    monkeypatch.setattr(
+        doctor, "codebuddy_executable", lambda: "/usr/bin/codebuddy",
+    )
+    monkeypatch.setattr(
+        codebuddy_provider, "codebuddy_version", lambda _executable: version,
+    )
+    monkeypatch.setattr(
+        doctor, "codebuddy_credential_status", lambda: (True, "ready"),
+    )
+    monkeypatch.setattr(
+        doctor, "codebuddy_runtime_image_error", lambda _docker: None,
+    )
+
+    assert doctor.plan_environment_issue(
+        _plan(harness="codebuddy", task_count=1),
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "executable,version,credentials_ready,image_issue,error_code,message",
+    [
+        (None, None, True, None, "current_tool_not_installed", "尚未安装"),
+        ("/usr/bin/codebuddy", None, True, None,
+         "current_tool_version_unknown", "无法识别"),
+        ("/usr/bin/codebuddy", "2.136.9", True, None,
+         "current_tool_version_incompatible", "不兼容"),
+        ("/usr/bin/codebuddy", "2.143.0", False, None,
+         "current_tool_not_authenticated", "尚未登录"),
+        ("/usr/bin/codebuddy", "2.143.0", True, "image missing",
+         "current_tool_runtime_not_ready", "隔离运行环境"),
+    ],
+)
+def test_codebuddy_plan_reports_each_readiness_failure_separately(
+    executable, version, credentials_ready, image_issue, error_code, message,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        doctor.shutil, "which",
+        lambda name: "/usr/bin/docker" if name == "docker" else None,
+    )
+    monkeypatch.setattr(doctor, "_probe", lambda _command: True)
+    monkeypatch.setattr(doctor.runner, "ensure_pier", lambda: None)
+    monkeypatch.setattr(doctor, "codebuddy_executable", lambda: executable)
+    monkeypatch.setattr(
+        codebuddy_provider, "codebuddy_version", lambda _executable: version,
+    )
+    monkeypatch.setattr(
+        doctor, "codebuddy_credential_status",
+        lambda: (credentials_ready, "login missing"),
+    )
+    monkeypatch.setattr(
+        doctor, "codebuddy_runtime_image_error", lambda _docker: image_issue,
+    )
+
+    issue = doctor.plan_environment_issue(
+        _plan(harness="codebuddy", task_count=1),
+    )
+
+    assert issue["error_code"] == error_code
+    assert message in issue["user_message"]
 
 
 @pytest.mark.parametrize("missing", ["cli", "oauth"])

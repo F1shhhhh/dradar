@@ -24,9 +24,9 @@ from .codebuddy_provider import (
     CODEBUDDY_CONTAINER_IMAGE,
     CODEBUDDY_MODEL,
     codebuddy_executable,
+    codebuddy_host_cli_status,
     codebuddy_runtime_image_error,
     codebuddy_subscription_session,
-    codebuddy_version,
     ensure_codebuddy_runtime_image,
     import_host_login,
     managed_codebuddy_home,
@@ -877,11 +877,20 @@ def cmd_provider_status(args) -> int:
 
 def _setup_codebuddy_subscription() -> int:
     executable = codebuddy_executable()
-    version = codebuddy_version(executable)
-    if version != CODEBUDDY_CLI_VERSION:
+    cli_issue, host_version = codebuddy_host_cli_status(executable)
+    if cli_issue is not None:
+        detail = {
+            "missing": "CodeBuddy is not installed",
+            "unrecognized": "the installed CodeBuddy version could not be recognized",
+            "incompatible": (
+                f"CodeBuddy {host_version} is incompatible; install "
+                f"{CODEBUDDY_CLI_VERSION} or newer within the 2.x series"
+            ),
+        }.get(cli_issue, "CodeBuddy is not ready")
         print(
-            f"CodeBuddy CLI {CODEBUDDY_CLI_VERSION} is required; found "
-            f"{version or 'none'}. Install that reviewed official release, "
+            f"{detail}. The host CLI is used only as the login source; "
+            f"benchmark tasks remain pinned to reviewed runtime "
+            f"{CODEBUDDY_CLI_VERSION}. "
             "complete CodeBuddy login in your own interactive Terminal, then retry."
         )
         return 1
@@ -921,11 +930,20 @@ def _setup_codebuddy_subscription() -> int:
 
 def _status_codebuddy_subscription(*, live: bool) -> int:
     executable = codebuddy_executable()
-    version = codebuddy_version(executable)
-    if version != CODEBUDDY_CLI_VERSION:
+    cli_issue, host_version = codebuddy_host_cli_status(executable)
+    if cli_issue is not None:
+        detail = {
+            "missing": "CodeBuddy is not installed",
+            "unrecognized": "the installed CodeBuddy version could not be recognized",
+            "incompatible": (
+                f"CodeBuddy {host_version} is incompatible; install "
+                f"{CODEBUDDY_CLI_VERSION} or newer within the 2.x series"
+            ),
+        }.get(cli_issue, "CodeBuddy is not ready")
         print(
-            f"CodeBuddy provider not ready: CLI {CODEBUDDY_CLI_VERSION} required, "
-            f"found {version or 'none'}."
+            f"CodeBuddy provider not ready: {detail}. The host CLI is used only "
+            f"as the login source; benchmark tasks remain pinned to reviewed "
+            f"runtime {CODEBUDDY_CLI_VERSION}."
         )
         return 1
     ok, detail = codebuddy_credential_status()
@@ -944,7 +962,8 @@ def _status_codebuddy_subscription(*, live: bool) -> int:
         return 1
     print(
         f"CodeBuddy provider ready via {managed_codebuddy_home()} "
-        f"({detail}, CLI {CODEBUDDY_CLI_VERSION}, model {CODEBUDDY_MODEL}, "
+        f"({detail}, host CLI {host_version} as login source, runtime CLI "
+        f"{CODEBUDDY_CLI_VERSION}, model {CODEBUDDY_MODEL}, "
         "API keys disabled, concurrent task sessions enabled)."
     )
     return _live_codebuddy_status() if live else 0
